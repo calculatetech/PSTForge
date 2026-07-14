@@ -148,9 +148,9 @@ work. Hash and identity evidence show that the source was not modified.
 - Decision: GitHub-dependent work starts only after the approved documentation
   baseline is pushed; it is not a prerequisite for local implementation and
   testing.
-  Rationale: An empty reachable remote was attached on 2026-07-14, but there is
-  no approved baseline or remote branch yet and the local `gh` CLI is not
-  authenticated. Local quality gates must remain independently useful.
+  Rationale: The remote and `gh` authentication became available on
+  2026-07-14. GitHub work follows the approved baseline, while local quality
+  gates remain independently useful.
   Date/Author: 2026-07-14 / project owner and Codex.
 
 ## Outcomes & Retrospective
@@ -444,12 +444,13 @@ dependency metadata pass inspection.
 ### Milestone 10: Version 0.5.1 - GitHub CI and Private-Corpus Automation
 
 Begin after the human-approved documentation baseline is pushed to the
-reachable `origin` remote and repository settings can be configured. Add
-pull-request workflows for formatting, clippy, unit/integration tests, Debian
-and Ubuntu builds, docs, license policy, and advisories. Add scheduled fuzzing
-and a manual self-hosted runner labeled for the private PST corpus. The private
-runner emits only redacted JUnit/summary data and never uploads PSTs, spool
-data, mail metadata, or verbose logs.
+reachable `origin` remote and repository settings can be configured. This
+repository does not use pull requests. Add branch-push workflows for formatting,
+clippy, unit/integration tests, Debian and Ubuntu builds, docs, license policy,
+and advisories. Add scheduled fuzzing and a manual self-hosted runner labeled
+for the private PST corpus. The private runner emits only redacted
+JUnit/summary data and never uploads PSTs, spool data, mail metadata, or verbose
+logs.
 
 Add a release workflow that builds but cannot publish without an approved tag
 and environment. Repository automation does not waive the rule that agents may
@@ -643,10 +644,9 @@ baseline is pushed, prefer an upstreamable patch, publish corresponding source
 with any distributed binary, and preserve runtime library replacement.
 
 GitHub Actions, remote forks, release environments, badges, branch protection,
-and self-hosted runner configuration require an approved baseline on the
-currently empty remote. Do not create or configure them before that push, and
-do not assume `gh` API access until the CLI is authenticated. Local work must
-never depend on their existence.
+and self-hosted runner configuration build on the approved remote baseline.
+Recheck authentication and repository settings before creating or configuring
+them. Local work must never depend on their existence.
 
 Revision note (2026-07-14): Initial decision-complete ExecPlan created from the
 reviewed outline, host/package inspection, upstream source and license review,

@@ -81,11 +81,11 @@ newer Ubuntu development host package.
 
 ### 10. Version 0.5.1 - GitHub CI and Private-Corpus Automation
 
-The empty GitHub remote is attached and reachable. Begin this milestone after
-the human-approved documentation baseline has been pushed and repository
-settings can be configured. Add pull-request checks, scheduled security and
-fuzzing jobs, release automation, and an explicitly invoked private self-hosted
-corpus runner that never uploads PST content or sensitive logs.
+The GitHub remote and approved documentation baseline are available. Add branch
+checks, scheduled security and fuzzing jobs, release automation, and an
+explicitly invoked private self-hosted corpus runner that never uploads PST
+content or sensitive logs. This repository does not use pull requests, so
+required checks apply to milestone branches and pre-merge local gates.
 
 ### 11. Version 0.6.0 - Interoperability Release Candidate
 

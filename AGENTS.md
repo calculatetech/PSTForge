@@ -73,13 +73,13 @@ Do not create a milestone branch until the previous milestone is approved.
 Do not push, merge, tag, publish, or rename the default branch without explicit
 human approval. Approval for a commit is not approval to push or merge.
 
-The repository has an empty reachable GitHub remote at
-`git@github.com:calculatetech/PSTForge.git`. Do not push the bootstrap commit
-until the human owner explicitly approves it. Add GitHub Actions, branch
-protection, release environments, badges, remote forks, or other dependent work
-only after the approved baseline exists remotely. Local automation must always
-work independently of GitHub. The `gh` CLI is not currently authenticated, so
-do not assume GitHub API operations are available from this host.
+The repository has a reachable GitHub remote at
+`git@github.com:calculatetech/PSTForge.git`, with `main` as the approved baseline
+and default branch. Add GitHub Actions, branch protection, release environments,
+badges, remote forks, or other dependent work only from an approved milestone.
+Local automation must always work independently of GitHub. The `gh` CLI is
+authenticated as `calculatetech` with `repo` scope; recheck `gh auth status`
+before an API operation rather than assuming credentials remain unchanged.
 
 ## Review And Commit Gate
 
