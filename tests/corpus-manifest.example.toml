@@ -1,0 +1,10 @@
+schema_version = 1
+
+[[cases]]
+name = "healthy-unicode-small"
+path = "/absolute/path/outside/repository/healthy-unicode.pst"
+sha256 = "0000000000000000000000000000000000000000000000000000000000000000"
+classification = "healthy_unicode"
+milestone_0_1 = true
+minimum_folders = 1
+minimum_messages = 0

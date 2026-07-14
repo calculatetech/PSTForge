@@ -38,7 +38,11 @@ work. Hash and identity evidence show that the source was not modified.
 - [x] (2026-07-14) Locked the 1.0 product goal, CLI, version sequence,
   architecture, licensing boundaries, test strategy, and Git workflow in the
   documentation baseline.
-- [ ] Milestone 0.1.0: Safe Foundation and Inspection.
+- [x] (2026-07-14) Milestone 0.1.0: Safe Foundation and Inspection. Added the
+  Rust workspace, dynamically linked safe `libpff` boundary, read-only source
+  identity and SHA-256 handling, `info` and basic `verify --mode full`,
+  versioned human/JSON reports, structured logging, fake-backend tests, and
+  local fast/full/release automation.
 - [ ] Milestone 0.1.1: Complete Mail Inventory.
 - [ ] Milestone 0.2.0: Unicode PST Writer Foundation.
 - [ ] Milestone 0.2.1: Mail-Fidelity PST Writer.
@@ -90,6 +94,27 @@ work. Hash and identity evidence show that the source was not modified.
   Evidence: direct inspection of Debian package
   `libpff-dev_20180714-3.1+b2_amd64.deb` and Ubuntu package
   `libpff-dev_20231205-1build1_amd64.deb`.
+
+- Observation: Ubuntu's packaged `cargo` and `rustc` do not install formatting
+  or linting tools automatically. The verified additional package names are
+  `rustfmt` and `rust-clippy`; RustSec checking requires `cargo install
+  cargo-audit --locked`.
+  Evidence: the initial 0.1.0 fast gate failed because `cargo fmt` was absent;
+  the gate then passed with Ubuntu's 1.93 formatter and Clippy packages.
+
+- Observation: The declared Rust 1.85 MSRV is sufficient for the complete
+  0.1.0 workspace and locked dependencies.
+  Evidence: `cargo check --workspace --all-targets --locked` passed with the
+  official Rust 1.85.0 toolchain on 2026-07-14.
+
+- Observation: A 31,761,408-byte public Enron Unicode PST provides a useful
+  real-mail acceptance case without storing mail in the repository. PSTForge,
+  `pffinfo`, and `readpst` all read it successfully; PSTForge accounted for 22
+  folders and 2,178 reachable messages, and its SHA-256, inode, size,
+  modification time, and access time remained unchanged across both commands.
+  Evidence: the 0.1.0 full gate passed with the external manifest on
+  2026-07-14; detailed local evidence remains under ignored
+  `.agent/test-results/`.
 
 ## Decision Log
 
@@ -153,13 +178,37 @@ work. Hash and identity evidence show that the source was not modified.
   gates remain independently useful.
   Date/Author: 2026-07-14 / project owner and Codex.
 
+- Decision: Version 0.1.0 `verify --mode full` reports only reachable folder
+  and direct-message counts. Deleted/recovered and orphan counts serialize as
+  `null` and display as `not scanned` until recovery enumeration is
+  implemented; they must never be presented as zero merely because the scan
+  was not run.
+  Rationale: The first milestone establishes safe traversal, while the stable
+  1.0 contract adds deeper property and recovery validation incrementally.
+  Date/Author: 2026-07-14 / Codex.
+
+- Decision: The source is opened once with Linux `O_NOFOLLOW`, `O_NOATIME`, and
+  read-only flags, then libpff receives the held inode through
+  `/proc/self/fd/<fd>` with its read access flag. Identity is checked before
+  and after native parsing.
+  Rationale: libpff's stable API accepts a filename rather than a Rust file
+  descriptor. The proc descriptor path avoids returning to the user-controlled
+  source path after the race-resistant open and preserves replaceable dynamic
+  linking.
+  Date/Author: 2026-07-14 / Codex.
+
 ## Outcomes & Retrospective
 
-The documentation baseline replaces an export-oriented outline with a
-decision-complete route to MailPlus-ready PST parts. Implementation has not
-started. Update this section at every major milestone with what a user can now
-do, evidence that acceptance passed, remaining gaps, and lessons that change
-later work.
+Version 0.1.0 now lets an operator inspect a healthy PST in human or JSON form
+and inventory its reachable folders/messages without changing the source. The
+workspace compiles at the Rust 1.85 MSRV, links dynamically to libpff 20231205,
+and passed formatting, check, Clippy, unit tests, rustdoc warnings, schema and
+documentation checks, license policy, RustSec audit, a real-mail external
+corpus run, `pffinfo`, and `readpst`. Recovery-only enumeration, message
+properties, attachment streaming, damaged-record continuation, and the PST
+writer remain later milestones. The main lesson is that recovery counters must
+encode "not scanned" separately from zero and that privacy-safe automation
+must suppress independent-reader output because it can contain mailbox names.
 
 ## Context and Orientation
 
