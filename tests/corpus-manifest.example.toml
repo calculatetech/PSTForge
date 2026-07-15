@@ -6,5 +6,24 @@ path = "/absolute/path/outside/repository/healthy-unicode.pst"
 sha256 = "0000000000000000000000000000000000000000000000000000000000000000"
 classification = "healthy_unicode"
 milestone_0_1 = true
+milestone_0_1_1 = true
 minimum_folders = 1
 minimum_messages = 0
+minimum_recipients = 0
+minimum_attachments = 0
+minimum_raw_properties = 1
+maximum_peak_stream_chunk_bytes = 65536
+
+[[cases]]
+name = "healthy-ansi-small"
+path = "/absolute/path/outside/repository/healthy-ansi.pst"
+sha256 = "0000000000000000000000000000000000000000000000000000000000000000"
+classification = "healthy_ansi"
+milestone_0_1 = false
+milestone_0_1_1 = true
+minimum_folders = 1
+minimum_messages = 0
+minimum_recipients = 0
+minimum_attachments = 0
+minimum_raw_properties = 1
+maximum_peak_stream_chunk_bytes = 65536

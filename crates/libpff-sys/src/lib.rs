@@ -1,6 +1,7 @@
 //! Safe, minimal ownership boundary around the libpff C API.
 
 mod bindings;
+mod catalog;
 
 use std::collections::HashSet;
 use std::ffi::{CStr, CString};
@@ -28,7 +29,29 @@ pub enum PffError {
     NullPointer { operation: &'static str },
     #[error("source file descriptor is not available through /proc/self/fd")]
     ProcFileDescriptorUnavailable,
+    #[error("catalog sink rejected {operation}: {detail}")]
+    Sink {
+        operation: &'static str,
+        detail: String,
+    },
+    #[error("{field} exceeds the supported limit: {value} > {limit}")]
+    LimitExceeded {
+        field: &'static str,
+        value: u64,
+        limit: u64,
+    },
+    #[error("libpff streamed {actual} bytes for {field}, expected {expected}")]
+    StreamSizeMismatch {
+        field: &'static str,
+        expected: u64,
+        actual: u64,
+    },
 }
+
+pub use catalog::{
+    CatalogEvent, CatalogIssue, CatalogSink, PropertyDescriptor, PropertyOwner, RawCatalog,
+    STREAM_CHUNK_BYTES,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RawPffMetadata {

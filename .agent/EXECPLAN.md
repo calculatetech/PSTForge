@@ -43,7 +43,20 @@ work. Hash and identity evidence show that the source was not modified.
   identity and SHA-256 handling, `info` and basic `verify --mode full`,
   versioned human/JSON reports, structured logging, fake-backend tests, and
   local fast/full/release automation.
-- [ ] Milestone 0.1.1: Complete Mail Inventory.
+- [x] (2026-07-14) Milestone 0.1.1: Complete Mail Inventory.
+  - [x] (2026-07-14) Added bounded folder/message traversal, owned known
+    metadata, raw MAPI property streaming, recipients, attachment payloads,
+    embedded-message relationships, unsupported-class accounting, and capped
+    diagnostics through a safe candidate-event sink.
+  - [x] (2026-07-14) Verified clean Unicode catalog invariants and a 64 KiB
+    peak stream chunk on public external PSTs without source metadata or hash
+    changes.
+  - [x] (2026-07-14) Passed the complete fast gate plus license and RustSec
+    checks; adversarial review capped diagnostic retention and removed the
+    direct-message pending allocation.
+  - [x] (2026-07-14) Passed the full gate on healthy ANSI and Unicode external
+    PSTs, including source immutability plus independent `pffinfo` and
+    `readpst` validation.
 - [ ] Milestone 0.2.0: Unicode PST Writer Foundation.
 - [ ] Milestone 0.2.1: Mail-Fidelity PST Writer.
 - [ ] Milestone 0.3.0: Recoverable Mail Pipeline.
@@ -115,6 +128,24 @@ work. Hash and identity evidence show that the source was not modified.
   Evidence: the 0.1.0 full gate passed with the external manifest on
   2026-07-14; detailed local evidence remains under ignored
   `.agent/test-results/`.
+
+- Observation: Deep enumeration shows the public Enron and larger Outlook
+  fixtures contain broken recipient or attachment local descriptors even
+  though shallow readers complete. They are useful damaged-continuation
+  cases, but are not clean 0.1.1 acceptance fixtures. A separate public
+  GroupDocs Unicode PST cleanly accounts for 43 folders, 10 messages, 10
+  recipients, one attachment, 777 properties, and bounded 64 KiB chunks.
+  Evidence: external catalog runs on 2026-07-14.
+
+- Observation: Most available public vendor fixtures are Unicode. A 2009
+  Govdocs1 file carrying a `.pst` extension is actually PostScript, and the
+  attached Outlook 97-2002 sample located in an old support thread is no
+  longer anonymously downloadable. Aspose Email 19.3 also rejects ANSI PST
+  creation as unimplemented. Sourcegraph path search located msgvault's public
+  65,536-byte Outlook version 14 store, which provided the clean ANSI case and
+  passed PSTForge, `file`, `pffinfo`, and `readpst` classification/reading.
+  Evidence: header classification, file inspection, and the 0.1.1 full gate on
+  2026-07-14.
 
 ## Decision Log
 
@@ -197,6 +228,23 @@ work. Hash and identity evidence show that the source was not modified.
   linking.
   Date/Author: 2026-07-14 / Codex.
 
+- Decision: Version 0.1.1 exposes native catalog data as ordered events with
+  owned metadata and borrowed payload slices no larger than 64 KiB. Direct
+  messages and embedded messages use explicit work stacks, native strings are
+  capped at 1 MiB, embedded depth at 64, and retained diagnostics at 10,000.
+  Rationale: The future durable candidate spool needs complete property data
+  without making memory proportional to a large body, attachment, or damage
+  count. Explicit relationships avoid recursive native-handle ownership.
+  Date/Author: 2026-07-14 / Codex.
+
+- Decision: Inspection schema `1.1.0` adds recipient, attachment, embedded,
+  unsupported, property, body, payload, peak-chunk, and omitted-issue fields.
+  `verify` returns source-incomplete when either retained or omitted issues are
+  nonzero.
+  Rationale: Operators and corpus automation need uniform accounting and must
+  not mistake a capped diagnostic list for a clean scan.
+  Date/Author: 2026-07-14 / Codex.
+
 ## Outcomes & Retrospective
 
 Version 0.1.0 now lets an operator inspect a healthy PST in human or JSON form
@@ -209,6 +257,17 @@ properties, attachment streaming, damaged-record continuation, and the PST
 writer remain later milestones. The main lesson is that recovery counters must
 encode "not scanned" separately from zero and that privacy-safe automation
 must suppress independent-reader output because it can contain mailbox names.
+
+Version 0.1.1 extends full verification to the complete reachable mail
+catalog. It owns metadata before releasing native handles, streams raw
+properties and attachments in at most 64 KiB chunks, records recipients and
+embedded relationships, identifies unsupported classes, and caps depth,
+counts, strings, and diagnostics. The full gate passed clean ANSI and Unicode
+external PSTs, including a Unicode attachment/body case, with source hashes,
+identity metadata, and access/modify times unchanged. `pffinfo` and `readpst`
+also accepted every promoted corpus case. Damaged-item recovery and
+fault-isolated continuation remain 0.3.x work rather than being silently
+claimed by this healthy-inventory milestone.
 
 ## Context and Orientation
 

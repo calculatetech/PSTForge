@@ -1,5 +1,6 @@
 #![deny(unsafe_code)]
 
+mod catalog;
 mod inspection;
 mod source;
 
@@ -10,3 +11,6 @@ pub use inspection::{
 pub use source::{SourceError, SourceFile, SourceIdentity, validate_output_relationship};
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+pub use catalog::{
+    CandidateSink, ContentCompleteness, ItemKey, ProcessingStatus, RecoveryProvenance,
+};

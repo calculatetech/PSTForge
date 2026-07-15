@@ -22,8 +22,18 @@ struct Case {
     sha256: String,
     classification: String,
     milestone_0_1: bool,
+    #[serde(default)]
+    milestone_0_1_1: bool,
     minimum_folders: u64,
     minimum_messages: u64,
+    #[serde(default)]
+    minimum_recipients: u64,
+    #[serde(default)]
+    minimum_attachments: u64,
+    #[serde(default)]
+    minimum_raw_properties: u64,
+    #[serde(default = "default_peak_chunk_limit")]
+    maximum_peak_stream_chunk_bytes: u64,
 }
 
 #[test]
@@ -40,7 +50,7 @@ fn milestone_0_1_external_psts_are_inspected_without_mutation()
     let cases: Vec<&Case> = manifest
         .cases
         .iter()
-        .filter(|case| case.milestone_0_1)
+        .filter(|case| case.milestone_0_1 || case.milestone_0_1_1)
         .collect();
     if cases.is_empty() {
         return Err("manifest has no milestone_0_1 cases".into());
@@ -74,6 +84,27 @@ fn milestone_0_1_external_psts_are_inspected_without_mutation()
         if folders < case.minimum_folders || messages < case.minimum_messages {
             return Err(format!("{} inventory is below manifest minimums", case.name).into());
         }
+        if case.milestone_0_1_1 {
+            let recipients = verify["inventory"]["recipients"]
+                .as_u64()
+                .unwrap_or_default();
+            let attachments = verify["inventory"]["attachments"]
+                .as_u64()
+                .unwrap_or_default();
+            let properties = verify["inventory"]["raw_properties"]
+                .as_u64()
+                .unwrap_or_default();
+            let peak = verify["inventory"]["peak_stream_chunk_bytes"]
+                .as_u64()
+                .unwrap_or(u64::MAX);
+            if recipients < case.minimum_recipients
+                || attachments < case.minimum_attachments
+                || properties < case.minimum_raw_properties
+                || peak > case.maximum_peak_stream_chunk_bytes
+            {
+                return Err(format!("{} catalog is outside manifest invariants", case.name).into());
+            }
+        }
 
         let after_metadata = fs::metadata(&case.path)?;
         let after_hash = pstforge_core::SourceFile::open(&case.path)?
@@ -89,6 +120,10 @@ fn milestone_0_1_external_psts_are_inspected_without_mutation()
         }
     }
     Ok(())
+}
+
+fn default_peak_chunk_limit() -> u64 {
+    65_536
 }
 
 fn run_json(command: &str, case: &Case) -> Result<serde_json::Value, Box<dyn std::error::Error>> {

@@ -38,7 +38,7 @@ pub enum Command {
         #[arg(long)]
         json: bool,
     },
-    /// Traverse reachable folders and count their messages.
+    /// Stream and account for reachable mail and its content.
     Verify {
         source: PathBuf,
         #[arg(long, value_enum, default_value_t = VerifyMode::Full)]
@@ -115,7 +115,7 @@ pub fn execute(cli: &Cli, output: &mut dyn Write) -> Result<CommandStatus, CliEr
             } else {
                 write_verify(output, &report)?;
             }
-            if report.inventory.issues.is_empty() {
+            if report.inventory.issues.is_empty() && report.inventory.issues_dropped == 0 {
                 Ok(CommandStatus::Complete)
             } else {
                 Ok(CommandStatus::SourceIncomplete)
@@ -152,12 +152,50 @@ fn write_verify(output: &mut dyn Write, report: &VerifyReport) -> Result<(), std
     )?;
     writeln!(output, "Folders: {}", report.inventory.folders)?;
     writeln!(output, "Normal items: {}", report.inventory.normal_items)?;
+    writeln!(output, "Recipients: {}", report.inventory.recipients)?;
+    writeln!(output, "Attachments: {}", report.inventory.attachments)?;
+    writeln!(
+        output,
+        "Embedded messages: {}",
+        report.inventory.embedded_messages
+    )?;
+    writeln!(
+        output,
+        "Unsupported messages: {}",
+        report.inventory.unsupported_messages
+    )?;
+    writeln!(
+        output,
+        "Raw properties: {}",
+        report.inventory.raw_properties
+    )?;
+    writeln!(
+        output,
+        "Property bytes: {}",
+        report.inventory.property_bytes
+    )?;
+    writeln!(output, "Body bytes: {}", report.inventory.body_bytes)?;
+    writeln!(
+        output,
+        "Attachment bytes: {}",
+        report.inventory.attachment_bytes
+    )?;
+    writeln!(
+        output,
+        "Peak stream chunk: {} bytes",
+        report.inventory.peak_stream_chunk_bytes
+    )?;
     write_optional_count(output, "Recovered items", report.inventory.recovered_items)?;
     write_optional_count(output, "Orphan items", report.inventory.orphan_items)?;
     writeln!(
         output,
         "Traversal issues: {}",
         report.inventory.issues.len()
+    )?;
+    writeln!(
+        output,
+        "Additional issues omitted: {}",
+        report.inventory.issues_dropped
     )?;
     writeln!(
         output,

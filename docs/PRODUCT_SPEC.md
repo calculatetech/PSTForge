@@ -57,6 +57,12 @@ recovery job. Recovery mode additionally invokes balanced deleted, recovered,
 and orphan discovery. The result states what was checked; it never calls the
 `libpff` corruption flag a complete integrity proof.
 
+The full-mode inventory uses a bounded event stream and reports folders,
+normal mail, recipients, attachments, embedded messages, unsupported message
+classes, raw-property and payload byte totals, the peak stream chunk, and a
+capped issue list with an omitted-issue count. Version 0.1.1 emits inspection
+schema `1.1.0`; absent recovery scans remain `null`, never zero.
+
 ### `pstforge split <source.pst> --output <job-dir> [OPTIONS]`
 
 `split` is the primary command. Its stable 1.0 options are:

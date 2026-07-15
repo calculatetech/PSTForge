@@ -1,14 +1,16 @@
 use std::os::fd::AsFd;
 use std::path::Path;
 
-use libpff_sys::{PffError, PffFile, RawInventory, RawPffMetadata};
+use libpff_sys::{
+    CatalogEvent, CatalogSink, PffError, PffFile, PropertyOwner, RawCatalog, RawPffMetadata,
+};
 use serde::Serialize;
 use thiserror::Error;
 use tracing::info;
 
 use crate::{SourceError, SourceFile, SourceIdentity, VERSION};
 
-pub const INSPECTION_SCHEMA_VERSION: &str = "1.0.0";
+pub const INSPECTION_SCHEMA_VERSION: &str = "1.1.0";
 
 #[derive(Debug, Error)]
 pub enum InspectionError {
@@ -77,9 +79,19 @@ pub struct InventoryReport {
     pub scope: String,
     pub folders: u64,
     pub normal_items: u64,
+    pub recipients: u64,
+    pub attachments: u64,
+    pub embedded_messages: u64,
+    pub unsupported_messages: u64,
+    pub raw_properties: u64,
+    pub property_bytes: u64,
+    pub body_bytes: u64,
+    pub attachment_bytes: u64,
+    pub peak_stream_chunk_bytes: u64,
     pub recovered_items: Option<u64>,
     pub orphan_items: Option<u64>,
     pub issues: Vec<InventoryIssueReport>,
+    pub issues_dropped: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -97,7 +109,7 @@ pub struct VerifyReport {
 pub trait InspectionBackend {
     fn library_version(&self) -> String;
     fn metadata(&self) -> Result<RawPffMetadata, PffError>;
-    fn inventory(&self) -> Result<RawInventory, PffError>;
+    fn catalog(&self, sink: &mut dyn CatalogSink) -> Result<RawCatalog, PffError>;
 }
 
 pub struct LibpffBackend {
@@ -121,8 +133,8 @@ impl InspectionBackend for LibpffBackend {
         self.file.metadata()
     }
 
-    fn inventory(&self) -> Result<RawInventory, PffError> {
-        self.file.inventory()
+    fn catalog(&self, sink: &mut dyn CatalogSink) -> Result<RawCatalog, PffError> {
+        self.file.catalog(sink)
     }
 }
 
@@ -166,7 +178,8 @@ pub fn verify_with_backend(
 ) -> Result<VerifyReport, InspectionError> {
     let raw = backend.metadata()?;
     validate_metadata(source, raw)?;
-    let raw_inventory = backend.inventory()?;
+    let mut sink = InventorySink::default();
+    let raw_inventory = backend.catalog(&mut sink)?;
     source.verify_unchanged()?;
     let issues = raw_inventory
         .issues
@@ -191,15 +204,58 @@ pub fn verify_with_backend(
         source: source.identity().clone(),
         pst: map_metadata(raw),
         inventory: InventoryReport {
-            scope: "reachable_folder_counts".to_owned(),
+            scope: "reachable_mail_catalog".to_owned(),
             folders: raw_inventory.folders,
             normal_items: raw_inventory.messages,
+            recipients: raw_inventory.recipients,
+            attachments: raw_inventory.attachments,
+            embedded_messages: raw_inventory.embedded_messages,
+            unsupported_messages: raw_inventory.unsupported_messages,
+            raw_properties: raw_inventory.properties,
+            property_bytes: raw_inventory.property_bytes,
+            body_bytes: sink.body_bytes,
+            attachment_bytes: raw_inventory.attachment_bytes,
+            peak_stream_chunk_bytes: sink.peak_chunk_bytes,
             recovered_items: None,
             orphan_items: None,
             issues,
+            issues_dropped: raw_inventory.issues_dropped,
         },
         source_unchanged: true,
     })
+}
+
+#[derive(Default)]
+struct InventorySink {
+    body_bytes: u64,
+    peak_chunk_bytes: u64,
+}
+
+impl CatalogSink for InventorySink {
+    fn event(&mut self, event: CatalogEvent<'_>) -> Result<(), String> {
+        match event {
+            CatalogEvent::PropertyData { descriptor, bytes } => {
+                let bytes = u64::try_from(bytes.len())
+                    .map_err(|_| "property chunk length does not fit u64".to_owned())?;
+                self.peak_chunk_bytes = self.peak_chunk_bytes.max(bytes);
+                if matches!(descriptor.owner, PropertyOwner::Message(_))
+                    && matches!(descriptor.entry_type, Some(0x1000 | 0x1009 | 0x1013))
+                {
+                    self.body_bytes = self
+                        .body_bytes
+                        .checked_add(bytes)
+                        .ok_or_else(|| "body byte count overflowed".to_owned())?;
+                }
+            }
+            CatalogEvent::AttachmentData { bytes, .. } => {
+                let bytes = u64::try_from(bytes.len())
+                    .map_err(|_| "attachment chunk length does not fit u64".to_owned())?;
+                self.peak_chunk_bytes = self.peak_chunk_bytes.max(bytes);
+            }
+            _ => {}
+        }
+        Ok(())
+    }
 }
 
 fn producer(backend: &dyn InspectionBackend) -> Producer {
@@ -256,7 +312,7 @@ fn map_metadata(raw: RawPffMetadata) -> PstMetadata {
 mod tests {
     use std::fs;
 
-    use libpff_sys::{PffError, RawInventory, RawPffMetadata};
+    use libpff_sys::{CatalogEvent, CatalogSink, PffError, RawCatalog, RawPffMetadata};
     use tempfile::tempdir;
 
     use super::{FileFormat, InspectionBackend, verify_with_backend};
@@ -281,11 +337,28 @@ mod tests {
             })
         }
 
-        fn inventory(&self) -> Result<RawInventory, PffError> {
-            Ok(RawInventory {
+        fn catalog(&self, sink: &mut dyn CatalogSink) -> Result<RawCatalog, PffError> {
+            sink.event(CatalogEvent::AttachmentData {
+                message_id: 10,
+                index: 0,
+                bytes: &[0_u8; 17],
+            })
+            .map_err(|detail| PffError::Sink {
+                operation: "fake catalog",
+                detail,
+            })?;
+            Ok(RawCatalog {
                 folders: 3,
                 messages: 12,
+                recipients: 24,
+                attachments: 4,
+                embedded_messages: 1,
+                unsupported_messages: 2,
+                properties: 60,
+                property_bytes: 4096,
+                attachment_bytes: 17,
                 issues: Vec::new(),
+                issues_dropped: 0,
             })
         }
     }
@@ -305,6 +378,8 @@ mod tests {
         assert_eq!(report.pst.format, FileFormat::Unicode64);
         assert_eq!(report.inventory.folders, 3);
         assert_eq!(report.inventory.normal_items, 12);
+        assert_eq!(report.inventory.recipients, 24);
+        assert_eq!(report.inventory.peak_stream_chunk_bytes, 17);
         assert!(report.source_unchanged);
         Ok(())
     }

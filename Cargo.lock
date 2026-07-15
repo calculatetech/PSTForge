@@ -364,7 +364,7 @@ checksum = "68ab91017fe16c622486840e4c83c9a37afeff978bd239b5293d61ece587de66"
 
 [[package]]
 name = "libpff-sys"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "pkg-config",
  "thiserror",
@@ -450,7 +450,7 @@ dependencies = [
 
 [[package]]
 name = "pstforge-cli"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "clap",
  "pstforge-core",
@@ -464,7 +464,7 @@ dependencies = [
 
 [[package]]
 name = "pstforge-core"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "chrono",
  "libc",
@@ -945,7 +945,7 @@ dependencies = [
 
 [[package]]
 name = "xtask"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "serde",
  "serde_json",

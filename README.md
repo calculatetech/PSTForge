@@ -28,7 +28,10 @@ cargo run -p pstforge-cli -- verify /data/mail.pst --mode full
 
 PSTForge refuses source symlinks and opens the source with Linux read-only,
 no-follow, no-atime flags. `info` hashes the file and reports format metadata.
-`verify` additionally traverses reachable folders and counts their messages.
+`verify` additionally streams the reachable mail catalog, including recipients,
+bodies, raw properties, attachments, and embedded-message relationships. It
+reports byte totals and the peak stream chunk without retaining an unbounded
+property or attachment in memory.
 
 ## Local Gates
 

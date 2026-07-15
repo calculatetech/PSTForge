@@ -22,9 +22,22 @@ struct CorpusCase {
     sha256: String,
     classification: String,
     milestone_0_1: bool,
+    #[serde(default)]
+    milestone_0_1_1: bool,
     minimum_folders: u64,
     #[serde(rename = "minimum_messages")]
     _minimum_messages: u64,
+    #[serde(default)]
+    #[serde(rename = "minimum_recipients")]
+    _minimum_recipients: u64,
+    #[serde(default)]
+    #[serde(rename = "minimum_attachments")]
+    _minimum_attachments: u64,
+    #[serde(default)]
+    #[serde(rename = "minimum_raw_properties")]
+    _minimum_raw_properties: u64,
+    #[serde(default = "default_peak_chunk_limit")]
+    maximum_peak_stream_chunk_bytes: u64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -370,6 +383,7 @@ impl Gate {
                 || !valid_hash
                 || !valid_classification
                 || case.minimum_folders == 0
+                || case.maximum_peak_stream_chunk_bytes > 65_536
             {
                 return Err(format!(
                     "corpus case {} violates the manifest schema",
@@ -377,11 +391,28 @@ impl Gate {
                 ));
             }
         }
+        if env!("CARGO_PKG_VERSION") == "0.1.1" {
+            for classification in ["healthy_ansi", "healthy_unicode"] {
+                if !manifest
+                    .cases
+                    .iter()
+                    .any(|case| case.milestone_0_1_1 && case.classification == classification)
+                {
+                    return Err(format!(
+                        "version 0.1.1 requires a {classification} milestone_0_1_1 case"
+                    ));
+                }
+            }
+        }
         Ok(())
     }
 
     fn run_independent_readers(&self, manifest: &CorpusManifest) -> Result<(), String> {
-        for case in manifest.cases.iter().filter(|case| case.milestone_0_1) {
+        for case in manifest
+            .cases
+            .iter()
+            .filter(|case| case.milestone_0_1 || case.milestone_0_1_1)
+        {
             let path = case
                 .path
                 .to_str()
@@ -435,6 +466,10 @@ impl Gate {
             ))
         }
     }
+}
+
+fn default_peak_chunk_limit() -> u64 {
+    65_536
 }
 
 fn sanitize(name: &str) -> String {
