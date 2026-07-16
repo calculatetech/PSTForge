@@ -95,6 +95,14 @@ pub enum LtpError {
     InvalidTableColumnBooleanValue(u8),
     #[error("Missing TCROWID: 0x{0:08X}")]
     TableRowIdNotFound(u32),
+    #[error("TCROWID 0x{row_id:08X} references row {index}, but the row matrix has {count} rows")]
+    InvalidTableRowIndex {
+        row_id: u32,
+        index: usize,
+        count: usize,
+    },
+    #[error("TCROWID index key 0x{expected:08X} references matrix row 0x{actual:08X}")]
+    TableRowIdMismatch { expected: u32, actual: u32 },
 }
 
 impl From<LtpError> for io::Error {

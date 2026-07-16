@@ -77,6 +77,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f2032f911046de80f0a198e0901378627c33f59ea0ac00e363d481118bd70a53"
 
 [[package]]
+name = "base64"
+version = "0.22.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "72b3254f16251a8381aa12e40e3c4d2f0199f8c6508fbecb9d91f575e0fbb8c6"
+
+[[package]]
 name = "bitflags"
 version = "2.13.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -178,6 +184,16 @@ name = "colorchoice"
 version = "1.0.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1d07550c9036bf2ae0c684c4297d503f838287c83c53686d05370d0e139ae570"
+
+[[package]]
+name = "compressed-rtf"
+version = "1.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "51b7f2aaf6791c6517669240b82ef12c1283b39772f0cad3bc5c73f19f6e7f16"
+dependencies = [
+ "byteorder",
+ "thiserror",
+]
 
 [[package]]
 name = "core-foundation-sys"
@@ -370,7 +386,7 @@ checksum = "68ab91017fe16c622486840e4c83c9a37afeff978bd239b5293d61ece587de66"
 
 [[package]]
 name = "libpff-sys"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "pkg-config",
  "thiserror",
@@ -456,7 +472,7 @@ dependencies = [
 
 [[package]]
 name = "pstforge-cli"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "clap",
  "pstforge-core",
@@ -470,7 +486,7 @@ dependencies = [
 
 [[package]]
 name = "pstforge-core"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "chrono",
  "libc",
@@ -484,9 +500,10 @@ dependencies = [
 
 [[package]]
 name = "pstforge-pst"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "byteorder",
+ "compressed-rtf",
  "rustix",
  "tempfile",
  "thiserror",
@@ -962,11 +979,15 @@ dependencies = [
 
 [[package]]
 name = "xtask"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
+ "base64",
+ "libpff-sys",
+ "pstforge-core",
  "pstforge-pst",
  "serde",
  "serde_json",
+ "sha2",
  "tempfile",
  "toml",
 ]

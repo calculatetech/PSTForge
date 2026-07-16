@@ -2,7 +2,7 @@
 
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use std::{
-    collections::{BTreeMap, VecDeque, btree_map},
+    collections::{BTreeMap, BTreeSet, VecDeque, btree_map},
     io::{self, Cursor, Read, Seek, SeekFrom, Write},
     iter,
 };
@@ -12,11 +12,123 @@ use super::{block_id::*, block_ref::*, byte_index::*, node_id::*, page::*, read_
 use crate::{AnsiPstFile, PstFile, PstFileReadWriteBlockBTree, PstReader, UnicodePstFile};
 
 pub const MAX_BLOCK_SIZE: u16 = 8192;
+const MAX_SUBNODE_TREE_DEPTH: usize = 32;
+const MAX_SUBNODE_TREE_ENTRIES: usize = 4096;
+const MAX_DATA_TREE_DEPTH: usize = 32;
+const MAX_DATA_TREE_ENTRIES: usize = 16_384;
+const MAX_MATERIALIZED_DATA_TREE_BYTES: usize = 64 * 1024 * 1024;
 
-pub const fn block_size(size: u16) -> u16 {
-    assert!(size > 0);
-    assert!(size <= MAX_BLOCK_SIZE);
-    size.div_ceil(64) * 64
+fn observe_materialized_data_tree_bytes(
+    declared: usize,
+    materialized: usize,
+    next: usize,
+) -> io::Result<usize> {
+    let actual =
+        materialized
+            .checked_add(next)
+            .ok_or(NdbError::DataTreeMaterializationLimitExceeded(
+                MAX_MATERIALIZED_DATA_TREE_BYTES,
+            ))?;
+    if actual > MAX_MATERIALIZED_DATA_TREE_BYTES {
+        return Err(NdbError::DataTreeMaterializationLimitExceeded(
+            MAX_MATERIALIZED_DATA_TREE_BYTES,
+        )
+        .into());
+    }
+    if actual > declared {
+        return Err(NdbError::DataTreeSizeMismatch { declared, actual }.into());
+    }
+    Ok(actual)
+}
+
+fn validate_data_tree_child_kind(parent_level: u8, child_is_internal: bool) -> NdbResult<()> {
+    if matches!((parent_level, child_is_internal), (1, false) | (2, true)) {
+        Ok(())
+    } else {
+        Err(NdbError::InvalidInternalBlockLevel(parent_level))
+    }
+}
+
+fn validate_data_tree_child_level(parent_level: u8, child_level: u8) -> NdbResult<()> {
+    if parent_level == 2 && child_level == 1 {
+        Ok(())
+    } else {
+        Err(NdbError::InvalidInternalBlockLevel(child_level))
+    }
+}
+
+fn validate_data_tree_total(declared: usize, actual: usize) -> NdbResult<()> {
+    if declared == actual {
+        Ok(())
+    } else {
+        Err(NdbError::DataTreeSizeMismatch { declared, actual })
+    }
+}
+
+#[derive(Default)]
+struct SubNodeTraversalBudget {
+    visited_blocks: BTreeSet<u64>,
+    visited_entries: usize,
+}
+
+impl SubNodeTraversalBudget {
+    fn observe_tree(&mut self, depth: usize, entries: usize) -> io::Result<()> {
+        if depth > MAX_SUBNODE_TREE_DEPTH {
+            return Err(NdbError::SubNodeTreeDepthExceeded(MAX_SUBNODE_TREE_DEPTH).into());
+        }
+        self.visited_entries = self.visited_entries.checked_add(entries).ok_or(
+            NdbError::SubNodeTreeEntryLimitExceeded(MAX_SUBNODE_TREE_ENTRIES),
+        )?;
+        if self.visited_entries > MAX_SUBNODE_TREE_ENTRIES {
+            return Err(NdbError::SubNodeTreeEntryLimitExceeded(MAX_SUBNODE_TREE_ENTRIES).into());
+        }
+        Ok(())
+    }
+
+    fn descend_to(&mut self, block_id: u64) -> io::Result<()> {
+        if self.visited_blocks.insert(block_id) {
+            Ok(())
+        } else {
+            Err(NdbError::SubNodeTreeCycle(block_id).into())
+        }
+    }
+}
+
+#[derive(Default)]
+struct DataTreeTraversalBudget {
+    visited_blocks: BTreeSet<u64>,
+    visited_entries: usize,
+}
+
+impl DataTreeTraversalBudget {
+    fn observe_tree(&mut self, depth: usize, entries: usize) -> io::Result<()> {
+        if depth > MAX_DATA_TREE_DEPTH {
+            return Err(NdbError::DataTreeDepthExceeded(MAX_DATA_TREE_DEPTH).into());
+        }
+        self.visited_entries = self
+            .visited_entries
+            .checked_add(entries)
+            .ok_or(NdbError::DataTreeEntryLimitExceeded(MAX_DATA_TREE_ENTRIES))?;
+        if self.visited_entries > MAX_DATA_TREE_ENTRIES {
+            return Err(NdbError::DataTreeEntryLimitExceeded(MAX_DATA_TREE_ENTRIES).into());
+        }
+        Ok(())
+    }
+
+    fn descend_to(&mut self, block_id: u64) -> io::Result<()> {
+        if self.visited_blocks.insert(block_id) {
+            Ok(())
+        } else {
+            Err(NdbError::DataTreeCycle(block_id).into())
+        }
+    }
+}
+
+pub fn block_size(size: u16) -> io::Result<u16> {
+    if size == 0 || size > MAX_BLOCK_SIZE {
+        return Err(NdbError::InvalidBlockSize(size).into());
+    }
+    Ok(size.div_ceil(64) * 64)
 }
 
 /// [BLOCKTRAILER](https://learn.microsoft.com/en-us/openspecs/office_file_formats/ms-pst/a14943ef-70c2-403f-898c-5bc3747117e1)
@@ -486,8 +598,8 @@ impl From<AnsiDataTreeEntry> for AnsiBlockId {
 /// / [XXBLOCK](https://learn.microsoft.com/en-us/openspecs/office_file_formats/ms-pst/061b6ac4-d1da-468c-b75d-0303a0a8f468)
 struct DataTreeBlockInner<Entry, Trailer>
 where
-    Entry: IntermediateTreeEntry,
-    Trailer: BlockTrailer,
+    Entry: IntermediateTreeEntryReadWrite,
+    Trailer: BlockTrailerReadWrite,
 {
     header: DataTreeBlockHeader,
     entries: Vec<Entry>,
@@ -496,14 +608,33 @@ where
 
 impl<Entry, Trailer> DataTreeBlockInner<Entry, Trailer>
 where
-    Entry: IntermediateTreeEntry,
-    Trailer: BlockTrailer,
+    Entry: IntermediateTreeEntryReadWrite,
+    Trailer: BlockTrailerReadWrite,
 {
     pub fn new(
         header: DataTreeBlockHeader,
         entries: Vec<Entry>,
         trailer: Trailer,
     ) -> NdbResult<Self> {
+        if !(1..=2).contains(&header.level()) {
+            return Err(NdbError::InvalidInternalBlockLevel(header.level()));
+        }
+        if usize::from(header.entry_count()) != entries.len() {
+            return Err(NdbError::InvalidInternalBlockEntryCount(
+                header.entry_count(),
+            ));
+        }
+        let entry_bytes = header.entry_count().checked_mul(Entry::ENTRY_SIZE).ok_or(
+            NdbError::InvalidInternalBlockEntryCount(header.entry_count()),
+        )?;
+        let logical_size = DataTreeBlockHeader::HEADER_SIZE
+            .checked_add(entry_bytes)
+            .ok_or(NdbError::InvalidInternalBlockEntryCount(
+                header.entry_count(),
+            ))?;
+        if trailer.size() != logical_size {
+            return Err(NdbError::InvalidBlockSize(trailer.size()));
+        }
         trailer.verify_block_id(true)?;
 
         Ok(Self {
@@ -542,6 +673,9 @@ impl IntermediateTreeBlockReadWrite for UnicodeDataTreeBlock {
         entries: Vec<UnicodeDataTreeEntry>,
         trailer: UnicodeBlockTrailer,
     ) -> NdbResult<Self> {
+        for entry in &entries {
+            validate_data_tree_child_kind(header.level(), entry.block().is_internal())?;
+        }
         Ok(Self {
             inner: DataTreeBlockInner::new(header, entries, trailer)?,
         })
@@ -576,6 +710,9 @@ impl IntermediateTreeBlockReadWrite for AnsiDataTreeBlock {
         entries: Vec<AnsiDataTreeEntry>,
         trailer: AnsiBlockTrailer,
     ) -> NdbResult<Self> {
+        for entry in &entries {
+            validate_data_tree_child_kind(header.level(), entry.block().is_internal())?;
+        }
         Ok(Self {
             inner: DataTreeBlockInner::new(header, entries, trailer)?,
         })
@@ -601,6 +738,13 @@ where
         IntermediateTreeEntryReadWrite,
     <Pst as PstFile>::DataBlock: BlockReadWrite,
 {
+    pub(crate) fn declared_size(&self) -> usize {
+        match self {
+            Self::Intermediate(block) => block.header().total_size() as usize,
+            Self::Leaf(block) => block.data().len(),
+        }
+    }
+
     pub fn read<R>(
         f: &mut R,
         encoding: NdbCryptMethod,
@@ -611,9 +755,11 @@ where
     {
         f.seek(SeekFrom::Start(block.block().index().index().into()))?;
 
-        let block_size = block_size(
-            block.size() + <<Pst as PstFile>::BlockTrailer as BlockTrailerReadWrite>::SIZE,
-        );
+        let physical_size = block
+            .size()
+            .checked_add(<<Pst as PstFile>::BlockTrailer as BlockTrailerReadWrite>::SIZE)
+            .ok_or(NdbError::InvalidBlockSize(block.size()))?;
+        let block_size = block_size(physical_size)?;
         let mut data = vec![0; block_size as usize];
         f.read_exact(&mut data)?;
         let mut cursor = Cursor::new(data);
@@ -680,27 +826,43 @@ where
             RootBTreeLeafPageReadWrite<Pst> + BTreePageReadWrite,
     {
         match self {
-            Self::Intermediate(block, ..) => {
-                let mut blocks = Vec::with_capacity(block.entries().len());
-                for entry in block.entries() {
-                    let data_tree = match block_cache.remove(&entry.block()) {
-                        Some(entry) => entry,
-                        None => {
-                            let data_block = block_btree.find_entry(
-                                f,
-                                entry.block().search_key(),
-                                page_cache,
-                            )?;
-                            Self::read(&mut *f, encoding, &data_block)?
-                        }
-                    };
-                    let entries = data_tree
-                        .blocks(f, encoding, block_btree, page_cache, block_cache)
-                        .map(|blocks| blocks.collect::<Vec<_>>());
-                    block_cache.insert(entry.block(), data_tree);
-                    blocks.push(entries?);
+            Self::Intermediate(..) => {
+                let declared = self.declared_size();
+                if declared > MAX_MATERIALIZED_DATA_TREE_BYTES {
+                    return Err(NdbError::DataTreeMaterializationLimitExceeded(
+                        MAX_MATERIALIZED_DATA_TREE_BYTES,
+                    )
+                    .into());
                 }
-                Ok(Box::new(blocks.into_iter().flatten()))
+                let entries = self
+                    .sub_entries(f, encoding, block_btree, page_cache, block_cache)?
+                    .collect::<Vec<_>>();
+                let mut blocks = Vec::with_capacity(entries.len());
+                let mut materialized = 0_usize;
+                for entry in entries {
+                    let data_tree = match block_cache.remove(&entry.block().block()) {
+                        Some(entry) => entry,
+                        None => Self::read(&mut *f, encoding, &entry)?,
+                    };
+                    let Self::Leaf(block) = &data_tree else {
+                        return Err(NdbError::InvalidInternalBlockLevel(0).into());
+                    };
+                    materialized = observe_materialized_data_tree_bytes(
+                        declared,
+                        materialized,
+                        block.data().len(),
+                    )?;
+                    blocks.push(block.as_ref().clone());
+                    block_cache.insert(entry.block().block(), data_tree);
+                }
+                if materialized != declared {
+                    return Err(NdbError::DataTreeSizeMismatch {
+                        declared,
+                        actual: materialized,
+                    }
+                    .into());
+                }
+                Ok(Box::new(blocks.into_iter()))
             }
             Self::Leaf(block) => Ok(Box::new(Some(block.as_ref()).cloned().into_iter())),
         }
@@ -794,6 +956,12 @@ where
         <<Pst as PstFile>::BlockBTree as RootBTree>::LeafPage:
             RootBTreeLeafPageReadWrite<Pst> + BTreePageReadWrite,
     {
+        if self.declared_size() > MAX_MATERIALIZED_DATA_TREE_BYTES {
+            return Err(NdbError::DataTreeMaterializationLimitExceeded(
+                MAX_MATERIALIZED_DATA_TREE_BYTES,
+            )
+            .into());
+        }
         let reader: DataTreeReader<'a, Pst, R> =
             DataTreeReader::new(self, f, encoding, block_btree, page_cache, block_cache)?;
         let reader: Box<dyn 'a + Read> = Box::new(reader);
@@ -829,32 +997,60 @@ where
     {
         match self {
             Self::Intermediate(block, ..) => {
-                let mut blocks = Vec::with_capacity(block.entries().len());
-                for entry in block.entries() {
-                    if entry.block().is_internal() {
-                        let data_tree = match block_cache.remove(&entry.block()) {
-                            Some(entry) => entry,
-                            None => {
-                                let data_block = block_btree.find_entry(
-                                    f,
-                                    entry.block().search_key(),
-                                    page_cache,
-                                )?;
-                                Self::read(&mut *f, encoding, &data_block)?
-                            }
-                        };
-                        let entries = data_tree
-                            .sub_entries(f, encoding, block_btree, page_cache, block_cache)
-                            .map(|entries| entries.collect::<Vec<_>>());
-                        block_cache.insert(entry.block(), data_tree);
-                        blocks.push(entries?);
-                    } else {
-                        let data_block =
-                            block_btree.find_entry(f, entry.block().search_key(), page_cache)?;
-                        blocks.push(vec![data_block]);
+                let mut budget = DataTreeTraversalBudget::default();
+                budget.observe_tree(0, block.entries().len())?;
+                let root_level = block.header().level();
+                let mut pending = block
+                    .entries()
+                    .iter()
+                    .map(|entry| (entry.block(), root_level, 1_usize))
+                    .collect::<VecDeque<_>>();
+                let mut blocks = Vec::new();
+                while let Some((block_id, parent_level, depth)) = pending.pop_front() {
+                    validate_data_tree_child_kind(parent_level, block_id.is_internal())?;
+                    if parent_level == 1 {
+                        blocks.push(block_btree.find_entry(
+                            f,
+                            block_id.search_key(),
+                            page_cache,
+                        )?);
+                        continue;
                     }
+                    budget.descend_to(block_id.into_u64())?;
+                    let data_tree = match block_cache.remove(&block_id) {
+                        Some(entry) => entry,
+                        None => {
+                            let data_block =
+                                block_btree.find_entry(f, block_id.search_key(), page_cache)?;
+                            Self::read(&mut *f, encoding, &data_block)?
+                        }
+                    };
+                    let Self::Intermediate(child) = &data_tree else {
+                        return Err(NdbError::InvalidInternalBlockLevel(0).into());
+                    };
+                    validate_data_tree_child_level(parent_level, child.header().level())?;
+                    let mut child_total = 0_usize;
+                    for entry in child.entries() {
+                        validate_data_tree_child_kind(
+                            child.header().level(),
+                            entry.block().is_internal(),
+                        )?;
+                        let leaf =
+                            block_btree.find_entry(f, entry.block().search_key(), page_cache)?;
+                        child_total = child_total.checked_add(usize::from(leaf.size())).ok_or(
+                            NdbError::DataTreeMaterializationLimitExceeded(
+                                MAX_MATERIALIZED_DATA_TREE_BYTES,
+                            ),
+                        )?;
+                    }
+                    validate_data_tree_total(child.header().total_size() as usize, child_total)?;
+                    budget.observe_tree(depth, child.entries().len())?;
+                    for entry in child.entries().iter().rev() {
+                        pending.push_front((entry.block(), 1, depth + 1));
+                    }
+                    block_cache.insert(block_id, data_tree);
                 }
-                Ok(Box::new(blocks.into_iter().flatten()))
+                Ok(Box::new(blocks.into_iter()))
             }
             Self::Leaf(_) => Ok(Box::new(iter::empty())),
         }
@@ -877,6 +1073,8 @@ where
     file: &'a mut R,
     encoding: NdbCryptMethod,
     cursor: DataTreeCursor<Pst>,
+    expected_size: usize,
+    total_read: usize,
 }
 
 impl<'a, Pst, R> DataTreeReader<'a, Pst, R>
@@ -935,6 +1133,8 @@ where
             cursor,
             file,
             encoding,
+            expected_size: data_tree.declared_size(),
+            total_read: 0,
         })
     }
 }
@@ -965,9 +1165,25 @@ where
     <Pst as PstFile>::DataBlock: BlockReadWrite,
 {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        let mut total_read = self.cursor.current.read(buf)?;
+        if buf.is_empty() {
+            return Ok(0);
+        }
+        let remaining = self.expected_size.saturating_sub(self.total_read);
+        if remaining == 0 {
+            if self.cursor.current.position() < self.cursor.current.get_ref().len() as u64
+                || !self.cursor.next.is_empty()
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "data tree exceeds its declared size",
+                ));
+            }
+            return Ok(0);
+        }
+        let requested = buf.len().min(remaining);
+        let mut total_read = self.cursor.current.read(&mut buf[..requested])?;
 
-        while total_read < buf.len() {
+        while total_read < requested {
             let Some(next) = self.cursor.next.pop_front() else {
                 break;
             };
@@ -983,10 +1199,16 @@ where
             };
             self.cursor.current = Cursor::new(next.data().to_vec());
 
-            let buf = &mut buf[total_read..];
+            let buf = &mut buf[total_read..requested];
             total_read += self.cursor.current.read(buf)?;
         }
-
+        self.total_read = self
+            .total_read
+            .checked_add(total_read)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "data tree size overflow"))?;
+        if total_read == 0 && self.total_read != self.expected_size {
+            return Err(io::Error::from(io::ErrorKind::UnexpectedEof));
+        }
         Ok(total_read)
     }
 }
@@ -1357,9 +1579,11 @@ where
     ) -> io::Result<Self> {
         f.seek(SeekFrom::Start(block.block().index().index().into()))?;
 
-        let block_size = block_size(
-            block.size() + <<Pst as PstFile>::BlockTrailer as BlockTrailerReadWrite>::SIZE,
-        );
+        let physical_size = block
+            .size()
+            .checked_add(<<Pst as PstFile>::BlockTrailer as BlockTrailerReadWrite>::SIZE)
+            .ok_or(NdbError::InvalidBlockSize(block.size()))?;
+        let block_size = block_size(physical_size)?;
         let mut data = vec![0; block_size as usize];
         f.read_exact(&mut data)?;
         let mut cursor = Cursor::new(data);
@@ -1425,29 +1649,105 @@ where
         <<Pst as PstFile>::BlockBTree as RootBTree>::LeafPage:
             RootBTreeLeafPageReadWrite<Pst> + BTreePageReadWrite,
     {
-        match self {
-            Self::Intermediate(block) => {
-                let entries = block.entries();
-                let index =
-                    entries.partition_point(|entry| u32::from(entry.node()) <= u32::from(node));
-                let entry = index
-                    .checked_sub(1)
-                    .and_then(|index| entries.get(index))
-                    .ok_or(NdbError::SubNodeNotFound(node))?;
-                let block = block_btree.find_entry(f, entry.block().search_key(), page_cache)?;
-                let page = Self::read(f, &block)?;
-                page.find_entry(f, block_btree, node, page_cache)
-            }
-            Self::Leaf(block) => {
-                let entry = block
+        Ok(self
+            .find_leaf_entry_bounded(f, block_btree, node, page_cache)?
+            .block())
+    }
+
+    pub fn find_leaf_entry_bounded<R>(
+        &self,
+        f: &mut R,
+        block_btree: &PstFileReadWriteBlockBTree<Pst>,
+        node: NodeId,
+        page_cache: &mut RootBTreePageCache<<Pst as PstFile>::BlockBTree>,
+    ) -> io::Result<LeafSubNodeTreeEntry<<Pst as PstFile>::BlockId>>
+    where
+        R: PstReader,
+        <Pst as PstFile>::BlockId: BlockId<Index = <Pst as PstFile>::BTreeKey> + BlockIdReadWrite,
+        <Pst as PstFile>::ByteIndex: ByteIndexReadWrite,
+        <Pst as PstFile>::BlockRef: BlockRefReadWrite,
+        <Pst as PstFile>::PageTrailer: PageTrailerReadWrite,
+        <Pst as PstFile>::BTreeKey: BTreePageKeyReadWrite,
+        <Pst as PstFile>::BlockBTree: RootBTreeReadWrite,
+        <<Pst as PstFile>::BlockBTree as RootBTree>::Entry: BTreeEntryReadWrite,
+        <<Pst as PstFile>::BlockBTree as RootBTree>::IntermediatePage:
+            RootBTreeIntermediatePageReadWrite<
+                    Pst,
+                    <<Pst as PstFile>::BlockBTree as RootBTree>::Entry,
+                    <<Pst as PstFile>::BlockBTree as RootBTree>::LeafPage,
+                >,
+        <<Pst as PstFile>::BlockBTree as RootBTree>::LeafPage:
+            RootBTreeLeafPageReadWrite<Pst> + BTreePageReadWrite,
+    {
+        fn descend<Pst, R>(
+            tree: &SubNodeTree<Pst>,
+            f: &mut R,
+            block_btree: &PstFileReadWriteBlockBTree<Pst>,
+            node: NodeId,
+            page_cache: &mut RootBTreePageCache<<Pst as PstFile>::BlockBTree>,
+            depth: usize,
+            budget: &mut SubNodeTraversalBudget,
+        ) -> io::Result<LeafSubNodeTreeEntry<<Pst as PstFile>::BlockId>>
+        where
+            Pst: PstFile,
+            R: PstReader,
+            <Pst as PstFile>::BlockId:
+                BlockId<Index = <Pst as PstFile>::BTreeKey> + BlockIdReadWrite,
+            <Pst as PstFile>::BlockTrailer: BlockTrailerReadWrite,
+            <Pst as PstFile>::SubNodeTreeBlockHeader: IntermediateTreeHeaderReadWrite,
+            <Pst as PstFile>::SubNodeTreeBlock: IntermediateTreeBlockReadWrite,
+            <<Pst as PstFile>::SubNodeTreeBlock as IntermediateTreeBlock>::Entry:
+                IntermediateTreeEntryReadWrite,
+            <Pst as PstFile>::SubNodeBlock: IntermediateTreeBlockReadWrite,
+            <<Pst as PstFile>::SubNodeBlock as IntermediateTreeBlock>::Entry:
+                IntermediateTreeEntryReadWrite,
+            <Pst as PstFile>::ByteIndex: ByteIndexReadWrite,
+            <Pst as PstFile>::BlockRef: BlockRefReadWrite,
+            <Pst as PstFile>::PageTrailer: PageTrailerReadWrite,
+            <Pst as PstFile>::BTreeKey: BTreePageKeyReadWrite,
+            <Pst as PstFile>::BlockBTree: RootBTreeReadWrite,
+            <<Pst as PstFile>::BlockBTree as RootBTree>::Entry: BTreeEntryReadWrite,
+            <<Pst as PstFile>::BlockBTree as RootBTree>::IntermediatePage:
+                RootBTreeIntermediatePageReadWrite<
+                        Pst,
+                        <<Pst as PstFile>::BlockBTree as RootBTree>::Entry,
+                        <<Pst as PstFile>::BlockBTree as RootBTree>::LeafPage,
+                    >,
+            <<Pst as PstFile>::BlockBTree as RootBTree>::LeafPage:
+                RootBTreeLeafPageReadWrite<Pst> + BTreePageReadWrite,
+        {
+            let entry_count = match tree {
+                SubNodeTree::Intermediate(block) => block.entries().len(),
+                SubNodeTree::Leaf(block) => block.entries().len(),
+            };
+            budget.observe_tree(depth, entry_count)?;
+
+            match tree {
+                SubNodeTree::Intermediate(block) => {
+                    let entries = block.entries();
+                    let index =
+                        entries.partition_point(|entry| u32::from(entry.node()) <= u32::from(node));
+                    let entry = index
+                        .checked_sub(1)
+                        .and_then(|index| entries.get(index))
+                        .ok_or(NdbError::SubNodeNotFound(node))?;
+                    let block_id = entry.block();
+                    budget.descend_to(block_id.into_u64())?;
+                    let block = block_btree.find_entry(f, block_id.search_key(), page_cache)?;
+                    let child = SubNodeTree::<Pst>::read(f, &block)?;
+                    descend(&child, f, block_btree, node, page_cache, depth + 1, budget)
+                }
+                SubNodeTree::Leaf(block) => block
                     .entries()
                     .iter()
                     .find(|entry| u32::from(entry.node()) == u32::from(node))
-                    .map(|entry| entry.block())
-                    .ok_or(NdbError::SubNodeNotFound(node))?;
-                Ok(entry)
+                    .copied()
+                    .ok_or_else(|| NdbError::SubNodeNotFound(node).into()),
             }
         }
+
+        let mut budget = SubNodeTraversalBudget::default();
+        descend(self, f, block_btree, node, page_cache, 0, &mut budget)
     }
 
     pub fn entries<'a, R>(
@@ -1477,19 +1777,35 @@ where
     {
         match self {
             Self::Intermediate(block) => {
-                let entries = block
+                let mut budget = SubNodeTraversalBudget::default();
+                budget.observe_tree(0, block.entries().len())?;
+                let mut pending = block
                     .entries()
                     .iter()
-                    .map(|entry| {
-                        let block =
-                            block_btree.find_entry(f, entry.block().search_key(), page_cache)?;
-                        let sub_nodes = Self::read(f, &block)?;
-                        sub_nodes.entries(f, block_btree, page_cache)
-                    })
-                    .collect::<io::Result<Vec<_>>>()?;
-                Ok(Box::new(entries.into_iter().flatten()))
+                    .map(|entry| (entry.block(), 1_usize))
+                    .collect::<VecDeque<_>>();
+                let mut leaves = Vec::new();
+                while let Some((block_id, depth)) = pending.pop_front() {
+                    budget.descend_to(block_id.into_u64())?;
+                    let block = block_btree.find_entry(f, block_id.search_key(), page_cache)?;
+                    match Self::read(f, &block)? {
+                        Self::Intermediate(child) => {
+                            budget.observe_tree(depth, child.entries().len())?;
+                            for entry in child.entries().iter().rev() {
+                                pending.push_front((entry.block(), depth + 1));
+                            }
+                        }
+                        Self::Leaf(child) => {
+                            budget.observe_tree(depth, child.entries().len())?;
+                            leaves.extend_from_slice(child.entries());
+                        }
+                    }
+                }
+                Ok(Box::new(leaves.into_iter()))
             }
             Self::Leaf(block) => {
+                let mut budget = SubNodeTraversalBudget::default();
+                budget.observe_tree(0, block.entries().len())?;
                 let entries = block.entries().to_vec();
                 Ok(Box::new(entries.into_iter()))
             }
@@ -1499,3 +1815,219 @@ where
 
 pub type UnicodeSubNodeTree = SubNodeTree<UnicodePstFile>;
 pub type AnsiSubNodeTree = SubNodeTree<AnsiPstFile>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn block_size_rejects_untrusted_out_of_range_values() {
+        assert!(block_size(0).is_err());
+        assert_eq!(
+            block_size(MAX_BLOCK_SIZE).expect("maximum block size"),
+            8192
+        );
+        assert!(block_size(MAX_BLOCK_SIZE + 1).is_err());
+
+        let block = UnicodeBlockBTreeEntry::new(
+            UnicodeBlockRef::new(
+                UnicodeBlockId::new(false, 1).expect("test block ID"),
+                UnicodeByteIndex::new(0),
+            ),
+            MAX_BLOCK_SIZE,
+        );
+        let mut input = Cursor::new(Vec::<u8>::new());
+        assert!(
+            DataTree::<UnicodePstFile>::read(
+                &mut input,
+                crate::ndb::header::NdbCryptMethod::None,
+                &block,
+            )
+            .is_err()
+        );
+        assert!(SubNodeTree::<UnicodePstFile>::read(&mut input, &block).is_err());
+
+        let undersized = UnicodeBlockBTreeEntry::new(
+            UnicodeBlockRef::new(
+                UnicodeBlockId::new(true, 2).expect("test internal block ID"),
+                UnicodeByteIndex::new(0),
+            ),
+            1,
+        );
+        let mut bytes = vec![0_u8; 64];
+        bytes[0] = 0x01;
+        bytes[1] = 0x01;
+        assert!(
+            DataTree::<UnicodePstFile>::read(
+                &mut Cursor::new(bytes),
+                crate::ndb::header::NdbCryptMethod::None,
+                &undersized,
+            )
+            .is_err()
+        );
+
+        let overflowing_count = UnicodeBlockBTreeEntry::new(
+            UnicodeBlockRef::new(
+                UnicodeBlockId::new(true, 3).expect("test internal block ID"),
+                UnicodeByteIndex::new(0),
+            ),
+            8,
+        );
+        let mut bytes = vec![0_u8; 64];
+        bytes[0] = 0x01;
+        bytes[1] = 0x01;
+        bytes[2..4].copy_from_slice(&u16::MAX.to_le_bytes());
+        assert!(
+            DataTree::<UnicodePstFile>::read(
+                &mut Cursor::new(bytes),
+                crate::ndb::header::NdbCryptMethod::None,
+                &overflowing_count,
+            )
+            .is_err()
+        );
+
+        let invalid_logical_size = DataTreeBlockHeader::new(1, 0, 0);
+        assert!(
+            <UnicodeDataTreeBlock as IntermediateTreeBlockReadWrite>::read(
+                &mut Cursor::new(Vec::<u8>::new()),
+                invalid_logical_size,
+                9,
+            )
+            .is_err()
+        );
+        for level in [0, 3] {
+            assert!(
+                <UnicodeDataTreeBlock as IntermediateTreeBlockReadWrite>::new(
+                    DataTreeBlockHeader::new(level, 0, 0),
+                    Vec::new(),
+                    UnicodeBlockTrailer::default(),
+                )
+                .is_err()
+            );
+        }
+        let internal_id = UnicodeBlockId::new(true, 4).expect("test internal block ID");
+        let valid_header = DataTreeBlockHeader::new(1, 0, 0);
+        let valid_trailer =
+            UnicodeBlockTrailer::new(8, 0, 0, internal_id).expect("valid test block trailer");
+        assert!(
+            <UnicodeDataTreeBlock as IntermediateTreeBlockReadWrite>::new(
+                DataTreeBlockHeader::new(1, 1, 0),
+                Vec::new(),
+                valid_trailer,
+            )
+            .is_err()
+        );
+        let invalid_trailer =
+            UnicodeBlockTrailer::new(1, 0, 0, internal_id).expect("test block trailer");
+        assert!(
+            <UnicodeDataTreeBlock as IntermediateTreeBlockReadWrite>::new(
+                valid_header,
+                Vec::new(),
+                invalid_trailer,
+            )
+            .is_err()
+        );
+        let valid = <UnicodeDataTreeBlock as IntermediateTreeBlockReadWrite>::new(
+            valid_header,
+            Vec::new(),
+            valid_trailer,
+        )
+        .expect("valid XBLOCK construction");
+        let mut serialized = Cursor::new(Vec::new());
+        valid.write(&mut serialized).expect("valid XBLOCK write");
+        serialized.set_position(0);
+        <UnicodeDataTreeBlock as IntermediateTreeBlockReadWrite>::read(
+            &mut serialized,
+            valid_header,
+            8,
+        )
+        .expect("written XBLOCK rereads");
+        let leaf_entry = UnicodeDataTreeEntry::new(
+            UnicodeBlockId::new(false, 5).expect("test external child BID"),
+        );
+        let internal_entry = UnicodeDataTreeEntry::new(
+            UnicodeBlockId::new(true, 6).expect("test internal child BID"),
+        );
+        let populated_trailer =
+            UnicodeBlockTrailer::new(16, 0, 0, internal_id).expect("populated test block trailer");
+        assert!(
+            <UnicodeDataTreeBlock as IntermediateTreeBlockReadWrite>::new(
+                DataTreeBlockHeader::new(1, 1, 8),
+                vec![leaf_entry],
+                populated_trailer,
+            )
+            .is_ok()
+        );
+        assert!(
+            <UnicodeDataTreeBlock as IntermediateTreeBlockReadWrite>::new(
+                DataTreeBlockHeader::new(2, 1, 8),
+                vec![internal_entry],
+                populated_trailer,
+            )
+            .is_ok()
+        );
+        assert!(
+            <UnicodeDataTreeBlock as IntermediateTreeBlockReadWrite>::new(
+                DataTreeBlockHeader::new(1, 1, 8),
+                vec![internal_entry],
+                populated_trailer,
+            )
+            .is_err()
+        );
+        assert!(
+            <UnicodeDataTreeBlock as IntermediateTreeBlockReadWrite>::new(
+                DataTreeBlockHeader::new(2, 1, 8),
+                vec![leaf_entry],
+                populated_trailer,
+            )
+            .is_err()
+        );
+        assert!(validate_data_tree_child_kind(1, true).is_err());
+        assert!(validate_data_tree_child_kind(2, false).is_err());
+        assert!(validate_data_tree_child_level(2, 2).is_err());
+        assert!(validate_data_tree_child_kind(1, false).is_ok());
+        assert!(validate_data_tree_child_level(2, 1).is_ok());
+        assert!(validate_data_tree_total(16_384, 16_384).is_ok());
+        assert!(validate_data_tree_total(16_384, 16_383).is_err());
+    }
+
+    #[test]
+    fn subnode_traversal_budget_rejects_cycles_depth_and_entry_amplification() {
+        let mut cycle = SubNodeTraversalBudget::default();
+        cycle.descend_to(0x42).expect("first block visit");
+        assert!(cycle.descend_to(0x42).is_err());
+
+        let mut depth = SubNodeTraversalBudget::default();
+        assert!(depth.observe_tree(MAX_SUBNODE_TREE_DEPTH + 1, 1).is_err());
+
+        let mut entries = SubNodeTraversalBudget::default();
+        assert!(
+            entries
+                .observe_tree(0, MAX_SUBNODE_TREE_ENTRIES + 1)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn data_tree_traversal_budget_rejects_cycles_depth_and_entry_amplification() {
+        let mut cycle = DataTreeTraversalBudget::default();
+        cycle.descend_to(0x84).expect("first block visit");
+        assert!(cycle.descend_to(0x84).is_err());
+
+        let mut depth = DataTreeTraversalBudget::default();
+        assert!(depth.observe_tree(MAX_DATA_TREE_DEPTH + 1, 1).is_err());
+
+        let mut entries = DataTreeTraversalBudget::default();
+        assert!(entries.observe_tree(0, MAX_DATA_TREE_ENTRIES + 1).is_err());
+
+        assert!(
+            observe_materialized_data_tree_bytes(
+                MAX_MATERIALIZED_DATA_TREE_BYTES,
+                MAX_MATERIALIZED_DATA_TREE_BYTES,
+                1,
+            )
+            .is_err()
+        );
+        assert!(observe_materialized_data_tree_bytes(4, 0, 5).is_err());
+    }
+}

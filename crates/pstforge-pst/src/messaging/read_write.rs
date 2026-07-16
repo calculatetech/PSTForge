@@ -38,8 +38,17 @@ where
         node: Pst::NodeBTreeEntry,
         prop_ids: Option<&[u16]>,
     ) -> io::Result<Rc<Self>>;
+    fn read_embedded_with_budget(
+        store: Rc<Pst::Store>,
+        node: Pst::NodeBTreeEntry,
+        prop_ids: Option<&[u16]>,
+        budget: Rc<std::cell::RefCell<crate::ltp::prop_context::PropertyMaterializationBudget>>,
+    ) -> io::Result<Rc<Self>>;
     fn pst_store(&self) -> &Rc<Pst::Store>;
     fn sub_nodes(&self) -> &MessageSubNodes<Pst>;
+    fn materialization_budget(
+        &self,
+    ) -> &Rc<std::cell::RefCell<crate::ltp::prop_context::PropertyMaterializationBudget>>;
 }
 
 pub trait AttachmentReadWrite<Pst>: Sized

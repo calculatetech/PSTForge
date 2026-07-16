@@ -1024,9 +1024,10 @@ where
         let entry = amap_pages
             .get_mut(amap_index)
             .ok_or(PstError::AllocationMapPageNotFound(amap_index))?;
-        let size = u64::from(block_size(
-            size + <<Pst as PstFile>::BlockTrailer as BlockTrailerReadWrite>::SIZE,
-        ));
+        let size = size
+            .checked_add(<<Pst as PstFile>::BlockTrailer as BlockTrailerReadWrite>::SIZE)
+            .ok_or(NdbError::InvalidBlockSize(size))?;
+        let size = u64::from(block_size(size)?);
         entry.free_space -= size;
 
         let bytes = entry.amap_page.map_bits_mut();

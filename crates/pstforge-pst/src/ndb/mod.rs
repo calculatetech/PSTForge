@@ -113,6 +113,22 @@ pub enum NdbError {
     InvalidSubNodeBlockPadding(u32),
     #[error("Sub-node not found: {0:?}")]
     SubNodeNotFound(NodeId),
+    #[error("Sub-node tree depth exceeds {0}")]
+    SubNodeTreeDepthExceeded(usize),
+    #[error("Sub-node tree contains a block cycle at BID 0x{0:X}")]
+    SubNodeTreeCycle(u64),
+    #[error("Sub-node tree traversal exceeds {0} entries")]
+    SubNodeTreeEntryLimitExceeded(usize),
+    #[error("Data tree depth exceeds {0}")]
+    DataTreeDepthExceeded(usize),
+    #[error("Data tree contains a block cycle at BID 0x{0:X}")]
+    DataTreeCycle(u64),
+    #[error("Data tree traversal exceeds {0} entries")]
+    DataTreeEntryLimitExceeded(usize),
+    #[error("Materialized data tree exceeds {0} bytes")]
+    DataTreeMaterializationLimitExceeded(usize),
+    #[error("Data tree materialized {actual} bytes but declared {declared}")]
+    DataTreeSizeMismatch { declared: usize, actual: usize },
 }
 
 impl From<NdbError> for io::Error {

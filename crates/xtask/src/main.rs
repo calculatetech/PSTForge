@@ -1,11 +1,14 @@
 #![deny(unsafe_code)]
 
 use std::fs;
+use std::os::fd::AsFd;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode, Output};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use base64::Engine;
 use serde::Deserialize;
+use sha2::{Digest, Sha256};
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -55,6 +58,147 @@ struct CargoPackage {
 struct Gate {
     root: PathBuf,
     evidence: PathBuf,
+}
+
+#[derive(Default)]
+struct IndependentFidelitySink {
+    top_level: Option<u64>,
+    embedded: Option<u64>,
+    top_level_id: Option<u32>,
+    embedded_id: Option<u32>,
+    recipients: Vec<(u32, Option<u32>, Option<String>)>,
+    properties: Vec<(libpff_sys::PropertyDescriptor, Vec<u8>)>,
+}
+
+impl IndependentFidelitySink {
+    fn property(&self, message_id: u32, property_id: u32) -> Result<&[u8], String> {
+        let mut matches = self.properties.iter().filter(|(descriptor, _)| {
+            descriptor.owner == libpff_sys::PropertyOwner::Message(message_id)
+                && descriptor.entry_type == Some(property_id)
+        });
+        let (_, bytes) = matches
+            .next()
+            .ok_or_else(|| format!("libpff did not expose property 0x{property_id:04X}"))?;
+        if matches.next().is_some() {
+            return Err(format!(
+                "libpff exposed duplicate property 0x{property_id:04X}"
+            ));
+        }
+        Ok(bytes)
+    }
+
+    fn property_type(&self, message_id: u32, property_id: u32) -> Option<u32> {
+        self.properties
+            .iter()
+            .find(|(descriptor, _)| {
+                descriptor.owner == libpff_sys::PropertyOwner::Message(message_id)
+                    && descriptor.entry_type == Some(property_id)
+            })
+            .and_then(|(descriptor, _)| descriptor.value_type)
+    }
+}
+
+impl libpff_sys::CatalogSink for IndependentFidelitySink {
+    fn event(&mut self, event: libpff_sys::CatalogEvent<'_>) -> Result<(), String> {
+        match event {
+            libpff_sys::CatalogEvent::MessageStart {
+                id,
+                parent_message_id,
+                delivery_filetime,
+                ..
+            } => {
+                let (time_slot, id_slot) = if parent_message_id.is_some() {
+                    (&mut self.embedded, &mut self.embedded_id)
+                } else {
+                    (&mut self.top_level, &mut self.top_level_id)
+                };
+                if time_slot
+                    .replace(delivery_filetime.ok_or_else(|| {
+                        "libpff did not expose the message delivery time".to_owned()
+                    })?)
+                    .is_some()
+                    || id_slot.replace(id).is_some()
+                {
+                    return Err("libpff exposed an unexpected additional message".to_owned());
+                }
+            }
+            libpff_sys::CatalogEvent::Recipient {
+                message_id,
+                recipient_type,
+                email_address,
+                ..
+            } => self
+                .recipients
+                .push((message_id, recipient_type, email_address)),
+            libpff_sys::CatalogEvent::PropertyStart(descriptor)
+                if matches!(descriptor.owner, libpff_sys::PropertyOwner::Message(_)) =>
+            {
+                self.properties.push((descriptor, Vec::new()));
+            }
+            libpff_sys::CatalogEvent::PropertyData { descriptor, bytes }
+                if matches!(descriptor.owner, libpff_sys::PropertyOwner::Message(_)) =>
+            {
+                let (_, output) = self
+                    .properties
+                    .iter_mut()
+                    .rev()
+                    .find(|(candidate, _)| *candidate == descriptor)
+                    .ok_or_else(|| {
+                        "libpff emitted property data before its descriptor".to_owned()
+                    })?;
+                output.extend_from_slice(bytes);
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+}
+
+fn utf16le(value: &str) -> Vec<u8> {
+    value.encode_utf16().flat_map(u16::to_le_bytes).collect()
+}
+
+fn validate_independent_properties(sink: &IndependentFidelitySink) -> Result<(), String> {
+    const PT_LONG: u32 = 0x0003;
+    const PT_BOOLEAN: u32 = 0x000b;
+    const PT_UNICODE: u32 = 0x001f;
+    const PT_CLSID: u32 = 0x0048;
+
+    let top = sink
+        .top_level_id
+        .ok_or_else(|| "libpff did not expose the top-level message ID".to_owned())?;
+    let embedded = sink
+        .embedded_id
+        .ok_or_else(|| "libpff did not expose the embedded message ID".to_owned())?;
+    let checks = [
+        (
+            top,
+            0x8000,
+            PT_UNICODE,
+            utf16le("named property checkpoint"),
+        ),
+        (top, 0x8002, PT_LONG, 21_i32.to_le_bytes().to_vec()),
+        (embedded, 0x8001, PT_BOOLEAN, vec![1]),
+        (top, 0x10f4, PT_UNICODE, utf16le("raw property checkpoint")),
+        (top, 0x10f5, PT_CLSID, b"PSTForgeRawGuid!".to_vec()),
+    ];
+    for (message, id, expected_type, expected) in checks {
+        if sink.property_type(message, id) != Some(expected_type) {
+            return Err(format!("libpff property 0x{id:04X} type mismatch"));
+        }
+        let actual = sink.property(message, id)?;
+        if actual != expected {
+            return Err(format!(
+                "libpff property 0x{id:04X} bytes mismatch: expected {expected:02x?}, got {actual:02x?}"
+            ));
+        }
+    }
+    if !sink.recipients.iter().any(|(message, kind, address)| {
+        *message == top && *kind == Some(3) && address.as_deref() == Some("bcc@example.com")
+    }) {
+        return Err("libpff did not expose the top-level Bcc recipient role/address".to_owned());
+    }
+    Ok(())
 }
 
 fn main() -> ExitCode {
@@ -439,12 +583,61 @@ impl Gate {
     fn validate_generated_store(&self) -> Result<(), String> {
         let scratch = tempfile::tempdir()
             .map_err(|error| format!("cannot create writer scratch directory: {error}"))?;
-        let pst = scratch.path().join("pstforge-writer-v0.2.0.pst");
-        pstforge_pst::writer::create_minimal_store(
-            &pst,
-            &pstforge_pst::writer::MinimalStore::default(),
-        )
-        .map_err(|error| format!("cannot create writer acceptance PST: {error}"))?;
+        let pst = scratch.path().join("pstforge-writer-v0.2.1.pst");
+        let fixture = pstforge_pst::writer::FidelityStore::default();
+        let report = pstforge_pst::writer::create_fidelity_store(&pst, &fixture)
+            .map_err(|error| format!("cannot create writer acceptance PST: {error}"))?;
+        if !report.unsupported_properties.is_empty() {
+            return Err("writer acceptance fixture omitted unsupported properties".to_owned());
+        }
+        let inventory = pstforge_core::verify(&pst)
+            .map_err(|error| format!("libpff rejected writer acceptance PST: {error}"))?;
+        if inventory.inventory.normal_items != 2
+            || inventory.inventory.recipients != 4
+            || inventory.inventory.attachments != 2
+            || inventory.inventory.embedded_messages != 1
+            || !inventory.inventory.issues.is_empty()
+        {
+            return Err(format!(
+                "libpff fidelity mismatch: items={}, recipients={}, attachments={}, embedded={}, issues={}",
+                inventory.inventory.normal_items,
+                inventory.inventory.recipients,
+                inventory.inventory.attachments,
+                inventory.inventory.embedded_messages,
+                inventory.inventory.issues.len()
+            ));
+        }
+        let source = fs::File::open(&pst)
+            .map_err(|error| format!("cannot reopen writer PST for libpff fidelity: {error}"))?;
+        let native = libpff_sys::PffFile::open_fd(source.as_fd())
+            .map_err(|error| format!("libpff cannot open writer PST for fidelity: {error}"))?;
+        let mut delivery = IndependentFidelitySink::default();
+        native
+            .catalog(&mut delivery)
+            .map_err(|error| format!("libpff cannot catalog writer delivery times: {error}"))?;
+        let expected_top = u64::try_from(fixture.message.received_filetime)
+            .map_err(|_| "writer top-level received FILETIME is negative".to_owned())?;
+        let expected_embedded = fixture
+            .message
+            .attachments
+            .iter()
+            .find_map(|attachment| match &attachment.content {
+                pstforge_pst::writer::AttachmentContent::Embedded(message) => {
+                    Some(message.received_filetime)
+                }
+                _ => None,
+            })
+            .ok_or_else(|| "writer fixture has no embedded message".to_owned())?;
+        let expected_embedded = u64::try_from(expected_embedded)
+            .map_err(|_| "writer embedded received FILETIME is negative".to_owned())?;
+        if delivery.top_level != Some(expected_top) || delivery.embedded != Some(expected_embedded)
+        {
+            return Err(format!(
+                "libpff delivery-time mismatch: top={:?}, embedded={:?}",
+                delivery.top_level, delivery.embedded
+            ));
+        }
+        validate_independent_properties(&delivery)?;
         let pst_path = pst
             .to_str()
             .ok_or_else(|| "writer acceptance path is not UTF-8".to_owned())?;
@@ -462,19 +655,42 @@ impl Gate {
             &["-q", "-r", "-o", extracted_path, pst_path],
         )?;
         let required = [
-            b"Subject: PSTForge writer checkpoint".as_slice(),
-            b"This message verifies Unicode PST creation.".as_slice(),
+            b"From: \"PSTForge Sender\" <sender@example.com>".as_slice(),
+            b"To: Primary Recipient".as_slice(),
+            b"Cc: Copy Recipient".as_slice(),
+            b"Message-ID: <pstforge-fidelity@example.com>".as_slice(),
+            b"Date: Wed, 01 Jan 2025 00:00:30 +0000".as_slice(),
+            b"Plain-text body checkpoint.".as_slice(),
+            "HTML body checkpoint: € 世界.".as_bytes(),
+            b"e1xydGYxXGFuc2lcYiBSVEYgYm9keSBjaGVja3BvaW50LlxiMH0=".as_slice(),
+            b"Embedded message checkpoint".as_slice(),
+            b"From: \"Embedded Sender\" <embedded-sender@example.com>".as_slice(),
+            b"To: Embedded Recipient".as_slice(),
+            b"Date: Wed, 01 Jan 2025 00:00:10 +0000".as_slice(),
+            b"Embedded plain-text body.".as_slice(),
+            b"Content-ID: <checkpoint@pstforge>".as_slice(),
         ];
         if !directory_contains_file_with(&extracted, &required)? {
-            return Err("readpst output did not contain the expected subject and body".to_owned());
+            return Err("readpst output did not contain the expected fidelity markers".to_owned());
         }
+        let expected_attachment = match &fixture.message.attachments[0].content {
+            pstforge_pst::writer::AttachmentContent::Binary(value) => value,
+            _ => return Err("writer fixture first attachment is not binary".to_owned()),
+        };
+        let extracted_attachment = extract_base64_attachment(&extracted, "checkpoint.txt")?;
+        if &extracted_attachment != expected_attachment {
+            return Err("readpst binary attachment content mismatch".to_owned());
+        }
+        let attachment_hash = format!("{:x}", Sha256::digest(&extracted_attachment));
         fs::write(
             self.evidence.join("writer-acceptance.log"),
             format!(
-                "generated bytes: {}\npffinfo: accepted\nreadpst: expected subject and body extracted\n",
+                "generated bytes: {}\ninternal typed comparison: top-level and embedded metadata, To/Cc/Bcc roles and addresses, bodies, headers, timestamps, RTF sync/container, named/raw properties, record keys, attachment metadata, and complete payloads match\nlibpff: 2 items, 4 recipients, 2 attachments, 1 embedded, exact top-level/embedded delivery FILETIMEs, independently sampled top-level/embedded NAMEID values, raw Unicode/GUID values, and Bcc role/address, no issues\npffinfo: accepted\nreadpst: sender, To/Cc, headers, timestamps, text, HTML, exact RTF, embedded sender/recipient/time/body, inline metadata, and complete attachment extracted\nattachment bytes: {}\nattachment sha256: {}\n",
                 pst.metadata()
                     .map_err(|error| format!("cannot inspect generated PST: {error}"))?
-                    .len()
+                    .len(),
+                extracted_attachment.len(),
+                attachment_hash,
             ),
         )
         .map_err(|error| format!("cannot record writer acceptance evidence: {error}"))?;
@@ -540,6 +756,47 @@ fn directory_contains_file_with(path: &Path, required: &[&[u8]]) -> Result<bool,
         }
     }
     Ok(false)
+}
+
+fn extract_base64_attachment(path: &Path, filename: &str) -> Result<Vec<u8>, String> {
+    let mut pending = vec![path.to_path_buf()];
+    let marker = format!("filename=\"{filename}\"");
+    while let Some(directory) = pending.pop() {
+        for entry in fs::read_dir(&directory)
+            .map_err(|error| format!("cannot read {}: {error}", directory.display()))?
+        {
+            let entry = entry.map_err(|error| {
+                format!("cannot read an entry in {}: {error}", directory.display())
+            })?;
+            let metadata = entry
+                .metadata()
+                .map_err(|error| format!("cannot inspect {}: {error}", entry.path().display()))?;
+            if metadata.is_dir() {
+                pending.push(entry.path());
+                continue;
+            }
+            if !metadata.is_file() || metadata.len() > 16 * 1024 * 1024 {
+                continue;
+            }
+            let content = fs::read_to_string(entry.path())
+                .map_err(|error| format!("cannot read {}: {error}", entry.path().display()))?;
+            let Some((_, after_marker)) = content.split_once(&marker) else {
+                continue;
+            };
+            let normalized = after_marker.replace("\r\n", "\n");
+            let Some((_, encoded_and_rest)) = normalized.split_once("\n\n") else {
+                return Err(format!("attachment {filename} has no MIME body"));
+            };
+            let encoded = encoded_and_rest
+                .lines()
+                .take_while(|line| !line.is_empty() && !line.starts_with("--"))
+                .collect::<String>();
+            return base64::engine::general_purpose::STANDARD
+                .decode(encoded)
+                .map_err(|error| format!("cannot decode attachment {filename}: {error}"));
+        }
+    }
+    Err(format!("readpst did not extract attachment {filename}"))
 }
 
 fn default_peak_chunk_limit() -> u64 {

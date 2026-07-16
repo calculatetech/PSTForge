@@ -7,6 +7,7 @@ use std::{
     collections::BTreeMap,
     fmt::{Debug, Display},
     io::{self, Cursor, Read, Write},
+    rc::Rc,
 };
 
 use super::{heap::*, prop_type::*, read_write::*, tree::*, *};
@@ -269,6 +270,15 @@ impl GuidValue {
         }
     }
 
+    pub fn to_le_bytes(self) -> [u8; 16] {
+        let mut bytes = [0_u8; 16];
+        bytes[..4].copy_from_slice(&self.data1.to_le_bytes());
+        bytes[4..6].copy_from_slice(&self.data2.to_le_bytes());
+        bytes[6..8].copy_from_slice(&self.data3.to_le_bytes());
+        bytes[8..].copy_from_slice(&self.data4);
+        bytes
+    }
+
     pub fn data1(&self) -> u32 {
         self.data1
     }
@@ -308,12 +318,14 @@ impl Debug for GuidValue {
 
 #[derive(Clone, Default)]
 pub struct BinaryValue {
-    buffer: Vec<u8>,
+    buffer: Rc<[u8]>,
 }
 
 impl BinaryValue {
     pub fn new(buffer: Vec<u8>) -> Self {
-        Self { buffer }
+        Self {
+            buffer: buffer.into(),
+        }
     }
 
     pub fn buffer(&self) -> &[u8] {
@@ -433,12 +445,79 @@ pub enum PropertyValue {
     /// `PtypMultipleTime`: Variable size; a COUNT field followed by that many
     /// [PropertyValue::Time] values.
     MultipleTime(Vec<i64>),
-    /// `PtypMultipleGuid`: Variable size; a COUNT field followed by that many
-    /// [PropertyValue::Guid] values.
+    /// `PtypMultipleGuid`: packed fixed-width [PropertyValue::Guid] values.
     MultipleGuid(Vec<GuidValue>),
     /// `PtypMultipleBinary`: Variable size; a COUNT field followed by that many
     /// [PropertyValue::Binary] values.
     MultipleBinary(Vec<BinaryValue>),
+}
+
+impl PropertyValue {
+    pub(crate) fn materialized_size(&self) -> Option<usize> {
+        let base = std::mem::size_of::<Self>();
+        let extra = match self {
+            Self::String8(value) => value.buffer.capacity(),
+            Self::Unicode(value) => value
+                .buffer
+                .capacity()
+                .checked_mul(std::mem::size_of::<u16>())?,
+            Self::Binary(value) => value.buffer.len(),
+            Self::MultipleInteger16(values) => {
+                values.capacity().checked_mul(std::mem::size_of::<i16>())?
+            }
+            Self::MultipleInteger32(values) => {
+                values.capacity().checked_mul(std::mem::size_of::<i32>())?
+            }
+            Self::MultipleFloating32(values) => {
+                values.capacity().checked_mul(std::mem::size_of::<f32>())?
+            }
+            Self::MultipleFloating64(values) => {
+                values.capacity().checked_mul(std::mem::size_of::<f64>())?
+            }
+            Self::MultipleCurrency(values) => {
+                values.capacity().checked_mul(std::mem::size_of::<i64>())?
+            }
+            Self::MultipleFloatingTime(values) => {
+                values.capacity().checked_mul(std::mem::size_of::<f64>())?
+            }
+            Self::MultipleInteger64(values) => {
+                values.capacity().checked_mul(std::mem::size_of::<i64>())?
+            }
+            Self::MultipleTime(values) => {
+                values.capacity().checked_mul(std::mem::size_of::<i64>())?
+            }
+            Self::MultipleGuid(values) => values
+                .capacity()
+                .checked_mul(std::mem::size_of::<GuidValue>())?,
+            Self::MultipleString8(values) => values.iter().try_fold(
+                values
+                    .capacity()
+                    .checked_mul(std::mem::size_of::<String8Value>())?,
+                |total, value| total.checked_add(value.buffer.len()),
+            )?,
+            Self::MultipleUnicode(values) => values.iter().try_fold(
+                values
+                    .capacity()
+                    .checked_mul(std::mem::size_of::<UnicodeValue>())?,
+                |total, value| {
+                    total.checked_add(
+                        value
+                            .buffer
+                            .capacity()
+                            .checked_mul(std::mem::size_of::<u16>())?,
+                    )
+                },
+            )?,
+            Self::MultipleBinary(values) => values.iter().try_fold(
+                values
+                    .capacity()
+                    .checked_mul(std::mem::size_of::<BinaryValue>())?,
+                |total, value| total.checked_add(value.buffer.len()),
+            )?,
+            _ => 0,
+        };
+        base.checked_add(extra)
+    }
 }
 
 impl From<&PropertyValue> for PropertyType {
@@ -473,6 +552,72 @@ impl From<&PropertyValue> for PropertyType {
             PropertyValue::MultipleGuid(_) => PropertyType::MultipleGuid,
             PropertyValue::MultipleBinary(_) => PropertyType::MultipleBinary,
         }
+    }
+}
+
+fn read_fixed_values<T>(
+    f: &mut dyn Read,
+    width: usize,
+    decode: impl Fn(&[u8]) -> T,
+) -> io::Result<Vec<T>> {
+    let mut values = Vec::new();
+    let mut bytes = vec![0_u8; width];
+    loop {
+        if f.read(&mut bytes[..1])? == 0 {
+            return Ok(values);
+        }
+        f.read_exact(&mut bytes[1..])?;
+        values.push(decode(&bytes));
+    }
+}
+
+fn require_eof(f: &mut dyn Read) -> io::Result<()> {
+    let mut byte = [0_u8; 1];
+    if f.read(&mut byte)? == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "count-prefixed property has trailing data",
+        ))
+    }
+}
+
+const MAX_MULTI_VALUE_ELEMENTS: usize = 65_536;
+pub(crate) const MAX_PROPERTY_MATERIALIZATION_BYTES: usize = 64 * 1024 * 1024;
+
+pub(crate) struct PropertyMaterializationBudget {
+    materialized: usize,
+}
+
+impl PropertyMaterializationBudget {
+    pub(crate) fn new() -> Self {
+        Self { materialized: 0 }
+    }
+
+    pub(crate) fn charge(&mut self, bytes: usize) -> io::Result<()> {
+        self.materialized = self.materialized.checked_add(bytes).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "property materialized-size overflow",
+            )
+        })?;
+        if self.materialized > MAX_PROPERTY_MATERIALIZATION_BYTES {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "properties exceed the materialization limit",
+            ));
+        }
+        Ok(())
+    }
+}
+
+fn read_multivalue_count(f: &mut dyn Read) -> io::Result<usize> {
+    let count = f.read_u32::<LittleEndian>()? as usize;
+    if count > MAX_MULTI_VALUE_ELEMENTS {
+        Err(LtpError::InvalidMultiValuePropertyCount(count).into())
+    } else {
+        Ok(count)
     }
 }
 
@@ -541,7 +686,9 @@ impl PropertyValueReadWrite for PropertyValue {
             PropertyType::Binary => {
                 let mut buffer = Vec::new();
                 f.read_to_end(&mut buffer)?;
-                Ok(Self::Binary(BinaryValue { buffer }))
+                Ok(Self::Binary(BinaryValue {
+                    buffer: buffer.into(),
+                }))
             }
 
             PropertyType::Object => {
@@ -551,74 +698,83 @@ impl PropertyValueReadWrite for PropertyValue {
             }
 
             PropertyType::MultipleInteger16 => {
-                let mut values = Vec::new();
-                while let Ok(value) = f.read_i16::<LittleEndian>() {
-                    values.push(value);
-                }
-                Ok(Self::MultipleInteger16(values))
+                Ok(Self::MultipleInteger16(read_fixed_values(f, 2, |bytes| {
+                    i16::from_le_bytes([bytes[0], bytes[1]])
+                })?))
             }
 
             PropertyType::MultipleInteger32 => {
-                let mut values = Vec::new();
-                while let Ok(value) = f.read_i32::<LittleEndian>() {
-                    values.push(value);
-                }
-                Ok(Self::MultipleInteger32(values))
+                Ok(Self::MultipleInteger32(read_fixed_values(f, 4, |bytes| {
+                    i32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])
+                })?))
             }
 
-            PropertyType::MultipleFloating32 => {
-                let mut values = Vec::new();
-                while let Ok(value) = f.read_f32::<LittleEndian>() {
-                    values.push(value);
-                }
-                Ok(Self::MultipleFloating32(values))
-            }
+            PropertyType::MultipleFloating32 => Ok(Self::MultipleFloating32(read_fixed_values(
+                f,
+                4,
+                |bytes| {
+                    f32::from_bits(u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+                },
+            )?)),
 
-            PropertyType::MultipleFloating64 => {
-                let mut values = Vec::new();
-                while let Ok(value) = f.read_f64::<LittleEndian>() {
-                    values.push(value);
-                }
-                Ok(Self::MultipleFloating64(values))
-            }
+            PropertyType::MultipleFloating64 => Ok(Self::MultipleFloating64(read_fixed_values(
+                f,
+                8,
+                |bytes| {
+                    f64::from_bits(u64::from_le_bytes([
+                        bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6],
+                        bytes[7],
+                    ]))
+                },
+            )?)),
 
             PropertyType::MultipleCurrency => {
-                let mut values = Vec::new();
-                while let Ok(value) = f.read_i64::<LittleEndian>() {
-                    values.push(value);
-                }
-                Ok(Self::MultipleCurrency(values))
+                Ok(Self::MultipleCurrency(read_fixed_values(f, 8, |bytes| {
+                    i64::from_le_bytes([
+                        bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6],
+                        bytes[7],
+                    ])
+                })?))
             }
 
-            PropertyType::MultipleFloatingTime => {
-                let mut values = Vec::new();
-                while let Ok(value) = f.read_f64::<LittleEndian>() {
-                    values.push(value);
-                }
-                Ok(Self::MultipleFloatingTime(values))
-            }
+            PropertyType::MultipleFloatingTime => Ok(Self::MultipleFloatingTime(
+                read_fixed_values(f, 8, |bytes| {
+                    f64::from_bits(u64::from_le_bytes([
+                        bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6],
+                        bytes[7],
+                    ]))
+                })?,
+            )),
 
             PropertyType::MultipleInteger64 => {
-                let mut values = Vec::new();
-                while let Ok(value) = f.read_i64::<LittleEndian>() {
-                    values.push(value);
-                }
-                Ok(Self::MultipleInteger64(values))
+                Ok(Self::MultipleInteger64(read_fixed_values(f, 8, |bytes| {
+                    i64::from_le_bytes([
+                        bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6],
+                        bytes[7],
+                    ])
+                })?))
             }
 
             PropertyType::MultipleString8 => {
                 // ulCount
-                let count = f.read_u32::<LittleEndian>()? as usize;
+                let count = read_multivalue_count(f)?;
 
                 // rgulDataOffsets
-                let mut offsets = Vec::with_capacity(count);
+                let mut offsets = Vec::new();
                 for _ in 0..count {
                     offsets.push(f.read_u32::<LittleEndian>()? as usize);
                 }
+                if offsets.is_empty() {
+                    require_eof(f)?;
+                }
 
                 // rgDataItems
-                let mut start = (offsets.len() + 1) * mem::size_of::<u32>();
-                let mut values = Vec::with_capacity(offsets.len());
+                let mut start = offsets
+                    .len()
+                    .checked_add(1)
+                    .and_then(|count| count.checked_mul(mem::size_of::<u32>()))
+                    .ok_or(LtpError::InvalidMultiValuePropertyOffset(usize::MAX))?;
+                let mut values = Vec::new();
                 for i in 0..offsets.len() {
                     let next = offsets[i];
                     if next != start {
@@ -632,9 +788,13 @@ impl PropertyValueReadWrite for PropertyValue {
                         }
 
                         if next > start {
-                            let mut buffer = vec![0; next - start];
+                            let length = next - start;
+                            let mut buffer = Vec::new();
+                            f.take(length as u64).read_to_end(&mut buffer)?;
+                            if buffer.len() != length {
+                                return Err(io::Error::from(io::ErrorKind::UnexpectedEof));
+                            }
                             start = next;
-                            f.read_exact(&mut buffer)?;
                             buffer
                         } else {
                             Default::default()
@@ -657,17 +817,24 @@ impl PropertyValueReadWrite for PropertyValue {
 
             PropertyType::MultipleUnicode => {
                 // ulCount
-                let count = f.read_u32::<LittleEndian>()? as usize;
+                let count = read_multivalue_count(f)?;
 
                 // rgulDataOffsets
-                let mut offsets = Vec::with_capacity(count);
+                let mut offsets = Vec::new();
                 for _ in 0..count {
                     offsets.push(f.read_u32::<LittleEndian>()? as usize);
                 }
+                if offsets.is_empty() {
+                    require_eof(f)?;
+                }
 
                 // rgDataItems
-                let mut start = (offsets.len() + 1) * mem::size_of::<u32>();
-                let mut values = Vec::with_capacity(offsets.len());
+                let mut start = offsets
+                    .len()
+                    .checked_add(1)
+                    .and_then(|count| count.checked_mul(mem::size_of::<u32>()))
+                    .ok_or(LtpError::InvalidMultiValuePropertyOffset(usize::MAX))?;
+                let mut values = Vec::new();
                 for i in 0..offsets.len() {
                     let next = offsets[i];
                     if next != start {
@@ -680,6 +847,9 @@ impl PropertyValueReadWrite for PropertyValue {
                         if next < start {
                             return Err(LtpError::InvalidMultiValuePropertyOffset(next).into());
                         }
+                        if (next - start) % mem::size_of::<u16>() != 0 {
+                            return Err(LtpError::InvalidMultiValuePropertyOffset(next).into());
+                        }
 
                         while start < next {
                             let ch = f.read_u16::<LittleEndian>()?;
@@ -687,8 +857,13 @@ impl PropertyValueReadWrite for PropertyValue {
                             start += mem::size_of::<u16>();
                         }
                     } else {
-                        while let Ok(ch) = f.read_u16::<LittleEndian>() {
-                            buffer.push(ch);
+                        let mut remaining = Vec::new();
+                        f.read_to_end(&mut remaining)?;
+                        if remaining.len() % mem::size_of::<u16>() != 0 {
+                            return Err(io::Error::from(io::ErrorKind::UnexpectedEof));
+                        }
+                        for bytes in remaining.chunks_exact(2) {
+                            buffer.push(u16::from_le_bytes([bytes[0], bytes[1]]));
                         }
                     };
 
@@ -703,46 +878,48 @@ impl PropertyValueReadWrite for PropertyValue {
             }
 
             PropertyType::MultipleTime => {
-                let mut values = Vec::new();
-                while let Ok(value) = f.read_i64::<LittleEndian>() {
-                    values.push(value);
-                }
-                Ok(Self::MultipleTime(values))
+                Ok(Self::MultipleTime(read_fixed_values(f, 8, |bytes| {
+                    i64::from_le_bytes([
+                        bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6],
+                        bytes[7],
+                    ])
+                })?))
             }
 
             PropertyType::MultipleGuid => {
-                let count = f.read_u32::<LittleEndian>()? as usize;
-                let mut values = Vec::with_capacity(count);
-                for _ in 0..count {
-                    let data1 = f.read_u32::<LittleEndian>()?;
-                    let data2 = f.read_u16::<LittleEndian>()?;
-                    let data3 = f.read_u16::<LittleEndian>()?;
-                    let mut data4 = [0; 8];
-                    f.read_exact(&mut data4)?;
-                    values.push(GuidValue {
-                        data1,
-                        data2,
-                        data3,
-                        data4,
-                    });
-                }
-
-                Ok(Self::MultipleGuid(values))
+                Ok(Self::MultipleGuid(read_fixed_values(f, 16, |bytes| {
+                    GuidValue {
+                        data1: u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]),
+                        data2: u16::from_le_bytes([bytes[4], bytes[5]]),
+                        data3: u16::from_le_bytes([bytes[6], bytes[7]]),
+                        data4: [
+                            bytes[8], bytes[9], bytes[10], bytes[11], bytes[12], bytes[13],
+                            bytes[14], bytes[15],
+                        ],
+                    }
+                })?))
             }
 
             PropertyType::MultipleBinary => {
                 // ulCount
-                let count = f.read_u32::<LittleEndian>()? as usize;
+                let count = read_multivalue_count(f)?;
 
                 // rgulDataOffsets
-                let mut offsets = Vec::with_capacity(count);
+                let mut offsets = Vec::new();
                 for _ in 0..count {
                     offsets.push(f.read_u32::<LittleEndian>()? as usize);
                 }
+                if offsets.is_empty() {
+                    require_eof(f)?;
+                }
 
                 // rgDataItems
-                let mut start = (offsets.len() + 1) * mem::size_of::<u32>();
-                let mut values = Vec::with_capacity(offsets.len());
+                let mut start = offsets
+                    .len()
+                    .checked_add(1)
+                    .and_then(|count| count.checked_mul(mem::size_of::<u32>()))
+                    .ok_or(LtpError::InvalidMultiValuePropertyOffset(usize::MAX))?;
+                let mut values = Vec::new();
                 for i in 0..offsets.len() {
                     let next = offsets[i];
                     if next != start {
@@ -756,9 +933,13 @@ impl PropertyValueReadWrite for PropertyValue {
                         }
 
                         if next > start {
-                            let mut buffer = vec![0; next - start];
+                            let length = next - start;
+                            let mut buffer = Vec::new();
+                            f.take(length as u64).read_to_end(&mut buffer)?;
+                            if buffer.len() != length {
+                                return Err(io::Error::from(io::ErrorKind::UnexpectedEof));
+                            }
                             start = next;
-                            f.read_exact(&mut buffer)?;
                             buffer
                         } else {
                             Default::default()
@@ -769,7 +950,9 @@ impl PropertyValueReadWrite for PropertyValue {
                         buffer
                     };
 
-                    values.push(BinaryValue { buffer });
+                    values.push(BinaryValue {
+                        buffer: buffer.into(),
+                    });
                 }
 
                 Ok(Self::MultipleBinary(values))
@@ -1032,14 +1215,20 @@ where
         block_btree: &PstFileReadWriteBlockBTree<Pst>,
         page_cache: &mut RootBTreePageCache<<Pst as PstFile>::BlockBTree>,
         value: PropertyTreeRecordValue,
+        mut budget: Option<&mut PropertyMaterializationBudget>,
     ) -> io::Result<PropertyValue> {
-        match value.value() {
+        let mut reserved = 0_usize;
+        let decoded = match value.value() {
             PropertyValueRecord::Heap(heap_id) => {
                 if u32::from(heap_id) == 0 {
                     return Ok(PropertyValue::Null);
                 }
 
                 let data = self.tree.heap().find_entry(heap_id)?;
+                reserved = data.len();
+                if let Some(budget) = budget.as_deref_mut() {
+                    budget.charge(reserved)?;
+                }
                 let mut cursor = Cursor::new(data);
                 PropertyValueReadWrite::read(&mut cursor, value.prop_type())
             }
@@ -1059,6 +1248,10 @@ where
                     Some(data_tree) => data_tree,
                     None => DataTree::read(f, encoding, &block)?,
                 };
+                reserved = data_tree.declared_size();
+                if let Some(budget) = budget.as_deref_mut() {
+                    budget.charge(reserved)?;
+                }
                 let mut data = vec![];
                 let result = data_tree
                     .reader(f, encoding, block_btree, page_cache, &mut block_cache)
@@ -1071,7 +1264,19 @@ where
             small => small
                 .small_value(value.prop_type())
                 .ok_or(LtpError::InvalidSmallPropertyType(value.prop_type()).into()),
+        }?;
+        if let Some(budget) = budget {
+            let actual = decoded.materialized_size().ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "property materialized-size overflow",
+                )
+            })?;
+            if actual > reserved {
+                budget.charge(actual - reserved)?;
+            }
         }
+        Ok(decoded)
     }
 }
 
@@ -1102,6 +1307,7 @@ impl UnicodePropertyContext {
             block_btree,
             page_cache,
             value,
+            None,
         )
     }
 }
@@ -1129,9 +1335,10 @@ impl PropertyContextReadWrite<UnicodePstFile> for UnicodePropertyContext {
         block_btree: &UnicodeBlockBTree,
         page_cache: &mut RootBTreePageCache<UnicodeBlockBTree>,
         value: PropertyTreeRecordValue,
+        budget: Option<&mut PropertyMaterializationBudget>,
     ) -> io::Result<PropertyValue> {
         self.inner
-            .read_property(f, encoding, block_btree, page_cache, value)
+            .read_property(f, encoding, block_btree, page_cache, value, budget)
     }
 }
 
@@ -1159,6 +1366,7 @@ impl AnsiPropertyContext {
             block_btree,
             page_cache,
             value,
+            None,
         )
     }
 }
@@ -1186,8 +1394,107 @@ impl PropertyContextReadWrite<AnsiPstFile> for AnsiPropertyContext {
         block_btree: &AnsiBlockBTree,
         page_cache: &mut RootBTreePageCache<AnsiBlockBTree>,
         value: PropertyTreeRecordValue,
+        budget: Option<&mut PropertyMaterializationBudget>,
     ) -> io::Result<PropertyValue> {
         self.inner
-            .read_property(f, encoding, block_btree, page_cache, value)
+            .read_property(f, encoding, block_btree, page_cache, value, budget)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn shared_property_budget_rejects_cumulative_materialization() {
+        let mut budget = PropertyMaterializationBudget::new();
+        budget
+            .charge(MAX_PROPERTY_MATERIALIZATION_BYTES)
+            .expect("exact property budget is accepted");
+        assert!(budget.charge(1).is_err());
+    }
+
+    #[test]
+    fn variable_multivalue_rejects_untrusted_counts_without_preallocation() {
+        for property_type in [
+            PropertyType::MultipleString8,
+            PropertyType::MultipleUnicode,
+            PropertyType::MultipleBinary,
+        ] {
+            let mut cursor = Cursor::new(u32::MAX.to_le_bytes());
+            assert!(PropertyValue::read(&mut cursor, property_type).is_err());
+        }
+
+        let count = u32::try_from(MAX_MULTI_VALUE_ELEMENTS + 1).expect("test count fits u32");
+        let mut realizable = Vec::with_capacity(4 + count as usize * 4);
+        realizable.extend_from_slice(&count.to_le_bytes());
+        realizable.resize(4 + count as usize * 4, 0);
+        let mut cursor = Cursor::new(realizable);
+        assert!(PropertyValue::read(&mut cursor, PropertyType::MultipleBinary).is_err());
+    }
+
+    #[test]
+    fn variable_multivalue_rejects_offsets_beyond_available_data() {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&2_u32.to_le_bytes());
+        bytes.extend_from_slice(&12_u32.to_le_bytes());
+        bytes.extend_from_slice(&u32::MAX.to_le_bytes());
+        for property_type in [
+            PropertyType::MultipleString8,
+            PropertyType::MultipleUnicode,
+            PropertyType::MultipleBinary,
+        ] {
+            let mut cursor = Cursor::new(bytes.as_slice());
+            assert!(PropertyValue::read(&mut cursor, property_type).is_err());
+        }
+    }
+
+    #[test]
+    fn fixed_multivalue_rejects_partial_trailing_elements() {
+        for (property_type, width) in [
+            (PropertyType::MultipleInteger16, 2),
+            (PropertyType::MultipleInteger32, 4),
+            (PropertyType::MultipleFloating32, 4),
+            (PropertyType::MultipleFloating64, 8),
+            (PropertyType::MultipleCurrency, 8),
+            (PropertyType::MultipleFloatingTime, 8),
+            (PropertyType::MultipleInteger64, 8),
+            (PropertyType::MultipleTime, 8),
+            (PropertyType::MultipleGuid, 16),
+        ] {
+            let mut cursor = Cursor::new(vec![0_u8; width - 1]);
+            assert!(PropertyValue::read(&mut cursor, property_type).is_err());
+            let mut empty = Cursor::new(Vec::<u8>::new());
+            assert!(PropertyValue::read(&mut empty, property_type).is_ok());
+        }
+    }
+
+    #[test]
+    fn count_prefixed_multivalue_rejects_trailing_data() {
+        for property_type in [
+            PropertyType::MultipleString8,
+            PropertyType::MultipleUnicode,
+            PropertyType::MultipleBinary,
+        ] {
+            let mut cursor = Cursor::new(vec![0, 0, 0, 0, 1]);
+            assert!(PropertyValue::read(&mut cursor, property_type).is_err());
+        }
+    }
+
+    #[test]
+    fn multiple_guid_uses_packed_fixed_width_storage() -> io::Result<()> {
+        let values = PropertyValue::MultipleGuid(vec![
+            GuidValue::new(1, 2, 3, [4; 8]),
+            GuidValue::new(5, 6, 7, [8; 8]),
+        ]);
+        let mut encoded = Vec::new();
+        values.write(&mut encoded)?;
+        assert_eq!(encoded.len(), 32);
+        assert_eq!(&encoded[..4], &1_u32.to_le_bytes());
+        assert!(matches!(
+            PropertyValue::read(&mut Cursor::new(encoded), PropertyType::MultipleGuid)?,
+            PropertyValue::MultipleGuid(decoded) if decoded.len() == 2
+        ));
+        Ok(())
     }
 }

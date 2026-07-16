@@ -109,7 +109,276 @@ work. Hash and identity evidence show that the source was not modified.
     the current-source full gate. Its detailed `scanpst` log is clean with no
     errors, repairs, or recovered objects; the unchanged file opened normally in
     Outlook without resource exhaustion and imported perfectly into MailPlus.
-- [ ] Milestone 0.2.1: Mail-Fidelity PST Writer.
+- [x] Milestone 0.2.1: Mail-Fidelity PST Writer.
+  - [x] (2026-07-15) Added a versioned canonical writer boundary for Unicode
+    sender/subject/address values, To/Cc/Bcc recipient rows, Internet headers,
+    text, HTML, literal-token LZFu RTF, by-value attachments, one-level
+    embedded messages, deterministic named-property IDs, and supported raw
+    properties.
+  - [x] (2026-07-15) Corrected attachment message flags and attachment-local
+    descriptor trees. `libpff` now accounts for two messages, four recipients,
+    two attachments, and one embedded message with no issues; independent
+    `readpst` emits the sender, both bodies, RTF, embedded RFC822 message, and
+    byte-exact attachment marker.
+  - [x] (2026-07-15) Extended the local writer gate to enforce those `libpff`
+    counts and independent-reader markers from one deterministic rich fixture.
+  - [x] (2026-07-15) Completed the first clean-context review remediation:
+    property subnode/XBLOCK storage through 16 KiB, recursive validation and
+    store-wide named IDs, arbitrary named GUID sets, additional scalar/GUID/
+    fixed-width multivalue raw types, explicit omission reports, unique message
+    record keys, honest RTF synchronization, inline attachment metadata, and
+    message-class subclass validation.
+  - [x] (2026-07-15) Full gate passed at `.agent/test-results/1784166700-full`:
+    libpff reports two items, four recipients, two attachments, one embedded
+    message, and no issues; pffinfo/readpst and all three external corpus cases
+    pass; the complete 16 KiB attachment is decoded and byte-compared with its
+    SHA-256 recorded in evidence.
+  - [x] (2026-07-15) The next fresh review found malformed `MultipleGuid`
+    encoding and incomplete omission/canonical-validation coverage. Added the
+    initially added a count prefix in both property encoders, removed attacker-sized
+    preallocation from its decoder, gave omissions deterministic message paths,
+    exercised every advertised raw type, and made pre-publication validation
+    recursively compare attachment metadata/content plus embedded message,
+    recipient, named, raw, body, header, timestamp, and record-key values.
+  - [x] (2026-07-15) Post-remediation full gate passed at
+    `.agent/test-results/1784167913-full`, including recursive typed internal
+    comparison, clean libpff inventory, exact readpst attachment extraction,
+    and all three external corpus reader pairs.
+    This count-prefix decision was corrected on 2026-07-16 after ScanPST
+    rejected the rich fixture: MS-PST PC storage uses packed fixed-width GUID
+    elements and derives their count from the allocation length; the prefixed
+    representation belongs to a different MAPI wire encoding.
+  - [x] (2026-07-15) A further fresh review found that the typed comparison
+    still did not prove absent optional values, top-level record keys,
+    embedded RTF synchronization, attachment table identities, or NAMEID
+    semantics. The validator now checks those relationships exactly, parses
+    each numeric/string/GUID NAMEID identity, compares every raw NAMEID stream
+    and hash bucket, and exercises two custom GUID sets across top-level and
+    embedded messages. Production panic sites identified by review were also
+    replaced with checked propagation or bounded conversions.
+  - [x] (2026-07-15) Final-remediation full gate passed at
+    `.agent/test-results/1784168632-full` with 29 PST crate tests, recursive
+    typed/NAMEID validation, clean generated-store readers, and all external
+    corpus cases.
+  - [x] (2026-07-15) The next clean-context review found four remaining
+    defensive-validation gaps. NAMEID string lookup now rejects malformed
+    offsets without panicking; `rtf_in_sync` cannot be asserted without an RTF
+    body; attachment-table size, number, filename, method, and rendering
+    position are checked against both the source specification and attachment
+    property context; and each supplied variable property is size-checked
+    before writer-side allocation or cloning.
+  - [x] (2026-07-15) Current-source full gate passed at
+    `.agent/test-results/1784169113-full` with 30 PST crate tests, clean
+    libpff/pffinfo/readpst acceptance, byte-exact 16 KiB attachment recovery,
+    and all three external corpus reader pairs.
+  - [x] (2026-07-15) A fresh review then found declared-length allocation in
+    malformed NAMEID strings and missing preflight limits for generated
+    recipient/NAMEID aggregates. NAMEID reads now consume only available bytes
+    and reject truncated declarations; aggregate recipient metadata, each
+    display-recipient property, every NAMEID stream, and collection counts are
+    checked before construction. Boundary and malicious-length regression tests
+    bring the PST crate total to 33.
+  - [x] (2026-07-15) Post-review full gate passed at
+    `.agent/test-results/1784169730-full` with clean generated-store readers and
+    all external corpus cases.
+  - [x] (2026-07-15) The following fresh review found prefix-tolerant malformed
+    NAMEID parsing, aggregate checks that did not yet prove the single-page
+    recipient and NAMEID encoders could succeed, and unbounded aggregate raw
+    property amplification. NAMEID streams now require exact structure and
+    zero padding; preflight uses encoder-compatible heap accounting; custom
+    property count and aggregate payload are bounded before cloning; and public
+    writer boundary tests exercise successful and rejected cases. Exact
+    validation also covers SMTP/address duplicates, display-recipient
+    properties, and long attachment filenames.
+  - [x] (2026-07-15) Post-remediation full gate passed at
+    `.agent/test-results/1784170416-full` with 34 PST crate tests, clean
+    generated-store readers, and every external corpus case.
+  - [x] (2026-07-15) Another clean-context pass found untrusted multivalue
+    counts/offsets that could request attacker-sized allocations, plus four
+    fidelity/accounting gaps. Variable multivalue decoding now grows only from
+    bytes actually read with checked offsets; minimal-store recipients are no
+    longer discarded; bounded omission reports are constructed before atomic
+    publication; NAMEID lookup accepts only parsed entry boundaries; and exact
+    validation covers attachment-PC numbers, sender duplicates/address types,
+    message flags, and has-attachments state.
+  - [x] (2026-07-15) Post-remediation full gate passed at
+    `.agent/test-results/1784170998-full` with 36 PST crate tests, clean
+    generated-store readers, and all external corpus cases.
+  - [x] (2026-07-15) The next fresh review isolated two remaining malformed
+    input cases: zero NAMEID bucket count and partial fixed-width multivalue
+    tails. Bucket count zero is rejected before hashing, and all eight affected
+    multivalue families now distinguish clean EOF from a truncated element.
+  - [x] (2026-07-15) Post-remediation full gate passed at
+    `.agent/test-results/1784171319-full` with 38 PST crate tests and clean
+    generated/external interoperability readers.
+  - [x] (2026-07-15) A further fresh review found count-prefixed multivalue
+    streams accepting undeclared trailing data and attachment readers
+    materializing an entire untrusted local subnode tree. Count-prefixed
+    decoders now require exact stream exhaustion. Attachment reading resolves
+    method first, skips local subnodes for by-value data, and performs targeted
+    embedded/storage lookup with cycle, depth, and cumulative-entry bounds.
+  - [x] (2026-07-15) Post-remediation full gate passed at
+    `.agent/test-results/1784171831-full` with 40 PST crate tests and clean
+    generated/external interoperability readers.
+  - [x] (2026-07-15) The following fresh review traced legacy unbounded
+    subnode and data-tree recursion below attachment property decoding, plus
+    missing attachment-table and message-PC heap preflight. All subnode lookups
+    now share targeted bounded traversal. Data-tree expansion is iterative with
+    cycle/depth/entry and 64 MiB materialization limits plus exact declared-size
+    reads. Writer validation preflights attachment tables, attachment PCs, and
+    message PCs; boundary tests cover attachment/scalar overflow and empty
+    by-value attachment fidelity.
+  - [x] (2026-07-15) Post-remediation full gate passed at
+    `.agent/test-results/1784172625-full` with 41 PST crate tests and clean
+    generated/external interoperability readers.
+  - [x] (2026-07-15) The next clean-context review found recursive full-tree
+    subnode enumeration, realizable multivalue count amplification, empty
+    typed variable inputs that serialized as null, and attachment sizes that
+    were trusted rather than checked. Subnode enumeration is now iterative and
+    uses the same cycle/depth/entry budget as targeted lookup; count-prefixed
+    variable multivalues have an explicit realizable element cap; empty
+    required/optional variable writer inputs are rejected before publication;
+    and attachment payload and object sizes are checked against the distinct
+    data each field describes.
+  - [x] (2026-07-15) Post-remediation full gate passed at
+    `.agent/test-results/1784173335-full` with 42 PST crate tests, clean
+    generated-store libpff/pffinfo/readpst acceptance, exact attachment
+    recovery, and all three external corpus reader pairs.
+  - [x] (2026-07-15) The subsequent clean-context review found panic-prone
+    corrupt BBT sizes, unbounded aggregate attachment-property materialization,
+    missing delivery-time fidelity, and a pathname race between validation and
+    publication. Block alignment and trailer arithmetic now reject malformed
+    sizes through fallible production paths; attachment properties share a
+    64 MiB cumulative materialization budget; delivery time is serialized and
+    exactly checked in the message PC and contents row; and the writer validates
+    through the held file descriptor before no-replace publication through held
+    private-source and destination directory descriptors.
+  - [x] (2026-07-15) Post-remediation full gate passed at
+    `.agent/test-results/1784174133-full` with 45 PST crate tests, clean
+    generated-store independent readers, exact attachment recovery, and all
+    external corpus cases. Regression tests exercise oversized BBT entries,
+    aggregate property accounting, and publication after the visible private
+    temporary-directory path is moved and replaced.
+  - [x] (2026-07-15) The following clean-context review found stale-path
+    cleanup risk after descriptor-based publication, success through a moved
+    destination directory, a heap/table bypass around the data-tree byte cap,
+    and no independent delivery-time assertion. Temporary cleanup guards are
+    now disarmed immediately and file cleanup unlinks only through the held
+    private directory; the requested path must
+    resolve to the published inode before success; every materializing
+    data-tree path enforces the 64 MiB ceiling and exact declared byte total;
+    and libpff independently checks top-level and embedded delivery FILETIMEs.
+  - [x] (2026-07-15) Post-remediation full gate passed at
+    `.agent/test-results/1784174888-full` with 46 PST crate tests, exact libpff
+    delivery-time fidelity, clean generated-store independent readers, exact
+    attachment recovery, and all external corpus cases. Publication tests also
+    prove replacement content survives cleanup and a moved destination parent
+    returns explicit uncertain-publication status.
+  - [x] (2026-07-15) The next clean-context review found undersized and
+    count-overflowing internal blocks that reached unchecked slice/arithmetic,
+    plus stale pathname removal of an empty replacement directory. Internal
+    block parsing now validates header space and uses checked entry and trailer
+    arithmetic before allocation or slicing. Temporary file cleanup remains
+    descriptor-only; pathname directory removal is deliberately forbidden, so
+    an empty private `.pstforge-*` directory can remain after a write rather
+    than risking deletion of unrelated replacement state. Later transactional
+    job-directory cleanup may reclaim only identity-proven artifacts.
+  - [x] (2026-07-15) Post-remediation full gate passed at
+    `.agent/test-results/1784175450-full` with 47 PST crate tests, exact libpff
+    delivery times, clean independent readers and external corpus cases.
+    Regression tests invoke production parsing for undersized and overflowing
+    internal BBT entries and prove an empty stale-path replacement survives.
+  - [x] (2026-07-15) A further clean-context review found that internal block
+    logical size, trailer `cb`, and XBLOCK level/topology metadata could still
+    disagree. Internal blocks now require exact header-plus-entry size and an
+    identical trailer size. Data trees accept only level 1/2; level-2 entries
+    must reference level-1 XBLOCKs, and level-1 entries must reference external
+    data blocks. Production-path regressions cover size, level, child-kind, and
+    child-level rejection.
+  - [x] (2026-07-15) Post-remediation full gate passed at
+    `.agent/test-results/1784175782-full` with all 47 PST crate tests, exact
+    libpff delivery times, clean independent readers, and all corpus cases.
+  - [x] (2026-07-15) The next clean-context review found that lower-level
+    XBLOCK construction did not yet enforce the exact invariants required by
+    parsing. Constructors now reject header/entry-count disagreement, checked
+    logical-size overflow, and trailer-size mismatch. A valid constructed
+    XBLOCK is written and reread in the regression suite.
+  - [x] (2026-07-15) Post-remediation full gate passed at
+    `.agent/test-results/1784176074-full` with all PST tests, exact libpff
+    delivery times, clean generated-store independent readers, and every
+    external corpus case.
+  - [x] (2026-07-15) The following clean-context review found that attachment
+    property accounting occurred after allocation, embedded-message properties
+    did not share the budget, and XBLOCK child-kind checks were traversal-only.
+    Property contexts now reserve external data-tree bytes before reading,
+    charge decoded overhead, and share one 64 MiB budget across attachment and
+    embedded-message property decoding. Unicode and ANSI XBLOCK construction
+    and reading now reject level-1 internal children and level-2 external
+    children; nonempty valid/invalid cases are tested.
+  - [x] (2026-07-15) Post-remediation full gate passed at
+    `.agent/test-results/1784176561-full` with all 47 PST tests, exact libpff
+    delivery times, clean rich embedded-message readers, and all corpus cases.
+  - [x] (2026-07-15) The next clean-context review found four remaining
+    resource and publication-order gaps. Store, folder, NAMEID, message,
+    attachment, and embedded-message property reads now share mandatory 64 MiB
+    materialization budgets; by-value attachment buffers use shared immutable
+    storage; and storage payloads are charged before reading. Every child
+    XBLOCK's `lcbTotal` is checked against its referenced leaf sizes. `pffinfo`
+    and `readpst` now validate the held temporary file before no-clobber
+    publication. The generalized empty NAMEID map preserves v0.2.0's reserved
+    MAPI entry and bucket because libpff rejects zero-length required streams.
+    Focused regressions cover cumulative budgets, child totals, and the empty
+    NAMEID fallback; all 48 PST tests and warning-denied workspace clippy pass.
+  - [x] (2026-07-15) Post-remediation full gate passed at
+    `.agent/test-results/1784177316-full` with all 48 PST tests, prepublication
+    `pffinfo`/`readpst` acceptance, clean licenses and advisories, and all
+    external corpus reader cases.
+  - [x] (2026-07-15) The following clean-context review found no blocker/high
+    issues and two medium acceptance gaps. Embedded-object validation now
+    compares `PtypObject` size with an XBLOCK data tree's declared logical size
+    instead of its physical root BBT size; an XBLOCK-root regression proves the
+    distinction. The full gate's independent libpff sink now samples
+    top-level and embedded NAMEID Unicode/integer/boolean values, raw
+    Unicode/GUID properties, and the Bcc role/address. All 49 PST tests and the
+    post-remediation full gate passed at
+    `.agent/test-results/1784178107-full`; its `writer-acceptance.log` contains
+    the expanded independent libpff evidence.
+  - [x] (2026-07-15) A scope-filtered clean-context review found the preceding
+    evidence reference stale and identified two directly applicable risks in
+    the new synchronous prepublication validators. Each validator now runs in
+    its own process group with a 60-second deadline; timeout kills the entire
+    group. Stdout and stderr are continuously drained but retain at most 64
+    KiB each. A rejection preserves the unpublished candidate and a synced
+    bounded diagnostic in its private directory. Timeout, truncation, and
+    retained-evidence regressions bring the PST crate suite to 51 tests.
+  - [x] (2026-07-15) Post-remediation full gate passed at
+    `.agent/test-results/1784178794-full` with 51 PST tests, warning-denied
+    clippy, independent semantic writer acceptance, and all external corpus
+    cases.
+  - [x] (2026-07-16) Milestone-scoped review found one medium defect in the
+    new validator deadline: a successful leader could exit while a descendant
+    retained its pipes, leaving the diagnostic joins unbounded. Validator
+    success now requires the leader and both pipe readers to finish before the
+    deadline; otherwise the process group is killed and the candidate is
+    retained as a timeout failure. The regression reproduces an immediate-exit
+    shell with a background descendant.
+  - [x] (2026-07-16) Post-remediation full gate passed at
+    `.agent/test-results/1784179116-full` with all 51 PST tests, independent
+    semantic writer acceptance, and all external corpus cases.
+  - [x] (2026-07-16) Corrected ScanPST findings through clean-context reviewed
+    r1-r3 candidates, added the normative compressed-RTF end reference for r4,
+    declared UTF-8 HTML through `PidTagInternetCodepage` for r5, and added the
+    explicit typed `PidTagNativeBody` selector for r6. Each code change passed a
+    new clean-context adversarial review before further edits.
+  - [x] (2026-07-16) Candidate r6 SHA-256
+    `63a6b68e0cd6d44a1f5214032df6b5f49bc739d7d47d296e2f42528d4bdec88a`
+    has a clean detailed ScanPST log, opens in Outlook without resource
+    exhaustion, selects and renders exact non-ASCII HTML, and imports into
+    MailPlus with exact HTML. Its generated-store gate passes 55 PST tests,
+    formatting, check, warning-denied Clippy, documentation, artifact and diff
+    checks, licenses, advisories, `libpff`, `pffinfo`, and `readpst`. The latest
+    external-corpus phase was not rerun because `PSTFORGE_CORPUS_MANIFEST` was
+    unset; the prior 0.2.1 external corpus gate remains clean.
 - [ ] Milestone 0.3.0: Recoverable Mail Pipeline.
 - [ ] Milestone 0.3.1: Fault-Isolated Recovery.
 - [ ] Milestone 0.4.0: Size-Limited PST Splitting.
@@ -121,6 +390,50 @@ work. Hash and identity evidence show that the source was not modified.
 - [ ] Milestone 1.0.0: MailPlus-Ready Release.
 
 ## Surprises & Discoveries
+
+- Observation: An embedded-message attachment requires two distinct local
+  descriptor levels: the parent message references the attachment PC, and the
+  attachment PC's own descriptor tree references the embedded message PC and
+  its recipient/attachment tables. Placing the embedded message directly in
+  the parent descriptor tree lets simple readers see the attachment row but
+  makes `libpff` reject the object lookup.
+  Evidence: the generated 0.2.1 fixture initially reported one attachment and
+  an invalid local-descriptor lookup; after the nested descriptor correction,
+  `libpff` reported two attachments and one embedded message without issues.
+
+- Observation: `PidTagHasAttachments` alone is insufficient for broad reader
+  behavior. `PidTagMessageFlags` must also carry `MSGFLAG_HASATTACH`, and each
+  attachment row needs a stable `PidTagAttachNumber`.
+  Evidence: `readpst` extracted the by-value payload before `libpff` enumerated
+  it; adding the conforming flags and numbering made both readers agree.
+
+- Observation: Growing the deterministic 0.2.1 fixture past 16 KiB adds enough
+  blocks to create a third BBT leaf. The internal reader and readpst traverse
+  that candidate, but libpff 20231205 fails the embedded recipient descriptor.
+  Evidence: a 32 KiB candidate reported three top-level recipients and one
+  retained `stream recipients` issue; the 16 KiB bounded candidate reports all
+  four recipients with no issues. Version 0.2.1 therefore rejects property
+  payloads above 16 KiB before publication. Arbitrary BBT breadth and payload
+  streaming remain required acceptance work for 0.4.x, not an implicit claim
+  of this fixture writer.
+
+- Observation: The vendored property-type conversion omitted `PtypObject`, and
+  the attachment reader searched the parent message descriptor tree instead of
+  the attachment-local tree before recursively opening an embedded message. It
+  also attempted that recursive open while holding the PST reader mutex.
+  Evidence: recursive pre-publication validation first saw only attachment
+  properties preceding `PidTagAttachDataObject`, then found the embedded node
+  missing, then deadlocked. Adding the Object mapping, reading the
+  attachment-local descriptor tree, and dropping the reader lock before the
+  recursive open makes the complete embedded message round-trip internally.
+
+- Observation: Comparing only the value at a locally calculated named-property
+  ID does not prove NAMEID identity. The GUID stream, entry stream, string
+  offsets, and hash buckets can be wrong while the property value still appears
+  at `0x8000 + index`.
+  Evidence: the final validator now independently parses each completed entry
+  and string/GUID identity and byte-compares all regenerated NAMEID streams and
+  buckets; the fixture spans two custom GUID sets plus PS_MAPI.
 
 - Observation: `docs/outline.md` made PST splitting a non-goal, but the actual
   urgent requirement is to produce smaller PSTs for MailPlus import. EML,
@@ -359,6 +672,17 @@ work. Hash and identity evidence show that the source was not modified.
   `4256ee7e02c60d8372e08719e2eb76f964004283d84db086ce086f58eabe9c7b`
   on 2026-07-15.
 
+- Observation: MailPlus converts a standards-compliant PST embedded-message
+  attachment into a bare `message/rfc822` MIME entity, renders its text inline,
+  and omits it from the ordinary-file attachment counter. A MailPlus-composed
+  reference instead lists an attached email only by wrapping the complete
+  exported MIME message as an `application/octet-stream` `.eml` file. The `.eml`
+  itself still contains the original `message/rfc822` entity. Real-world PSTs
+  containing attached messages are required before choosing whether PSTForge
+  should offer a target-specific compatibility conversion.
+  Evidence: `v0.2.1-fidelity-r5-mailplus.txt` and
+  `v0.2.1-fidelity-mailplus-attachment.eml`, inspected 2026-07-16.
+
 ## Decision Log
 
 - Decision: PSTForge 1.0 writes smaller PSTs; general export formats move
@@ -470,6 +794,73 @@ work. Hash and identity evidence show that the source was not modified.
   before the arbitrary-mail expansion.
   Date/Author: 2026-07-14 / Codex.
 
+- Decision: Version 0.2.1 assigns named-property IDs by sorting GUID set and
+  name, builds the name-to-ID streams and hash buckets per store, and rejects
+  duplicate identities or raw properties that collide with writer-managed
+  MAPI IDs. Embedded messages are limited to one attachment level at this
+  writer boundary; unsupported deeper nesting is an explicit error.
+  Rationale: deterministic assignment is required for byte-identical rebuilds,
+  while silent collision or ambiguous recursive object graphs would lose
+  source semantics. The later pipeline can mark unsupported content partial.
+  Date/Author: 2026-07-15 / Codex.
+
+- Decision: Version 0.2.1 derives a unique deterministic record key for each
+  top-level or embedded message, treats RTF synchronization and inline
+  attachment metadata as explicit inputs, assigns named properties across the
+  complete message graph, and returns structured accounting for unsupported
+  properties. Its canonical single-message property payload limit is 16 KiB;
+  exceeding it is a checked error before the temporary file is published.
+  Rationale: fidelity metadata must not be fabricated or silently dropped, and
+  a bounded, independently verified writer is preferable to producing a wider
+  BBT layout that a required reader cannot traverse. The 0.4.x packer owns the
+  arbitrary-size BBT and multi-part design.
+  Date/Author: 2026-07-15 / Codex.
+
+- Decision: Version 0.2.1 defines binary HTML body input as UTF-8, rejects
+  invalid UTF-8 before creating the temporary store, and emits
+  `PidTagInternetCodepage` (`0x3FDE`) with value 65001 on every top-level and
+  embedded message. It does not synthesize `PidTagMessageCodepage` (`0x3FFD`),
+  whose generic fallback is redundant when the explicit Internet code page is
+  present; a source `0x3FFD` supplied through the typed raw-property boundary
+  remains preservable. The IDs remain distinct in validation: `0x3FDE` is
+  writer-managed, while `0x3FFD` is absent from PSTForge's canonical fixture.
+  Rationale: Microsoft requires the Internet code page when binary HTML is
+  present. Without it, MailPlus guessed UTF-16LE and paired the fixture's UTF-8
+  bytes into mojibake even though Outlook rendered the same property. Fixing
+  the encoding contract preserves byte-exact non-ASCII HTML across clients
+  without expanding this milestone into arbitrary legacy-code-page support.
+  Date/Author: 2026-07-16 / Codex.
+
+- Decision: Version 0.2.1 represents `PidTagNativeBody` (`0x1016`) as an
+  optional typed input with plain-text, RTF, and HTML variants. A selected
+  representation must be present; the writer does not derive a preference from
+  which bodies happen to exist. The canonical top-level fixture selects HTML,
+  and its embedded message selects plain text. Raw-property input cannot
+  override this writer-managed semantic.
+  Rationale: Multiple body representations can coexist without identifying
+  which one is authoritative. Candidate r5 preserved every body and produced
+  byte-exact UTF-8 HTML, but Outlook selected RTF because the best body was
+  unspecified. An explicit optional selector preserves source absence while
+  allowing deterministic client body selection without fabricating fidelity.
+  Date/Author: 2026-07-16 / Codex.
+
+- Decision: Version 0.2.1 preserves embedded messages as MAPI
+  `afEmbeddedMessage` attachments and does not silently replace them with
+  by-value `.eml` files. A MailPlus compatibility transformation is deferred
+  until external corpus cases demonstrate how genuine PST embedded messages
+  import and whether conversion improves accessibility without losing source
+  semantics. The canonical fixture's Outlook list preview may show its RTF
+  checkpoint while the opened message shows native HTML because its three body
+  fixtures deliberately differ and `rtf_in_sync` is false; that synthetic
+  preview difference is not a release defect.
+  Rationale: Microsoft requires method-5 embedded messages to convert to
+  `message/rfc822`; the current raw export proves that behavior. The MailPlus
+  reference uses an opaque outer `.eml` wrapper, which is a target-specific
+  transformation rather than a metadata correction. Guessing that policy from
+  one synthetic case would reduce fidelity and require a MIME serialization
+  contract without representative source evidence.
+  Date/Author: 2026-07-16 / Codex.
+
 ## Outcomes & Retrospective
 
 Version 0.1.0 now lets an operator inspect a healthy PST in human or JSON form
@@ -512,6 +903,15 @@ MailPlus confirms the folder and message import without Outlook resource
   failure. The post-acceptance clean-context review found no unresolved blocker,
   high, or medium issue, and the final current-source full gate passed with both
   required healthy ANSI and Unicode external cases.
+
+Version 0.2.1 now writes deterministic rich mail with typed sender, recipient,
+timestamp, plain-text, UTF-8 HTML, compressed RTF, native-body, Internet-header,
+by-value attachment, embedded-message, named-property, and raw-property
+semantics. Candidate r6 is ScanPST-clean, opens without Outlook resource
+exhaustion, renders its declared native HTML in Outlook and MailPlus, and passes
+all generated-store independent readers. MailPlus's presentation of true
+embedded messages remains a documented external-corpus question rather than a
+reason to replace standards-compliant source semantics speculatively.
 
 ## Context and Orientation
 

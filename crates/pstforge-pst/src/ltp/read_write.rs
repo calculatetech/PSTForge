@@ -60,6 +60,7 @@ where
         block_btree: &PstFileReadWriteBlockBTree<Pst>,
         page_cache: &mut RootBTreePageCache<<Pst as PstFile>::BlockBTree>,
         value: PropertyTreeRecordValue,
+        budget: Option<&mut PropertyMaterializationBudget>,
     ) -> io::Result<PropertyValue>;
 }
 

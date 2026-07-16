@@ -209,12 +209,21 @@ where
                 1
             };
             let entry_id = entry_id.try_into()?;
+            let mut property_budget =
+                crate::ltp::prop_context::PropertyMaterializationBudget::new();
             let properties = prop_context
                 .properties()?
                 .into_iter()
                 .map(|(prop_id, record)| {
                     prop_context
-                        .read_property(file, encoding, &block_btree, &mut block_page_cache, record)
+                        .read_property(
+                            file,
+                            encoding,
+                            &block_btree,
+                            &mut block_page_cache,
+                            record,
+                            Some(&mut property_budget),
+                        )
                         .map(|value| (prop_id, value))
                 })
                 .chain([

@@ -1,13 +1,13 @@
 //! ## [Message Objects](https://learn.microsoft.com/en-us/openspecs/office_file_formats/ms-pst/1042af37-aaa4-4edc-bffd-90a1ede24188)
 
-use std::{collections::BTreeMap, io, rc::Rc};
+use std::{cell::RefCell, collections::BTreeMap, io, rc::Rc};
 
 use super::{read_write::*, store::*, *};
 use crate::{
     AnsiPstFile, PstFile, PstFileLock, UnicodePstFile,
     ltp::{
         heap::HeapNode,
-        prop_context::{PropertyContext, PropertyValue},
+        prop_context::{PropertyContext, PropertyMaterializationBudget, PropertyValue},
         prop_type::PropertyType,
         read_write::*,
         table_context::TableContext,
@@ -148,6 +148,7 @@ where
     sub_nodes: MessageSubNodes<Pst>,
     recipient_table: Option<Rc<dyn TableContext>>,
     attachment_table: Option<Rc<dyn TableContext>>,
+    property_budget: Rc<RefCell<PropertyMaterializationBudget>>,
 }
 
 impl<Pst> MessageInner<Pst>
@@ -236,6 +237,16 @@ where
         node: <Pst as PstFile>::NodeBTreeEntry,
         prop_ids: Option<&[u16]>,
     ) -> io::Result<Self> {
+        let budget = Rc::new(RefCell::new(PropertyMaterializationBudget::new()));
+        Self::read_embedded_with_budget(store, node, prop_ids, budget)
+    }
+
+    fn read_embedded_with_budget(
+        store: Rc<<Pst as PstFile>::Store>,
+        node: <Pst as PstFile>::NodeBTreeEntry,
+        prop_ids: Option<&[u16]>,
+        budget: Rc<RefCell<PropertyMaterializationBudget>>,
+    ) -> io::Result<Self> {
         let pst = store.pst();
         let header = pst.header();
         let root = header.root();
@@ -270,16 +281,21 @@ where
 
             let tree = <Pst as PstFile>::PropertyTree::new(heap, header.user_root());
             let prop_context = <Pst as PstFile>::PropertyContext::new(node, tree);
-            let properties = prop_context
-                .properties()?
-                .into_iter()
-                .filter(|(prop_id, _)| prop_ids.is_none_or(|ids| ids.contains(prop_id)))
-                .map(|(prop_id, record)| {
-                    prop_context
-                        .read_property(file, encoding, &block_btree, &mut page_cache, record)
-                        .map(|value| (prop_id, value))
-                })
-                .collect::<io::Result<BTreeMap<_, _>>>()?;
+            let mut properties = BTreeMap::new();
+            for (prop_id, record) in prop_context.properties()? {
+                if prop_ids.is_some_and(|ids| !ids.contains(&prop_id)) {
+                    continue;
+                }
+                let value = prop_context.read_property(
+                    file,
+                    encoding,
+                    &block_btree,
+                    &mut page_cache,
+                    record,
+                    Some(&mut *budget.borrow_mut()),
+                )?;
+                properties.insert(prop_id, value);
+            }
             let properties = MessageProperties { properties };
 
             let block = block_btree.find_entry(file, sub_node.search_key(), &mut page_cache)?;
@@ -351,6 +367,7 @@ where
             sub_nodes,
             recipient_table,
             attachment_table,
+            property_budget: budget,
         })
     }
 }
@@ -410,12 +427,26 @@ impl MessageReadWrite<UnicodePstFile> for UnicodeMessage {
         Ok(Rc::new(Self { inner }))
     }
 
+    fn read_embedded_with_budget(
+        store: Rc<UnicodeStore>,
+        node: UnicodeNodeBTreeEntry,
+        prop_ids: Option<&[u16]>,
+        budget: Rc<RefCell<PropertyMaterializationBudget>>,
+    ) -> io::Result<Rc<Self>> {
+        let inner = MessageInner::read_embedded_with_budget(store, node, prop_ids, budget)?;
+        Ok(Rc::new(Self { inner }))
+    }
+
     fn pst_store(&self) -> &Rc<UnicodeStore> {
         &self.inner.store
     }
 
     fn sub_nodes(&self) -> &UnicodeMessageSubNodes {
         &self.inner.sub_nodes
+    }
+
+    fn materialization_budget(&self) -> &Rc<RefCell<PropertyMaterializationBudget>> {
+        &self.inner.property_budget
     }
 }
 
@@ -470,11 +501,25 @@ impl MessageReadWrite<AnsiPstFile> for AnsiMessage {
         Ok(Rc::new(Self { inner }))
     }
 
+    fn read_embedded_with_budget(
+        store: Rc<AnsiStore>,
+        node: AnsiNodeBTreeEntry,
+        prop_ids: Option<&[u16]>,
+        budget: Rc<RefCell<PropertyMaterializationBudget>>,
+    ) -> io::Result<Rc<Self>> {
+        let inner = MessageInner::read_embedded_with_budget(store, node, prop_ids, budget)?;
+        Ok(Rc::new(Self { inner }))
+    }
+
     fn pst_store(&self) -> &Rc<AnsiStore> {
         &self.inner.store
     }
 
     fn sub_nodes(&self) -> &AnsiMessageSubNodes {
         &self.inner.sub_nodes
+    }
+
+    fn materialization_budget(&self) -> &Rc<RefCell<PropertyMaterializationBudget>> {
+        &self.inner.property_budget
     }
 }

@@ -164,6 +164,27 @@ without ambiguity. An unsupported property is recorded on its item and does
 not discard otherwise usable mail. An attachment failure leaves the parent
 mail partial rather than failed when the remaining message can be written.
 
+Writer inputs use typed recipient roles, body formats, attachment content,
+named-property identities, and raw-property values. Named-property identifiers
+are assigned store-wide after deterministic identity ordering, including
+embedded messages and arbitrary GUID sets. Inline attachment position,
+content ID, content location, and flags are explicit. RTF synchronization is
+an input fact and is never inferred from the presence of RTF bytes. The native
+body selector is also explicit and optional: it selects plain text, RTF, or
+HTML only when that representation is present, and absence remains absence
+rather than a derived preference. Version 0.2.1 accepts HTML bodies only as
+valid UTF-8 bytes and emits
+`PidTagInternetCodepage` 65001 on every top-level and embedded message; it does
+not synthesize the redundant `PidTagMessageCodepage` fallback, while a source
+value supplied through the typed raw-property boundary remains preservable. A raw property that
+duplicates a writer-managed property is rejected at the writer boundary rather
+than silently replacing the conforming value. Every intentionally omitted
+property is returned in a structured write report with an empty top-level path
+or the deterministic attachment-index path of its embedded message. The 0.2.1
+canonical fixture boundary externalizes property values through 16 KiB and
+rejects larger values; arbitrary payload streaming and packing is a 0.4.x
+requirement.
+
 Output creation is append/build-only in a `.partial` file. The writer flushes
 all blocks, allocation maps, B-trees, tables, and headers, syncs the file,
 closes it, validates it with internal and external readers, hashes it, writes

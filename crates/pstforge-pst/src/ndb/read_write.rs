@@ -571,8 +571,10 @@ where
         let mut data = vec![0; size as usize];
         f.read_exact(&mut data)?;
 
-        let offset = size + Self::Trailer::SIZE;
-        let offset = i64::from(block_size(offset) - offset);
+        let offset = size
+            .checked_add(Self::Trailer::SIZE)
+            .ok_or(NdbError::InvalidBlockSize(size))?;
+        let offset = i64::from(block_size(offset)? - offset);
         if offset > 0 {
             f.seek(SeekFrom::Current(offset))?;
         }
@@ -627,8 +629,10 @@ where
         f.write_all(&data)?;
 
         let size = data.len() as u16;
-        let offset = size + Self::Trailer::SIZE;
-        let offset = i64::from(block_size(offset) - offset);
+        let offset = size
+            .checked_add(Self::Trailer::SIZE)
+            .ok_or(NdbError::InvalidBlockSize(size))?;
+        let offset = i64::from(block_size(offset)? - offset);
         if offset > 0 {
             f.seek(SeekFrom::Current(offset))?;
         }
@@ -668,32 +672,47 @@ where
     ) -> NdbResult<Self>;
 
     fn read<R: PstReader>(f: &mut R, header: Self::Header, size: u16) -> io::Result<Self> {
+        let available = size
+            .checked_sub(Self::Header::HEADER_SIZE)
+            .ok_or(NdbError::InvalidBlockSize(size))?;
+        let entry_count = header.entry_count();
+        let entry_bytes = entry_count
+            .checked_mul(Self::Entry::ENTRY_SIZE)
+            .ok_or(NdbError::InvalidInternalBlockEntryCount(entry_count))?;
+        if entry_bytes > available {
+            return Err(NdbError::InvalidInternalBlockEntryCount(entry_count).into());
+        }
+        let used_size = Self::Header::HEADER_SIZE
+            .checked_add(entry_bytes)
+            .ok_or(NdbError::InvalidInternalBlockEntryCount(entry_count))?;
+        if used_size != size {
+            return Err(NdbError::InvalidBlockSize(size).into());
+        }
+
         let mut data = vec![0; size as usize];
         f.read_exact(&mut data)?;
         let mut cursor = Cursor::new(&data[Self::Header::HEADER_SIZE as usize..]);
-
-        let entry_count = header.entry_count();
-
-        if entry_count * Self::Entry::ENTRY_SIZE > size - Self::Header::HEADER_SIZE {
-            return Err(NdbError::InvalidInternalBlockEntryCount(entry_count).into());
-        }
 
         let entries = (0..entry_count)
             .map(move |_| <Self::Entry as IntermediateTreeEntryReadWrite>::read(&mut cursor))
             .collect::<io::Result<Vec<_>>>()?;
 
-        let size = Self::Header::HEADER_SIZE + entry_count * Self::Entry::ENTRY_SIZE;
-        let offset = size + Self::Trailer::SIZE;
-        let offset = i64::from(block_size(offset) - offset);
+        let offset = used_size
+            .checked_add(Self::Trailer::SIZE)
+            .ok_or(NdbError::InvalidBlockSize(used_size))?;
+        let offset = i64::from(block_size(offset)? - offset);
         match offset.cmp(&0) {
             Ordering::Greater => {
                 f.seek(SeekFrom::Current(offset))?;
             }
-            Ordering::Less => return Err(NdbError::InvalidBlockSize(size).into()),
+            Ordering::Less => return Err(NdbError::InvalidBlockSize(used_size).into()),
             _ => {}
         }
 
         let trailer = Self::Trailer::read(f)?;
+        if trailer.size() != size {
+            return Err(NdbError::InvalidBlockSize(trailer.size()).into());
+        }
         trailer.verify_block_id(true)?;
 
         let crc = compute_crc(0, &data);
@@ -727,8 +746,11 @@ where
             trailer.block_id(),
         )?;
 
-        let offset = trailer.size() + Self::Trailer::SIZE;
-        let offset = block_size(offset) - offset;
+        let offset = trailer
+            .size()
+            .checked_add(Self::Trailer::SIZE)
+            .ok_or(NdbError::InvalidBlockSize(trailer.size()))?;
+        let offset = block_size(offset)? - offset;
 
         f.write_all(&data)?;
         f.seek(SeekFrom::Current(i64::from(offset)))?;

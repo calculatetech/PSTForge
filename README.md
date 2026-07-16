@@ -1,9 +1,10 @@
 # PSTForge
 
 PSTForge is a Linux command-line utility for read-only inspection and eventual
-recovery of large or damaged Outlook PST files. Version 0.2.0 adds the internal
-Unicode PST writer foundation to the existing protected source inspection and
-complete reachable-mail inventory.
+recovery of large or damaged Outlook PST files. Version 0.2.1 extends the
+template-free Unicode PST writer with mail-fidelity structures for recipients,
+text/HTML/RTF bodies, headers, attachments, embedded messages, named
+properties, and safely serializable raw properties.
 
 ## Ubuntu Dependencies
 
@@ -45,14 +46,25 @@ PSTFORGE_CORPUS_MANIFEST=/absolute/external/manifest.toml \
 Real PST files and their manifest must remain outside the repository. Start
 from [`tests/corpus-manifest.example.toml`](tests/corpus-manifest.example.toml).
 The full gate verifies source hash and timestamps before and after both CLI
-commands, creates a fresh one-folder/one-message Unicode PST without a runtime
-template, and reads generated and healthy corpus cases with `pffinfo` and
-`readpst`.
+commands, creates a rich Unicode PST without a runtime template, round-trips it
+through `libpff`, `pffinfo`, and independent `readpst`, and validates healthy
+external corpus cases.
 Detailed logs are written under the ignored `.agent/test-results/` directory;
 independent-reader output is redacted because it can contain mailbox data.
 
-Writer developers can generate the 0.2.0 acceptance store directly:
+Writer developers can generate the 0.2.1 acceptance store directly:
 
 ```bash
-cargo run -p pstforge-pst --example create_minimal -- /tmp/pstforge-smoke.pst
+cargo run -p pstforge-pst --example create_fidelity -- /tmp/pstforge-fidelity.pst
 ```
+
+The current public writer boundary emits one deterministic mail folder and one
+top-level message per call. It supports multiple To/Cc/Bcc recipients,
+by-value attachments, inline content metadata, custom named-property GUID
+sets, typed raw properties, and one attachment level of embedded messages.
+Version 0.2.1 externalizes individual property payloads above the heap limit
+through 16 KiB and rejects larger values before publication; the 0.4.x packer
+removes that bounded-fixture limit as part of arbitrary size-limited output.
+The
+0.3.x pipeline supplies recovered canonical items; 0.4.x generalizes folder
+and message packing across size-limited parts.

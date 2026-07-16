@@ -12,7 +12,7 @@ use crate::{
         read_write::*,
     },
     ndb::{
-        block::{DataTree, IntermediateTreeBlock},
+        block::{DataTree, IntermediateTreeBlock, SubNodeTree},
         block_id::BlockId,
         header::Header,
         node_id::{NodeId, NodeIdType},
@@ -77,6 +77,34 @@ impl AttachmentProperties {
                     .into(),
             ),
         }
+    }
+}
+
+fn declared_attachment_size(properties: &AttachmentProperties) -> io::Result<usize> {
+    let size = properties.attachment_size()?;
+    usize::try_from(size)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "attachment size is negative"))
+}
+
+fn validate_attachment_content_size(declared: usize, actual: usize) -> io::Result<()> {
+    if actual > declared {
+        Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "attachment payload exceeds its declared object size",
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+fn validate_object_content_size(declared: u32, actual: usize) -> io::Result<()> {
+    if declared as usize != actual {
+        Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "attachment object size does not match its referenced data",
+        ))
+    } else {
+        Ok(())
     }
 }
 
@@ -173,6 +201,13 @@ where
     <<Pst as PstFile>::BlockBTree as RootBTree>::LeafPage:
         RootBTreeLeafPageReadWrite<Pst> + BTreePageReadWrite,
     <Pst as PstFile>::BlockTrailer: BlockTrailerReadWrite,
+    <Pst as PstFile>::SubNodeTreeBlockHeader: IntermediateTreeHeaderReadWrite,
+    <Pst as PstFile>::SubNodeTreeBlock: IntermediateTreeBlockReadWrite,
+    <<Pst as PstFile>::SubNodeTreeBlock as IntermediateTreeBlock>::Entry:
+        IntermediateTreeEntryReadWrite,
+    <Pst as PstFile>::SubNodeBlock: IntermediateTreeBlockReadWrite,
+    <<Pst as PstFile>::SubNodeBlock as IntermediateTreeBlock>::Entry:
+        IntermediateTreeEntryReadWrite,
     <Pst as PstFile>::DataTreeBlock: IntermediateTreeBlockReadWrite,
     <<Pst as PstFile>::DataTreeBlock as IntermediateTreeBlock>::Entry:
         IntermediateTreeEntryReadWrite,
@@ -197,11 +232,12 @@ where
         }
 
         let store = message.pst_store();
+        let property_budget = message.materialization_budget().clone();
         let pst = store.pst();
         let header = pst.header();
         let root = header.root();
 
-        let (properties, data) = {
+        let (properties, data, embedded_node) = {
             let mut file = pst
                 .reader()
                 .lock()
@@ -240,17 +276,20 @@ where
             let prop_context = <<Pst as PstFile>::PropertyContext as PropertyContextReadWrite<
                 Pst,
             >>::new(node, tree);
-            let properties = prop_context
-                .properties()?
-                .into_iter()
-                .map(|(prop_id, record)| {
-                    prop_context
-                        .read_property(file, encoding, &block_btree, &mut page_cache, record)
-                        .map(|value| (prop_id, value))
-                })
-                .collect::<io::Result<BTreeMap<_, _>>>()?;
+            let mut properties = BTreeMap::new();
+            for (prop_id, record) in prop_context.properties()? {
+                let value = prop_context.read_property(
+                    file,
+                    encoding,
+                    &block_btree,
+                    &mut page_cache,
+                    record,
+                    Some(&mut *property_budget.borrow_mut()),
+                )?;
+                properties.insert(prop_id, value);
+            }
             let properties = AttachmentProperties { properties };
-
+            let attachment_size = declared_attachment_size(&properties)?;
             let attachment_method = AttachmentMethod::try_from(properties.attachment_method()?)?;
             let data = match attachment_method {
                 AttachmentMethod::ByValue => {
@@ -258,7 +297,8 @@ where
                         .get(0x3701)
                         .ok_or(MessagingError::AttachmentMessageObjectDataNotFound)?
                     {
-                        PropertyValue::Binary(value) => value,
+                        PropertyValue::Binary(value) => value.clone(),
+                        PropertyValue::Null => BinaryValue::new(Vec::new()),
                         invalid => {
                             return Err(MessagingError::InvalidMessageObjectData(
                                 PropertyType::from(invalid),
@@ -266,7 +306,8 @@ where
                             .into());
                         }
                     };
-                    Some(AttachmentData::Binary(binary_data.clone()))
+                    validate_attachment_content_size(attachment_size, binary_data.buffer().len())?;
+                    (Some(AttachmentData::Binary(binary_data)), None)
                 }
                 AttachmentMethod::EmbeddedMessage => {
                     let object_data = match properties
@@ -281,25 +322,25 @@ where
                             .into());
                         }
                     };
-
                     let sub_node = object_data.node();
-                    let node = message
-                        .sub_nodes()
-                        .get(&sub_node)
+                    let root = node
+                        .sub_node()
                         .ok_or(MessagingError::AttachmentSubNodeNotFound(sub_node))?;
+                    let block = block_btree.find_entry(file, root.search_key(), &mut page_cache)?;
+                    let tree = SubNodeTree::<Pst>::read(file, &block)?;
+                    let node = tree.find_leaf_entry_bounded(
+                        file,
+                        &block_btree,
+                        sub_node,
+                        &mut page_cache,
+                    )?;
                     let node = <<Pst as PstFile>::NodeBTreeEntry as NodeBTreeEntryReadWrite>::new(
                         node.node(),
                         node.block(),
                         node.sub_node(),
                         None,
                     );
-                    let message =
-                        <<Pst as PstFile>::Message as MessageReadWrite<Pst>>::read_embedded(
-                            store.clone(),
-                            node,
-                            prop_ids,
-                        )?;
-                    Some(AttachmentData::Message(message))
+                    (None, Some((node, attachment_size, object_data.size())))
                 }
                 AttachmentMethod::Storage => {
                     let object_data = match properties
@@ -314,14 +355,23 @@ where
                             .into());
                         }
                     };
+                    let object_size = object_data.size();
                     let sub_node = object_data.node();
-                    let node = message
-                        .sub_nodes()
-                        .get(&sub_node)
+                    let root = node
+                        .sub_node()
                         .ok_or(MessagingError::AttachmentSubNodeNotFound(sub_node))?;
+                    let block = block_btree.find_entry(file, root.search_key(), &mut page_cache)?;
+                    let tree = SubNodeTree::<Pst>::read(file, &block)?;
+                    let node = tree.find_leaf_entry_bounded(
+                        file,
+                        &block_btree,
+                        sub_node,
+                        &mut page_cache,
+                    )?;
                     let block =
                         block_btree.find_entry(file, node.block().search_key(), &mut page_cache)?;
                     let block = DataTree::read(file, encoding, &block)?;
+                    property_budget.borrow_mut().charge(block.declared_size())?;
                     let mut data = vec![];
                     let _ = block
                         .reader(
@@ -332,12 +382,34 @@ where
                             &mut Default::default(),
                         )?
                         .read_to_end(&mut data)?;
-                    Some(AttachmentData::Binary(BinaryValue::new(data)))
+                    validate_object_content_size(object_size, data.len())?;
+                    validate_attachment_content_size(attachment_size, data.len())?;
+                    (Some(AttachmentData::Binary(BinaryValue::new(data))), None)
                 }
-                _ => None,
+                _ => (None, None),
             };
 
-            (properties, data)
+            (properties, data.0, data.1)
+        };
+        let data = match embedded_node {
+            Some((node, attachment_size, object_size)) => {
+                let message = <<Pst as PstFile>::Message as MessageReadWrite<
+                    Pst,
+                >>::read_embedded_with_budget(
+                    store.clone(), node, prop_ids, property_budget.clone()
+                )?;
+                let message_size =
+                    usize::try_from(message.properties().message_size()?).map_err(|_| {
+                        io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "embedded message size is negative",
+                        )
+                    })?;
+                validate_object_content_size(object_size, message_size)?;
+                validate_attachment_content_size(attachment_size, message_size)?;
+                Some(AttachmentData::Message(message))
+            }
+            None => data,
         };
 
         Ok(Self {
@@ -423,5 +495,46 @@ impl AttachmentReadWrite<AnsiPstFile> for AnsiAttachment {
     ) -> io::Result<Rc<Self>> {
         let inner = AttachmentInner::read(message, sub_node, prop_ids)?;
         Ok(Rc::new(Self { inner }))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ndb::block::{
+        DataTreeBlockHeader, UnicodeBlockTrailer, UnicodeDataTreeBlock, UnicodeDataTreeEntry,
+    };
+    use crate::ndb::block_id::UnicodeBlockId;
+    use crate::ndb::read_write::IntermediateTreeBlockReadWrite;
+
+    #[test]
+    fn attachment_size_validation_rejects_negative_and_undersized_values() {
+        let negative = AttachmentProperties {
+            properties: BTreeMap::from([(0x0E20, PropertyValue::Integer32(-1))]),
+        };
+        assert!(declared_attachment_size(&negative).is_err());
+        assert!(validate_attachment_content_size(4, 5).is_err());
+        assert!(validate_attachment_content_size(4, 4).is_ok());
+        assert!(validate_attachment_content_size(4, 3).is_ok());
+        assert!(validate_object_content_size(4, 3).is_err());
+        assert!(validate_object_content_size(4, 4).is_ok());
+    }
+
+    #[test]
+    fn embedded_object_size_uses_xblock_logical_size() {
+        let root = UnicodeBlockId::new(true, 1).expect("internal block ID");
+        let leaf = UnicodeBlockId::new(false, 2).expect("external block ID");
+        let trailer = UnicodeBlockTrailer::new(16, 0, 0, root).expect("XBLOCK trailer");
+        let xblock = UnicodeDataTreeBlock::new(
+            DataTreeBlockHeader::new(1, 1, 16_384),
+            vec![UnicodeDataTreeEntry::from(leaf)],
+            trailer,
+        )
+        .expect("valid XBLOCK");
+        let tree = DataTree::<UnicodePstFile>::Intermediate(Box::new(xblock));
+
+        assert_eq!(tree.declared_size(), 16_384);
+        assert!(validate_object_content_size(16_384, tree.declared_size()).is_ok());
+        assert!(validate_object_content_size(16_384, 16).is_err());
     }
 }

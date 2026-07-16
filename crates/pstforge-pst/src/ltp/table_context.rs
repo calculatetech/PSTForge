@@ -830,6 +830,22 @@ pub trait TableContext {
     ) -> io::Result<PropertyValue>;
 }
 
+fn indexed_row(rows: &[TableRowData], id: TableRowId, index: u32) -> LtpResult<&TableRowData> {
+    let index = index as usize;
+    let row = rows.get(index).ok_or(LtpError::InvalidTableRowIndex {
+        row_id: u32::from(id),
+        index,
+        count: rows.len(),
+    })?;
+    if row.id() != id {
+        return Err(LtpError::TableRowIdMismatch {
+            expected: u32::from(id),
+            actual: u32::from(row.id()),
+        });
+    }
+    Ok(row)
+}
+
 struct TableContextInner<Pst, RowIndex, RowIndexTree>
 where
     Pst: PstFile,
@@ -1082,7 +1098,7 @@ impl TableContext for UnicodeTableContext {
             .row_index
             .get(&id)
             .ok_or(LtpError::TableRowIdNotFound(u32::from(id)))?;
-        Ok(&self.inner.rows[u32::from(*index) as usize])
+        indexed_row(&self.inner.rows, id, u32::from(*index))
     }
 
     fn read_column(
@@ -1138,7 +1154,7 @@ impl TableContext for AnsiTableContext {
             .row_index
             .get(&id)
             .ok_or(LtpError::TableRowIdNotFound(u32::from(id)))?;
-        Ok(&self.inner.rows[u32::from(*index) as usize])
+        indexed_row(&self.inner.rows, id, u32::from(*index))
     }
 
     fn read_column(
@@ -1154,5 +1170,49 @@ impl TableContextReadWrite<AnsiPstFile> for AnsiTableContext {
     fn read(store: Rc<AnsiStore>, node: AnsiNodeBTreeEntry) -> io::Result<Rc<dyn TableContext>> {
         let inner = TableContextInner::read(store, node)?;
         Ok(Rc::new(Self { inner }))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn indexed_row_rejects_out_of_range_bth_values() {
+        let id = TableRowId::new(1);
+        let rows = [TableRowData::new(
+            id,
+            0,
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+        )];
+        assert_eq!(indexed_row(&rows, id, 0).expect("valid row").id(), id);
+        assert!(matches!(
+            indexed_row(&rows, id, 1),
+            Err(LtpError::InvalidTableRowIndex {
+                row_id: 1,
+                index: 1,
+                count: 1,
+            })
+        ));
+
+        let wrong_id = TableRowId::new(2);
+        let wrong_rows = [TableRowData::new(
+            wrong_id,
+            0,
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+        )];
+        assert!(matches!(
+            indexed_row(&wrong_rows, id, 0),
+            Err(LtpError::TableRowIdMismatch {
+                expected: 1,
+                actual: 2,
+            })
+        ));
     }
 }
