@@ -1,6 +1,8 @@
 use std::collections::HashSet;
 use std::ptr;
 
+use serde::{Deserialize, Serialize};
+
 use crate::bindings::{
     self, libpff_error_t, libpff_item_t, libpff_record_entry_t, libpff_record_set_t,
 };
@@ -12,13 +14,97 @@ const MAX_RECORD_SETS: u64 = 1_000_000;
 const MAX_RECORD_ENTRIES: u64 = 1_000_000;
 const MAX_MESSAGES: u64 = 100_000_000;
 const MAX_EMBEDDED_DEPTH: u32 = 64;
+const MAX_FOLDER_DEPTH: usize = 64;
 const MAX_CATALOG_ISSUES: usize = 10_000;
+const RECOVERY_FLAG_IGNORE_ALLOCATION_DATA: u8 = 0x01;
+const RECOVERY_FLAG_SCAN_FOR_FRAGMENTS: u8 = 0x02;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RecoveryCollectionFunctions {
+    count: unsafe extern "C" fn(
+        *mut bindings::libpff_file_t,
+        *mut i32,
+        *mut *mut libpff_error_t,
+    ) -> i32,
+    item: unsafe extern "C" fn(
+        *mut bindings::libpff_file_t,
+        i32,
+        *mut *mut libpff_item_t,
+        *mut *mut libpff_error_t,
+    ) -> i32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum CatalogProvenance {
     Normal,
     Recovered,
     Orphan,
+    Fragment,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RecoveryMode {
+    #[default]
+    Balanced,
+    Aggressive,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct FolderAddress {
+    head: [u32; 32],
+    tail: [u32; 32],
+    depth: u8,
+}
+
+impl FolderAddress {
+    fn root() -> Self {
+        Self {
+            head: [0; 32],
+            tail: [0; 32],
+            depth: 0,
+        }
+    }
+
+    fn child(self, index: u32) -> Option<Self> {
+        let depth = usize::from(self.depth);
+        if depth >= MAX_FOLDER_DEPTH {
+            return None;
+        }
+        let mut child = self;
+        if depth < 32 {
+            child.head[depth] = index;
+        } else {
+            child.tail[depth - 32] = index;
+        }
+        child.depth = child.depth.checked_add(1)?;
+        Some(child)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum RecoveryUnit {
+    Folder {
+        address: FolderAddress,
+    },
+    ChildFolder {
+        address: FolderAddress,
+    },
+    Normal {
+        folder: FolderAddress,
+        folder_id: u32,
+        message_index: u64,
+    },
+    Recovered {
+        index: u64,
+    },
+    Orphan {
+        index: u64,
+    },
+    Fragment {
+        index: u64,
+    },
 }
 
 const MESSAGE_CLASS: u32 = 0x001a;
@@ -35,7 +121,8 @@ const EMAIL_ADDRESS: u32 = 0x3003;
 const ATTACH_FILENAME: u32 = 0x3707;
 const ATTACH_FILENAME_SHORT: u32 = 0x3704;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum PropertyOwner {
     Folder(u32),
     Message(u32),
@@ -43,7 +130,7 @@ pub enum PropertyOwner {
     Attachment { message_id: u32, index: u32 },
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PropertyDescriptor {
     pub owner: PropertyOwner,
     pub record_set_index: u32,
@@ -55,6 +142,8 @@ pub struct PropertyDescriptor {
 
 #[derive(Debug)]
 pub enum CatalogEvent<'a> {
+    UnitStart(RecoveryUnit),
+    UnitEnd(RecoveryUnit),
     Folder {
         id: u32,
         parent_id: Option<u32>,
@@ -133,6 +222,7 @@ pub struct RawCatalog {
     pub messages: u64,
     pub recovered_messages: u64,
     pub orphan_messages: u64,
+    pub fragment_messages: u64,
     pub recipients: u64,
     pub attachments: u64,
     pub embedded_messages: u64,
@@ -156,11 +246,21 @@ impl RawCatalog {
 
 impl PffFile {
     pub fn catalog(&self, sink: &mut dyn CatalogSink) -> Result<RawCatalog, PffError> {
-        self.catalog_reachable(sink).map(|(catalog, _)| catalog)
+        self.catalog_reachable(sink, &HashSet::new())
+            .map(|(catalog, _)| catalog)
     }
 
     pub fn recovery_catalog(&mut self, sink: &mut dyn CatalogSink) -> Result<RawCatalog, PffError> {
-        let (mut catalog, mut visited_messages) = match self.catalog_reachable(sink) {
+        self.recovery_catalog_skipping(sink, &HashSet::new(), RecoveryMode::Balanced)
+    }
+
+    pub fn recovery_catalog_skipping(
+        &mut self,
+        sink: &mut dyn CatalogSink,
+        skipped: &HashSet<RecoveryUnit>,
+        mode: RecoveryMode,
+    ) -> Result<RawCatalog, PffError> {
+        let (mut catalog, mut visited_messages) = match self.catalog_reachable(sink, skipped) {
             Ok(reachable) => reachable,
             Err(
                 error @ (PffError::Native { .. }
@@ -174,24 +274,33 @@ impl PffFile {
             Err(error) => return Err(error),
         };
         let mut error = ptr::null_mut();
-        // SAFETY: self.raw is an open file. Balanced recovery uses no aggressive flags.
-        let result = unsafe { bindings::libpff_file_recover_items(self.raw, 0, &mut error) };
+        let recovery_flags = recovery_flags(mode);
+        // SAFETY: self.raw is an open file and recovery_flags contains only libpff-defined flags.
+        let result =
+            unsafe { bindings::libpff_file_recover_items(self.raw, recovery_flags, &mut error) };
         check_one(result, error, "recover items")?;
+        let recovered_provenance = recovered_provenance(mode);
         self.stream_recovery_collection(
-            CatalogProvenance::Recovered,
-            bindings::libpff_file_get_number_of_recovered_items,
-            bindings::libpff_file_get_recovered_item_by_index,
+            recovered_provenance,
+            RecoveryCollectionFunctions {
+                count: bindings::libpff_file_get_number_of_recovered_items,
+                item: bindings::libpff_file_get_recovered_item_by_index,
+            },
             &mut visited_messages,
             sink,
             &mut catalog,
+            skipped,
         )?;
         self.stream_recovery_collection(
             CatalogProvenance::Orphan,
-            bindings::libpff_file_get_number_of_orphan_items,
-            bindings::libpff_file_get_orphan_item_by_index,
+            RecoveryCollectionFunctions {
+                count: bindings::libpff_file_get_number_of_orphan_items,
+                item: bindings::libpff_file_get_orphan_item_by_index,
+            },
             &mut visited_messages,
             sink,
             &mut catalog,
+            skipped,
         )?;
         Ok(catalog)
     }
@@ -199,18 +308,59 @@ impl PffFile {
     fn catalog_reachable(
         &self,
         sink: &mut dyn CatalogSink,
+        skipped: &HashSet<RecoveryUnit>,
     ) -> Result<(RawCatalog, HashSet<u32>), PffError> {
-        let root = self.root_folder()?;
         let mut catalog = RawCatalog::default();
-        let mut folders = vec![(root, None)];
         let mut visited_folders = HashSet::new();
         let mut visited_messages = HashSet::new();
+        let root_address = FolderAddress::root();
+        let root_unit = RecoveryUnit::Folder {
+            address: root_address,
+        };
+        if skipped.contains(&root_unit) {
+            catalog.record_issue(CatalogIssue {
+                node_id: None,
+                operation: "skip isolated recovery unit",
+                message: "root folder subtree was isolated".to_owned(),
+            });
+            return Ok((catalog, visited_messages));
+        }
+        emit(
+            sink,
+            "start recovery unit",
+            CatalogEvent::UnitStart(root_unit),
+        )?;
+        let root = self.root_folder()?;
+        let mut folders = vec![(root, None, root_address, true)];
 
-        while let Some((folder, parent_id)) = folders.pop() {
+        while let Some((folder, parent_id, folder_address, unit_started)) = folders.pop() {
+            let folder_unit = RecoveryUnit::Folder {
+                address: folder_address,
+            };
+            if !unit_started {
+                if skipped.contains(&folder_unit) {
+                    catalog.record_issue(CatalogIssue {
+                        node_id: parent_id,
+                        operation: "skip isolated recovery unit",
+                        message: "folder subtree was isolated".to_owned(),
+                    });
+                    continue;
+                }
+                emit(
+                    sink,
+                    "start recovery unit",
+                    CatalogEvent::UnitStart(folder_unit),
+                )?;
+            }
             let folder_id = match folder.identifier() {
                 Ok(folder_id) => folder_id,
                 Err(error) => {
                     record_item_issue(&mut catalog, None, "get folder identifier", error)?;
+                    emit(
+                        sink,
+                        "end recovery unit",
+                        CatalogEvent::UnitEnd(folder_unit),
+                    )?;
                     continue;
                 }
             };
@@ -220,6 +370,11 @@ impl PffFile {
                     operation: "traverse folder",
                     message: "duplicate or cyclic folder identifier".to_owned(),
                 });
+                emit(
+                    sink,
+                    "end recovery unit",
+                    CatalogEvent::UnitEnd(folder_unit),
+                )?;
                 continue;
             }
             catalog.folders = checked_increment(catalog.folders, "folder count", 1_000_000)?;
@@ -266,7 +421,76 @@ impl PffFile {
                     0
                 }
             };
+            let child_count = match folder.sub_folder_count() {
+                Ok(count) => count,
+                Err(error) => {
+                    record_item_issue(&mut catalog, Some(folder_id), "count child folders", error)?;
+                    0
+                }
+            };
+            emit(
+                sink,
+                "end recovery unit",
+                CatalogEvent::UnitEnd(folder_unit),
+            )?;
+            for index in (0..child_count).rev() {
+                let child_index = u32::try_from(index).map_err(|_| PffError::LimitExceeded {
+                    field: "child folder index",
+                    value: index,
+                    limit: u64::from(u32::MAX),
+                })?;
+                let Some(child_address) = folder_address.child(child_index) else {
+                    catalog.record_issue(CatalogIssue {
+                        node_id: Some(folder_id),
+                        operation: "traverse child folder",
+                        message: format!("folder depth exceeds {MAX_FOLDER_DEPTH}"),
+                    });
+                    continue;
+                };
+                let child_unit = RecoveryUnit::ChildFolder {
+                    address: child_address,
+                };
+                if skipped.contains(&child_unit) {
+                    catalog.record_issue(CatalogIssue {
+                        node_id: Some(folder_id),
+                        operation: "skip isolated recovery unit",
+                        message: format!("child folder index {index} was isolated"),
+                    });
+                    continue;
+                }
+                emit(
+                    sink,
+                    "start recovery unit",
+                    CatalogEvent::UnitStart(child_unit),
+                )?;
+                match folder.sub_folder(index) {
+                    Ok(child) => {
+                        folders.push((child, Some(folder_id), child_address, false));
+                    }
+                    Err(error) => record_item_issue(
+                        &mut catalog,
+                        Some(folder_id),
+                        "read child folder",
+                        error,
+                    )?,
+                }
+                emit(sink, "end recovery unit", CatalogEvent::UnitEnd(child_unit))?;
+            }
             for index in 0..message_count {
+                let unit = RecoveryUnit::Normal {
+                    folder: folder_address,
+                    folder_id,
+                    message_index: index,
+                };
+                if skipped.contains(&unit) {
+                    catalog.record_issue(CatalogIssue {
+                        node_id: Some(folder_id),
+                        operation: "skip isolated recovery unit",
+                        message: format!("normal message index {index} was isolated"),
+                    });
+                    continue;
+                }
+                emit(sink, "start recovery unit", CatalogEvent::UnitStart(unit))?;
                 let item = match folder.sub_message(index) {
                     Ok(item) => item,
                     Err(error) => {
@@ -276,6 +500,7 @@ impl PffFile {
                             "read folder message",
                             error,
                         )?;
+                        emit(sink, "end recovery unit", CatalogEvent::UnitEnd(unit))?;
                         continue;
                     }
                 };
@@ -307,25 +532,7 @@ impl PffFile {
                         }
                     }
                 }
-            }
-
-            let child_count = match folder.sub_folder_count() {
-                Ok(count) => count,
-                Err(error) => {
-                    record_item_issue(&mut catalog, Some(folder_id), "count child folders", error)?;
-                    continue;
-                }
-            };
-            for index in (0..child_count).rev() {
-                match folder.sub_folder(index) {
-                    Ok(child) => folders.push((child, Some(folder_id))),
-                    Err(error) => record_item_issue(
-                        &mut catalog,
-                        Some(folder_id),
-                        "read child folder",
-                        error,
-                    )?,
-                }
+                emit(sink, "end recovery unit", CatalogEvent::UnitEnd(unit))?;
             }
         }
         Ok((catalog, visited_messages))
@@ -334,25 +541,16 @@ impl PffFile {
     fn stream_recovery_collection(
         &self,
         provenance: CatalogProvenance,
-        count_function: unsafe extern "C" fn(
-            *mut bindings::libpff_file_t,
-            *mut i32,
-            *mut *mut libpff_error_t,
-        ) -> i32,
-        item_function: unsafe extern "C" fn(
-            *mut bindings::libpff_file_t,
-            i32,
-            *mut *mut libpff_item_t,
-            *mut *mut libpff_error_t,
-        ) -> i32,
+        functions: RecoveryCollectionFunctions,
         visited_messages: &mut HashSet<u32>,
         sink: &mut dyn CatalogSink,
         catalog: &mut RawCatalog,
+        skipped: &HashSet<RecoveryUnit>,
     ) -> Result<(), PffError> {
         let mut count = 0_i32;
         let mut error = ptr::null_mut();
         // SAFETY: self.raw is open and count/error are initialized out-pointers.
-        let result = unsafe { count_function(self.raw, &mut count, &mut error) };
+        let result = unsafe { (functions.count)(self.raw, &mut count, &mut error) };
         check_one(result, error, "count recovery items")?;
         if count < 0 || u64::try_from(count).unwrap_or(u64::MAX) > MAX_MESSAGES {
             return Err(PffError::InvalidValue {
@@ -361,21 +559,53 @@ impl PffFile {
             });
         }
         for index in 0..count {
+            let recovery_index = u64::try_from(index).map_err(|_| PffError::InvalidValue {
+                field: "recovery item index",
+                value: i64::from(index),
+            })?;
+            let unit = match provenance {
+                CatalogProvenance::Recovered => RecoveryUnit::Recovered {
+                    index: recovery_index,
+                },
+                CatalogProvenance::Orphan => RecoveryUnit::Orphan {
+                    index: recovery_index,
+                },
+                CatalogProvenance::Fragment => RecoveryUnit::Fragment {
+                    index: recovery_index,
+                },
+                CatalogProvenance::Normal => {
+                    return Err(PffError::InvalidValue {
+                        field: "recovery provenance",
+                        value: 0,
+                    });
+                }
+            };
+            if skipped.contains(&unit) {
+                catalog.record_issue(CatalogIssue {
+                    node_id: None,
+                    operation: "skip isolated recovery unit",
+                    message: format!("recovery item index {recovery_index} was isolated"),
+                });
+                continue;
+            }
+            emit(sink, "start recovery unit", CatalogEvent::UnitStart(unit))?;
             let mut raw = ptr::null_mut();
             error = ptr::null_mut();
             // SAFETY: the index is within the count returned by libpff and outputs are initialized.
-            let result = unsafe { item_function(self.raw, index, &mut raw, &mut error) };
+            let result = unsafe { (functions.item)(self.raw, index, &mut raw, &mut error) };
             if let Err(error) = check_one(result, error, "get recovery item") {
                 if let Ok(item) = PffItem::from_raw(raw, "clean failed recovery item") {
                     drop(item);
                 }
                 catalog.record_issue(catalog_issue(None, "get recovery item", error));
+                emit(sink, "end recovery unit", CatalogEvent::UnitEnd(unit))?;
                 continue;
             }
             let item = match PffItem::from_raw(raw, "get recovery item") {
                 Ok(item) => item,
                 Err(error) => {
                     catalog.record_issue(catalog_issue(None, "get recovery item", error));
+                    emit(sink, "end recovery unit", CatalogEvent::UnitEnd(unit))?;
                     continue;
                 }
             };
@@ -386,10 +616,7 @@ impl PffFile {
                 parent_attachment_index: None,
                 depth: 0,
                 provenance,
-                recovery_index: Some(u64::try_from(index).map_err(|_| PffError::InvalidValue {
-                    field: "recovery item index",
-                    value: i64::from(index),
-                })?),
+                recovery_index: Some(recovery_index),
             }];
             while let Some(work) = pending.pop() {
                 if let Err(error) =
@@ -401,6 +628,7 @@ impl PffFile {
                     }
                 }
             }
+            emit(sink, "end recovery unit", CatalogEvent::UnitEnd(unit))?;
         }
         Ok(())
     }
@@ -414,6 +642,20 @@ impl PffFile {
         check_one(result, error, "get root folder")?;
         PffItem::from_raw(raw, "get root folder")
     }
+}
+
+fn recovery_flags(mode: RecoveryMode) -> u8 {
+    match mode {
+        RecoveryMode::Balanced => 0,
+        RecoveryMode::Aggressive => {
+            RECOVERY_FLAG_IGNORE_ALLOCATION_DATA | RECOVERY_FLAG_SCAN_FOR_FRAGMENTS
+        }
+    }
+}
+
+fn recovered_provenance(mode: RecoveryMode) -> CatalogProvenance {
+    let _ = mode;
+    CatalogProvenance::Recovered
 }
 
 struct MessageWork {
@@ -464,6 +706,14 @@ fn process_message(
             MAX_MESSAGES,
         )?,
         _ => catalog.orphan_messages,
+    };
+    let fragment_messages = match work.provenance {
+        CatalogProvenance::Fragment => checked_increment(
+            catalog.fragment_messages,
+            "fragment message count",
+            MAX_MESSAGES,
+        )?,
+        _ => catalog.fragment_messages,
     };
     let embedded_messages = if work.parent_message_id.is_some() {
         checked_increment(
@@ -570,6 +820,7 @@ fn process_message(
     catalog.messages = messages;
     catalog.recovered_messages = recovered_messages;
     catalog.orphan_messages = orphan_messages;
+    catalog.fragment_messages = fragment_messages;
     catalog.embedded_messages = embedded_messages;
     catalog.unsupported_messages = unsupported_messages;
     mark_stable_identifier(visited, message_id);
@@ -1615,12 +1866,31 @@ mod tests {
     use std::collections::HashSet;
 
     use super::{
-        CatalogEvent, CatalogIssue, CatalogSink, MAX_CATALOG_ISSUES, PropertyDescriptor,
-        PropertyOwner, RawCatalog, STREAM_CHUNK_BYTES, checked_increment, decode_native_string,
-        mark_stable_identifier, record_item_issue, recover_item_value, stable_identifier_seen,
-        validate_string_size,
+        CatalogEvent, CatalogIssue, CatalogProvenance, CatalogSink, FolderAddress,
+        MAX_CATALOG_ISSUES, PropertyDescriptor, PropertyOwner,
+        RECOVERY_FLAG_IGNORE_ALLOCATION_DATA, RECOVERY_FLAG_SCAN_FOR_FRAGMENTS, RawCatalog,
+        RecoveryMode, RecoveryUnit, STREAM_CHUNK_BYTES, checked_increment, decode_native_string,
+        mark_stable_identifier, record_item_issue, recover_item_value, recovered_provenance,
+        recovery_flags, stable_identifier_seen, validate_string_size,
     };
     use crate::PffError;
+
+    #[test]
+    fn aggressive_mode_uses_both_native_flags_without_relabeling_generic_recovery_items() {
+        assert_eq!(recovery_flags(RecoveryMode::Balanced), 0);
+        assert_eq!(
+            recovery_flags(RecoveryMode::Aggressive),
+            RECOVERY_FLAG_IGNORE_ALLOCATION_DATA | RECOVERY_FLAG_SCAN_FOR_FRAGMENTS
+        );
+        assert_eq!(
+            recovered_provenance(RecoveryMode::Balanced),
+            CatalogProvenance::Recovered
+        );
+        assert_eq!(
+            recovered_provenance(RecoveryMode::Aggressive),
+            CatalogProvenance::Recovered
+        );
+    }
 
     #[test]
     fn stable_identity_dedup_ignores_zero_and_marks_only_after_accounting() {
@@ -1631,6 +1901,22 @@ mod tests {
         assert!(visited.is_empty());
         mark_stable_identifier(&mut visited, 42);
         assert!(stable_identifier_seen(&visited, 42));
+    }
+
+    #[test]
+    fn zero_identifier_folders_have_distinct_recovery_units() {
+        let first = RecoveryUnit::Normal {
+            folder: FolderAddress::root().child(3).expect("first child"),
+            folder_id: 0,
+            message_index: 1,
+        };
+        let second = RecoveryUnit::Normal {
+            folder: FolderAddress::root().child(4).expect("second child"),
+            folder_id: 0,
+            message_index: 1,
+        };
+        assert_ne!(first, second);
+        assert_eq!(HashSet::from([first, second]).len(), 2);
     }
 
     #[test]

@@ -7,6 +7,7 @@ license.workspace = true
 links = "pff"
 
 [dependencies]
+serde.workspace = true
 thiserror.workspace = true
 
 [build-dependencies]

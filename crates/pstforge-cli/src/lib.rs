@@ -5,8 +5,8 @@ use std::path::PathBuf;
 
 use clap::{ArgAction, Parser, Subcommand, ValueEnum};
 use pstforge_core::{
-    EncryptionMode, FileFormat, InfoReport, InspectionError, RecoveryError, RecoveryReport,
-    SourceError, VerifyReport,
+    EncryptionMode, FileFormat, InfoReport, InspectionError, RecoveryError, RecoveryMode,
+    RecoveryReport, SourceError, VerifyReport, WorkerProtocolError,
 };
 use thiserror::Error;
 
@@ -54,8 +54,18 @@ pub enum Command {
         source: PathBuf,
         #[arg(long, short = 'o')]
         output: PathBuf,
+        #[arg(long, value_enum, default_value_t = RecoveryModeArg::Balanced)]
+        recovery: RecoveryModeArg,
         #[arg(long)]
         json: bool,
+    },
+    #[command(name = "__worker", hide = true)]
+    Worker {
+        source: PathBuf,
+        expected_identity: String,
+        skipped_units: String,
+        #[arg(value_enum)]
+        recovery: RecoveryModeArg,
     },
 }
 
@@ -77,22 +87,42 @@ pub enum VerifyMode {
     Full,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum RecoveryModeArg {
+    Balanced,
+    Aggressive,
+}
+
+impl From<RecoveryModeArg> for RecoveryMode {
+    fn from(value: RecoveryModeArg) -> Self {
+        match value {
+            RecoveryModeArg::Balanced => Self::Balanced,
+            RecoveryModeArg::Aggressive => Self::Aggressive,
+        }
+    }
+}
+
 #[derive(Debug, Error)]
 pub enum CliError {
     #[error(transparent)]
     Inspection(#[from] InspectionError),
     #[error(transparent)]
     Recovery(#[from] RecoveryError),
+    #[error(transparent)]
+    Worker(#[from] WorkerProtocolError),
     #[error("cannot write command result: {0}")]
     Output(#[from] std::io::Error),
     #[error("cannot serialize command result: {0}")]
     Json(#[from] serde_json::Error),
+    #[error("cannot locate the pstforge executable: {0}")]
+    Executable(std::io::Error),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CommandStatus {
     Complete,
     Partial,
+    Interrupted,
 }
 
 impl CliError {
@@ -104,17 +134,27 @@ impl CliError {
                 | InspectionError::UnsupportedContentType { .. },
             ) => 3,
             Self::Recovery(RecoveryError::Job(_))
-            | Self::Recovery(RecoveryError::Pff(pstforge_core::PffError::Sink { .. }))
+            | Self::Recovery(RecoveryError::WorkerProtocol(WorkerProtocolError::Sink(_)))
             | Self::Recovery(RecoveryError::Source(SourceError::UnsafeOutput(_)))
             | Self::Output(_) => 4,
-            Self::Recovery(
-                RecoveryError::Source(_)
-                | RecoveryError::Pff(_)
-                | RecoveryError::UnsupportedContentType { .. }
-                | RecoveryError::SizeMismatch { .. },
-            ) => 3,
+            Self::Recovery(RecoveryError::Source(_))
+            | Self::Recovery(RecoveryError::WorkerProtocol(WorkerProtocolError::ReportedSource(
+                _,
+            ))) => 3,
+            Self::Recovery(RecoveryError::Interrupted) => 130,
             Self::Inspection(InspectionError::SizeMismatch { .. }) => 3,
-            Self::Recovery(RecoveryError::InconsistentCounters) | Self::Json(_) => 6,
+            Self::Recovery(
+                RecoveryError::WorkerProtocol(_)
+                | RecoveryError::WorkerExecutable(_)
+                | RecoveryError::WorkerSpawn(_)
+                | RecoveryError::MissingWorkerOutput
+                | RecoveryError::WorkerExit { .. }
+                | RecoveryError::WorkerStalled
+                | RecoveryError::InconsistentCounters,
+            )
+            | Self::Worker(_)
+            | Self::Json(_)
+            | Self::Executable(_) => 6,
         }
     }
 }
@@ -146,15 +186,20 @@ pub fn execute(cli: &Cli, output: &mut dyn Write) -> Result<CommandStatus, CliEr
         Command::Recover {
             source,
             output: job_directory,
+            recovery,
             json,
         } => {
-            let report = pstforge_core::recover(source, job_directory)?;
+            let executable = std::env::current_exe().map_err(CliError::Executable)?;
+            let report =
+                pstforge_core::recover(source, job_directory, &executable, (*recovery).into())?;
             if *json {
                 write_json(output, &report)?;
             } else {
                 write_recovery(output, &report)?;
             }
-            if report.partial_candidates == 0
+            if report.interrupted {
+                Ok(CommandStatus::Interrupted)
+            } else if report.partial_candidates == 0
                 && report.unsupported_candidates == 0
                 && report.issues == 0
                 && report.issues_dropped == 0
@@ -163,6 +208,23 @@ pub fn execute(cli: &Cli, output: &mut dyn Write) -> Result<CommandStatus, CliEr
             } else {
                 Ok(CommandStatus::Partial)
             }
+        }
+        Command::Worker {
+            source,
+            expected_identity,
+            skipped_units,
+            recovery,
+        } => {
+            let expected_identity = serde_json::from_str(expected_identity)?;
+            let skipped_units = serde_json::from_str(skipped_units)?;
+            pstforge_core::run_recovery_worker(
+                source,
+                &expected_identity,
+                &skipped_units,
+                (*recovery).into(),
+                output,
+            )?;
+            Ok(CommandStatus::Complete)
         }
     }
 }
@@ -257,6 +319,7 @@ fn write_recovery(output: &mut dyn Write, report: &RecoveryReport) -> Result<(),
     writeln!(output, "Normal items: {}", report.normal_items)?;
     writeln!(output, "Recovered items: {}", report.recovered_items)?;
     writeln!(output, "Orphan items: {}", report.orphan_items)?;
+    writeln!(output, "Fragment candidates: {}", report.fragment_items)?;
     writeln!(
         output,
         "Committed candidates: {}",
@@ -276,6 +339,10 @@ fn write_recovery(output: &mut dyn Write, report: &RecoveryReport) -> Result<(),
     writeln!(output, "Spool blobs: {}", report.blob_count)?;
     writeln!(output, "Spool bytes: {}", report.blob_bytes)?;
     writeln!(output, "Recovery issues: {}", report.issues)?;
+    writeln!(output, "Worker attempts: {}", report.worker_attempts)?;
+    writeln!(output, "Worker failures: {}", report.worker_failures)?;
+    writeln!(output, "Isolated units: {}", report.isolated_units)?;
+    writeln!(output, "Interrupted: {}", yes_no(report.interrupted))?;
     writeln!(
         output,
         "Additional issues omitted: {}",
@@ -357,10 +424,10 @@ mod tests {
     use std::path::PathBuf;
 
     use clap::Parser;
-    use pstforge_core::{PffError, RecoveryError, SourceError};
+    use pstforge_core::{RecoveryError, SourceError};
     use pstforge_job::JobError;
 
-    use super::{Cli, CliError, Command, VerifyMode};
+    use super::{Cli, CliError, Command, RecoveryModeArg, VerifyMode};
 
     #[test]
     fn parses_info_json_with_global_options_after_command() {
@@ -399,7 +466,35 @@ mod tests {
         let cli = Cli::try_parse_from([
             "pstforge", "recover", "mail.pst", "--output", "job", "--json",
         ])?;
-        assert!(matches!(cli.command, Command::Recover { json: true, .. }));
+        assert!(matches!(
+            cli.command,
+            Command::Recover {
+                recovery: RecoveryModeArg::Balanced,
+                json: true,
+                ..
+            }
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn parses_explicit_aggressive_recovery() -> Result<(), clap::Error> {
+        let cli = Cli::try_parse_from([
+            "pstforge",
+            "recover",
+            "mail.pst",
+            "--output",
+            "job",
+            "--recovery",
+            "aggressive",
+        ])?;
+        assert!(matches!(
+            cli.command,
+            Command::Recover {
+                recovery: RecoveryModeArg::Aggressive,
+                ..
+            }
+        ));
         Ok(())
     }
 
@@ -409,20 +504,35 @@ mod tests {
             PathBuf::from("job"),
         )));
         assert_eq!(partial_output.exit_code(), 4);
-        let wrapped_sink = CliError::Recovery(RecoveryError::Pff(PffError::Sink {
-            operation: "property data",
-            detail: "filesystem full".to_owned(),
-        }));
-        assert_eq!(wrapped_sink.exit_code(), 4);
         let unsafe_output = CliError::Recovery(RecoveryError::Source(SourceError::UnsafeOutput(
             PathBuf::from("job"),
         )));
         assert_eq!(unsafe_output.exit_code(), 4);
-        let bad_source = CliError::Recovery(RecoveryError::UnsupportedContentType { raw: None });
-        assert_eq!(bad_source.exit_code(), 3);
         assert_eq!(
             CliError::Recovery(RecoveryError::InconsistentCounters).exit_code(),
             6
         );
+        assert_eq!(
+            CliError::Recovery(RecoveryError::Interrupted).exit_code(),
+            130
+        );
+    }
+
+    #[test]
+    fn worker_command_is_hidden_but_parseable() -> Result<(), clap::Error> {
+        let help = Cli::try_parse_from(["pstforge", "--help"])
+            .expect_err("help exits through clap")
+            .to_string();
+        assert!(!help.contains("__worker"));
+        let cli = Cli::try_parse_from([
+            "pstforge",
+            "__worker",
+            "mail.pst",
+            r#"{"canonical_path":"/mail.pst","device":1,"inode":2,"size_bytes":3,"modified_at":"now","sha256":"abc"}"#,
+            "[]",
+            "balanced",
+        ])?;
+        assert!(matches!(cli.command, Command::Worker { .. }));
+        Ok(())
     }
 }

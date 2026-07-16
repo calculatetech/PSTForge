@@ -19,7 +19,7 @@ PSTForge 1.0 supports healthy and damaged ANSI and Unicode PST input that
 `libpff` can open. It recovers the normal folder tree, email, recipients,
 message bodies, attachments, embedded messages, deleted or disconnected mail
 exposed by `libpff`, orphan items, and fragment candidates in explicit
-aggressive mode.
+aggressive mode when the input library can prove fragment origin.
 
 PSTForge 1.0 always writes new 64-bit Unicode PST version 23 files with
 512-byte pages. Output uses the format's compressible permutation encoding for
@@ -96,8 +96,11 @@ A mismatch is refused and neither existing parts nor state are changed.
 
 Balanced recovery processes the normal tree, `libpff` deleted/recovered items,
 and orphan items. Aggressive recovery also sets the `libpff` flags to ignore
-allocation data and scan fragments. Aggressive candidates retain lower
-confidence and are never presented as ordinary reachable mail.
+allocation data and scan fragments. Items from libpff's generic recovered-item
+collection retain `recovered` provenance; they are not relabeled as fragments.
+Provenance `fragment` is reserved for candidates whose fragment origin is
+explicitly exposed by the native boundary. Aggressive non-normal candidates
+retain lower confidence and are never presented as ordinary reachable mail.
 
 The maximum is a hard target for a normal part. Packing accounts for complete
 on-disk PST overhead, validates the final size, and repacks before publication

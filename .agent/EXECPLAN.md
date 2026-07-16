@@ -395,7 +395,36 @@ work. Hash and identity evidence show that the source was not modified.
     Enron run committed 2,178 candidates (2,173 complete and 5 partial),
     35,997 blobs totaling 15,198,391 bytes in 8.71 seconds with 20,672 KiB
     maximum RSS; source SHA-256 and timestamps remained unchanged.
-- [ ] Milestone 0.3.1: Fault-Isolated Recovery.
+- [x] (2026-07-16) Milestone 0.3.1: Fault-Isolated Recovery.
+  - [x] Moved native parsing behind a versioned, bounded, source-identity-checked
+    worker protocol with a supervisor watchdog, three retries, durable replay,
+    worker-event accounting, and exact isolated-unit records.
+  - [x] Made folders and top-level messages independently addressable through
+    stable bounded child-index paths; candidates retain their recovery-unit
+    identity so an isolated unit can keep prior committed mail without causing
+    replay-order cascades.
+  - [x] Added explicit balanced/aggressive recovery selection. Aggressive sets
+    both libpff allocation-ignore and fragment-scan flags while generic
+    recovered-list results retain `recovered` provenance; current upstream
+    libpff exposes no constructed fragment objects, so fragment totals remain
+    zero rather than overstating recovery.
+  - [x] Passed workspace tests and external real-PST checks for transient and
+    persistent aborts, stalls, folder/unit isolation, late in-unit failure
+    after a durable candidate, aggressive accounting, and source immutability.
+  - [x] Added graceful SIGINT/SIGTERM handling that kills the active worker,
+    rolls back only the active candidate, checkpoints prior commits, records
+    interruption, and returns a durable partial report. Added a real SIGSEGV
+    shim and a parser-error-after-commit shim; both pass external real-PST
+    replay/continuation checks without changing the source.
+  - [x] Completed clean-context adversarial review and remediated late
+    in-unit replay isolation, folder/child-pointer isolation, truthful
+    aggressive provenance, and exit-130 signal handling. The remaining review
+    suggestion to create durable state during the initial worker handshake was
+    rejected as outside the documented contract: no durable checkpoint has
+    yet been attempted, and invalid/unopenable input must not leave a job.
+  - [x] Passed `cargo xtask gate full`, including licenses, advisories, writer
+    interoperability, and the external corpus. Evidence:
+    `.agent/test-results/1784216979-full`.
 - [ ] Milestone 0.4.0: Size-Limited PST Splitting.
 - [ ] Milestone 0.4.1: Resume and 50 GB Qualification.
 - [ ] Milestone 0.5.0: Operational UX and Debian Packaging.
@@ -748,6 +777,33 @@ work. Hash and identity evidence show that the source was not modified.
   Rationale: Balanced mode recovers normal, deleted, recovered, and orphan mail
   without the cost and false-positive risk of ignoring allocation metadata.
   Date/Author: 2026-07-14 / project owner.
+
+- Decision: Version 0.3.1 aggressive mode passes both documented libpff flags,
+  but does not relabel the generic recovered-item collection as fragment data.
+  `fragment` provenance is emitted only when the native boundary can prove
+  fragment origin. The supported upstream libpff accepts
+  `SCAN_FOR_FRAGMENTS`, but its raw data-block path ends at an unimplemented
+  `consider data block as fragment` marker and exposes no per-item origin API.
+  Rationale: allocation-ignore results include ordinary recovered index
+  entries. Calling all of them fragments would create false provenance and
+  could distort later packing and recovery claims. A future fragment
+  constructor/provenance API belongs in the separately licensed LGPL fork and
+  must retain distinct lower-confidence accounting.
+  Date/Author: 2026-07-16 / Codex after upstream source review.
+
+- Decision: Fault-isolation addresses use a maximum-64-level folder
+  child-index path, not folder identifiers or traversal ordinals. Folder
+  metadata/child enumeration and top-level messages are announced as separate
+  units. Every committed candidate stores its unit in the private ledger;
+  replay omits candidates in isolated units while final accounting retains
+  them.
+  Rationale: folder identifiers can be zero or duplicated, traversal ordinals
+  shift when a damaged subtree is skipped, and a message unit can commit an
+  outer message before a later embedded child crashes. Stable paths plus
+  unit-bound durable candidates let the supervisor isolate the exact subtree
+  or top-level message without discarding prior progress or cascading replay
+  mismatches into unrelated mail.
+  Date/Author: 2026-07-16 / Codex after adversarial review.
 
 - Decision: Use system `libpff` through a narrow dynamically linked FFI for
   input recovery, and adapt Microsoft `outlook-pst` 1.2.0 in a separately

@@ -4,6 +4,8 @@ use std::fs;
 use std::os::unix::fs::MetadataExt;
 use std::path::PathBuf;
 use std::process::Command;
+use std::thread;
+use std::time::{Duration, Instant};
 
 use serde::Deserialize;
 
@@ -122,6 +124,399 @@ fn milestone_0_3_external_recovery_spools_without_mutation()
             return Err(format!("{} changed during recovery", case.name).into());
         }
     }
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires PSTFORGE_CORPUS_MANIFEST with external real PST files"]
+fn milestone_0_3_aggressive_recovery_is_distinct_and_non_mutating()
+-> Result<(), Box<dyn std::error::Error>> {
+    let manifest_path = std::env::var_os("PSTFORGE_CORPUS_MANIFEST")
+        .ok_or("PSTFORGE_CORPUS_MANIFEST is required")?;
+    let manifest: Manifest = toml::from_str(&fs::read_to_string(&manifest_path)?)?;
+    let case = manifest
+        .cases
+        .iter()
+        .min_by_key(|case| {
+            fs::metadata(&case.path)
+                .map(|metadata| metadata.len())
+                .unwrap_or(u64::MAX)
+        })
+        .ok_or("manifest has no recovery case")?;
+    let before = pstforge_core::SourceFile::open(&case.path)?
+        .identity()
+        .clone();
+    if before.sha256 != case.sha256 {
+        return Err(format!("{} SHA-256 does not match its manifest", case.name).into());
+    }
+    let directory = tempfile::tempdir()?;
+    let job = directory.path().join("job");
+    let output = Command::new(env!("CARGO_BIN_EXE_pstforge"))
+        .arg("recover")
+        .arg(&case.path)
+        .arg("--output")
+        .arg(&job)
+        .arg("--recovery")
+        .arg("aggressive")
+        .arg("--json")
+        .output()?;
+    if !output.status.success() && output.status.code() != Some(1) {
+        return Err(String::from_utf8_lossy(&output.stderr).into_owned().into());
+    }
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+    assert_eq!(report["mode"], "aggressive");
+    let committed = report["committed_candidates"].as_u64().unwrap_or_default();
+    let normal = report["normal_items"].as_u64().unwrap_or_default();
+    let recovered = report["recovered_items"].as_u64().unwrap_or_default();
+    let orphan = report["orphan_items"].as_u64().unwrap_or_default();
+    let fragments = report["fragment_items"].as_u64().unwrap_or_default();
+    assert_eq!(committed, normal + recovered + orphan + fragments);
+    let sink = pstforge_job::DurableCatalogSink::open(&job)?;
+    let summary = sink.summary()?;
+    assert_eq!(summary.committed_candidates, committed);
+    assert_eq!(summary.recovered_candidates, recovered);
+    assert_eq!(summary.orphan_candidates, orphan);
+    assert_eq!(summary.fragment_candidates, fragments);
+    assert_eq!(
+        pstforge_core::SourceFile::open(&case.path)?.identity(),
+        &before
+    );
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires PSTFORGE_CORPUS_MANIFEST with external real PST files"]
+fn milestone_0_3_worker_abort_replays_committed_candidates()
+-> Result<(), Box<dyn std::error::Error>> {
+    let manifest_path = std::env::var_os("PSTFORGE_CORPUS_MANIFEST")
+        .ok_or("PSTFORGE_CORPUS_MANIFEST is required")?;
+    let manifest: Manifest = toml::from_str(&fs::read_to_string(&manifest_path)?)?;
+    let case = manifest
+        .cases
+        .iter()
+        .find(|case| {
+            (case.milestone_0_3 || case.classification == "damaged") && case.minimum_messages > 1
+        })
+        .ok_or("manifest has no multi-message recovery case")?;
+    let before = pstforge_core::SourceFile::open(&case.path)?
+        .identity()
+        .clone();
+    let directory = tempfile::tempdir()?;
+    let job = directory.path().join("job");
+    let output = Command::new(env!("CARGO_BIN_EXE_pstforge"))
+        .arg("recover")
+        .arg(&case.path)
+        .arg("--output")
+        .arg(&job)
+        .arg("--json")
+        .env("PSTFORGE_TEST_ABORT_AFTER_CANDIDATES", "1")
+        .output()?;
+    if !output.status.success() && output.status.code() != Some(1) {
+        return Err(String::from_utf8_lossy(&output.stderr).into_owned().into());
+    }
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+    assert_eq!(report["worker_attempts"], 2);
+    assert_eq!(report["worker_failures"], 1);
+    assert!(report["committed_candidates"].as_u64().unwrap_or_default() > 1);
+    assert_eq!(
+        pstforge_core::SourceFile::open(&case.path)?.identity(),
+        &before
+    );
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires PSTFORGE_CORPUS_MANIFEST with external real PST files"]
+fn milestone_0_3_persistent_worker_abort_is_bounded_and_partial()
+-> Result<(), Box<dyn std::error::Error>> {
+    let manifest_path = std::env::var_os("PSTFORGE_CORPUS_MANIFEST")
+        .ok_or("PSTFORGE_CORPUS_MANIFEST is required")?;
+    let manifest: Manifest = toml::from_str(&fs::read_to_string(&manifest_path)?)?;
+    let case = manifest
+        .cases
+        .iter()
+        .find(|case| {
+            (case.milestone_0_3 || case.classification == "damaged") && case.minimum_messages > 1
+        })
+        .ok_or("manifest has no multi-message recovery case")?;
+    let before = pstforge_core::SourceFile::open(&case.path)?
+        .identity()
+        .clone();
+    let directory = tempfile::tempdir()?;
+    let job = directory.path().join("job");
+    let output = Command::new(env!("CARGO_BIN_EXE_pstforge"))
+        .arg("recover")
+        .arg(&case.path)
+        .arg("--output")
+        .arg(&job)
+        .arg("--json")
+        .env("PSTFORGE_TEST_ABORT_EVERY_ATTEMPT_AFTER_CANDIDATES", "1")
+        .output()?;
+    assert_eq!(output.status.code(), Some(1));
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+    assert_eq!(report["worker_attempts"], 4);
+    assert_eq!(report["worker_failures"], 4);
+    assert_eq!(report["committed_candidates"], 1);
+    assert_eq!(report["issues"], 1);
+    assert_eq!(
+        pstforge_core::SourceFile::open(&case.path)?.identity(),
+        &before
+    );
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires PSTFORGE_CORPUS_MANIFEST with external real PST files"]
+fn milestone_0_3_worker_stall_is_killed_and_replayed() -> Result<(), Box<dyn std::error::Error>> {
+    let manifest_path = std::env::var_os("PSTFORGE_CORPUS_MANIFEST")
+        .ok_or("PSTFORGE_CORPUS_MANIFEST is required")?;
+    let manifest: Manifest = toml::from_str(&fs::read_to_string(&manifest_path)?)?;
+    let case = manifest
+        .cases
+        .iter()
+        .find(|case| {
+            (case.milestone_0_3 || case.classification == "damaged") && case.minimum_messages > 1
+        })
+        .ok_or("manifest has no multi-message recovery case")?;
+    let before = pstforge_core::SourceFile::open(&case.path)?
+        .identity()
+        .clone();
+    let directory = tempfile::tempdir()?;
+    let job = directory.path().join("job");
+    let output = Command::new(env!("CARGO_BIN_EXE_pstforge"))
+        .arg("recover")
+        .arg(&case.path)
+        .arg("--output")
+        .arg(&job)
+        .arg("--json")
+        .env("PSTFORGE_TEST_STALL_AFTER_CANDIDATES", "1")
+        .env("PSTFORGE_TEST_STALL_TIMEOUT_MS", "1000")
+        .output()?;
+    if !output.status.success() && output.status.code() != Some(1) {
+        return Err(String::from_utf8_lossy(&output.stderr).into_owned().into());
+    }
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+    assert_eq!(report["worker_attempts"], 2);
+    assert_eq!(report["worker_failures"], 1);
+    assert!(report["committed_candidates"].as_u64().unwrap_or_default() > 1);
+    assert_eq!(
+        pstforge_core::SourceFile::open(&case.path)?.identity(),
+        &before
+    );
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires PSTFORGE_CORPUS_MANIFEST with external real PST files"]
+fn milestone_0_3_repeated_unit_crash_is_isolated() -> Result<(), Box<dyn std::error::Error>> {
+    let manifest_path = std::env::var_os("PSTFORGE_CORPUS_MANIFEST")
+        .ok_or("PSTFORGE_CORPUS_MANIFEST is required")?;
+    let manifest: Manifest = toml::from_str(&fs::read_to_string(&manifest_path)?)?;
+    let case = manifest
+        .cases
+        .iter()
+        .find(|case| {
+            (case.milestone_0_3 || case.classification == "damaged") && case.minimum_messages > 2
+        })
+        .ok_or("manifest has no recovery case with at least three messages")?;
+    let before = pstforge_core::SourceFile::open(&case.path)?
+        .identity()
+        .clone();
+    let directory = tempfile::tempdir()?;
+    let job = directory.path().join("job");
+    let output = Command::new(env!("CARGO_BIN_EXE_pstforge"))
+        .arg("recover")
+        .arg(&case.path)
+        .arg("--output")
+        .arg(&job)
+        .arg("--json")
+        .env("PSTFORGE_TEST_ABORT_ON_UNIT_ORDINAL", "2")
+        .output()?;
+    assert_eq!(output.status.code(), Some(1));
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+    assert_eq!(report["worker_attempts"], 5);
+    assert_eq!(report["worker_failures"], 4);
+    assert_eq!(report["isolated_units"], 1);
+    assert!(report["committed_candidates"].as_u64().unwrap_or_default() > 1);
+    assert!(report["issues"].as_u64().unwrap_or_default() >= 1);
+    assert_eq!(
+        pstforge_core::SourceFile::open(&case.path)?.identity(),
+        &before
+    );
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires PSTFORGE_CORPUS_MANIFEST with external real PST files"]
+fn milestone_0_3_replayed_candidate_does_not_prevent_unit_isolation()
+-> Result<(), Box<dyn std::error::Error>> {
+    let manifest_path = std::env::var_os("PSTFORGE_CORPUS_MANIFEST")
+        .ok_or("PSTFORGE_CORPUS_MANIFEST is required")?;
+    let manifest: Manifest = toml::from_str(&fs::read_to_string(&manifest_path)?)?;
+    let case = manifest
+        .cases
+        .iter()
+        .find(|case| {
+            (case.milestone_0_3 || case.classification == "damaged") && case.minimum_messages > 2
+        })
+        .ok_or("manifest has no recovery case with at least three messages")?;
+    let before = pstforge_core::SourceFile::open(&case.path)?
+        .identity()
+        .clone();
+    let directory = tempfile::tempdir()?;
+    let job = directory.path().join("job");
+    let output = Command::new(env!("CARGO_BIN_EXE_pstforge"))
+        .arg("recover")
+        .arg(&case.path)
+        .arg("--output")
+        .arg(&job)
+        .arg("--json")
+        .env("PSTFORGE_TEST_ABORT_INSIDE_UNIT_AFTER_CANDIDATES", "1")
+        .output()?;
+    assert_eq!(output.status.code(), Some(1));
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+    assert_eq!(report["worker_attempts"], 5);
+    assert_eq!(report["worker_failures"], 4);
+    assert_eq!(report["isolated_units"], 1);
+    assert!(report["committed_candidates"].as_u64().unwrap_or_default() > 1);
+    assert_eq!(
+        pstforge_core::SourceFile::open(&case.path)?.identity(),
+        &before
+    );
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires PSTFORGE_CORPUS_MANIFEST with external real PST files"]
+fn milestone_0_3_sigsegv_is_contained_and_isolated() -> Result<(), Box<dyn std::error::Error>> {
+    let manifest_path = std::env::var_os("PSTFORGE_CORPUS_MANIFEST")
+        .ok_or("PSTFORGE_CORPUS_MANIFEST is required")?;
+    let manifest: Manifest = toml::from_str(&fs::read_to_string(&manifest_path)?)?;
+    let case = manifest
+        .cases
+        .iter()
+        .find(|case| case.milestone_0_3 || case.classification == "damaged")
+        .ok_or("manifest has no damaged recovery case")?;
+    let before = pstforge_core::SourceFile::open(&case.path)?
+        .identity()
+        .clone();
+    let directory = tempfile::tempdir()?;
+    let job = directory.path().join("job");
+    let output = Command::new(env!("CARGO_BIN_EXE_pstforge"))
+        .arg("recover")
+        .arg(&case.path)
+        .arg("--output")
+        .arg(&job)
+        .arg("--json")
+        .env("PSTFORGE_TEST_SEGV_ON_UNIT_ORDINAL", "2")
+        .output()?;
+    assert_eq!(output.status.code(), Some(1));
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+    assert_eq!(report["worker_attempts"], 5);
+    assert_eq!(report["worker_failures"], 4);
+    assert_eq!(report["isolated_units"], 1);
+    assert!(report["committed_candidates"].as_u64().unwrap_or_default() > 1);
+    assert!(job.join(".pstforge/job.sqlite3").is_file());
+    assert_eq!(
+        pstforge_core::SourceFile::open(&case.path)?.identity(),
+        &before
+    );
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires PSTFORGE_CORPUS_MANIFEST with external real PST files"]
+fn milestone_0_3_parser_error_after_commit_replays_and_continues()
+-> Result<(), Box<dyn std::error::Error>> {
+    let manifest_path = std::env::var_os("PSTFORGE_CORPUS_MANIFEST")
+        .ok_or("PSTFORGE_CORPUS_MANIFEST is required")?;
+    let manifest: Manifest = toml::from_str(&fs::read_to_string(&manifest_path)?)?;
+    let case = manifest
+        .cases
+        .iter()
+        .find(|case| {
+            (case.milestone_0_3 || case.classification == "damaged") && case.minimum_messages > 1
+        })
+        .ok_or("manifest has no multi-message recovery case")?;
+    let before = pstforge_core::SourceFile::open(&case.path)?
+        .identity()
+        .clone();
+    let directory = tempfile::tempdir()?;
+    let job = directory.path().join("job");
+    let output = Command::new(env!("CARGO_BIN_EXE_pstforge"))
+        .arg("recover")
+        .arg(&case.path)
+        .arg("--output")
+        .arg(&job)
+        .arg("--json")
+        .env("PSTFORGE_TEST_PARSER_ERROR_AFTER_CANDIDATES", "1")
+        .output()?;
+    if !output.status.success() && output.status.code() != Some(1) {
+        return Err(String::from_utf8_lossy(&output.stderr).into_owned().into());
+    }
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+    assert_eq!(report["worker_attempts"], 2);
+    assert_eq!(report["worker_failures"], 1);
+    assert!(report["committed_candidates"].as_u64().unwrap_or_default() > 1);
+    assert_eq!(
+        pstforge_core::SourceFile::open(&case.path)?.identity(),
+        &before
+    );
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires PSTFORGE_CORPUS_MANIFEST with external real PST files"]
+fn milestone_0_3_sigint_and_sigterm_leave_durable_partial_jobs()
+-> Result<(), Box<dyn std::error::Error>> {
+    let manifest_path = std::env::var_os("PSTFORGE_CORPUS_MANIFEST")
+        .ok_or("PSTFORGE_CORPUS_MANIFEST is required")?;
+    let manifest: Manifest = toml::from_str(&fs::read_to_string(&manifest_path)?)?;
+    let case = manifest
+        .cases
+        .iter()
+        .find(|case| case.milestone_0_3 || case.classification == "damaged")
+        .ok_or("manifest has no damaged recovery case")?;
+    let before = pstforge_core::SourceFile::open(&case.path)?
+        .identity()
+        .clone();
+    for signal in [rustix::process::Signal::INT, rustix::process::Signal::TERM] {
+        let directory = tempfile::tempdir()?;
+        let job = directory.path().join("job");
+        let mut child = Command::new(env!("CARGO_BIN_EXE_pstforge"))
+            .arg("recover")
+            .arg(&case.path)
+            .arg("--output")
+            .arg(&job)
+            .arg("--json")
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()?;
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !job.join(".pstforge/job.sqlite3").is_file() {
+            if Instant::now() >= deadline {
+                let _ = child.kill();
+                return Err("recovery job did not start before signal deadline".into());
+            }
+            thread::sleep(Duration::from_millis(25));
+        }
+        thread::sleep(Duration::from_millis(500));
+        let pid = i32::try_from(child.id())
+            .ok()
+            .and_then(rustix::process::Pid::from_raw)
+            .ok_or("child PID is out of range")?;
+        rustix::process::kill_process(pid, signal)?;
+        let output = child.wait_with_output()?;
+        assert_eq!(output.status.code(), Some(130));
+        let report: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+        assert_eq!(report["interrupted"], true);
+        assert!(report["committed_candidates"].as_u64().unwrap_or_default() > 0);
+        assert!(job.join(".pstforge/job.sqlite3").is_file());
+    }
+    assert_eq!(
+        pstforge_core::SourceFile::open(&case.path)?.identity(),
+        &before
+    );
     Ok(())
 }
 

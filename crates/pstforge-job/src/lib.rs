@@ -8,14 +8,16 @@ use std::os::fd::{AsRawFd, RawFd};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
-use libpff_sys::{CatalogEvent, CatalogProvenance, CatalogSink, PropertyDescriptor, PropertyOwner};
+use libpff_sys::{
+    CatalogEvent, CatalogProvenance, CatalogSink, PropertyDescriptor, PropertyOwner, RecoveryUnit,
+};
 use rusqlite::{Connection, OpenFlags, params};
 use serde_json::json;
 use sha2::{Digest, Sha256};
 use tempfile::NamedTempFile;
 use thiserror::Error;
 
-const JOB_SCHEMA_VERSION: i64 = 1;
+const JOB_SCHEMA_VERSION: i64 = 3;
 
 #[derive(Debug, Error)]
 pub enum JobError {
@@ -44,11 +46,31 @@ pub enum JobError {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct JobSummary {
     pub committed_candidates: u64,
+    pub recovered_candidates: u64,
+    pub orphan_candidates: u64,
+    pub fragment_candidates: u64,
     pub complete_candidates: u64,
     pub partial_candidates: u64,
     pub unsupported_candidates: u64,
     pub blob_count: u64,
     pub blob_bytes: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReplayCandidate {
+    pub id: u32,
+    pub provenance: CatalogProvenance,
+    pub recovery_index: Option<u64>,
+    pub occurrence: u32,
+    pub metadata: serde_json::Value,
+    pub unit: Option<RecoveryUnit>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkerEvent {
+    pub kind: String,
+    pub attempt: u32,
+    pub category: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
@@ -72,6 +94,7 @@ pub struct DurableCatalogSink {
     active: Option<ActiveCandidate>,
     property: Option<ActiveProperty>,
     attachment: Option<ActiveAttachment>,
+    unit: Option<RecoveryUnit>,
 }
 
 struct ActiveCandidate {
@@ -171,6 +194,7 @@ impl DurableCatalogSink {
             active: None,
             property: None,
             attachment: None,
+            unit: None,
         })
     }
 
@@ -235,6 +259,7 @@ impl DurableCatalogSink {
             active: None,
             property: None,
             attachment: None,
+            unit: None,
         })
     }
 
@@ -247,6 +272,16 @@ impl DurableCatalogSink {
         self.connection
             .execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")?;
         sync_directory(&self.private_root)
+    }
+
+    pub fn abort_worker_attempt(&mut self) -> Result<(), JobError> {
+        self.property = None;
+        self.attachment = None;
+        self.unit = None;
+        if self.active.take().is_some() {
+            self.connection.execute_batch("ROLLBACK")?;
+        }
+        Ok(())
     }
 
     pub fn bind_source(&self, source: &JobSourceIdentity) -> Result<(), JobError> {
@@ -262,23 +297,126 @@ impl DurableCatalogSink {
         Ok(())
     }
 
+    pub fn bind_recovery_mode(&self, mode: &'static str) -> Result<(), JobError> {
+        if self.active.is_some() || !matches!(mode, "balanced" | "aggressive") {
+            return Err(JobError::EventSequence(
+                "cannot bind invalid recovery mode during an active candidate".to_owned(),
+            ));
+        }
+        self.connection.execute(
+            "INSERT INTO job_metadata(key, value) VALUES ('recovery_mode', ?1)",
+            [mode],
+        )?;
+        Ok(())
+    }
+
+    pub fn record_worker_supervision(
+        &self,
+        attempts: u32,
+        failures: u32,
+        exhausted: bool,
+    ) -> Result<(), JobError> {
+        if self.active.is_some() {
+            return Err(JobError::EventSequence(
+                "cannot record supervision during an active candidate".to_owned(),
+            ));
+        }
+        for (key, value) in [
+            ("worker_attempts", attempts.to_string()),
+            ("worker_failures", failures.to_string()),
+            ("worker_retries_exhausted", exhausted.to_string()),
+        ] {
+            self.connection.execute(
+                "INSERT OR REPLACE INTO job_metadata(key, value) VALUES (?1, ?2)",
+                params![key, value],
+            )?;
+        }
+        Ok(())
+    }
+
+    pub fn record_interrupted(&self) -> Result<(), JobError> {
+        if self.active.is_some() {
+            return Err(JobError::EventSequence(
+                "cannot record interruption during an active candidate".to_owned(),
+            ));
+        }
+        self.connection.execute(
+            "INSERT OR REPLACE INTO job_metadata(key, value) VALUES ('interrupted', 'true')",
+            [],
+        )?;
+        Ok(())
+    }
+
+    pub fn record_worker_event(
+        &self,
+        kind: &'static str,
+        attempt: u32,
+        category: &'static str,
+    ) -> Result<(), JobError> {
+        if self.active.is_some() || !matches!(kind, "started" | "failure") {
+            return Err(JobError::EventSequence(
+                "invalid worker supervision event".to_owned(),
+            ));
+        }
+        self.connection.execute(
+            "INSERT INTO worker_events(kind, attempt, category) VALUES (?1, ?2, ?3)",
+            params![kind, attempt, category],
+        )?;
+        Ok(())
+    }
+
+    pub fn worker_events(&self) -> Result<Vec<WorkerEvent>, JobError> {
+        let mut statement = self
+            .connection
+            .prepare("SELECT kind, attempt, category FROM worker_events ORDER BY sequence")?;
+        Ok(statement
+            .query_map([], |row| {
+                Ok(WorkerEvent {
+                    kind: row.get(0)?,
+                    attempt: row.get(1)?,
+                    category: row.get(2)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?)
+    }
+
+    pub fn record_isolated_unit(&self, unit: RecoveryUnit, failures: u32) -> Result<(), JobError> {
+        if self.active.is_some() {
+            return Err(JobError::EventSequence(
+                "cannot isolate a unit during an active candidate".to_owned(),
+            ));
+        }
+        self.connection.execute(
+            "INSERT OR REPLACE INTO isolated_units(unit_json, failures) VALUES (?1, ?2)",
+            params![serde_json::to_string(&unit)?, failures],
+        )?;
+        Ok(())
+    }
+
     pub fn summary(&self) -> Result<JobSummary, JobError> {
-        let (committed, complete, partial, unsupported) = self.connection.query_row(
-            "SELECT COUNT(*),\
+        let (committed, recovered, orphan, fragment, complete, partial, unsupported) =
+            self.connection.query_row(
+                "SELECT COUNT(*),\
+                    COALESCE(SUM(provenance = 'recovered'), 0),\
+                    COALESCE(SUM(provenance = 'orphan'), 0),\
+                    COALESCE(SUM(provenance = 'fragment'), 0),\
                     COALESCE(SUM(completeness = 'complete'), 0),\
                     COALESCE(SUM(completeness = 'partial'), 0),\
                     COALESCE(SUM(status = 'unsupported'), 0)\
              FROM candidates WHERE status IN ('spooled', 'unsupported')",
-            [],
-            |row| {
-                Ok((
-                    row.get::<_, u64>(0)?,
-                    row.get::<_, u64>(1)?,
-                    row.get::<_, u64>(2)?,
-                    row.get::<_, u64>(3)?,
-                ))
-            },
-        )?;
+                [],
+                |row| {
+                    Ok((
+                        row.get::<_, u64>(0)?,
+                        row.get::<_, u64>(1)?,
+                        row.get::<_, u64>(2)?,
+                        row.get::<_, u64>(3)?,
+                        row.get::<_, u64>(4)?,
+                        row.get::<_, u64>(5)?,
+                        row.get::<_, u64>(6)?,
+                    ))
+                },
+            )?;
         let (blob_count, blob_bytes) = self.connection.query_row(
             "SELECT COUNT(*), COALESCE(SUM(byte_len), 0) FROM blobs",
             [],
@@ -286,12 +424,67 @@ impl DurableCatalogSink {
         )?;
         Ok(JobSummary {
             committed_candidates: committed,
+            recovered_candidates: recovered,
+            orphan_candidates: orphan,
+            fragment_candidates: fragment,
             complete_candidates: complete,
             partial_candidates: partial,
             unsupported_candidates: unsupported,
             blob_count,
             blob_bytes,
         })
+    }
+
+    pub fn replay_candidates(&self) -> Result<Vec<ReplayCandidate>, JobError> {
+        let mut statement = self.connection.prepare(
+            "SELECT provenance, source_node_id, recovery_index, occurrence, metadata_json, recovery_unit_json \
+             FROM candidates \
+             WHERE status IN ('spooled', 'unsupported') ORDER BY rowid",
+        )?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Option<i64>>(1)?,
+                    row.get::<_, Option<i64>>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, Option<String>>(5)?,
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        rows.into_iter()
+            .map(
+                |(provenance, source_node_id, recovery_index, occurrence, metadata, unit)| {
+                    let provenance = match provenance.as_str() {
+                        "normal" => CatalogProvenance::Normal,
+                        "recovered" => CatalogProvenance::Recovered,
+                        "orphan" => CatalogProvenance::Orphan,
+                        "fragment" => CatalogProvenance::Fragment,
+                        other => {
+                            return Err(JobError::Integrity(format!(
+                                "invalid candidate provenance {other:?}"
+                            )));
+                        }
+                    };
+                    Ok(ReplayCandidate {
+                        id: source_node_id
+                            .map(u32::try_from)
+                            .transpose()
+                            .map_err(|_| JobError::Integrity("invalid source node id".to_owned()))?
+                            .unwrap_or(0),
+                        provenance,
+                        recovery_index: recovery_index.map(u64::try_from).transpose().map_err(
+                            |_| JobError::Integrity("invalid recovery index".to_owned()),
+                        )?,
+                        occurrence: u32::try_from(occurrence)
+                            .map_err(|_| JobError::Integrity("invalid occurrence".to_owned()))?,
+                        metadata: serde_json::from_str(&metadata)?,
+                        unit: unit.map(|value| serde_json::from_str(&value)).transpose()?,
+                    })
+                },
+            )
+            .collect()
     }
 
     fn start_candidate(
@@ -323,6 +516,7 @@ impl DurableCatalogSink {
             CatalogProvenance::Normal => "normal",
             CatalogProvenance::Recovered => "recovered",
             CatalogProvenance::Orphan => "orphan",
+            CatalogProvenance::Fragment => "fragment",
         };
         let source_node_id = (id != 0).then_some(i64::from(id));
         let occurrence = self.connection.query_row(
@@ -340,15 +534,18 @@ impl DurableCatalogSink {
         let result = self.connection.execute(
             "INSERT INTO candidates(\
                 item_key, provenance, source_node_id, recovery_index, occurrence,\
-                completeness, status, metadata_json\
-             ) VALUES (?1, ?2, ?3, ?4, ?5, 'damaged', 'pending', ?6)",
+                completeness, status, metadata_json, recovery_unit_json\
+             ) VALUES (?1, ?2, ?3, ?4, ?5, 'damaged', 'pending', ?6, ?7)",
             params![
                 key,
                 provenance,
                 source_node_id,
                 recovery_index,
                 occurrence,
-                serde_json::to_string(&metadata)?
+                serde_json::to_string(&metadata)?,
+                self.unit
+                    .map(|unit| serde_json::to_string(&unit))
+                    .transpose()?
             ],
         );
         if let Err(error) = result {
@@ -497,6 +694,7 @@ impl DurableCatalogSink {
     fn rollback(&mut self) {
         self.property = None;
         self.attachment = None;
+        self.unit = None;
         if self.active.take().is_some() {
             let _ = self.connection.execute_batch("ROLLBACK");
         }
@@ -512,6 +710,25 @@ impl CatalogSink for DurableCatalogSink {
 impl DurableCatalogSink {
     fn handle_event(&mut self, event: CatalogEvent<'_>) -> Result<(), JobError> {
         match event {
+            CatalogEvent::UnitStart(unit) => {
+                if self.active.is_some() {
+                    return Err(JobError::EventSequence(
+                        "recovery unit boundary occurred during a candidate".to_owned(),
+                    ));
+                }
+                if self.unit.replace(unit).is_some() {
+                    return Err(JobError::EventSequence(
+                        "recovery units cannot be nested".to_owned(),
+                    ));
+                }
+            }
+            CatalogEvent::UnitEnd(unit) => {
+                if self.active.is_some() || self.unit.take() != Some(unit) {
+                    return Err(JobError::EventSequence(
+                        "recovery unit ended out of sequence".to_owned(),
+                    ));
+                }
+            }
             CatalogEvent::Folder {
                 id,
                 parent_id,
@@ -843,7 +1060,8 @@ fn create_schema(connection: &Connection) -> Result<(), JobError> {
             occurrence INTEGER NOT NULL CHECK(occurrence >= 0),\
             completeness TEXT NOT NULL CHECK(completeness IN ('complete','partial','damaged')),\
             status TEXT NOT NULL CHECK(status IN ('pending','spooled','written','unsupported','failed')),\
-            metadata_json TEXT NOT NULL\
+            metadata_json TEXT NOT NULL,\
+            recovery_unit_json TEXT\
          ) STRICT;\
          CREATE TABLE blobs(\
             sha256 TEXT PRIMARY KEY CHECK(\
@@ -860,6 +1078,16 @@ fn create_schema(connection: &Connection) -> Result<(), JobError> {
             byte_len INTEGER CHECK(byte_len >= 0),\
             CHECK((blob_sha256 IS NULL) = (byte_len IS NULL)),\
             PRIMARY KEY(item_key, sequence)\
+         ) STRICT;\
+         CREATE TABLE worker_events(\
+            sequence INTEGER PRIMARY KEY AUTOINCREMENT,\
+            kind TEXT NOT NULL CHECK(kind IN ('started','failure')),\
+            attempt INTEGER NOT NULL CHECK(attempt > 0),\
+            category TEXT NOT NULL\
+         ) STRICT;\
+         CREATE TABLE isolated_units(\
+            unit_json TEXT PRIMARY KEY,\
+            failures INTEGER NOT NULL CHECK(failures > 0)\
          ) STRICT;",
     )?;
     Ok(())
@@ -1212,7 +1440,8 @@ mod tests {
     use sha2::{Digest, Sha256};
 
     use super::{
-        DurableCatalogSink, JobError, digest_hex, private_state_attributes_valid, write_hashed,
+        DurableCatalogSink, JobError, WorkerEvent, digest_hex, private_state_attributes_valid,
+        write_hashed,
     };
 
     struct PrefixThenError {
@@ -1283,11 +1512,17 @@ mod tests {
             (10, CatalogProvenance::Normal, None, Some(1)),
             (20, CatalogProvenance::Recovered, Some(4), None),
             (0, CatalogProvenance::Orphan, Some(7), None),
+            (30, CatalogProvenance::Fragment, Some(9), None),
         ] {
             message_start_with(&mut sink, id, provenance, recovery_index, folder_id)?;
             sink.event(CatalogEvent::MessageEnd { id, complete: true })?;
         }
         sink.checkpoint()?;
+        let summary = sink.summary()?;
+        assert_eq!(summary.committed_candidates, 4);
+        assert_eq!(summary.recovered_candidates, 1);
+        assert_eq!(summary.orphan_candidates, 1);
+        assert_eq!(summary.fragment_candidates, 1);
         drop(sink);
         let connection = Connection::open(job.join(".pstforge/job.sqlite3"))?;
         let mut statement = connection.prepare(
@@ -1325,6 +1560,12 @@ mod tests {
                     None,
                     Some(7)
                 ),
+                (
+                    "fragment:30:9:0".to_owned(),
+                    "fragment".to_owned(),
+                    Some(30),
+                    Some(9)
+                ),
             ]
         );
         Ok(())
@@ -1357,6 +1598,33 @@ mod tests {
                 row.get::<_, String>(0)
             })?;
         assert_eq!(status, "unsupported");
+        Ok(())
+    }
+
+    #[test]
+    fn worker_supervision_events_survive_reopen() -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempdir()?;
+        let job = directory.path().join("job");
+        let sink = DurableCatalogSink::create(&job)?;
+        sink.record_worker_event("started", 1, "parser")?;
+        sink.record_worker_event("failure", 1, "stall")?;
+        drop(sink);
+        let reopened = DurableCatalogSink::open(&job)?;
+        assert_eq!(
+            reopened.worker_events()?,
+            vec![
+                WorkerEvent {
+                    kind: "started".to_owned(),
+                    attempt: 1,
+                    category: "parser".to_owned(),
+                },
+                WorkerEvent {
+                    kind: "failure".to_owned(),
+                    attempt: 1,
+                    category: "stall".to_owned(),
+                },
+            ]
+        );
         Ok(())
     }
 

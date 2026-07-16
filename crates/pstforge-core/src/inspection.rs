@@ -352,6 +352,7 @@ mod tests {
                 messages: 12,
                 recovered_messages: 0,
                 orphan_messages: 0,
+                fragment_messages: 0,
                 recipients: 24,
                 attachments: 4,
                 embedded_messages: 1,
