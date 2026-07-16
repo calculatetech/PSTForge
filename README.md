@@ -1,8 +1,9 @@
 # PSTForge
 
 PSTForge is a Linux command-line utility for read-only inspection and eventual
-recovery of large or damaged Outlook PST files. Version 0.1.0 provides source
-identity protection, metadata inspection, and reachable folder/message counts.
+recovery of large or damaged Outlook PST files. Version 0.2.0 adds the internal
+Unicode PST writer foundation to the existing protected source inspection and
+complete reachable-mail inventory.
 
 ## Ubuntu Dependencies
 
@@ -44,6 +45,14 @@ PSTFORGE_CORPUS_MANIFEST=/absolute/external/manifest.toml \
 Real PST files and their manifest must remain outside the repository. Start
 from [`tests/corpus-manifest.example.toml`](tests/corpus-manifest.example.toml).
 The full gate verifies source hash and timestamps before and after both CLI
-commands, then reads each healthy milestone case with `pffinfo` and `readpst`.
+commands, creates a fresh one-folder/one-message Unicode PST without a runtime
+template, and reads generated and healthy corpus cases with `pffinfo` and
+`readpst`.
 Detailed logs are written under the ignored `.agent/test-results/` directory;
 independent-reader output is redacted because it can contain mailbox data.
+
+Writer developers can generate the 0.2.0 acceptance store directly:
+
+```bash
+cargo run -p pstforge-pst --example create_minimal -- /tmp/pstforge-smoke.pst
+```

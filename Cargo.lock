@@ -98,6 +98,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "72f5acc6cb2ba439de613abc23857ec3d78374d8ed5ac84e9d11336e87da8649"
 
 [[package]]
+name = "byteorder"
+version = "1.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1fd0f2584146f6f2ef48085050886acf353beff7305ebd1ae69500e27c67f64b"
+
+[[package]]
 name = "cc"
 version = "1.2.67"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -364,7 +370,7 @@ checksum = "68ab91017fe16c622486840e4c83c9a37afeff978bd239b5293d61ece587de66"
 
 [[package]]
 name = "libpff-sys"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "pkg-config",
  "thiserror",
@@ -450,7 +456,7 @@ dependencies = [
 
 [[package]]
 name = "pstforge-cli"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "clap",
  "pstforge-core",
@@ -464,13 +470,24 @@ dependencies = [
 
 [[package]]
 name = "pstforge-core"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "chrono",
  "libc",
  "libpff-sys",
  "serde",
  "sha2",
+ "tempfile",
+ "thiserror",
+ "tracing",
+]
+
+[[package]]
+name = "pstforge-pst"
+version = "0.2.0"
+dependencies = [
+ "byteorder",
+ "rustix",
  "tempfile",
  "thiserror",
  "tracing",
@@ -945,8 +962,9 @@ dependencies = [
 
 [[package]]
 name = "xtask"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
+ "pstforge-pst",
  "serde",
  "serde_json",
  "tempfile",

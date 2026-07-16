@@ -57,7 +57,58 @@ work. Hash and identity evidence show that the source was not modified.
   - [x] (2026-07-14) Passed the full gate on healthy ANSI and Unicode external
     PSTs, including source immutability plus independent `pffinfo` and
     `readpst` validation.
-- [ ] Milestone 0.2.0: Unicode PST Writer Foundation.
+- [x] (2026-07-15) Milestone 0.2.0: Unicode PST Writer Foundation.
+  - [x] (2026-07-14) Imported Microsoft `outlook-pst` 1.2.0 at pinned commit
+    `1397836e73b690dbb09663f66056012fced45ff9`, retained its MIT license, and
+    documented provenance in the separately licensed writer crate.
+  - [x] (2026-07-14) Added template-free version 23 creation for a compact
+    message store, name-to-ID map, root/IPM/deleted/mail folders, indexed
+    hierarchy, contents, and associated-contents tables, and one plain-text
+    message with an empty subnode tree.
+  - [x] (2026-07-14) Passed internal header/map/BBT/NBT/heap/property/table/CRC
+    and signature checks plus independent `pffinfo` and `readpst`; `readpst`
+    extracted nonempty message data from the generated store.
+  - [x] (2026-07-15) Imported the generated acceptance PST into a dedicated
+    Synology MailPlus test mailbox and recorded folder/message counts before
+    promotion. Candidate
+    `cbdc012d420203348dad202cecefc133e6050e5a3f8addb19abd7199a18aca31`
+    failed on 2026-07-15 with MailPlus `System error` and made Outlook terminate
+    with resource exhaustion; it is rejected and must not be promoted.
+    Corrected candidate
+    `aa57b675b36e2d45833ba2891d85f8fbff9ff61a108e7af36d5e8a7ddce54ddc`
+    imported but rendered trailing characters in the folder and subject, so it
+    is also rejected for display fidelity. Candidate
+    `bc82dfbc5ec6fe684d4799903b28ed89c16fa052a8687dd22ad8239ec5178312`
+    reproduced both trailing characters and Outlook resource exhaustion on
+    2026-07-15 and is rejected. Candidate
+    `2ab18ffe2608895d38eb816424570b65728107f3e1f724335cae8c1c754f2009`
+    passed the complete local and external-corpus gate and imported into
+    MailPlus with exact folder/subject text, but Outlook still exhausted
+    resources; it is rejected. Candidate
+    `a68d52de1badaaba5225df300436cdc52035ef572a97577f51ab753da3c5f964`
+    corrects the density-list/header BID mismatch but retains the broader r4
+    Messaging-layer defects exposed by `scanpst`; it is superseded without
+    promotion. Candidate
+    `ffd03ea2c3cf195ce47f6962d3428e0fad3459e00dabf08acb94dcf34f466fec`
+    incorporated the first `scanpst`-driven structural rewrite; its r6 log
+    proved the NDB layer clean but exposed a row-ordering defect and missing
+    Outlook maintenance objects, so it is superseded. Candidate
+    `2bc7b7a75874bf4de5b046fcc2433a0b8e22e1729a238830c0a1f058e49804ca`
+    matched the repaired r6 top-level node graph but retained four Messaging-
+    layer schema/row diagnostics, so it is superseded. Candidate
+    `14314f094fc636834fb78dca33f45a7bdea6e87b55551346b9c0eb6eeafaf118`
+    corrected the r8 findings but retained the contents-row mismatch, so it is
+    superseded. Candidate
+    `0a26f87d3b2086d35a864f4cb39f26d25bc75f9edbdf2fada382af73b09b77d9`
+    corrected the replication-property mapping but reproduced the same
+    contents-row mismatch; it is rejected. The next candidate is blocked on a
+    clean-context review and full gate after replacing heuristic message size
+    with the checked serialized size. Candidate
+    `4256ee7e02c60d8372e08719e2eb76f964004283d84db086ce086f58eabe9c7b`
+    passed a clean-context adversarial review with no blocker/high findings and
+    the current-source full gate. Its detailed `scanpst` log is clean with no
+    errors, repairs, or recovered objects; the unchanged file opened normally in
+    Outlook without resource exhaustion and imported perfectly into MailPlus.
 - [ ] Milestone 0.2.1: Mail-Fidelity PST Writer.
 - [ ] Milestone 0.3.0: Recoverable Mail Pipeline.
 - [ ] Milestone 0.3.1: Fault-Isolated Recovery.
@@ -146,6 +197,167 @@ work. Hash and identity evidence show that the source was not modified.
   passed PSTForge, `file`, `pffinfo`, and `readpst` classification/reading.
   Evidence: header classification, file inspection, and the 0.1.1 full gate on
   2026-07-14.
+
+- Observation: `readpst` and Microsoft's reader accept an empty name-to-ID
+  property context, but `libpff` refuses to open the store unless the entry and
+  GUID streams contain data. A minimal MAPI named-property entry and PS_MAPI
+  GUID stream satisfy all three readers without copying a template store.
+  Evidence: rejected and accepted generated-store runs in the 0.2.0 full-gate
+  evidence on 2026-07-14.
+
+- Observation: Microsoft `outlook-pst` 1.2.0 holds the PST reader mutex while
+  `root_hierarchy_table` opens a table context, which tries to acquire the same
+  mutex and deadlocks. Microsoft's commit
+  `d0f9f00110990f596ea6449c078640dc5bbf294e` fixes this after the pinned
+  release; PSTForge backports that exact lock-scope correction and tests the
+  path against every generated acceptance store.
+  Evidence: the new writer round-trip test hung before the backport and passes
+  after it on 2026-07-14; provenance is recorded in the writer crate's
+  `UPSTREAM.md`.
+
+- Observation: `pffinfo`, `readpst`, and Microsoft's adapted reader accepted a
+  store whose root folder was its own NBT parent, whose advertised folder and
+  message counts had no corresponding table rows, and whose density list
+  overstated free allocation slots. MailPlus rejected that candidate with
+  `System error`, while Outlook crashed with an out-of-memory or system-resource
+  error consistent with cyclic traversal. The writer now emits an acyclic root,
+  independent indexed hierarchy/contents tables, and matching AMap/DList free
+  counts; tests traverse the complete folder/message path and cross-check the
+  allocation metadata.
+  Evidence: human MailPlus and Outlook smoke results reported 2026-07-15, known-
+  good external table schemas, and the corrected writer structural tests.
+
+- Observation: PST heap allocations for PtypString values are length-delimited
+  in both property and table contexts. Known-good Outlook-compatible folder
+  property and hierarchy-table allocations each store `Top of Personal
+  Folders` as exactly 46 UTF-16LE bytes with no trailing null. PSTForge retained
+  a null in the property context after correcting only the table path, so the
+  third candidate reproduced MailPlus's `_` folder and `€` subject suffixes.
+  Both serialization paths now share the exact-length encoding and regression
+  coverage.
+  Evidence: raw heap-allocation comparison against the external Aspose Unicode
+  store and human MailPlus display results for the second and third candidates
+  on 2026-07-15.
+
+- Observation: The rejected generated stores left `bidUnused`, `dwUnique`, and
+  every `rgnid` creation counter at zero/default values and marked density-list
+  backfill incomplete. Microsoft-created stores use the required fixed
+  `bidUnused` value, advance each node-type counter beyond emitted nodes, assign
+  a nonzero unique value, and mark completed allocation metadata accordingly.
+  The writer now emits those creation-state invariants, balances NBT leaf
+  occupancy, and validates their raw header and density-list representation.
+  Evidence: raw header/density-list comparison against Microsoft sample-header
+  values and an Outlook-created external PST, plus writer regression tests on
+  2026-07-15.
+
+- Observation: The density-list page trailer BID MUST equal the header's
+  `bidNextP`. Every Outlook-created and third-party control store satisfies this
+  invariant, but all four rejected PSTForge candidates used the fixed density-
+  list file offset `0x4200` as its trailer BID while the header advertised
+  `0x104`. The adapted reader treats that mismatch as a missing or corrupt
+  density list and initializes allocation-map backfill; Outlook's repeated
+  resource exhaustion is consistent with taking that recovery path. The writer
+  now uses the same next-page BID in both locations and tests the serialized
+  equality.
+  Evidence: raw header/trailer comparison against Outlook and Aspose control
+  stores, adapted reader recovery logic, and the r4 Outlook result on
+  2026-07-15.
+
+- Observation: Outlook `scanpst` identified the complete r4 defect set rather
+  than a single allocation-metadata error. The report found a zero-entry
+  SLBLOCK, a non-null HNID for an empty Name-to-ID string stream, an unaligned
+  heap page map, absent password/search/template/queue objects, incomplete
+  hierarchy/contents/FAI schemas on every folder, and an unreadable contents
+  table that made the folder's stored message count disagree with traversal.
+  The writer now emits an aligned HN, a one-entry recipient subnode, null HNID
+  for empty data, all six MS-PST 2.7 fixed templates, the search queues and
+  minimum Search Root/spam hierarchy, complete `scanpst` column sets, and the
+  required zero-valued PST password property. The specification-required root
+  self-parent is restored; folder traversal uses hierarchy rows rather than NBT
+  parent recursion.
+  Evidence: `v0.2.0-mailplus-r4.log`, SHA-256
+  `245c1c4cce87c3754383e44de5f6c843495a423897e7eeb32201a3e8598d3d3b`,
+  Microsoft MS-PST 11.2 section 2.7, and expanded writer regression tests on
+  2026-07-15.
+
+- Observation: The r6 `scanpst` report contains no header, AMap, BBT, NBT,
+  refcount, high-water-mark, heap, or low-level block errors. Its root hierarchy
+  BTH was instead serialized in display order (`8022`, `8042`, `2223`) rather
+  than ascending RowID order, which caused cascading missing-column, folder,
+  and `PR_SUBFOLDERS` diagnoses. The writer now sorts every TC row set before
+  emitting both its BTH leaf and row matrix. It also mirrors the repaired r6
+  graph of 42 top-level nodes and 27 blocks: receive/outgoing tables, persisted
+  index templates, search update/criteria/contents objects, SAL, and the
+  reserved HMP. The message PC now carries the delivery time copied into its
+  contents row. The repaired file retains ScanPST's synthetic `EC1`
+  search-folder/update-queue warning, which is not treated as a PSTForge data
+  loss defect.
+  Evidence: `v0.2.0-mailplus-r6.log`, SHA-256
+  `06e56855951c7fd1205e26601882c2f49bcac357d553172319e2a28a87d80340`,
+  repaired r6 SHA-256
+  `ff4d322ab9fac68b09ddee6e1e1ce04f18c31ce6615a258971415d920e83006f`,
+  NBT/BBT and payload comparison, and full-gate evidence
+  `.agent/test-results/1784153468-full` on 2026-07-15.
+
+- Observation: The r8 report reduced ScanPST recovery to an absent empty-string
+  default receive class, two incorrect outgoing-queue descriptors, one missing
+  search-index descriptor, message instance metadata absent from the contents
+  row, and the informational SDO deletion. The receive class is now an empty
+  Unicode value with null HNID; the outgoing table uses `00390040` and
+  `0E140003`; the search-index template includes `0E3E0102`; and the contents
+  row carries the same `0E30`, `0E33`, and `0E34` instance metadata generated
+  in the repaired r6 reference. Regression tests fix these tag/type/value
+  contracts.
+  Evidence: `v0.2.0-mailplus-r8.log`, SHA-256
+  `19fde0ee65d030b47f017458d916b0dd408508bc511037efce0d0fb1bf56c767`,
+  repaired-r6 row payload comparison, and full-gate evidence
+  `.agent/test-results/1784154040-full` on 2026-07-15.
+
+- Observation: The r9 and r10 reports both contain only the contents-row
+  mismatch and ScanPST's informational SDO deletion. Correcting the replication
+  property mapping did not change the diagnostic. A clean-context adversarial
+  review then found that both the message PC and row used the same heuristic
+  size (`325`) rather than the bytes consumed by the serialized message. The
+  writer now computes one checked size from the PC plus recipient table (`556`
+  for the compact fixture) and places it in both objects. The value differs from
+  repaired r6's `558` because ScanPST retained one two-byte free heap-map entry.
+  The same review found that publication lacked a pre-rename reopen/validation
+  and parent-directory `fsync`; both are now required by the writer path.
+  Evidence: `v0.2.0-mailplus-r9.log`, SHA-256
+  `d1c51a1795f5159e783377fde75a2273de9d73cedbc8744795e4f6c155487a4f`,
+  `v0.2.0-mailplus-r10.log`, SHA-256
+  `d1c51a1795f5159e783377fde75a2273de9d73cedbc8744795e4f6c155487a4f`,
+  repaired-r6 row/heap comparison, and clean-context adversarial review on
+  2026-07-15.
+
+- Observation: The post-r10 clean-context review found and resolved two writer
+  publication defects unrelated to the ScanPST row: internal validation did not
+  run before rename, and `tempfile::persist_noclobber` can fall back from atomic
+  `renameat2(RENAME_NOREPLACE)` to link/unlink. The writer now reopens and checks
+  the completed temporary store, uses safe `rustix` no-replace rename with no
+  fallback, syncs the parent directory, and distinguishes a published output
+  whose directory sync failed. A subsequent clean-context review found no
+  blocker/high issue and authorized the full gate. The remaining medium test
+  gaps now directly exercise the rename `EEXIST` branch, destination
+  preservation, temporary-file retention, and the explicit published-but-
+  durability-unknown outcome after a forced directory-sync failure.
+  Evidence: focused writer tests and strict Clippy, clean-context reviews on
+  2026-07-15, and full-gate evidence
+  `.agent/test-results/1784160850-full`.
+
+- Observation: ScanPST's r11 GUI reported the generic summary "minor
+  inconsistencies" and offered optional repair, but its detailed log contains
+  no `!!` error, no `??` repair, no orphan recovery, and no failed NDB or
+  Messaging-layer phase. Running the optional repair can add synthetic Outlook
+  maintenance state and produce a subsequent diagnostic, so the repaired copy
+  is not evidence against the original. The byte-identical, unrepaired r11 PST
+  is the only acceptance artifact; do not run repair before Outlook or MailPlus
+  testing.
+  Evidence: `v0.2.0-mailplus-r11.log`, SHA-256
+  `29b6cd78feb3e2a91de8bc37392373cff71e0d623f9c409f0dc9ebd73062f398`,
+  and r11 PST SHA-256
+  `4256ee7e02c60d8372e08719e2eb76f964004283d84db086ce086f58eabe9c7b`
+  on 2026-07-15.
 
 ## Decision Log
 
@@ -245,6 +457,19 @@ work. Hash and identity evidence show that the source was not modified.
   not mistake a capped diagnostic list for a clean scan.
   Date/Author: 2026-07-14 / Codex.
 
+- Decision: Version 0.2.0 emits a compact single-leaf BBT and a two-leaf NBT
+  beneath an intermediate root. Folder and message discovery is represented
+  consistently in both acyclic NBT parent identifiers and independent
+  hierarchy/contents table rows; every folder also has an associated-contents
+  node. The writer always serializes a nonempty minimal name-to-ID map for
+  `libpff` interoperability.
+  Rationale: The foundation must prove every PST layer and independent import
+  without carrying opaque template bytes. Keeping the first graph within leaf
+  capacities makes CRC, allocation, and relationship review tractable; leaf
+  split boundaries and the serialized intermediate-root traversal are tested
+  before the arbitrary-mail expansion.
+  Date/Author: 2026-07-14 / Codex.
+
 ## Outcomes & Retrospective
 
 Version 0.1.0 now lets an operator inspect a healthy PST in human or JSON form
@@ -268,6 +493,25 @@ identity metadata, and access/modify times unchanged. `pffinfo` and `readpst`
 also accepted every promoted corpus case. Damaged-item recovery and
 fault-isolated continuation remain 0.3.x work rather than being silently
 claimed by this healthy-inventory milestone.
+
+Version 0.2.0 reached its human interoperability gate with unrepaired candidate
+r11: its detailed ScanPST log is clean, Outlook opens it without resource
+exhaustion, and MailPlus imports the exact folder and message. Earlier, the
+first candidate was rejected after
+MailPlus reported `System error` and Outlook exhausted resources; no commit or
+merge was made. A second candidate imported but failed exact folder/subject
+display fidelity. A third candidate retained the same property-context string
+defect and still exhausted Outlook resources, exposing invalid initial header
+counters and allocation backfill state. The corrected adapted MIT crate creates
+a Unicode v23 store from
+typed structures, not a template, with compressible permutation encoding,
+valid header and page CRCs, block signatures, consistent allocation maps and
+density lists, leaf BBT/NBT, indexed property/table heaps, required folders,
+and one plain-text message. No milestone commit or merge is permitted until
+MailPlus confirms the folder and message import without Outlook resource
+  failure. The post-acceptance clean-context review found no unresolved blocker,
+  high, or medium issue, and the final current-source full gate passed with both
+  required healthy ANSI and Unicode external cases.
 
 ## Context and Orientation
 

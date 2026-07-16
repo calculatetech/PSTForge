@@ -1,0 +1,16 @@
+[package]
+name = "pstforge-pst"
+description = "Unicode PST writer adapted from Microsoft outlook-pst"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+license = "MIT"
+publish = false
+
+[dependencies]
+byteorder.workspace = true
+rustix.workspace = true
+tempfile.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
