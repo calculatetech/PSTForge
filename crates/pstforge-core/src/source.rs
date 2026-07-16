@@ -133,6 +133,10 @@ impl SourceFile {
     }
 
     pub fn verify_unchanged(&self) -> Result<(), SourceError> {
+        self.verify_unchanged_observing(|_| {})
+    }
+
+    fn verify_unchanged_observing(&self, observer: impl FnMut(u64)) -> Result<(), SourceError> {
         let fd_metadata = self
             .file
             .metadata()
@@ -144,6 +148,23 @@ impl SourceFile {
         if path_metadata.file_type().is_symlink()
             || self.stat != StatIdentity::from(&fd_metadata)
             || self.stat != StatIdentity::from(&path_metadata)
+        {
+            return Err(SourceError::Changed(self.path.clone()));
+        }
+        if hash_file_at_observing(&self.file, &self.path, observer)? != self.identity.sha256 {
+            return Err(SourceError::Changed(self.path.clone()));
+        }
+        let final_fd_metadata = self
+            .file
+            .metadata()
+            .map_err(|source| io("final recheck of open", &self.path, source))?;
+        let final_path_metadata = self
+            .path
+            .symlink_metadata()
+            .map_err(|source| io("final recheck of path", &self.path, source))?;
+        if final_path_metadata.file_type().is_symlink()
+            || self.stat != StatIdentity::from(&final_fd_metadata)
+            || self.stat != StatIdentity::from(&final_path_metadata)
         {
             return Err(SourceError::Changed(self.path.clone()));
         }
@@ -190,6 +211,14 @@ fn canonicalize_existing_ancestor(path: &Path) -> Result<PathBuf, SourceError> {
 }
 
 fn hash_file_at(file: &File, path: &Path) -> Result<String, SourceError> {
+    hash_file_at_observing(file, path, |_| {})
+}
+
+fn hash_file_at_observing(
+    file: &File,
+    path: &Path,
+    mut observer: impl FnMut(u64),
+) -> Result<String, SourceError> {
     use std::os::unix::fs::FileExt;
 
     let mut hasher = Sha256::new();
@@ -206,6 +235,7 @@ fn hash_file_at(file: &File, path: &Path) -> Result<String, SourceError> {
         offset = offset
             .checked_add(u64::try_from(read).map_err(|_| SourceError::Changed(path.to_path_buf()))?)
             .ok_or_else(|| SourceError::Changed(path.to_path_buf()))?;
+        observer(offset);
     }
     Ok(format!("{:x}", hasher.finalize()))
 }
@@ -262,6 +292,28 @@ mod tests {
             source.verify_unchanged(),
             Err(SourceError::Changed(_))
         ));
+        Ok(())
+    }
+
+    #[test]
+    fn final_identity_check_detects_same_size_change_to_hashed_region()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempdir()?;
+        let path = directory.path().join("mail.pst");
+        let original = vec![0_u8; super::HASH_BUFFER_SIZE * 2];
+        fs::write(&path, &original)?;
+        let source = SourceFile::open(&path)?;
+        let mut changed = original;
+        changed[0] = 1;
+        let mut injected = false;
+        let result = source.verify_unchanged_observing(|offset| {
+            if !injected && offset == super::HASH_BUFFER_SIZE as u64 {
+                fs::write(&path, &changed).expect("inject same-size source mutation");
+                injected = true;
+            }
+        });
+        assert!(injected);
+        assert!(matches!(result, Err(SourceError::Changed(_))));
         Ok(())
     }
 

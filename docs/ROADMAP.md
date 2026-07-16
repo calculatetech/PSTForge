@@ -48,7 +48,9 @@ permits.
 Add normal, deleted, recovered, and orphan item extraction through `libpff`.
 Record how every candidate was found, how complete its content is, and what was
 written. Demonstrate that one damaged message or attachment does not stop
-unrelated mail from reaching the durable recovery spool.
+unrelated mail from reaching a private transactional ledger and
+content-addressed recovery spool. Expose balanced recovery as a durable job;
+PST part creation remains 0.4.0.
 
 ### 6. Version 0.3.1 - Fault-Isolated Recovery
 
@@ -67,8 +69,8 @@ clearly marked oversize part.
 
 ### 8. Version 0.4.1 - Resume and 50 GB Qualification
 
-Add a transactional job ledger, private recovery spool, explicit compatible
-resume, graceful interruption, progress, disk-space checks, and cleanup. Run
+Extend the transactional job ledger and private recovery spool with explicit
+compatible resume, graceful interruption, progress, disk-space checks, and cleanup. Run
 the real 50 GB corrupt PST end to end and show that forced termination cannot
 damage the source or already finalized parts.
 

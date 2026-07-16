@@ -15,7 +15,7 @@ fn main() -> ExitCode {
     let mut output = stdout.lock();
     match pstforge_cli::execute(&cli, &mut output) {
         Ok(CommandStatus::Complete) => ExitCode::SUCCESS,
-        Ok(CommandStatus::SourceIncomplete) => ExitCode::from(3),
+        Ok(CommandStatus::Partial) => ExitCode::from(1),
         Err(run_error) => {
             error!(error = %run_error, "command failed");
             eprintln!("pstforge: {run_error}");

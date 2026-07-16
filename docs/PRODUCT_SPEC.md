@@ -63,6 +63,22 @@ classes, raw-property and payload byte totals, the peak stream chunk, and a
 capped issue list with an omitted-issue count. Version 0.1.1 emits inspection
 schema `1.1.0`; absent recovery scans remain `null`, never zero.
 
+### `pstforge recover <source.pst> --output <job-dir> [--json]`
+
+Version 0.3.0 exposes balanced recovery as an operator-visible checkpoint.
+It processes reachable mail first, invokes `libpff` deleted-item recovery with
+the balanced flag set, then enumerates recovered and orphan collections. Every
+emitted candidate records provenance, source node identifier when available,
+recovery index, occurrence, completeness, status, private metadata, and
+content-addressed payloads in a bundled-SQLite WAL job under
+`<job-dir>/.pstforge`.
+
+This command creates durable canonical recovery input, not importable PST
+parts. A fresh invocation refuses a nonempty job directory. It verifies the
+held source identity and SHA-256 before and after native parsing. Exit status
+`1` means the ledger is usable but one or more candidates or substreams are
+partial; output/durable-state failure is `4`.
+
 ### `pstforge split <source.pst> --output <job-dir> [OPTIONS]`
 
 `split` is the primary command. Its stable 1.0 options are:

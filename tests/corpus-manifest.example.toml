@@ -13,6 +13,9 @@ minimum_recipients = 0
 minimum_attachments = 0
 minimum_raw_properties = 1
 maximum_peak_stream_chunk_bytes = 65536
+milestone_0_3 = false
+minimum_recovered_items = 0
+minimum_orphan_items = 0
 
 [[cases]]
 name = "healthy-ansi-small"
@@ -27,3 +30,6 @@ minimum_recipients = 0
 minimum_attachments = 0
 minimum_raw_properties = 1
 maximum_peak_stream_chunk_bytes = 65536
+milestone_0_3 = false
+minimum_recovered_items = 0
+minimum_orphan_items = 0

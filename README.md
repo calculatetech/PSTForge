@@ -1,10 +1,10 @@
 # PSTForge
 
-PSTForge is a Linux command-line utility for read-only inspection and eventual
-recovery of large or damaged Outlook PST files. Version 0.2.1 extends the
-template-free Unicode PST writer with mail-fidelity structures for recipients,
-text/HTML/RTF bodies, headers, attachments, embedded messages, named
-properties, and safely serializable raw properties.
+PSTForge is a Linux command-line utility for recovery of large or damaged
+Outlook PST files. Version 0.3.0 adds balanced normal, recovered, and orphan
+mail extraction into a private transactional job spool. The accepted 0.2.1
+writer provides the template-free mail-fidelity PST structures used by later
+size-limited packing milestones.
 
 ## Ubuntu Dependencies
 
@@ -26,6 +26,7 @@ The project MSRV is Rust 1.85.
 cargo run -p pstforge-cli -- info /data/mail.pst
 cargo run -p pstforge-cli -- info /data/mail.pst --json
 cargo run -p pstforge-cli -- verify /data/mail.pst --mode full
+cargo run -p pstforge-cli -- recover /data/mail.pst --output /data/recovery-job
 ```
 
 PSTForge refuses source symlinks and opens the source with Linux read-only,
@@ -34,6 +35,13 @@ no-follow, no-atime flags. `info` hashes the file and reports format metadata.
 bodies, raw properties, attachments, and embedded-message relationships. It
 reports byte totals and the peak stream chunk without retaining an unbounded
 property or attachment in memory.
+
+`recover` traverses reachable mail first, invokes balanced `libpff` recovery,
+then spools recovered and orphan candidates. It creates a private SQLite ledger
+and content-addressed blobs under `OUTPUT/.pstforge`; it does not yet create
+importable PST parts. A fresh run refuses a nonempty output directory. Exit
+status `1` means durable candidates were produced but some source content was
+partial or damaged.
 
 ## Local Gates
 
@@ -45,8 +53,8 @@ PSTFORGE_CORPUS_MANIFEST=/absolute/external/manifest.toml \
 
 Real PST files and their manifest must remain outside the repository. Start
 from [`tests/corpus-manifest.example.toml`](tests/corpus-manifest.example.toml).
-The full gate verifies source hash and timestamps before and after both CLI
-commands, creates a rich Unicode PST without a runtime template, round-trips it
+The full gate verifies source hash and timestamps before and after inspection
+and recovery commands, creates a rich Unicode PST without a runtime template, round-trips it
 through `libpff`, `pffinfo`, and independent `readpst`, and validates healthy
 external corpus cases.
 Detailed logs are written under the ignored `.agent/test-results/` directory;

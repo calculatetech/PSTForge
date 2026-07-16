@@ -34,6 +34,95 @@ struct Case {
     minimum_raw_properties: u64,
     #[serde(default = "default_peak_chunk_limit")]
     maximum_peak_stream_chunk_bytes: u64,
+    #[serde(default)]
+    milestone_0_3: bool,
+    #[serde(default)]
+    minimum_recovered_items: u64,
+    #[serde(default)]
+    minimum_orphan_items: u64,
+}
+
+#[test]
+#[ignore = "requires PSTFORGE_CORPUS_MANIFEST with external real PST files"]
+fn milestone_0_3_external_recovery_spools_without_mutation()
+-> Result<(), Box<dyn std::error::Error>> {
+    let manifest_path = std::env::var_os("PSTFORGE_CORPUS_MANIFEST")
+        .ok_or("PSTFORGE_CORPUS_MANIFEST is required")?;
+    let manifest: Manifest = toml::from_str(&fs::read_to_string(&manifest_path)?)?;
+    if manifest.schema_version != 1 {
+        return Err(format!("unsupported corpus schema {}", manifest.schema_version).into());
+    }
+    let cases: Vec<&Case> = manifest
+        .cases
+        .iter()
+        .filter(|case| case.milestone_0_3 || case.classification == "damaged")
+        .collect();
+    if cases.is_empty() {
+        return Err("manifest has no milestone_0_3 or damaged cases".into());
+    }
+
+    for case in cases {
+        let before_metadata = fs::metadata(&case.path)?;
+        let before_hash = pstforge_core::SourceFile::open(&case.path)?
+            .identity()
+            .sha256
+            .clone();
+        if before_hash != case.sha256 {
+            return Err(format!("{} SHA-256 does not match its manifest", case.name).into());
+        }
+        let directory = tempfile::tempdir()?;
+        let job = directory.path().join("job");
+        let output = Command::new(env!("CARGO_BIN_EXE_pstforge"))
+            .arg("recover")
+            .arg(&case.path)
+            .arg("--output")
+            .arg(&job)
+            .arg("--json")
+            .arg("--color")
+            .arg("never")
+            .output()?;
+        if !output.status.success() && output.status.code() != Some(1) {
+            return Err(format!(
+                "recover failed for {}: {}",
+                case.name,
+                String::from_utf8_lossy(&output.stderr)
+            )
+            .into());
+        }
+        let report: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+        let normal = report["normal_items"].as_u64().unwrap_or_default();
+        let recovered = report["recovered_items"].as_u64().unwrap_or_default();
+        let orphan = report["orphan_items"].as_u64().unwrap_or_default();
+        let committed = report["committed_candidates"].as_u64().unwrap_or_default();
+        if normal < case.minimum_messages
+            || recovered < case.minimum_recovered_items
+            || orphan < case.minimum_orphan_items
+            || committed != normal + recovered + orphan
+        {
+            return Err(format!(
+                "{} recovery totals violate manifest expectations",
+                case.name
+            )
+            .into());
+        }
+        if !job.join(".pstforge/job.sqlite3").is_file() {
+            return Err(format!("{} did not produce a durable job ledger", case.name).into());
+        }
+
+        let after_metadata = fs::metadata(&case.path)?;
+        let after_hash = pstforge_core::SourceFile::open(&case.path)?
+            .identity()
+            .sha256
+            .clone();
+        if before_hash != after_hash
+            || before_metadata.len() != after_metadata.len()
+            || modified_ns(&before_metadata)? != modified_ns(&after_metadata)?
+            || accessed_ns(&before_metadata) != accessed_ns(&after_metadata)
+        {
+            return Err(format!("{} changed during recovery", case.name).into());
+        }
+    }
+    Ok(())
 }
 
 #[test]

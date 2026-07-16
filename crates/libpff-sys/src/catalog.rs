@@ -14,6 +14,13 @@ const MAX_MESSAGES: u64 = 100_000_000;
 const MAX_EMBEDDED_DEPTH: u32 = 64;
 const MAX_CATALOG_ISSUES: usize = 10_000;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CatalogProvenance {
+    Normal,
+    Recovered,
+    Orphan,
+}
+
 const MESSAGE_CLASS: u32 = 0x001a;
 const SUBJECT: u32 = 0x0037;
 const SENDER_NAME: u32 = 0x0c1a;
@@ -55,7 +62,9 @@ pub enum CatalogEvent<'a> {
     },
     MessageStart {
         id: u32,
-        folder_id: u32,
+        provenance: CatalogProvenance,
+        recovery_index: Option<u64>,
+        folder_id: Option<u32>,
         parent_message_id: Option<u32>,
         parent_attachment_index: Option<u32>,
         item_type: Option<u8>,
@@ -87,12 +96,20 @@ pub enum CatalogEvent<'a> {
         index: u32,
         bytes: &'a [u8],
     },
+    AttachmentEnd {
+        message_id: u32,
+        index: u32,
+    },
     PropertyStart(PropertyDescriptor),
     PropertyData {
         descriptor: PropertyDescriptor,
         bytes: &'a [u8],
     },
     PropertyEnd(PropertyDescriptor),
+    PropertyAbort {
+        descriptor: PropertyDescriptor,
+        reason: String,
+    },
     MessageEnd {
         id: u32,
         complete: bool,
@@ -114,6 +131,8 @@ pub struct CatalogIssue {
 pub struct RawCatalog {
     pub folders: u64,
     pub messages: u64,
+    pub recovered_messages: u64,
+    pub orphan_messages: u64,
     pub recipients: u64,
     pub attachments: u64,
     pub embedded_messages: u64,
@@ -137,6 +156,50 @@ impl RawCatalog {
 
 impl PffFile {
     pub fn catalog(&self, sink: &mut dyn CatalogSink) -> Result<RawCatalog, PffError> {
+        self.catalog_reachable(sink).map(|(catalog, _)| catalog)
+    }
+
+    pub fn recovery_catalog(&mut self, sink: &mut dyn CatalogSink) -> Result<RawCatalog, PffError> {
+        let (mut catalog, mut visited_messages) = match self.catalog_reachable(sink) {
+            Ok(reachable) => reachable,
+            Err(
+                error @ (PffError::Native { .. }
+                | PffError::MissingRootFolder
+                | PffError::NullPointer { .. }),
+            ) => {
+                let mut catalog = RawCatalog::default();
+                catalog.record_issue(catalog_issue(None, "traverse normal folder tree", error));
+                (catalog, HashSet::new())
+            }
+            Err(error) => return Err(error),
+        };
+        let mut error = ptr::null_mut();
+        // SAFETY: self.raw is an open file. Balanced recovery uses no aggressive flags.
+        let result = unsafe { bindings::libpff_file_recover_items(self.raw, 0, &mut error) };
+        check_one(result, error, "recover items")?;
+        self.stream_recovery_collection(
+            CatalogProvenance::Recovered,
+            bindings::libpff_file_get_number_of_recovered_items,
+            bindings::libpff_file_get_recovered_item_by_index,
+            &mut visited_messages,
+            sink,
+            &mut catalog,
+        )?;
+        self.stream_recovery_collection(
+            CatalogProvenance::Orphan,
+            bindings::libpff_file_get_number_of_orphan_items,
+            bindings::libpff_file_get_orphan_item_by_index,
+            &mut visited_messages,
+            sink,
+            &mut catalog,
+        )?;
+        Ok(catalog)
+    }
+
+    fn catalog_reachable(
+        &self,
+        sink: &mut dyn CatalogSink,
+    ) -> Result<(RawCatalog, HashSet<u32>), PffError> {
         let root = self.root_folder()?;
         let mut catalog = RawCatalog::default();
         let mut folders = vec![(root, None)];
@@ -144,8 +207,14 @@ impl PffFile {
         let mut visited_messages = HashSet::new();
 
         while let Some((folder, parent_id)) = folders.pop() {
-            let folder_id = folder.identifier()?;
-            if !visited_folders.insert(folder_id) {
+            let folder_id = match folder.identifier() {
+                Ok(folder_id) => folder_id,
+                Err(error) => {
+                    record_item_issue(&mut catalog, None, "get folder identifier", error)?;
+                    continue;
+                }
+            };
+            if stable_identifier_seen(&visited_folders, folder_id) {
                 catalog.record_issue(CatalogIssue {
                     node_id: Some(folder_id),
                     operation: "traverse folder",
@@ -154,48 +223,186 @@ impl PffFile {
                 continue;
             }
             catalog.folders = checked_increment(catalog.folders, "folder count", 1_000_000)?;
+            let name = match folder.folder_name() {
+                Ok(name) => name,
+                Err(error) => {
+                    record_item_issue(&mut catalog, Some(folder_id), "get folder name", error)?;
+                    None
+                }
+            };
             emit(
                 sink,
                 "folder metadata",
                 CatalogEvent::Folder {
                     id: folder_id,
                     parent_id,
-                    name: folder.folder_name()?,
+                    name,
                 },
             )?;
-            stream_item_properties(
+            mark_stable_identifier(&mut visited_folders, folder_id);
+            if let Err(error) = stream_item_properties(
                 &folder,
                 PropertyOwner::Folder(folder_id),
                 sink,
                 &mut catalog,
-            )?;
+            ) {
+                record_item_issue(
+                    &mut catalog,
+                    Some(folder_id),
+                    "stream folder properties",
+                    error,
+                )?;
+            }
 
-            let message_count = folder.sub_message_count()?;
+            let message_count = match folder.sub_message_count() {
+                Ok(count) => count,
+                Err(error) => {
+                    record_item_issue(
+                        &mut catalog,
+                        Some(folder_id),
+                        "count folder messages",
+                        error,
+                    )?;
+                    0
+                }
+            };
             for index in 0..message_count {
+                let item = match folder.sub_message(index) {
+                    Ok(item) => item,
+                    Err(error) => {
+                        record_item_issue(
+                            &mut catalog,
+                            Some(folder_id),
+                            "read folder message",
+                            error,
+                        )?;
+                        continue;
+                    }
+                };
                 let mut messages = vec![MessageWork {
-                    item: folder.sub_message(index)?,
-                    folder_id,
+                    item,
+                    folder_id: Some(folder_id),
                     parent_message_id: None,
                     parent_attachment_index: None,
                     depth: 0,
+                    provenance: CatalogProvenance::Normal,
+                    recovery_index: None,
                 }];
                 while let Some(work) = messages.pop() {
-                    process_message(
+                    if let Err(error) = process_message(
                         work,
                         &mut messages,
                         &mut visited_messages,
                         sink,
                         &mut catalog,
-                    )?;
+                    ) {
+                        match error {
+                            error @ PffError::Sink { .. } => return Err(error),
+                            error => record_item_issue(
+                                &mut catalog,
+                                None,
+                                "process folder message",
+                                error,
+                            )?,
+                        }
+                    }
                 }
             }
 
-            let child_count = folder.sub_folder_count()?;
+            let child_count = match folder.sub_folder_count() {
+                Ok(count) => count,
+                Err(error) => {
+                    record_item_issue(&mut catalog, Some(folder_id), "count child folders", error)?;
+                    continue;
+                }
+            };
             for index in (0..child_count).rev() {
-                folders.push((folder.sub_folder(index)?, Some(folder_id)));
+                match folder.sub_folder(index) {
+                    Ok(child) => folders.push((child, Some(folder_id))),
+                    Err(error) => record_item_issue(
+                        &mut catalog,
+                        Some(folder_id),
+                        "read child folder",
+                        error,
+                    )?,
+                }
             }
         }
-        Ok(catalog)
+        Ok((catalog, visited_messages))
+    }
+
+    fn stream_recovery_collection(
+        &self,
+        provenance: CatalogProvenance,
+        count_function: unsafe extern "C" fn(
+            *mut bindings::libpff_file_t,
+            *mut i32,
+            *mut *mut libpff_error_t,
+        ) -> i32,
+        item_function: unsafe extern "C" fn(
+            *mut bindings::libpff_file_t,
+            i32,
+            *mut *mut libpff_item_t,
+            *mut *mut libpff_error_t,
+        ) -> i32,
+        visited_messages: &mut HashSet<u32>,
+        sink: &mut dyn CatalogSink,
+        catalog: &mut RawCatalog,
+    ) -> Result<(), PffError> {
+        let mut count = 0_i32;
+        let mut error = ptr::null_mut();
+        // SAFETY: self.raw is open and count/error are initialized out-pointers.
+        let result = unsafe { count_function(self.raw, &mut count, &mut error) };
+        check_one(result, error, "count recovery items")?;
+        if count < 0 || u64::try_from(count).unwrap_or(u64::MAX) > MAX_MESSAGES {
+            return Err(PffError::InvalidValue {
+                field: "recovery item count",
+                value: i64::from(count),
+            });
+        }
+        for index in 0..count {
+            let mut raw = ptr::null_mut();
+            error = ptr::null_mut();
+            // SAFETY: the index is within the count returned by libpff and outputs are initialized.
+            let result = unsafe { item_function(self.raw, index, &mut raw, &mut error) };
+            if let Err(error) = check_one(result, error, "get recovery item") {
+                if let Ok(item) = PffItem::from_raw(raw, "clean failed recovery item") {
+                    drop(item);
+                }
+                catalog.record_issue(catalog_issue(None, "get recovery item", error));
+                continue;
+            }
+            let item = match PffItem::from_raw(raw, "get recovery item") {
+                Ok(item) => item,
+                Err(error) => {
+                    catalog.record_issue(catalog_issue(None, "get recovery item", error));
+                    continue;
+                }
+            };
+            let mut pending = vec![MessageWork {
+                item,
+                folder_id: None,
+                parent_message_id: None,
+                parent_attachment_index: None,
+                depth: 0,
+                provenance,
+                recovery_index: Some(u64::try_from(index).map_err(|_| PffError::InvalidValue {
+                    field: "recovery item index",
+                    value: i64::from(index),
+                })?),
+            }];
+            while let Some(work) = pending.pop() {
+                if let Err(error) =
+                    process_message(work, &mut pending, visited_messages, sink, catalog)
+                {
+                    match error {
+                        error @ PffError::Sink { .. } => return Err(error),
+                        error => record_item_issue(catalog, None, "process recovery item", error)?,
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 
     fn root_folder(&self) -> Result<PffItem, PffError> {
@@ -211,10 +418,12 @@ impl PffFile {
 
 struct MessageWork {
     item: PffItem,
-    folder_id: u32,
+    folder_id: Option<u32>,
     parent_message_id: Option<u32>,
     parent_attachment_index: Option<u32>,
     depth: u32,
+    provenance: CatalogProvenance,
+    recovery_index: Option<u64>,
 }
 
 fn process_message(
@@ -224,8 +433,14 @@ fn process_message(
     sink: &mut dyn CatalogSink,
     catalog: &mut RawCatalog,
 ) -> Result<(), PffError> {
-    let message_id = work.item.identifier()?;
-    if !visited.insert(message_id) {
+    let issue_state = (catalog.issues.len(), catalog.issues_dropped);
+    let message_id = recover_item_value(
+        catalog,
+        None,
+        "get message identifier",
+        work.item.identifier(),
+    )?;
+    if stable_identifier_seen(visited, message_id) {
         catalog.record_issue(CatalogIssue {
             node_id: Some(message_id),
             operation: "traverse message",
@@ -233,72 +448,140 @@ fn process_message(
         });
         return Ok(());
     }
-    catalog.messages = checked_increment(catalog.messages, "message count", MAX_MESSAGES)?;
-    if work.parent_message_id.is_some() {
-        catalog.embedded_messages =
-            catalog
-                .embedded_messages
-                .checked_add(1)
-                .ok_or(PffError::LimitExceeded {
-                    field: "embedded message count",
-                    value: u64::MAX,
-                    limit: u64::MAX - 1,
-                })?;
-    }
-    let message_class = work.item.message_string(MESSAGE_CLASS)?;
-    let recipient_count_hint = work.item.optional_u32(RECIPIENT_COUNT)?;
-    let has_attachments = work
-        .item
-        .optional_u32(MESSAGE_FLAGS)?
-        .map(|flags| flags & MESSAGE_FLAG_HAS_ATTACHMENTS != 0);
+    let messages = checked_increment(catalog.messages, "message count", MAX_MESSAGES)?;
+    let recovered_messages = match work.provenance {
+        CatalogProvenance::Recovered => checked_increment(
+            catalog.recovered_messages,
+            "recovered message count",
+            MAX_MESSAGES,
+        )?,
+        _ => catalog.recovered_messages,
+    };
+    let orphan_messages = match work.provenance {
+        CatalogProvenance::Orphan => checked_increment(
+            catalog.orphan_messages,
+            "orphan message count",
+            MAX_MESSAGES,
+        )?,
+        _ => catalog.orphan_messages,
+    };
+    let embedded_messages = if work.parent_message_id.is_some() {
+        checked_increment(
+            catalog.embedded_messages,
+            "embedded message count",
+            u64::MAX,
+        )?
+    } else {
+        catalog.embedded_messages
+    };
+    let message_class = recover_item_value(
+        catalog,
+        Some(message_id),
+        "get message class",
+        work.item.message_string(MESSAGE_CLASS),
+    )?;
+    let recipient_count_hint = recover_item_value(
+        catalog,
+        Some(message_id),
+        "get recipient count",
+        work.item.optional_u32(RECIPIENT_COUNT),
+    )?;
+    let message_flags = recover_item_value(
+        catalog,
+        Some(message_id),
+        "get message flags",
+        work.item.optional_u32(MESSAGE_FLAGS),
+    )?;
+    let has_attachments = message_flags.map(|flags| flags & MESSAGE_FLAG_HAS_ATTACHMENTS != 0);
     let supported = message_class
         .as_deref()
         .is_some_and(|value| value.starts_with("IPM.Note") || value.starts_with("REPORT.IPM.Note"));
-    if !supported {
-        catalog.unsupported_messages =
-            catalog
-                .unsupported_messages
-                .checked_add(1)
-                .ok_or(PffError::LimitExceeded {
-                    field: "unsupported message count",
-                    value: u64::MAX,
-                    limit: u64::MAX - 1,
-                })?;
-    }
+    let unsupported_messages = if supported {
+        catalog.unsupported_messages
+    } else {
+        checked_increment(
+            catalog.unsupported_messages,
+            "unsupported message count",
+            u64::MAX,
+        )?
+    };
+    let item_type = recover_item_value(
+        catalog,
+        Some(message_id),
+        "get message item type",
+        work.item.item_type(),
+    )?;
+    let subject = recover_item_value(
+        catalog,
+        Some(message_id),
+        "get message subject",
+        work.item.message_string(SUBJECT),
+    )?;
+    let sender_name = recover_item_value(
+        catalog,
+        Some(message_id),
+        "get sender name",
+        work.item.message_string(SENDER_NAME),
+    )?;
+    let sender_email = recover_item_value(
+        catalog,
+        Some(message_id),
+        "get sender email",
+        work.item.message_string(SENDER_EMAIL),
+    )?;
+    let submit_filetime = recover_item_value(
+        catalog,
+        Some(message_id),
+        "get client submit time",
+        work.item.optional_filetime(
+            "get client submit time",
+            bindings::libpff_message_get_client_submit_time,
+        ),
+    )?;
+    let delivery_filetime = recover_item_value(
+        catalog,
+        Some(message_id),
+        "get delivery time",
+        work.item.optional_filetime(
+            "get delivery time",
+            bindings::libpff_message_get_delivery_time,
+        ),
+    )?;
     emit(
         sink,
         "message metadata",
         CatalogEvent::MessageStart {
             id: message_id,
+            provenance: work.provenance,
+            recovery_index: work.recovery_index,
             folder_id: work.folder_id,
             parent_message_id: work.parent_message_id,
             parent_attachment_index: work.parent_attachment_index,
-            item_type: work.item.item_type()?,
+            item_type,
             message_class,
-            subject: work.item.message_string(SUBJECT)?,
-            sender_name: work.item.message_string(SENDER_NAME)?,
-            sender_email: work.item.message_string(SENDER_EMAIL)?,
-            submit_filetime: work.item.optional_filetime(
-                "get client submit time",
-                bindings::libpff_message_get_client_submit_time,
-            )?,
-            delivery_filetime: work.item.optional_filetime(
-                "get delivery time",
-                bindings::libpff_message_get_delivery_time,
-            )?,
+            subject,
+            sender_name,
+            sender_email,
+            submit_filetime,
+            delivery_filetime,
             supported,
         },
     )?;
-    let issue_state = (catalog.issues.len(), catalog.issues_dropped);
+    catalog.messages = messages;
+    catalog.recovered_messages = recovered_messages;
+    catalog.orphan_messages = orphan_messages;
+    catalog.embedded_messages = embedded_messages;
+    catalog.unsupported_messages = unsupported_messages;
+    mark_stable_identifier(visited, message_id);
     if let Err(error) =
         stream_recipients(&work.item, message_id, recipient_count_hint, sink, catalog)
     {
-        catalog.record_issue(catalog_issue(Some(message_id), "stream recipients", error));
+        record_item_issue(catalog, Some(message_id), "stream recipients", error)?;
     }
     if let Err(error) =
         stream_attachments(&work, message_id, has_attachments, pending, sink, catalog)
     {
-        catalog.record_issue(catalog_issue(Some(message_id), "stream attachments", error));
+        record_item_issue(catalog, Some(message_id), "stream attachments", error)?;
     }
     if let Err(error) = stream_item_properties(
         &work.item,
@@ -306,11 +589,12 @@ fn process_message(
         sink,
         catalog,
     ) {
-        catalog.record_issue(catalog_issue(
+        record_item_issue(
+            catalog,
             Some(message_id),
             "stream message properties",
             error,
-        ));
+        )?;
     }
     emit(
         sink,
@@ -320,6 +604,16 @@ fn process_message(
             complete: (catalog.issues.len(), catalog.issues_dropped) == issue_state,
         },
     )
+}
+
+fn stable_identifier_seen(visited: &HashSet<u32>, identifier: u32) -> bool {
+    identifier != 0 && visited.contains(&identifier)
+}
+
+fn mark_stable_identifier(visited: &mut HashSet<u32>, identifier: u32) {
+    if identifier != 0 {
+        visited.insert(identifier);
+    }
 }
 
 fn stream_recipients(
@@ -475,9 +769,19 @@ fn stream_attachments(
                     parent_message_id: Some(message_id),
                     parent_attachment_index: Some(index_u32),
                     depth,
+                    provenance: work.provenance,
+                    recovery_index: work.recovery_index,
                 });
             }
         }
+        emit(
+            sink,
+            "attachment end",
+            CatalogEvent::AttachmentEnd {
+                message_id,
+                index: index_u32,
+            },
+        )?;
     }
     Ok(())
 }
@@ -531,13 +835,34 @@ fn stream_record_set(
             "property start",
             CatalogEvent::PropertyStart(descriptor),
         )?;
-        let actual = entry.stream(descriptor, sink)?;
+        let actual = match entry.stream(descriptor, sink) {
+            Ok(actual) => actual,
+            Err(error @ PffError::Sink { .. }) => return Err(error),
+            Err(error) => {
+                let reason = error.to_string();
+                emit(
+                    sink,
+                    "property abort",
+                    CatalogEvent::PropertyAbort { descriptor, reason },
+                )?;
+                return Err(error);
+            }
+        };
         if actual != descriptor.data_size {
-            return Err(PffError::StreamSizeMismatch {
+            let error = PffError::StreamSizeMismatch {
                 field: "property data",
                 expected: descriptor.data_size,
                 actual,
-            });
+            };
+            emit(
+                sink,
+                "property abort",
+                CatalogEvent::PropertyAbort {
+                    descriptor,
+                    reason: error.to_string(),
+                },
+            )?;
+            return Err(error);
         }
         emit(sink, "property end", CatalogEvent::PropertyEnd(descriptor))?;
         catalog.properties = catalog
@@ -1255,13 +1580,118 @@ fn catalog_issue(node_id: Option<u32>, operation: &'static str, error: PffError)
     }
 }
 
+fn record_item_issue(
+    catalog: &mut RawCatalog,
+    node_id: Option<u32>,
+    operation: &'static str,
+    error: PffError,
+) -> Result<(), PffError> {
+    match error {
+        error @ (PffError::Sink { .. } | PffError::LimitExceeded { .. }) => Err(error),
+        error => {
+            catalog.record_issue(catalog_issue(node_id, operation, error));
+            Ok(())
+        }
+    }
+}
+
+fn recover_item_value<T: Default>(
+    catalog: &mut RawCatalog,
+    node_id: Option<u32>,
+    operation: &'static str,
+    result: Result<T, PffError>,
+) -> Result<T, PffError> {
+    match result {
+        Ok(value) => Ok(value),
+        Err(error) => {
+            record_item_issue(catalog, node_id, operation, error)?;
+            Ok(T::default())
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use std::collections::HashSet;
+
     use super::{
         CatalogEvent, CatalogIssue, CatalogSink, MAX_CATALOG_ISSUES, PropertyDescriptor,
         PropertyOwner, RawCatalog, STREAM_CHUNK_BYTES, checked_increment, decode_native_string,
+        mark_stable_identifier, record_item_issue, recover_item_value, stable_identifier_seen,
         validate_string_size,
     };
+    use crate::PffError;
+
+    #[test]
+    fn stable_identity_dedup_ignores_zero_and_marks_only_after_accounting() {
+        let mut visited = HashSet::new();
+        assert!(!stable_identifier_seen(&visited, 42));
+        assert!(!stable_identifier_seen(&visited, 0));
+        mark_stable_identifier(&mut visited, 0);
+        assert!(visited.is_empty());
+        mark_stable_identifier(&mut visited, 42);
+        assert!(stable_identifier_seen(&visited, 42));
+    }
+
+    #[test]
+    fn sink_and_limit_failures_are_fatal_while_native_item_errors_are_recorded() {
+        let mut catalog = RawCatalog::default();
+        assert!(matches!(
+            record_item_issue(
+                &mut catalog,
+                None,
+                "test",
+                PffError::Sink {
+                    operation: "sink",
+                    detail: "rejected".to_owned()
+                }
+            ),
+            Err(PffError::Sink { .. })
+        ));
+        assert!(matches!(
+            record_item_issue(
+                &mut catalog,
+                None,
+                "test",
+                PffError::LimitExceeded {
+                    field: "count",
+                    value: 2,
+                    limit: 1
+                }
+            ),
+            Err(PffError::LimitExceeded { .. })
+        ));
+        record_item_issue(
+            &mut catalog,
+            Some(7),
+            "test",
+            PffError::Native {
+                operation: "read",
+                detail: "damaged".to_owned(),
+            },
+        )
+        .expect("native item damage remains recoverable");
+        assert_eq!(catalog.issues.len(), 1);
+        assert_eq!(catalog.issues[0].node_id, Some(7));
+    }
+
+    #[test]
+    fn damaged_optional_metadata_defaults_and_marks_the_candidate_partial() {
+        let mut catalog = RawCatalog::default();
+        let value: Option<String> = recover_item_value(
+            &mut catalog,
+            Some(9),
+            "get subject",
+            Err(PffError::Native {
+                operation: "read subject",
+                detail: "damaged".to_owned(),
+            }),
+        )
+        .expect("native metadata damage is recoverable");
+        assert_eq!(value, None);
+        assert_eq!(catalog.issues.len(), 1);
+        assert_eq!(catalog.issues[0].node_id, Some(9));
+    }
 
     struct BoundedSink {
         peak: usize,

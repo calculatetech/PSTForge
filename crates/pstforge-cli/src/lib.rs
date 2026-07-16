@@ -4,7 +4,10 @@ use std::io::Write;
 use std::path::PathBuf;
 
 use clap::{ArgAction, Parser, Subcommand, ValueEnum};
-use pstforge_core::{EncryptionMode, FileFormat, InfoReport, InspectionError, VerifyReport};
+use pstforge_core::{
+    EncryptionMode, FileFormat, InfoReport, InspectionError, RecoveryError, RecoveryReport,
+    SourceError, VerifyReport,
+};
 use thiserror::Error;
 
 #[derive(Debug, Parser)]
@@ -46,6 +49,14 @@ pub enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Recover reachable, deleted, and orphan mail into a durable private job spool.
+    Recover {
+        source: PathBuf,
+        #[arg(long, short = 'o')]
+        output: PathBuf,
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -70,6 +81,8 @@ pub enum VerifyMode {
 pub enum CliError {
     #[error(transparent)]
     Inspection(#[from] InspectionError),
+    #[error(transparent)]
+    Recovery(#[from] RecoveryError),
     #[error("cannot write command result: {0}")]
     Output(#[from] std::io::Error),
     #[error("cannot serialize command result: {0}")]
@@ -79,7 +92,7 @@ pub enum CliError {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CommandStatus {
     Complete,
-    SourceIncomplete,
+    Partial,
 }
 
 impl CliError {
@@ -90,9 +103,18 @@ impl CliError {
                 | InspectionError::Pff(_)
                 | InspectionError::UnsupportedContentType { .. },
             ) => 3,
-            Self::Inspection(InspectionError::SizeMismatch { .. })
-            | Self::Output(_)
-            | Self::Json(_) => 6,
+            Self::Recovery(RecoveryError::Job(_))
+            | Self::Recovery(RecoveryError::Pff(pstforge_core::PffError::Sink { .. }))
+            | Self::Recovery(RecoveryError::Source(SourceError::UnsafeOutput(_)))
+            | Self::Output(_) => 4,
+            Self::Recovery(
+                RecoveryError::Source(_)
+                | RecoveryError::Pff(_)
+                | RecoveryError::UnsupportedContentType { .. }
+                | RecoveryError::SizeMismatch { .. },
+            ) => 3,
+            Self::Inspection(InspectionError::SizeMismatch { .. }) => 3,
+            Self::Recovery(RecoveryError::InconsistentCounters) | Self::Json(_) => 6,
         }
     }
 }
@@ -118,7 +140,28 @@ pub fn execute(cli: &Cli, output: &mut dyn Write) -> Result<CommandStatus, CliEr
             if report.inventory.issues.is_empty() && report.inventory.issues_dropped == 0 {
                 Ok(CommandStatus::Complete)
             } else {
-                Ok(CommandStatus::SourceIncomplete)
+                Ok(CommandStatus::Partial)
+            }
+        }
+        Command::Recover {
+            source,
+            output: job_directory,
+            json,
+        } => {
+            let report = pstforge_core::recover(source, job_directory)?;
+            if *json {
+                write_json(output, &report)?;
+            } else {
+                write_recovery(output, &report)?;
+            }
+            if report.partial_candidates == 0
+                && report.unsupported_candidates == 0
+                && report.issues == 0
+                && report.issues_dropped == 0
+            {
+                Ok(CommandStatus::Complete)
+            } else {
+                Ok(CommandStatus::Partial)
             }
         }
     }
@@ -205,6 +248,47 @@ fn write_verify(output: &mut dyn Write, report: &VerifyReport) -> Result<(), std
     Ok(())
 }
 
+fn write_recovery(output: &mut dyn Write, report: &RecoveryReport) -> Result<(), std::io::Error> {
+    writeln!(output, "PSTForge recovery")?;
+    writeln!(output, "Source: {}", report.source.canonical_path)?;
+    writeln!(output, "SHA-256: {}", report.source.sha256)?;
+    writeln!(output, "Job: {}", report.job_directory)?;
+    writeln!(output, "Mode: {}", report.mode)?;
+    writeln!(output, "Normal items: {}", report.normal_items)?;
+    writeln!(output, "Recovered items: {}", report.recovered_items)?;
+    writeln!(output, "Orphan items: {}", report.orphan_items)?;
+    writeln!(
+        output,
+        "Committed candidates: {}",
+        report.committed_candidates
+    )?;
+    writeln!(
+        output,
+        "Complete candidates: {}",
+        report.complete_candidates
+    )?;
+    writeln!(output, "Partial candidates: {}", report.partial_candidates)?;
+    writeln!(
+        output,
+        "Unsupported candidates: {}",
+        report.unsupported_candidates
+    )?;
+    writeln!(output, "Spool blobs: {}", report.blob_count)?;
+    writeln!(output, "Spool bytes: {}", report.blob_bytes)?;
+    writeln!(output, "Recovery issues: {}", report.issues)?;
+    writeln!(
+        output,
+        "Additional issues omitted: {}",
+        report.issues_dropped
+    )?;
+    writeln!(
+        output,
+        "Source unchanged: {}",
+        yes_no(report.source_unchanged)
+    )?;
+    Ok(())
+}
+
 fn write_common(output: &mut dyn Write, report: &InfoReport) -> Result<(), std::io::Error> {
     writeln!(output, "Source: {}", report.source.canonical_path)?;
     writeln!(output, "SHA-256: {}", report.source.sha256)?;
@@ -270,9 +354,13 @@ fn write_optional_count(
 
 #[cfg(test)]
 mod tests {
-    use clap::Parser;
+    use std::path::PathBuf;
 
-    use super::{Cli, Command, VerifyMode};
+    use clap::Parser;
+    use pstforge_core::{PffError, RecoveryError, SourceError};
+    use pstforge_job::JobError;
+
+    use super::{Cli, CliError, Command, VerifyMode};
 
     #[test]
     fn parses_info_json_with_global_options_after_command() {
@@ -304,5 +392,37 @@ mod tests {
     fn recovery_mode_is_not_exposed_before_implementation() {
         let cli = Cli::try_parse_from(["pstforge", "verify", "mail.pst", "--mode", "recovery"]);
         assert!(cli.is_err());
+    }
+
+    #[test]
+    fn parses_balanced_recover_job() -> Result<(), clap::Error> {
+        let cli = Cli::try_parse_from([
+            "pstforge", "recover", "mail.pst", "--output", "job", "--json",
+        ])?;
+        assert!(matches!(cli.command, Command::Recover { json: true, .. }));
+        Ok(())
+    }
+
+    #[test]
+    fn recovery_exit_codes_follow_the_product_contract() {
+        let partial_output = CliError::Recovery(RecoveryError::Job(JobError::ExistingJob(
+            PathBuf::from("job"),
+        )));
+        assert_eq!(partial_output.exit_code(), 4);
+        let wrapped_sink = CliError::Recovery(RecoveryError::Pff(PffError::Sink {
+            operation: "property data",
+            detail: "filesystem full".to_owned(),
+        }));
+        assert_eq!(wrapped_sink.exit_code(), 4);
+        let unsafe_output = CliError::Recovery(RecoveryError::Source(SourceError::UnsafeOutput(
+            PathBuf::from("job"),
+        )));
+        assert_eq!(unsafe_output.exit_code(), 4);
+        let bad_source = CliError::Recovery(RecoveryError::UnsupportedContentType { raw: None });
+        assert_eq!(bad_source.exit_code(), 3);
+        assert_eq!(
+            CliError::Recovery(RecoveryError::InconsistentCounters).exit_code(),
+            6
+        );
     }
 }

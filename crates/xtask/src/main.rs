@@ -41,6 +41,15 @@ struct CorpusCase {
     _minimum_raw_properties: u64,
     #[serde(default = "default_peak_chunk_limit")]
     maximum_peak_stream_chunk_bytes: u64,
+    #[serde(default)]
+    #[serde(rename = "milestone_0_3")]
+    _milestone_0_3: bool,
+    #[serde(default)]
+    #[serde(rename = "minimum_recovered_items")]
+    _minimum_recovered_items: u64,
+    #[serde(default)]
+    #[serde(rename = "minimum_orphan_items")]
+    _minimum_orphan_items: u64,
 }
 
 #[derive(Debug, Deserialize)]

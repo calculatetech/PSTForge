@@ -379,7 +379,22 @@ work. Hash and identity evidence show that the source was not modified.
     checks, licenses, advisories, `libpff`, `pffinfo`, and `readpst`. The latest
     external-corpus phase was not rerun because `PSTFORGE_CORPUS_MANIFEST` was
     unset; the prior 0.2.1 external corpus gate remains clean.
-- [ ] Milestone 0.3.0: Recoverable Mail Pipeline.
+- [x] (2026-07-16) Milestone 0.3.0: Recoverable Mail Pipeline.
+  - [x] Added balanced normal-first `libpff` recovery enumeration for recovered
+    and orphan collections with explicit provenance, recovery indices,
+    nonzero stable-ID deduplication, and partial metadata/substream salvage.
+  - [x] Added the private bundled-SQLite WAL ledger and content-addressed spool,
+    one candidate transaction per message, crash-safe checkpoints, source
+    identity binding, integrity/reopen validation, and strict private-state
+    ownership, mode, link-count, hash, and size checks.
+  - [x] Added `pstforge recover SOURCE --output JOB_DIR [--json]`, documented
+    `0/1/3/4/6` status behavior, and retained the fresh-job/no-nonempty-output
+    boundary. Importable size-limited PST parts remain milestone 0.4.0.
+  - [x] Passed repeated clean-context adversarial reviews, the fast gate, the
+    accepted external r6 fixture, and the real damaged Enron corpus case. The
+    Enron run committed 2,178 candidates (2,173 complete and 5 partial),
+    35,997 blobs totaling 15,198,391 bytes in 8.71 seconds with 20,672 KiB
+    maximum RSS; source SHA-256 and timestamps remained unchanged.
 - [ ] Milestone 0.3.1: Fault-Isolated Recovery.
 - [ ] Milestone 0.4.0: Size-Limited PST Splitting.
 - [ ] Milestone 0.4.1: Resume and 50 GB Qualification.
@@ -683,6 +698,24 @@ work. Hash and identity evidence show that the source was not modified.
   Evidence: `v0.2.1-fidelity-r5-mailplus.txt` and
   `v0.2.1-fidelity-mailplus-attachment.eml`, inspected 2026-07-16.
 
+- Observation: MailPlus's attached-message presentation is not caused by the
+  PSTForge writer. An equivalent message exported by Outlook and imported into
+  MailPlus also omitted the embedded message from the visible attachment list,
+  while its raw message retained the expected MIME content and exposed images
+  from the nested message as separate attachments. Treat this as an external
+  client behavior pending Synology guidance; do not convert MAPI embedded
+  messages to opaque `.eml` files in PSTForge.
+  Evidence: owner comparison using an Outlook-exported reference on 2026-07-16;
+  no private message content is retained in repository evidence.
+
+- Observation: Balanced recovery of the external damaged Enron PST completed
+  2,173 messages and isolated five partial candidates without stopping the
+  job. Its 31,761,408-byte source produced a 15,198,391-byte deduplicated spool
+  in 8.71 seconds at 20,672 KiB maximum RSS, with identical source SHA-256,
+  size, modification time, and access time before and after.
+  Evidence: the ignored external-corpus recovery gate using the private
+  manifest outside the repository on 2026-07-16.
+
 ## Decision Log
 
 - Decision: PSTForge 1.0 writes smaller PSTs; general export formats move
@@ -861,6 +894,36 @@ work. Hash and identity evidence show that the source was not modified.
   contract without representative source evidence.
   Date/Author: 2026-07-16 / Codex.
 
+- Decision: Version 0.3.0 exposes a balanced `recover` command that creates a
+  durable canonical job but does not claim to create importable PST parts.
+  Normal mail is processed before `libpff_file_recover_items` with flags zero,
+  followed by recovered and orphan collections. Aggressive allocation-ignore
+  and fragment flags remain version 0.3.1.
+  Rationale: operators and the external corpus need an executable recovery
+  checkpoint now, while supervised native workers and PST packing have their
+  own milestone acceptance boundaries.
+  Date/Author: 2026-07-16 / Codex.
+
+- Decision: The 0.3.0 job uses bundled SQLite in WAL/FULL-synchronous mode and
+  a private SHA-256 spool. One message is one immediate transaction; complete
+  properties and attachments have explicit end events, recoverable stream
+  failures have explicit abort/partial markers, and sink or resource-limit
+  errors remain fatal. Job, SQLite, sidecar, and blob state must be owned by
+  the effective user, inaccessible to group/other, and not hard linked.
+  Rationale: committed candidates must survive process termination without
+  silently upgrading partial data or exposing mailbox content.
+  Date/Author: 2026-07-16 / Codex.
+
+- Decision: Concurrent hostile mutation by another process with the same UID
+  is outside the 0.3.0 filesystem threat boundary. SQLite cannot combine its
+  `SQLITE_OPEN_NOFOLLOW` flag with the held `/proc/self/fd/<dir>` path used for
+  job containment; pre/post inode, type, owner, permission, and link checks
+  remain mandatory. Untrusted PST bytes never control filesystem operations.
+  Rationale: the no-follow flag rejects the proc-descriptor parent and makes
+  every legitimate ledger open fail. A same-UID attacker can already rewrite
+  the owner's private job state and requires OS isolation beyond this tool.
+  Date/Author: 2026-07-16 / Codex.
+
 ## Outcomes & Retrospective
 
 Version 0.1.0 now lets an operator inspect a healthy PST in human or JSON form
@@ -913,6 +976,15 @@ all generated-store independent readers. MailPlus's presentation of true
 embedded messages remains a documented external-corpus question rather than a
 reason to replace standards-compliant source semantics speculatively.
 
+Version 0.3.0 now gives an operator a balanced, source-preserving recovery
+command and a durable private job containing normal, recovered, and orphan
+mail candidates. It does not yet produce the smaller PST files needed for
+MailPlus import. The real damaged Enron corpus demonstrated candidate-level
+containment and low memory use: 2,178 candidates committed, five partial, no
+source identity change, 8.71 seconds elapsed, and 20,672 KiB maximum RSS. The
+next milestone adds native crash isolation and bounded retries before 0.4.0
+packs the accepted spool into importable parts.
+
 ## Context and Orientation
 
 The repository initially contains only documentation. `AGENTS.md` governs all
@@ -963,6 +1035,7 @@ second behavior path:
 
     pstforge info <source.pst> [--json]
     pstforge verify <source.pst> [--mode full|recovery] [--json]
+    pstforge recover <source.pst> --output <job-dir> [--json]
     pstforge split <source.pst> --output <job-dir> \
       [--max-pst-size <size>] [--recovery balanced|aggressive] \
       [--resume] [--keep-work] [--json]

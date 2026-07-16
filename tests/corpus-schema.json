@@ -26,12 +26,15 @@
           },
           "milestone_0_1": { "type": "boolean" },
           "milestone_0_1_1": { "type": "boolean" },
+          "milestone_0_3": { "type": "boolean" },
           "minimum_folders": { "type": "integer", "minimum": 1 },
           "minimum_messages": { "type": "integer", "minimum": 0 },
           "minimum_recipients": { "type": "integer", "minimum": 0 },
           "minimum_attachments": { "type": "integer", "minimum": 0 },
           "minimum_raw_properties": { "type": "integer", "minimum": 0 },
-          "maximum_peak_stream_chunk_bytes": { "type": "integer", "minimum": 1 }
+          "maximum_peak_stream_chunk_bytes": { "type": "integer", "minimum": 1 },
+          "minimum_recovered_items": { "type": "integer", "minimum": 0 },
+          "minimum_orphan_items": { "type": "integer", "minimum": 0 }
         }
       }
     }

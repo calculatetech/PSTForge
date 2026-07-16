@@ -61,6 +61,33 @@ unsafe extern "C" {
         file: *mut libpff_file_t,
         error: *mut *mut libpff_error_t,
     ) -> c_int;
+    pub(crate) fn libpff_file_recover_items(
+        file: *mut libpff_file_t,
+        recovery_flags: c_uchar,
+        error: *mut *mut libpff_error_t,
+    ) -> c_int;
+    pub(crate) fn libpff_file_get_number_of_orphan_items(
+        file: *mut libpff_file_t,
+        number_of_orphan_items: *mut c_int,
+        error: *mut *mut libpff_error_t,
+    ) -> c_int;
+    pub(crate) fn libpff_file_get_orphan_item_by_index(
+        file: *mut libpff_file_t,
+        orphan_item_index: c_int,
+        orphan_item: *mut *mut libpff_item_t,
+        error: *mut *mut libpff_error_t,
+    ) -> c_int;
+    pub(crate) fn libpff_file_get_number_of_recovered_items(
+        file: *mut libpff_file_t,
+        number_of_recovered_items: *mut c_int,
+        error: *mut *mut libpff_error_t,
+    ) -> c_int;
+    pub(crate) fn libpff_file_get_recovered_item_by_index(
+        file: *mut libpff_file_t,
+        recovered_item_index: c_int,
+        recovered_item: *mut *mut libpff_item_t,
+        error: *mut *mut libpff_error_t,
+    ) -> c_int;
     pub(crate) fn libpff_file_get_size(
         file: *mut libpff_file_t,
         size: *mut u64,
