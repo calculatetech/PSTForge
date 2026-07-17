@@ -819,6 +819,40 @@ impl TableRowReadWrite for TableRowData {
     }
 }
 
+fn read_row_matrix(
+    reader: &mut dyn Read,
+    context: &TableContextInfo,
+    byte_len: usize,
+) -> io::Result<Vec<TableRowData>> {
+    let row_size = usize::from(context.end_existence_bitmap());
+    if row_size == 0 || byte_len % row_size != 0 {
+        return Err(LtpError::InvalidTableRowMatrixSize {
+            size: byte_len,
+            row_size,
+        }
+        .into());
+    }
+    let row_count = byte_len / row_size;
+    let mut rows = Vec::with_capacity(row_count);
+    for _ in 0..row_count {
+        rows.push(TableRowData::read(reader, context)?);
+    }
+    Ok(rows)
+}
+
+fn read_row_matrix_block(data: &[u8], context: &TableContextInfo) -> io::Result<Vec<TableRowData>> {
+    let row_size = usize::from(context.end_existence_bitmap());
+    if row_size == 0 {
+        return Err(LtpError::InvalidTableRowMatrixSize {
+            size: data.len(),
+            row_size,
+        }
+        .into());
+    }
+    let row_bytes = data.len() - data.len() % row_size;
+    read_row_matrix(&mut Cursor::new(&data[..row_bytes]), context, row_bytes)
+}
+
 pub trait TableContext {
     fn context(&self) -> &TableContextInfo;
     fn rows_matrix<'a>(&'a self) -> Box<dyn 'a + Iterator<Item = &'a TableRowData>>;
@@ -934,7 +968,8 @@ where
             match rows.id_type() {
                 Ok(NodeIdType::HeapNode) => {
                     let rows: u32 = rows.into();
-                    vec![heap.find_entry(HeapId::from(rows))?.to_vec()]
+                    let data = heap.find_entry(HeapId::from(rows))?;
+                    read_row_matrix(&mut Cursor::new(data), &context, data.len())?
                 }
                 _ => {
                     let sub_node = node
@@ -959,30 +994,16 @@ where
                             &mut page_cache,
                             &mut block_cache,
                         )
-                        .map(|blocks| {
+                        .and_then(|blocks| {
                             blocks
-                                .map(|block| block.data().to_vec())
-                                .collect::<Vec<_>>()
-                        });
+                                .map(|block| read_row_matrix_block(block.data(), &context))
+                                .collect::<io::Result<Vec<_>>>()
+                        })
+                        .map(|blocks| blocks.into_iter().flatten().collect());
                     block_cache.insert(block.block().block(), data_tree);
                     result?
                 }
             }
-            .into_iter()
-            .map(|data| {
-                let row_count = data.len() / context.end_existence_bitmap() as usize;
-                let mut cursor = Cursor::new(data);
-                let mut rows = Vec::with_capacity(row_count);
-                for _ in 0..row_count {
-                    let row = TableRowData::read(&mut cursor, &context)?;
-                    rows.push(row);
-                }
-                Ok(rows)
-            })
-            .collect::<io::Result<Vec<_>>>()?
-            .into_iter()
-            .flatten()
-            .collect()
         } else {
             Default::default()
         };
@@ -1214,5 +1235,29 @@ mod tests {
                 actual: 2,
             })
         ));
+    }
+
+    #[test]
+    fn row_matrix_block_ignores_arbitrary_tail_padding() {
+        let context = TableContextInfo::new(8, 8, 8, 8, HeapId::default(), None, Vec::new())
+            .expect("minimal table context");
+        let mut block = Vec::new();
+        block.extend_from_slice(&1_u32.to_le_bytes());
+        block.extend_from_slice(&1_u32.to_le_bytes());
+        block.extend_from_slice(&[0; 7]);
+        assert_eq!(
+            read_row_matrix_block(&block, &context)
+                .expect("zero padding")
+                .len(),
+            1
+        );
+
+        *block.last_mut().expect("padding byte") = 1;
+        assert_eq!(
+            read_row_matrix_block(&block, &context)
+                .expect("dead space contents are ignored")
+                .len(),
+            1
+        );
     }
 }

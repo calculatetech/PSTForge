@@ -425,9 +425,13 @@ const FMAP_DATA_SIZE: u64 = AMAP_DATA_SIZE * FMAP_PAGE_COUNT;
 
 const FPMAP_FIRST_SIZE: u64 = 128 * 64;
 const FPMAP_FIRST_DATA_SIZE: u64 = AMAP_DATA_SIZE * FPMAP_FIRST_SIZE;
-const FPMAP_FIRST_OFFSET: u64 = AMAP_FIRST_OFFSET + FPMAP_FIRST_DATA_SIZE + (3 * PAGE_SIZE) as u64;
+const FPMAP_FIRST_OFFSET: u64 = AMAP_FIRST_OFFSET + FPMAP_FIRST_DATA_SIZE + (2 * PAGE_SIZE) as u64;
 const FPMAP_PAGE_COUNT: u64 = size_of::<MapBits>() as u64 * 64;
 const FPMAP_DATA_SIZE: u64 = AMAP_DATA_SIZE * FPMAP_PAGE_COUNT;
+
+fn pmap_page_count(amap_pages: u64) -> u64 {
+    amap_pages.div_ceil(PMAP_PAGE_COUNT)
+}
 
 struct AllocationMapPageInfo<Pst>
 where
@@ -717,7 +721,7 @@ where
             *entry = free_space;
         }
 
-        let pmap_pages: Vec<_> = (0..=(num_amap_pages / 8))
+        let pmap_pages: Vec<_> = (0..pmap_page_count(num_amap_pages))
             .map(|index| {
                 let index =
                     <<<Pst as PstFile>::ByteIndex as ByteIndex>::Index as TryFrom<u64>>::try_from(
@@ -1190,4 +1194,16 @@ pub fn open_store(path: impl AsRef<Path>) -> io::Result<Rc<dyn Store>> {
         let pst_file = AnsiPstFile::open(path.as_ref())?;
         AnsiStore::read(Rc::new(pst_file))?
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{PMAP_PAGE_COUNT, pmap_page_count};
+
+    #[test]
+    fn exact_pmap_coverage_does_not_append_an_extra_page() {
+        assert_eq!(pmap_page_count(PMAP_PAGE_COUNT - 1), 1);
+        assert_eq!(pmap_page_count(PMAP_PAGE_COUNT), 1);
+        assert_eq!(pmap_page_count(PMAP_PAGE_COUNT + 1), 2);
+    }
 }

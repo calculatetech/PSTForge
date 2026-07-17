@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use libpff_sys::{CatalogProvenance, FolderAddress, RecoveryUnit};
 use pstforge_job::{
@@ -47,6 +48,7 @@ pub struct CanonicalMail {
     pub durable_item_key: String,
     pub key: ItemKey,
     pub folder_path: Vec<String>,
+    pub folder_role: CanonicalFolderRole,
     pub message_class: Option<String>,
     pub subject: Option<String>,
     pub sender_name: Option<String>,
@@ -58,6 +60,13 @@ pub struct CanonicalMail {
     pub properties: Vec<CanonicalProperty>,
     pub completeness: ContentCompleteness,
     pub spooled_bytes: u64,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
+pub enum CanonicalFolderRole {
+    #[default]
+    Ordinary,
+    DeletedItems,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -88,6 +97,28 @@ pub enum CanonicalError {
 }
 
 pub fn load_canonical_mail(job: &DurableCatalogSink) -> Result<Vec<CanonicalMail>, CanonicalError> {
+    load_canonical_mail_expected(job, None)
+}
+
+pub fn load_canonical_mail_interruptible(
+    job: &DurableCatalogSink,
+    interrupted: &AtomicBool,
+) -> Result<Vec<CanonicalMail>, CanonicalError> {
+    load_canonical_mail_expected(job, Some(interrupted))
+}
+
+fn load_canonical_mail_expected(
+    job: &DurableCatalogSink,
+    interrupted: Option<&AtomicBool>,
+) -> Result<Vec<CanonicalMail>, CanonicalError> {
+    let check_interrupted = || {
+        if interrupted.is_some_and(|flag| flag.load(Ordering::Relaxed)) {
+            Err(CanonicalError::Job(JobError::Interrupted))
+        } else {
+            Ok(())
+        }
+    };
+    check_interrupted()?;
     let folders = job.spooled_folders()?;
     let folders_by_address = folders
         .iter()
@@ -100,18 +131,25 @@ pub fn load_canonical_mail(job: &DurableCatalogSink) -> Result<Vec<CanonicalMail
             .and_modify(|value| *value = None)
             .or_insert(Some(folder));
     }
-    let candidates = job.spooled_candidates()?;
+    let candidates = match interrupted {
+        Some(flag) => job.spooled_candidates_interruptible(flag)?,
+        None => job.spooled_candidates()?,
+    };
     let by_key = candidates
         .iter()
         .map(|candidate| (candidate.item_key.as_str(), candidate))
         .collect::<BTreeMap<_, _>>();
-    let ownerships = job.candidate_ownerships()?;
+    let ownerships = match interrupted {
+        Some(flag) => job.candidate_ownerships_interruptible(flag)?,
+        None => job.candidate_ownerships()?,
+    };
     let ownership_by_key = ownerships
         .iter()
         .map(|ownership| (ownership.item_key.as_str(), ownership))
         .collect::<BTreeMap<_, _>>();
     let mut claimed_slots = BTreeMap::<(&str, u32), &CandidateOwnership>::new();
     for ownership in &ownerships {
+        check_interrupted()?;
         validate_ownership(ownership, &ownership_by_key)?;
         if let (Some(parent), Some(index)) = (
             ownership.parent_item_key.as_deref(),
@@ -130,6 +168,7 @@ pub fn load_canonical_mail(job: &DurableCatalogSink) -> Result<Vec<CanonicalMail
     }
     let mut children = BTreeMap::<(&str, u32), &SpooledCandidate>::new();
     for candidate in &candidates {
+        check_interrupted()?;
         let ownership = ownership_by_key
             .get(candidate.item_key.as_str())
             .ok_or_else(|| {
@@ -156,6 +195,7 @@ pub fn load_canonical_mail(job: &DurableCatalogSink) -> Result<Vec<CanonicalMail
     }
     let mut unsupported_children = BTreeMap::<&str, BTreeSet<u32>>::new();
     for ownership in ownerships.iter().filter(|ownership| !ownership.writable) {
+        check_interrupted()?;
         let (Some(parent_key), Some(index)) = (
             ownership.parent_item_key.as_deref(),
             ownership.parent_attachment_index,
@@ -180,6 +220,7 @@ pub fn load_canonical_mail(job: &DurableCatalogSink) -> Result<Vec<CanonicalMail
             .as_deref()
             .is_none_or(|parent| !by_key.contains_key(parent))
     }) {
+        check_interrupted()?;
         output.push(build_mail(
             candidate,
             &folders_by_address,
@@ -267,7 +308,7 @@ fn build_mail(
     children: &BTreeMap<(&str, u32), &SpooledCandidate>,
     unsupported_children: &BTreeMap<&str, BTreeSet<u32>>,
     active: &mut BTreeSet<String>,
-    inherited_folder: Option<&[String]>,
+    inherited_folder: Option<(&[String], CanonicalFolderRole)>,
 ) -> Result<CanonicalMail, CanonicalError> {
     if !active.insert(candidate.item_key.clone()) {
         return Err(CanonicalError::EmbeddedCycle(candidate.item_key.clone()));
@@ -292,11 +333,14 @@ fn build_mail_inner(
     children: &BTreeMap<(&str, u32), &SpooledCandidate>,
     unsupported_children: &BTreeMap<&str, BTreeSet<u32>>,
     active: &mut BTreeSet<String>,
-    inherited_folder: Option<&[String]>,
+    inherited_folder: Option<(&[String], CanonicalFolderRole)>,
 ) -> Result<CanonicalMail, CanonicalError> {
-    let folder_path = match inherited_folder {
-        Some(path) => path.to_vec(),
-        None => candidate_folder_path(candidate, folders_by_address, folders_by_id)?,
+    let (folder_path, folder_role) = match inherited_folder {
+        Some((path, role)) => (path.to_vec(), role),
+        None => (
+            candidate_folder_path(candidate, folders_by_address, folders_by_id)?,
+            candidate_folder_role(candidate, folders_by_address, folders_by_id),
+        ),
     };
     let mut recipients = BTreeMap::new();
     let mut attachments = BTreeMap::<u32, CanonicalAttachment>::new();
@@ -517,7 +561,7 @@ fn build_mail_inner(
                 children,
                 unsupported_children,
                 active,
-                Some(&folder_path),
+                Some((&folder_path, folder_role)),
             )?;
             spooled_bytes = spooled_bytes
                 .checked_add(embedded.spooled_bytes)
@@ -539,6 +583,7 @@ fn build_mail_inner(
             occurrence: candidate.occurrence,
         },
         folder_path,
+        folder_role,
         message_class: metadata_string(candidate, "message_class")?,
         subject: metadata_string(candidate, "subject")?,
         sender_name: metadata_string(candidate, "sender_name")?,
@@ -558,6 +603,30 @@ fn build_mail_inner(
     })
 }
 
+fn candidate_folder_role(
+    candidate: &SpooledCandidate,
+    folders_by_address: &BTreeMap<FolderAddress, &SpooledFolder>,
+    folders_by_id: &BTreeMap<u32, Option<&SpooledFolder>>,
+) -> CanonicalFolderRole {
+    const NID_DELETED_ITEMS: u32 = 0x8062;
+
+    let source_id = match candidate.unit {
+        Some(RecoveryUnit::Normal { folder, .. }) => {
+            folders_by_address.get(&folder).map(|value| value.source_id)
+        }
+        _ => metadata_u32(candidate, "folder_id")
+            .ok()
+            .flatten()
+            .and_then(|id| folders_by_id.get(&id).and_then(|value| *value))
+            .map(|value| value.source_id),
+    };
+    if source_id == Some(NID_DELETED_ITEMS) {
+        CanonicalFolderRole::DeletedItems
+    } else {
+        CanonicalFolderRole::Ordinary
+    }
+}
+
 fn candidate_folder_path(
     candidate: &SpooledCandidate,
     folders_by_address: &BTreeMap<FolderAddress, &SpooledFolder>,
@@ -573,20 +642,22 @@ fn candidate_folder_path(
                 ));
             }
             if let Some(folder) = folders_by_address.get(&address) {
-                path.push(
-                    folder
-                        .name
-                        .clone()
-                        .filter(|name| !name.is_empty())
-                        .unwrap_or_else(|| format!("Recovered Folder {}", folder.source_id)),
-                );
-            } else {
+                if is_visible_mail_folder(address, folder.source_id) {
+                    path.push(
+                        folder
+                            .name
+                            .clone()
+                            .filter(|name| !name.is_empty())
+                            .unwrap_or_else(|| format!("Recovered Folder {}", folder.source_id)),
+                    );
+                }
+            } else if address != FolderAddress::root() {
                 path.push("Recovered Folder".to_owned());
             }
             current = address.parent();
         }
         path.reverse();
-        return Ok(path);
+        return Ok(nonempty_folder_path(path, candidate.provenance));
     }
     let Some(folder_id) = metadata_u32(candidate, "folder_id")? else {
         return Ok(vec![
@@ -610,17 +681,44 @@ fn candidate_folder_path(
             path.push(format!("Recovered Folder {id}"));
             break;
         };
-        path.push(
-            folder
-                .name
-                .clone()
-                .filter(|name| !name.is_empty())
-                .unwrap_or_else(|| format!("Recovered Folder {id}")),
-        );
+        if folder
+            .address
+            .is_none_or(|address| is_visible_mail_folder(address, folder.source_id))
+        {
+            path.push(
+                folder
+                    .name
+                    .clone()
+                    .filter(|name| !name.is_empty())
+                    .unwrap_or_else(|| format!("Recovered Folder {id}")),
+            );
+        }
         current = folder.parent_source_id;
     }
     path.reverse();
-    Ok(path)
+    Ok(nonempty_folder_path(path, candidate.provenance))
+}
+
+fn is_visible_mail_folder(address: FolderAddress, source_id: u32) -> bool {
+    const NID_IPM_SUBTREE: u32 = 0x8022;
+
+    address != FolderAddress::root() && source_id != NID_IPM_SUBTREE
+}
+
+fn nonempty_folder_path(path: Vec<String>, provenance: CatalogProvenance) -> Vec<String> {
+    if path.is_empty() {
+        vec![
+            match provenance {
+                CatalogProvenance::Normal => "Unfiled Mail",
+                CatalogProvenance::Recovered => "Recovered Mail",
+                CatalogProvenance::Orphan => "Orphan Mail",
+                CatalogProvenance::Fragment => "Fragment Mail",
+            }
+            .to_owned(),
+        ]
+    } else {
+        path
+    }
 }
 
 fn canonical_property(
@@ -834,7 +932,7 @@ mod tests {
     use rusqlite::{Connection, params};
     use tempfile::tempdir;
 
-    use super::load_canonical_mail;
+    use super::{CanonicalFolderRole, load_canonical_mail};
     use crate::{build_part_writer_input, split_recovered_job};
 
     fn message_start(
@@ -1030,7 +1128,7 @@ mod tests {
 
         let mail = load_canonical_mail(&sink)?;
         assert_eq!(mail.len(), 1);
-        assert_eq!(mail[0].folder_path, ["Root", "Inbox"]);
+        assert_eq!(mail[0].folder_path, ["Inbox"]);
         assert_eq!(mail[0].recipients[0].properties.len(), 1);
         assert_eq!(mail[0].attachments[0].index, 3);
         assert_eq!(
@@ -1056,7 +1154,7 @@ mod tests {
             8 * 1024 * 1024,
             1,
         )?;
-        assert_eq!(input.store.folders[0].path, ["Root", "Inbox"]);
+        assert_eq!(input.store.folders[0].path, ["Inbox"]);
         assert_eq!(input.store.folders[0].messages[0].attachments.len(), 2);
         let pstforge_pst::writer::AttachmentContent::Embedded(embedded) =
             &input.store.folders[0].messages[0].attachments[0].content
@@ -1071,6 +1169,7 @@ mod tests {
         let output = directory.path().join("translated.pst");
         pstforge_pst::writer::create_mail_store(&output, &input.store)?;
         assert!(output.is_file());
+        sink.checkpoint()?;
         let (parts, written, partial) = split_recovered_job(
             &directory.path().join("job"),
             &"0".repeat(64),
@@ -1086,6 +1185,16 @@ mod tests {
         let reopened = DurableCatalogSink::open(&directory.path().join("job"))?;
         assert_eq!(reopened.summary()?.unsupported_candidates, 1);
         assert!(reopened.spooled_candidates()?.is_empty());
+        drop(reopened);
+        let (resumed_parts, resumed_written, resumed_partial) = split_recovered_job(
+            &directory.path().join("job"),
+            &"0".repeat(64),
+            RecoveryMode::Balanced,
+            1,
+        )?;
+        assert_eq!(resumed_parts, parts);
+        assert_eq!(resumed_written, written);
+        assert!(resumed_partial);
         Ok(())
     }
 
@@ -1141,6 +1250,52 @@ mod tests {
         assert_eq!(mail.len(), 1);
         assert_eq!(mail[0].key.source_node_id, Some(21));
         assert_eq!(mail[0].folder_path, ["Recovered Mail"]);
+        Ok(())
+    }
+
+    #[test]
+    fn removes_only_pst_infrastructure_from_normal_folder_paths()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempdir()?;
+        let mut sink = DurableCatalogSink::create(&directory.path().join("job"))?;
+        let root = FolderAddress::root();
+        let ipm = root.child(0).ok_or("IPM address")?;
+        let inbox = ipm.child(0).ok_or("Inbox address")?;
+        for (address, id, parent_id, name) in [
+            (root, 0x122, None, None),
+            (
+                ipm,
+                0x8022,
+                Some(0x122),
+                Some("Localized data-file container"),
+            ),
+            (inbox, 0x8082, Some(0x8022), Some("Inbox")),
+        ] {
+            sink.event(CatalogEvent::UnitStart(RecoveryUnit::Folder { address }))?;
+            sink.event(CatalogEvent::Folder {
+                id,
+                parent_id,
+                name: name.map(str::to_owned),
+            })?;
+            sink.event(CatalogEvent::UnitEnd(RecoveryUnit::Folder { address }))?;
+        }
+        let message_unit = RecoveryUnit::Normal {
+            folder: inbox,
+            folder_id: 0x8082,
+            message_index: 0,
+        };
+        sink.event(CatalogEvent::UnitStart(message_unit))?;
+        message_start(&mut sink, 0x9004, Some(0x8062), None)?;
+        sink.event(CatalogEvent::MessageEnd {
+            id: 0x9004,
+            complete: true,
+        })?;
+        sink.event(CatalogEvent::UnitEnd(message_unit))?;
+
+        let mail = load_canonical_mail(&sink)?;
+        assert_eq!(mail.len(), 1);
+        assert_eq!(mail[0].folder_path, ["Inbox"]);
+        assert_eq!(mail[0].folder_role, CanonicalFolderRole::Ordinary);
         Ok(())
     }
 
@@ -1203,6 +1358,7 @@ mod tests {
         )?;
         assert_eq!(input.omitted_attachments, 1);
 
+        sink.checkpoint()?;
         drop(sink);
         let (parts, written, partial) = split_recovered_job(
             &job,
@@ -1260,6 +1416,7 @@ mod tests {
             id: 50,
             complete: true,
         })?;
+        sink.checkpoint()?;
         drop(sink);
         let connection = Connection::open(job.join(".pstforge/job.sqlite3"))?;
         connection.execute(
@@ -1291,6 +1448,7 @@ mod tests {
             id: 60,
             complete: true,
         })?;
+        sink.checkpoint()?;
         drop(sink);
         let connection = Connection::open(property_job.join(".pstforge/job.sqlite3"))?;
         let metadata: String = connection.query_row(
@@ -1327,6 +1485,7 @@ mod tests {
             id: 80,
             complete: true,
         })?;
+        sink.checkpoint()?;
         drop(sink);
         let connection = Connection::open(terminal_job.join(".pstforge/job.sqlite3"))?;
         let metadata: String = connection.query_row(
@@ -1376,6 +1535,7 @@ mod tests {
             id: 90,
             complete: false,
         })?;
+        sink.checkpoint()?;
         drop(sink);
         let connection = Connection::open(incomplete_job.join(".pstforge/job.sqlite3"))?;
         let metadata: String = connection.query_row(
@@ -1474,6 +1634,7 @@ mod tests {
             })?;
             sink.event(CatalogEvent::MessageEnd { id, complete: true })?;
         }
+        sink.checkpoint()?;
         drop(sink);
 
         let (parts, written, partial) = split_recovered_job(

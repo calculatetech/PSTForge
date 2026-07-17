@@ -506,7 +506,366 @@ work. Hash and identity evidence show that the source was not modified.
     keyed by its durable parent candidate and attachment path. A focused
     regression forces the same identifier through top-level and embedded
     scopes. A fresh clean-context remediation review returned `CLEAN`.
-- [ ] Milestone 0.4.1: Resume and 50 GB Qualification.
+- [x] Milestone 0.4.1: Resume and 50 GB Qualification.
+  - [x] (2026-07-16) Implemented exact read-only resume validation for source
+    identity and SHA-256, tool major, schema, recovery mode, hard size policy,
+    and writer format. Completed jobs reuse their durable recovery completion
+    without restarting libpff; historical spool metrics and finalized part
+    hashes remain stable across repeated resume.
+  - [x] (2026-07-16) Added `split --resume` and `--keep-work`, continued part
+    numbering, automatic ledger integrity checks, stale partial and writer
+    scratch cleanup, three-times-source disk preflight, privacy-safe progress,
+    elapsed/throughput/output metrics, and sampled supervisor/worker peak RSS.
+  - [x] (2026-07-16) Added real-PST gates for completed resume, immutable
+    mismatch refusal, SIGTERM checkpoint/resume, SIGKILL recovery, worker
+    parent-death containment, source immutability, and finalized-part
+    preservation. Focused external corpus runs pass.
+  - [x] (2026-07-16) Passed the full automated gate, including formatting,
+    warning-denied compilation and Clippy, workspace tests, documentation,
+    artifacts, licenses, RustSec advisories, writer acceptance, all external
+    corpus tests, and independent `pffinfo`/`readpst` checks. Evidence:
+    `.agent/test-results/1784253706-full`.
+  - [x] (2026-07-16) The first milestone-wide clean-context review found one
+    high and two medium resume risks. Remediation credits only validated
+    existing job allocation against resume capacity, revalidates immutable
+    metadata on the exact held ledger before reconciliation, and observes
+    interruption after hashing, after each atomic publication, and around
+    final cleanup. The real-PST signal gate now interrupts after part 0001 is
+    finalized and proves resume preserves its hash and continues numbering.
+  - [x] (2026-07-16) The next fresh review found three medium scale-workflow
+    gaps. Remediation installs signal handling before source hashing and checks
+    it at each 1 MiB source/blob/part hash chunk, rejects untracked private-root
+    entries before allocation credit, and measures an existing job directory
+    itself so a job mountpoint uses the correct filesystem. A direct 2 GiB
+    pre-hash SIGTERM trial exited 130 without creating a job; focused tests and
+    the full gate pass.
+  - [x] (2026-07-16) The third fresh review found three remaining medium gaps.
+    Remediation threads interruption through recovery source rechecks, staged
+    part hashes, publication verification, and publication-intent
+    reconciliation; rejects every untracked spool entry before allocation
+    credit; and opens a resume ledger query-only until exact immutable metadata
+    and integrity are validated, enabling WAL/configuration only afterward.
+    Focused regressions and the full gate pass.
+  - [x] (2026-07-16) The fourth fresh review found one remaining medium
+    interruption pattern. Standalone recovery now installs its handler before
+    source hashing, worker retry and every ordinary split ledger reopen use
+    interruptible validation, and an already-interrupted report skips
+    secondary full-job hashes. Focused real-PST tests and the full gate pass.
+  - [x] (2026-07-16) The fifth fresh review found one relevant medium capacity
+    issue: retained independent-validator failure scratch could be credited as
+    resumable job allocation. Resume capacity now credits the private ledger,
+    validated spool, and finalized parts but excludes all contents beneath the
+    diagnostic partial directory. A regression retains the diagnostic evidence
+    while proving its failed PST allocation is not credited.
+  - [x] (2026-07-17) Diagnosed the first 19 GB qualification attempt without
+    modifying its source or job. After about twelve minutes the old path had
+    created 72,905 spool files, written about 26 GB physically, and performed
+    about 1.5 TB of logical reads without publishing a part. SIGTERM could not
+    complete promptly inside the synchronous hot path; the owner used SIGKILL,
+    and the parser child exited through its parent-death signal. The durable
+    schema-5 job remains available for compatible resume.
+  - [x] (2026-07-17) Removed the observed scale amplification while retaining
+    streaming and crash containment. Properties through 64 KiB use
+    SHA-verified SQLite BLOB storage; larger values remain durable streamed
+    spool files. Candidate work commits in batches of at most 128 with a
+    per-candidate savepoint, so graceful interruption commits completed
+    candidates and abrupt process death can replay only the current bounded
+    batch. Existing schema-5 file-spool jobs gain the additive table and
+    blob-reference index on reopen.
+  - [x] (2026-07-17) Prefiltered candidate conversion before packing so one
+    unrepresentable message cannot repeatedly rebuild or fragment otherwise
+    valid parts. A fresh 2,178-message, 31,761,408-byte real-PST benchmark
+    completed in 7.83 seconds with 202,296 KiB maximum RSS, one 25,920,512-byte
+    part, 2,147 written candidates, 31 explicitly unsupported candidates, and
+    21 large spool files. The pre-remediation binary was killed after 334.77
+    seconds with 80 fragmented parts and 35,997 spool files. Reopening and
+    validating the completed job fell from more than 103 seconds without
+    completion to 1.93 seconds after indexing blob references.
+  - [x] (2026-07-17) The first updated full gate caught a worker-crash
+    lifecycle regression: the retry branch dropped an open candidate batch and
+    replayed completed work. It now aborts only the active candidate and commits
+    the completed bounded batch before reopening the ledger. The focused
+    persistent-abort real-PST regression again passes with four bounded worker
+    failures, one surviving committed candidate, and explicit partial status.
+  - [x] (2026-07-17) The refreshed full milestone gate passes formatting,
+    warning-denied compilation and Clippy, all workspace and external-corpus
+    tests, documentation and artifact checks, licensing, RustSec advisories,
+    writer acceptance, and independent `pffinfo`/`readpst` checks. Evidence:
+    `.agent/test-results/1784264675-full`.
+  - [x] (2026-07-17) A fresh scale-focused review found one high and three
+    medium issues, all relevant to 0.4.1. Remediation keeps `readpst` extraction
+    beneath the held private publication directory; securely deletes inline
+    payloads, checkpoints WAL, and vacuums the retained ledger; additively
+    indexes candidate occurrence lookup in schema 5; and makes PST block/message
+    construction plus validator process groups interruption-aware. Query-plan,
+    private-sentinel/compaction, scratch-boundary, validator-process, and
+    failure-classification regressions pass.
+  - [x] (2026-07-17) The representative no-`--keep-work` benchmark, including
+    secure ledger compaction, completed in 8.14 seconds with 201,840 KiB
+    maximum RSS, one 25,920,512-byte part, zero retained spool files, and a
+    54 MiB completed job.
+  - [x] (2026-07-17) The post-review full milestone gate passes all local,
+    external-corpus, license, advisory, writer acceptance, and independent
+    reader checks. Evidence: `.agent/test-results/1784265413-full`.
+  - [x] (2026-07-17) The next fresh review found one remaining medium issue:
+    schema migration, integrity SQL, secure deletion, and compaction could
+    suppress SIGTERM for a large ledger. SQLite work now runs with a monitoring
+    thread and interrupt handle, filesystem cleanup checks the same flag, and a
+    durable `cleanup_compaction_pending` marker makes interrupted vacuum
+    restartable. The external real-PST gate waits for deliberately long cleanup
+    SQL, sends SIGTERM, requires status 130, and proves resume finishes cleanup.
+    Crash-left nested `readpst` extraction is safely removed through held
+    directory handles.
+  - [x] (2026-07-17) The cleanup-interruption remediation passes the full
+    milestone gate, including the expanded external signal/resume case.
+    Evidence: `.agent/test-results/1784266394-full`.
+  - [x] (2026-07-17) A fresh review found two remaining medium containment
+    gaps relevant to the qualification run: canonical catalog reconstruction
+    and candidate prefilter translation did not observe SIGTERM throughout,
+    and a supervisor killed during independent validation could leave the
+    validator process tree alive. Catalog, event, ownership, blob-verification,
+    translation, and prefilter paths now share the interruption flag. Validators
+    run through a hidden parent-death supervisor that owns their process group
+    and kills the complete group when the PSTForge parent disappears.
+  - [x] (2026-07-17) Added focused regressions that interrupt at candidate
+    prefilter and resume from the durable job, and that prove a stalled
+    validator plus descendant cannot outlive its parent. Reconciled
+    `Cargo.lock` offline after moving runtime signal/process support into the
+    CLI dependency set; `cargo check --locked` and the fast gate pass.
+    Evidence: `.agent/test-results/1784268053-fast`.
+  - [x] (2026-07-17) The first fresh optimized 19 GB run proved the SQLite
+    inline-blob remediation was still the wrong large-mailbox architecture.
+    Recovery completed in about 4 minutes 40 seconds, but 37,373 candidates,
+    3,616,287 event rows, and 714,994 inline blobs then entered a silent
+    per-candidate replay. After 14 minutes 45 seconds, 2.38 GB of ledger and
+    about 12 GB of private job data existed but no PST part did. SIGTERM
+    checkpointed and exited with status 130. The failed old and fresh jobs were
+    removed after retaining bounded metrics, reclaiming about 14 GB.
+  - [x] (2026-07-17) Replaced per-payload SQLite/file storage with one
+    append-only durable pack with checked offset/length/hash slices, pack-first
+    transaction durability, crash-tail truncation, one ordered event scan, and
+    bounded failed-run cleanup. A 16 MB real-PST smoke produced 60 messages
+    accepted by PSTForge, `pffinfo`, and `readpst`. Fast-gate evidence:
+    `.agent/test-results/1784275380-fast`.
+  - [x] (2026-07-17) Completed the automated 19 GB split in 9:35.13. One
+    productive libpff pass durably found 37,373 candidates; a deterministic
+    global recovery-index error was recorded as partial rather than rescanning
+    the readable mailbox. Completed-store failures were bisected into valid
+    groups. The retained result has 14 independently finalized PST parts,
+    36,369 written candidates, 1,004 explicitly unsupported candidates,
+    19,128,924,160 output bytes, and unchanged source identity. Private payload
+    work was removed, leaving a 19 GB result job. External bounded evidence:
+    `large-qualification-20260717T080346Z`.
+  - [x] (2026-07-17) The owner accepted the measured 5,317,328,896-byte peak
+    RSS as a known limitation for 0.4.1 after the 19 GB run completed within
+    the operational time target. The 2 GiB objective remains an optimization
+    and release-scale gate rather than blocking this split-validation
+    milestone.
+  - [x] (2026-07-17) Rejected the first completed 19 GB qualification at its
+    first human gate. ScanPST found one invalid XBLOCK, 35,541 missing BBT
+    references, two invalid folder table nodes, and re-added 4,241 messages as
+    orphans. The first finding identified 8,064-byte aligned non-final row
+    matrix blocks where the PST data tree requires the full 8,176-byte payload.
+    The other findings are consequences of losing those table data trees.
+    Testing stopped after part 0001; the other thirteen parts require no
+    acceptance work. External evidence:
+    `qualification-v041-pack-r5/part-0001.log`.
+  - [x] (2026-07-17) Removed row-aligned data-tree chunking, taught the table
+    reader to stream fixed-size rows across block boundaries, and added a
+    large external-table regression requiring every non-final XBLOCK child to
+    use the maximum payload. Fast gate:
+    `.agent/test-results/1784293287-fast`.
+  - [x] (2026-07-17) Repeated the automated 19 GB qualification with the
+    corrected writer in 9:34.50. It again finalized 14 parts totaling
+    19,128,924,160 bytes, wrote 36,369 candidates, explicitly marked 1,004
+    unsupported, removed private payload work, and reverified source SHA-256
+    `1552450f3ff27090aea4b20b461bb310c49d9999eaee89c65ca1a4b96e394ad5`.
+    All 14 parts opened with Ubuntu `pffinfo` and completed a one-at-a-time
+    `readpst` extraction; each extraction was deleted immediately and the
+    private scratch directory is absent. Bounded evidence:
+    `large-qualification-20260717T130341Z`.
+  - [x] (2026-07-17) Rejected corrected job r6 at part 0001 ScanPST. The prior
+    XBLOCK/BBT defect was eliminated: no invalid blocks, invalid nodes, or
+    missing BBT references remain. ScanPST instead counted 306 of 310 Deleted
+    Items rows and 3,877 of 3,931 Inbox rows, losing approximately one row at
+    each external row-matrix block boundary; it then discarded both contents
+    tables and orphaned all 4,241 messages. The repaired reference confirmed
+    that rows remain block-aligned while unused tail bytes fill every non-final
+    leaf to the required 8,176-byte payload.
+  - [x] (2026-07-17) Implemented padded block-aligned row matrices, ignored
+    arbitrary dead-space bytes when reading, and added BTH lookup assertions
+    for the rows immediately before and after a padded boundary. A single
+    clean-context review found and resolved the dead-space compatibility and
+    boundary-lookup test gaps. Fast gate:
+    `.agent/test-results/1784314227-fast`.
+  - [x] (2026-07-17) Repeated the automated 19 GB qualification as r7 in
+    10:15.36. It finalized 14 parts totaling 19,128,924,160 bytes, wrote 36,369
+    candidates, explicitly marked 1,004 unsupported, and removed private
+    payload work. All 14 parts passed Ubuntu `pffinfo` and complete
+    one-at-a-time `readpst` extraction; extraction scratch was deleted
+    immediately. Peak process RSS was 5,321,302,016 bytes, so the memory gate
+    remains open. Bounded evidence: `large-qualification-20260717T185245Z`.
+  - [x] (2026-07-17) The owner ran ScanPST on every original r7 part with no
+    errors, opened every part in Outlook, and successfully imported the parts
+    into MailPlus. This accepted the corrected row-matrix representation but
+    exposed two product-level defects: part sizes varied widely below the
+    requested target, and the visible hierarchy was wrapped in `Recovered
+    Folder > Top of Outlook data file`.
+  - [x] (2026-07-17) Replaced writer-error group subdivision with calibrated
+    procedural packing of one deterministic ordered prefix. A validated trial
+    that leaves room is extended; one that exceeds the maximum is reduced; no
+    diagnostic half is published. Prefix bounds prevent oscillation, and
+    exponential plus binary probing avoids whole-mailbox cloning per trial.
+    Three focused reviews resolved retry and scale-complexity findings; the
+    final focused review returned `CLEAN`.
+  - [x] (2026-07-17) Corrected the adapted writer's FPMap start from allocation
+    page three to page two. Examination of the owner's known-good 19 GB Outlook
+    PST showed page zero AMap, page one PMap, page two FPMap, and data beginning
+    at page three; the inherited offset overwrote data at the first FPMap
+    boundary. A sparse 2,081,000,000-byte attachment regression crosses that
+    boundary and passed completed-store validation.
+  - [x] (2026-07-17) Removed the source store root and the source IPM subtree
+    from canonical visible paths by source identity, not by localized display
+    name or arbitrary depth. Well-known Deleted Items mapping now uses its
+    source role/NID rather than name comparison, so an ordinary user folder
+    named `Deleted items` remains distinct and retains its own mail.
+  - [x] (2026-07-17) Rejected and automatically removed qualification r8 after
+    its first two published parts exposed the obsolete raw-size estimator
+    (2,058,806,272 and 2,074,551,296 bytes). Only 16 KiB of bounded evidence was
+    retained at `large-qualification-20260717T202657Z`; no failed PST, payload
+    pack, or extraction tree remains.
+  - [x] (2026-07-17) Qualification r9 completed in 9:54.11 and finalized five
+    PSTs. Parts 0001-0004 are 4,294,854,656; 4,293,837,824; 4,286,219,264; and
+    4,274,791,424 bytes; part 0005 is the 1,977,541,632-byte final remainder.
+    All five passed completed-store validation, Ubuntu `pffinfo`, and complete
+    one-at-a-time `readpst` extraction before atomic publication. The run wrote
+    36,369 of 37,373 candidates, explicitly accounted for 1,004 unsupported
+    candidates, reverified the unchanged source SHA-256
+    `1552450f3ff27090aea4b20b461bb310c49d9999eaee89c65ca1a4b96e394ad5`,
+    and removed its 11 GB payload pack and reader scratch. Bounded evidence:
+    `large-qualification-20260717T204931Z`.
+  - [x] (2026-07-17) Updated the real-PST conformance fixture to compare
+    source-visible paths after removing identified root/IPM infrastructure, and
+    to exercise a 1 MiB part boundary now that artificial wrapper folders no
+    longer inflate the output. Worker-fault expectations now match the
+    milestone's one-failure unit isolation and no-rescan handling of a
+    deterministic global parser error. The complete full gate passes formatting,
+    warning-denied compilation and Clippy, all workspace and external-corpus
+    tests, documentation and artifact checks, licensing, RustSec advisories,
+    writer acceptance, and independent `pffinfo`/`readpst` checks. Evidence:
+    `.agent/test-results/1784322570-full`.
+  - [x] (2026-07-17) The final milestone-wide clean-context review found two
+    high issues. The previously recorded 5.32 GB canonical-mail RSS remains an
+    open milestone gate rather than a defect in the five published r9 parts.
+    Resume replay identity now also includes the durable recovery unit, fixing
+    the new correctness finding: a newly readable item with identical metadata
+    in an earlier unit is retained even when the old candidate's worker ID
+    shifts. A focused regression uses identical metadata across two normal
+    units and passes. The post-remediation full gate passes at
+    `.agent/test-results/1784323000-full`.
+  - [x] (2026-07-17) The fresh replay remediation review found that an embedded
+    candidate's parent worker ID can also shift. Replay identity now excludes
+    only that transient `parent_message_id` while retaining the durable unit,
+    embedded attachment path, and all stable start metadata. A nested regression
+    shifts the parent ID and proves the committed embedded candidate is matched
+    without discarding its newly readable parent. The full gate passes at
+    `.agent/test-results/1784323233-full`.
+  - [x] (2026-07-17) The next fresh review found the crash boundary between a
+    committed parent and an uncommitted embedded child. A replay match now
+    registers the exact durable item key and old source ID against the observed
+    worker ID/path for that recovery unit. A new child resolves its parent
+    through that exact mapping and stores the durable parent ID. The regression
+    commits a parent, checkpoints, replays it under a shifted ID, adds its new
+    child, and passes complete canonical ownership reconstruction. The full
+    gate passes at `.agent/test-results/1784323598-full`.
+  - [x] (2026-07-17) A fresh clean-context review of the replay ownership
+    remediation returned `CLEAN`, with no blocker, high, or outcome-relevant
+    medium resume/data-loss finding.
+  - [x] (2026-07-17) The owner accepted r11 and closed the 0.4.1 human gate.
+    ScanPST runs completed at that point were clean, Outlook attached an
+    original part successfully, and its visible folders matched the source
+    without the rejected recovery/store-root wrapper. The owner accepted this
+    as proof of independently valid, tightly sized splits; remaining all-part
+    content-fidelity analysis is not claimed by this milestone. Retain the
+    50 GB PST for the later final scale gate.
+  - [x] (2026-07-17) Rejected r9 after ScanPST of original part 0001; testing
+    stopped before the other four parts. At an exact eight-AMap boundary,
+    allocation rebuild wrote one inclusive extra PMap beyond the header EOF.
+    ScanPST consequently saw a 1,024-byte physical/logical EOF mismatch,
+    expected a nonexistent terminal AMap, and reported the extra PMap outside
+    AMap coverage. Shared empty contents/hierarchy template blocks also retained
+    one reference for the removed artificial wrapper, producing BBT/RBT counts
+    `6 vs 5` and `7 vs 6`.
+  - [x] (2026-07-17) PMap rebuild now uses ceiling page coverage without an
+    inclusive endpoint, and shared template reference bases no longer count the
+    removed wrapper. The ordinary writer suite passes 71 tests; the explicitly
+    executed 2.081 GB sparse attachment regression crosses the first FPMap,
+    verifies physical length equals header EOF, and passes completed-store
+    validation in 120.45 seconds with automatic scratch cleanup. One full-gate
+    run hit the unrelated post-publication signal timing assertion; its focused
+    rerun passed without changes, and the repeated complete full gate passes at
+    `.agent/test-results/1784324482-full`.
+  - [x] (2026-07-17) A fresh focused review found that shared-table bases also
+    had to depend on whether an explicit Deleted Items plan actually uses each
+    default empty table. Contents and hierarchy reference counts now derive
+    that condition separately. Regressions assert stored BBT counts for a
+    nonempty explicit Deleted Items folder and for one with a child, including
+    the ordinary user-created `Deleted items` sibling case. The full gate
+    passes at `.agent/test-results/1784324705-full`.
+  - [x] (2026-07-17) The remediation reviewer confirmed the separate contents
+    and hierarchy predicates and found only the missing empty-Deleted-Items
+    with nonempty-child test combination. That case now asserts that the shared
+    contents reference is included while the shared hierarchy reference is
+    excluded. The repeated full gate passes at
+    `.agent/test-results/1784324986-full`.
+  - [x] (2026-07-17) The final clean-context ScanPST remediation review returned
+    `CLEAN`. Rejected r9 was removed after its 1,317-byte part-0001 log was
+    retained externally; no r9 PST or private work remains.
+  - [x] (2026-07-17) Qualification r10 completed in 10:38.05 and finalized five
+    PSTs of 4,294,853,632; 4,293,837,824; 4,286,219,264; 4,274,791,424; and
+    1,977,541,632 bytes. Every physical file length exactly matches its header
+    EOF. Completed-store validation, `pffinfo`, and complete one-at-a-time
+    `readpst` extraction passed before publication. The run wrote 36,369 of
+    37,373 candidates, explicitly accounted for 1,004 unsupported candidates,
+    preserved source SHA-256
+    `1552450f3ff27090aea4b20b461bb310c49d9999eaee89c65ca1a4b96e394ad5`,
+    and removed private payload and reader scratch. Peak RSS remains
+    5,317,582,848 bytes. Bounded evidence:
+    `large-qualification-20260717T215308Z`.
+  - [x] (2026-07-17) Rejected r10 after ScanPST of original part 0001; no other
+    part was tested. EOF, AMap, PMap, BBT, and NBT structure are now clean.
+    Only shared BBT `cRef` arithmetic remained: raw BIDs `0x14` and `0x24`
+    stored `4` and `5` while ScanPST's reference B-tree counted `5` and `6`.
+  - [x] (2026-07-17) Corrected the shared-block formula to include the PST BBT
+    ownership baseline in addition to NBT references, while retaining the
+    separately reviewed Deleted Items contents/hierarchy predicates. Focused
+    topology tests and the complete full gate pass at
+    `.agent/test-results/1784326070-full`.
+  - [x] (2026-07-17) Rejected r10 after ScanPST part 0001 showed the two shared
+    counts had moved from one too high to one too low (`4 vs 5`, `5 vs 6`).
+    This isolated the missing BBT ownership baseline; no new review was opened
+    for the already-reviewed predicates. The 910-byte log was retained
+    externally and all rejected r10 PST/private work was removed.
+  - [x] (2026-07-17) Qualification r11 completed in 10:40.29 and finalized five
+    PSTs of 4,294,853,632; 4,293,837,824; 4,286,219,264; 4,274,791,424; and
+    1,977,541,632 bytes. Each physical length equals its header EOF, all
+    completed-store and independent-reader checks passed before publication,
+    source identity/SHA-256 remained unchanged, and private payload/reader
+    scratch was removed. Peak RSS remains 5,317,328,896 bytes. Bounded
+    evidence: `large-qualification-20260717T220903Z`.
+  - [x] (2026-07-17) Recorded the owner's milestone boundary: 0.4.1 proves
+    source-safe resume, practical 19 GB splitting, hard 4 GiB targeting,
+    source-visible folder layout, and independently valid output PSTs.
+    Attachment/content omission analysis is adjacent data-correctness work
+    reserved for a separately planned 0.4.2 branch. No 0.4.2 implementation is
+    included in this review unit.
+  - [x] (2026-07-17) The final complete-diff review found one high-severity
+    qualification-helper cleanup risk: any failed resumed run could recursively
+    remove its pre-existing job. Cleanup is now armed only when the requested
+    job path was absent for a fresh invocation; every resumed failure retains
+    the job for diagnosis and another resume. A direct failed-resume regression
+    preserved a sentinel, shell syntax passed, and the complete fast gate passes
+    at `.agent/test-results/1784329593-fast`.
 - [ ] Milestone 0.5.0: Operational UX and Debian Packaging.
 - [ ] Milestone 0.5.1: GitHub CI and Private-Corpus Automation; the remote is
   reachable, and work begins after the approved baseline is pushed.
@@ -514,6 +873,67 @@ work. Hash and identity evidence show that the source was not modified.
 - [ ] Milestone 1.0.0: MailPlus-Ready Release.
 
 ## Surprises & Discoveries
+
+- Observation: The original durable-spool design performed one file publish,
+  file sync, directory sync, and later rehash per property. A 19 GB corrupt
+  source therefore amplified small properties into tens of thousands of files,
+  terabytes of logical reads, and no visible output because PST publication is
+  intentionally a second phase. SQLite candidate events also lacked an index
+  on `blob_sha256`, making orphan-blob validation quadratic at realistic job
+  scale.
+
+- Observation: Durable replay cannot use libpff message IDs or ledger row
+  position as its sole identity. Synthetic embedded IDs shift when earlier
+  damaged units are skipped, and a failed unit creates a legitimate gap before
+  later durable candidates. A hashed multiset of immutable provenance,
+  recovery index, and metadata lets new gaps proceed while requiring every
+  durable candidate to be observed before completion.
+
+- Observation: The successful 19 GB run met the 20-minute target and published
+  its first part in under six minutes, but whole-mailbox canonical event
+  materialization peaked at 5.32 GB RSS. The payload pack solved disk and I/O
+  amplification; canonical reconstruction must still become a bounded
+  candidate/part stream to satisfy the 2 GiB gate.
+  Evidence: read-only `/proc` and ledger inspection of the interrupted owner
+  run plus the 2026-07-17 real-PST before/after benchmark.
+
+- Observation: A table row matrix is a logical byte stream; its row boundaries
+  may cross data-block boundaries. Aligning each leaf block to the row width
+  produced 8,064-byte non-final blocks instead of the required 8,176 bytes.
+  PSTForge's former block-by-block table reader concealed the defect, while
+  ScanPST rejected the XBLOCK and consequently orphaned 4,241 folder messages.
+  Evidence: `qualification-v041-pack-r5/part-0001.log` and focused writer
+  regressions in `.agent/test-results/1784293287-fast`.
+
+- Observation: External table row-matrix leaves have two simultaneous
+  constraints: rows cannot cross leaf boundaries, and every non-final XBLOCK
+  child must consume the full 8,176-byte payload. The unused tail after the
+  final complete row is dead space whose contents readers must ignore. The r6
+  writer satisfied only the second constraint, causing ScanPST to lose one row
+  at nearly every boundary.
+  Evidence: r6 part-0001 ScanPST log and repaired comparison, plus
+  `.agent/test-results/1784314227-fast`.
+
+- Observation: Moving small payloads into SQLite removed file-count growth but
+  did not remove work amplification. On the fresh 19 GB run, recovery produced
+  714,994 inline payloads and 3,616,287 event rows. Canonical reconstruction
+  then issued tens of thousands of separately prepared event queries and
+  reread roughly 29 GB logically every 15-20 seconds without publishing a
+  part. The mailbox had already been parsed successfully; normalizing and
+  replaying the entire mailbox before output was redundant.
+  Evidence: `/proc` I/O deltas, read-only ledger counts, bounded run log, and
+  `/usr/bin/time -v` from the interrupted 14:45 qualification run.
+
+- Observation: The owner will use a 19 GB corrupt PST for the first large-file
+  qualification because moving the 50 GB source and derived data is
+  unnecessarily expensive. The 50 GB source remains the final 1.0 scale gate.
+  Evidence: owner direction on 2026-07-16.
+
+- Observation: A Linux supervisor killed with SIGKILL cannot clean up its
+  native parser child. The worker therefore arms `PR_SET_PDEATHSIG` through
+  rustix and verifies the expected parent after arming it; the external gate
+  confirms the worker exits and the durable job resumes.
+  Evidence: focused forced-kill external-corpus run on 2026-07-16.
 
 - Observation: An embedded-message attachment requires two distinct local
   descriptor levels: the parent message references the attachment PC, and the
@@ -898,6 +1318,24 @@ work. Hash and identity evidence show that the source was not modified.
   Evidence: MS-PST subnode ownership, the durable parent/path model, focused
   libpff-sys tests, and final clean-context review on 2026-07-16.
 
+- Observation: The adapted upstream writer placed the first FPMap one allocation
+  page too late. At the first large-file FPMap boundary this caused allocation
+  metadata to overwrite a data page, while smaller generated PSTs remained
+  unaffected and therefore could not expose the defect.
+  Evidence: the owner's known-good 19 GB Outlook PST places AMap, PMap, FPMap,
+  and the first data page at consecutive allocation pages zero through three;
+  the corrected sparse 2,081,000,000-byte attachment regression crosses the
+  boundary and passes completed-store validation.
+
+- Observation: Raw recovered-property bytes are not a stable predictor of
+  serialized PST size. Table overhead, allocation maps, compression, and
+  message shape made the old estimate underfill ordinary r7 parts by roughly
+  half. Measuring a validated procedural trial and calibrating the same ordered
+  prefix produced four non-final r9 parts within 20,175,872 bytes of 4 GiB.
+  Evidence: r8 bounded evidence
+  `large-qualification-20260717T202657Z` and successful r9 evidence
+  `large-qualification-20260717T204931Z`.
+
 ## Decision Log
 
 - Decision: PSTForge 1.0 writes smaller PSTs; general export formats move
@@ -1133,15 +1571,19 @@ work. Hash and identity evidence show that the source was not modified.
   the owner's private job state and requires OS isolation beyond this tool.
   Date/Author: 2026-07-16 / Codex.
 
-- Decision: Version 0.4.0 treats the requested part size as a hard limit on the
-  finalized PST, not an estimator promise. Candidate estimates determine the
-  first packing attempt; completed normal parts that exceed the limit are
-  deterministically reduced and rebuilt until compliant. Only a singleton
-  message that itself cannot fit may publish as an explicitly marked oversize
-  part.
-  Rationale: real PST table and tree growth is discontinuous, so an estimate
-  alone cannot provide import checkpoints with a dependable maximum size.
-  Date/Author: 2026-07-16 / Codex.
+- Decision: Version 0.4.x treats the requested part size as a hard serialized
+  target, with a 4 GiB default. For each ordinary non-final part, use the
+  longest deterministic ordered prefix whose validated PST fits. Extend an
+  underfilled trial and reduce an over-limit trial without reordering or
+  publishing diagnostic subdivisions. Only the final remainder or the
+  indivisible size of the next message may leave a normal part below target;
+  only a singleton message that cannot fit may publish as an explicitly marked
+  oversize part.
+  Rationale: real PST table and tree growth is discontinuous, so a raw-byte
+  estimate cannot provide dependable import checkpoints. Calibrating actual
+  serialized trials preserves procedural writing while tightly controlling
+  completed part sizes.
+  Date/Author: 2026-07-17 / Codex after owner correction and focused review.
 
 - Decision: A published part consists of an immutable PST plus a schema-1.0.0
   JSON sidecar whose exact typed value is stored in the ledger transaction.
@@ -1262,7 +1704,7 @@ work. Hash and identity evidence show that the source was not modified.
 
 - Decision: When the writer intentionally omits attachments nested below one
   embedded-message level, every omitted descendant candidate key is marked
-  unsupported after the staged part survives actual-size bisection and before
+  unsupported after the staged part survives completed-store validation and before
   the accepted part is published. Written item assignments include only mail
   actually serialized.
   Rationale: nested descendants must not remain `spooled`, be reported written,
@@ -1279,6 +1721,16 @@ work. Hash and identity evidence show that the source was not modified.
   still contains the message in the correct folder.
   Date/Author: 2026-07-16 / Codex with human acceptance evidence.
 
+- Decision: Output visible folder paths omit only identified PST infrastructure
+  nodes: the source store root and its IPM subtree. Preserve every other source
+  folder name and hierarchy without a recovery wrapper. Map the well-known
+  Deleted Items folder by its source role/NID, never by display name, so an
+  ordinary user-created `Deleted items` folder is not conflated with it.
+  Rationale: reopening an Outlook-exported PST reproduces its visible hierarchy;
+  artificial parents disrupt imports, while names are user data and cannot
+  safely identify a well-known folder.
+  Date/Author: 2026-07-17 / project owner and Codex.
+
 - Decision: Use the visited native-identifier set only for nonzero top-level
   messages. Never suppress an embedded candidate because its local NID matches
   a top-level message or an embedded message in another subnode tree. Durable
@@ -1287,6 +1739,141 @@ work. Hash and identity evidence show that the source was not modified.
   Rationale: NIDs are scoped within subnode trees; global deduplication can turn
   a valid embedded attachment into an unresolved child and abort publication.
   Date/Author: 2026-07-16 / Codex after clean-context adversarial review.
+
+- Decision: Treat the owner's 19 GB corrupt PST as the first large-file
+  milestone qualification and the 50 GB corrupt PST as the final scale gate.
+  Test in place from the external corpus manifest, write only beneath a
+  separate output job directory, and do not create a full source copy merely
+  for convenience.
+  Rationale: PSTForge opens and rechecks the held source read-only; avoiding
+  redundant 19 GB and 50 GB copies reduces test time and disk demand without
+  weakening source safety.
+  Date/Author: 2026-07-16 / project owner and Codex.
+
+- Decision: Require three times the source size as free output capacity before
+  starting a fresh split. A matching resume credits the validated allocation
+  already consumed by that job against the same conservative total. Report
+  invocation time, logical source/final output bytes,
+  end-to-end throughput, and maximum sampled RSS across the supervisor and
+  parser workers. Retain empty private directories and the SQLite ledger after
+  cleaning spool payloads so completed jobs can be validated and resumed
+  without reparsing.
+  Rationale: The conservative capacity check covers private spool plus output
+  and temporary publication overhead; durable aggregate metrics preserve
+  useful qualification evidence after private payload cleanup.
+  Date/Author: 2026-07-16 / Codex.
+
+- Decision: Keep job schema version 5 and migrate it additively with an
+  `inline_blobs` table, a partial `candidate_events(blob_sha256)` index, and a
+  candidate occurrence index over provenance and source identifiers.
+  Store properties through 64 KiB transactionally in SQLite, retain streamed
+  content-addressed files for larger values, and expose verified inline values
+  to the writer through disposable Linux memfd or private cache files.
+  Candidate transactions may batch at most 128 completed candidates while each
+  candidate remains isolated by a savepoint. SIGINT/SIGTERM commits completed
+  work in the batch; SIGKILL or power loss may replay only that current batch.
+  Rationale: This removes per-property filesystem durability amplification and
+  quadratic resume validation without invalidating the owner's existing
+  schema-5 job. The threshold bounds SQLite values and memory, while the batch
+  bound makes forced-termination replay finite and testable.
+  Date/Author: 2026-07-17 / Codex after the first 19 GB qualification attempt.
+
+- Decision: When `--keep-work` is false, enable SQLite secure deletion, remove
+  blob references and payloads transactionally, truncate WAL, vacuum the
+  ledger, and checkpoint again. Record compaction as pending in the deletion
+  transaction and clear it only after vacuum succeeds, so interruption or
+  process death resumes cleanup rather than silently skipping it. Long SQLite
+  work uses an interrupt handle monitored from the shared signal flag. Create
+  independent-reader extraction only
+  inside the held private publication directory. The split writer observes the
+  shared interruption flag between messages and blocks, and kills an active
+  validator process group when the flag is set.
+  Rationale: Inline storage must not turn the retained resume ledger into an
+  undeclared archive of recovered content or permanent disk allocation.
+  Validator output is generated data and remains subject to the job-directory
+  boundary. Installing a signal handler is insufficient unless long output and
+  conformance stages can observe it promptly.
+  Date/Author: 2026-07-17 / Codex after clean-context adversarial review.
+
+- Decision: Treat 20 minutes as the operational acceptance target for the
+  owner's 19 GB qualification on this host, in addition to the existing 2 GiB
+  RSS and correctness gates. Emit phase progress during recovery so the absence
+  of finalized parts before traversal completes is distinguishable from a
+  stall.
+  Rationale: The utility is needed for immediate recovery work, and a nominal
+  24-hour ceiling does not satisfy the owner's stated usable turnaround.
+  Date/Author: 2026-07-17 / project owner and Codex.
+
+- Decision: Close 0.4.1 on the accepted r11 split and validation evidence even
+  though its measured 5,317,328,896-byte peak RSS exceeds the original 2 GiB
+  qualification objective. Preserve the 2 GiB objective for later optimization
+  and release-scale gates. Reserve version 0.4.2 for a separately planned
+  data-correctness milestone; do not fold attachment-fidelity changes into the
+  reviewed 0.4.1 branch.
+  Rationale: The owner confirmed that the milestone's useful outcome is proven:
+  the 19 GB source splits within the operational time target into tightly
+  controlled, independently valid PSTs whose source-visible folders attach in
+  Outlook as expected. Content omissions need focused correctness requirements
+  and evidence rather than reopening the validated splitting implementation.
+  Date/Author: 2026-07-17 / project owner and Codex.
+
+- Decision: Propagate the shared interruption flag through canonical catalog
+  reconstruction, indexed event/ownership reads, content verification, and
+  writer-input translation. Launch each independent reader through a hidden
+  PSTForge validator supervisor in a dedicated process group. The wrapper arms
+  a Linux parent-death signal, verifies its expected parent after arming, and
+  kills its complete process group if the parent disappears.
+  Rationale: The qualification job can spend meaningful time before and after
+  PST serialization. SIGTERM must be bounded in every data-dependent phase,
+  while SIGKILL must not orphan a reader or reader descendant that holds the
+  private validation scratch tree.
+  Date/Author: 2026-07-17 / Codex after clean-context adversarial review.
+
+- Decision: Replace the large-run payload hot path with a single append-only
+  job-local pack file. Store checked offset, length, and SHA-256 references in
+  the ledger; fsync the pack before committing a bounded candidate batch; and
+  truncate any uncommitted tail during resume. Consume candidate and event
+  metadata through one ordered cursor and expose bounded pack slices directly
+  to the writer. Publish a part as soon as a deterministic group of completed
+  top-level messages reaches the target instead of reconstructing the entire
+  mailbox first. Failed or interrupted qualification jobs are deleted after
+  bounded evidence is retained; successful parts remain for ScanPST and import
+  acceptance.
+  Rationale: PST node databases must be rebuilt per part, but message payloads
+  need only sequential copying plus integrity checks. A pack preserves durable
+  crash recovery without creating a second database-shaped mailbox, hundreds
+  of thousands of temporary files, or a full replay before the first
+  checkpoint.
+  Date/Author: 2026-07-17 / project owner and Codex after the fresh 19 GB run.
+
+- Decision: Treat a reported global libpff parser failure with no active
+  recovery unit as a recorded partial-recovery boundary after the productive
+  traversal, rather than repeating the immutable mailbox. Continue to retry
+  worker startup, crash, stall, and transport failures; isolate an exact
+  damaged unit after its first contained failure. Match resume candidates by a
+  stable metadata multiset rather than synthetic parser IDs or row position.
+  Rationale: The 19 GB source deterministically fails its optional recovery
+  index at an out-of-bounds offset only after all readable normal candidates
+  are durable. Repeating that result cannot recover data and previously turned
+  minutes of useful work into repeated full scans.
+  Date/Author: 2026-07-17 / Codex from automated 19 GB qualification evidence.
+
+- Decision: Serialize external table row matrices with ordinary maximum-size
+  PST data-tree leaves and stream rows across leaf boundaries in the reader.
+  Never shorten a non-final XBLOCK child merely to preserve application-level
+  record alignment.
+  Rationale: MS-PST defines the data tree as one logical stream. ScanPST
+  requires each non-final child at the maximum payload size, and independent
+  compatibility takes precedence over PSTForge's previous reader assumption.
+  Date/Author: 2026-07-17 / Codex from the rejected part-0001 ScanPST evidence.
+
+- Decision: Pack only complete table rows into each external row-matrix leaf,
+  pad every non-final leaf to 8,176 bytes, and ignore the sub-row dead-space
+  remainder during reads regardless of its contents. Keep BTH row indices
+  logical and contiguous across leaves.
+  Rationale: This is the representation accepted by ScanPST's repaired r6
+  reference and preserves both valid XBLOCK sizing and row lookup semantics.
+  Date/Author: 2026-07-17 / Codex after r6 evidence and clean-context review.
 
 ## Outcomes & Retrospective
 
@@ -1370,6 +1957,70 @@ attachment losses, and attachments beyond the PST signed-size boundary are
 explicit partial omissions rather than silent success. The 50 GB damaged
 source, interruption/resume, disk preflight, and stale-scratch cleanup remain
 0.4.1 qualification work.
+
+Version 0.4.1 implementation now provides exact compatible resume, durable
+recovery-completion reuse, continued part numbering, private-work retention or
+cleanup, capacity preflight, privacy-safe progress, and bounded runtime/resource
+metrics. Focused real-PST tests prove that completed resume does not restart
+libpff or change part hashes, configuration mismatch is read-only, SIGTERM and
+SIGKILL jobs resume, and a parser worker cannot outlive its supervisor. The
+first 19 GB attempt exposed severe property-spool and ledger-validation
+amplification. The remediation reduced the representative 2,178-message
+real-PST split from more than 334 seconds without completion to 7.83 seconds,
+and completed-job resume to 1.93 seconds. The last complete automated gate
+passes at `.agent/test-results/1784266394-full`; subsequent containment changes
+make canonical prefiltering interruptible and prevent a validator process tree
+from surviving supervisor death. Their fast gate passes at
+`.agent/test-results/1784268053-fast`; the refreshed full gate and fresh
+clean-context review remain before the owner resumes the 19 GB job. The 50 GB
+source remains the final 1.0 scale gate.
+
+The rejected 19 GB qualification completed in 9:35.13 and produced 14 finalized
+parts totaling 19,128,924,160 bytes. It wrote 36,369 of 37,373 durable
+candidates, explicitly accounted for 1,004 unsupported candidates, verified
+the source unchanged, and removed the 11 GB private payload pack. Completed
+store validation forced four deterministic group bisections instead of
+aborting completed work. ScanPST rejected part 0001 because external row
+matrices used invalid shortened non-final XBLOCK children; it then orphaned
+4,241 messages after losing both folder contents tables. The writer and reader
+now follow the logical byte-stream rule and the focused fast gate passes, but
+the corrected 19 GB qualification must be repeated. The automated scale result
+is also not yet a milestone pass because peak RSS was 5.32 GB, above the 2 GiB
+gate; bounded canonical streaming and a fresh full gate/review remain.
+
+The corrected qualification completed in 9:34.50 with the same deterministic
+candidate and part accounting. Every part passed `pffinfo` and a complete
+one-at-a-time `readpst` extraction without persistent extraction copies. The
+source SHA-256 remains unchanged. Its peak RSS was 5,195,616 KiB, so the 2 GiB
+memory gate still fails independently of the pending human ScanPST result.
+ScanPST rejected r6 part 0001 because 58 rows crossed external row-matrix leaf
+boundaries; the XBLOCK and BBT structures themselves were clean. The reviewed
+r7 fix pads block-aligned rows, preserves BTH lookup across the boundary, and
+passes the fast gate. The r7 qualification completed in 10:15.36 with all 14
+parts accepted by both Linux independent readers and all private extraction
+scratch removed. The owner subsequently accepted every r7 original in ScanPST,
+Outlook, and MailPlus, then rejected its widely underfilled parts and artificial
+`Recovered Folder > Top of Outlook data file` visible hierarchy as product
+behavior.
+
+The r9 qualification corrected both issues. It preserves source-visible paths
+without the store/IPM infrastructure wrapper, distinguishes the well-known
+Deleted Items folder from an ordinary same-named user folder by role rather
+than text, and procedurally calibrates each deterministic ordered prefix against
+its validated serialized size. It completed in 9:54.11 with four normal parts
+within 20,175,872 bytes of 4 GiB and one 1,977,541,632-byte final remainder.
+All five passed completed-store validation, `pffinfo`, and complete `readpst`
+extraction before publication; private payload and extraction scratch were
+removed. ScanPST then exposed two shared-block reference-count defects in r9
+and r10. The reviewed r11 correction completed in 10:40.29 with the same five
+tightly controlled part sizes, exact physical/header EOF agreement, unchanged
+source identity, complete independent-reader validation, and removal of
+private work. ScanPST runs completed at owner acceptance were clean, and an
+original part attached in Outlook with the expected source-visible folders.
+The owner accepted that evidence as completion of 0.4.1. Peak RSS remains
+5,317,328,896 bytes by explicit exception; attachment/content omission analysis
+is reserved for the separately planned 0.4.2 milestone, and the 50 GB source
+remains the final release-scale gate.
 
 ## Context and Orientation
 
@@ -1633,11 +2284,47 @@ throughput/resource metrics, and conservative disk-space preflight. A resume
 may continue only if source SHA-256 and identity, recovery mode, maximum size,
 writer format, schema, and compatible tool major version match.
 
-Run the 50 GB corrupt PST in balanced mode on the current host. Capture bounded
-evidence under `.agent/test-results/`, interrupt it normally and with SIGKILL,
-resume it, validate every part, and verify source identity. Acceptance is
-completion within 24 hours, peak process RSS below 2 GiB, no loss of finalized
-parts, and final accounting for every discovered mail candidate.
+Run the owner's 19 GB corrupt PST first in balanced mode on the current host,
+then retain the 50 GB source as the final scale gate. Capture bounded evidence
+under `.agent/test-results/`, interrupt normally and with SIGKILL, resume,
+validate every part with ScanPST first and the automated independent readers,
+and verify source identity. Milestone acceptance requires the 19 GB run to
+complete within the owner's 20-minute operational target, with no loss of
+finalized parts and final accounting for every discovered mail candidate. The
+owner accepted the measured 5,317,328,896-byte peak RSS as a known 0.4.1
+limitation; the 2 GiB objective remains for later optimization and release-scale
+qualification. The 1.0 release still requires the same acceptance behavior on
+the 50 GB source.
+
+The human qualification uses the external source in place; it never copies the
+source into the repository or job. Set `SOURCE` to the 19 GB manifest entry and
+`JOB` to a new directory on a filesystem with at least three times the source
+size free (at least 57 GB for a 19 GB source). Record only hashes, counts,
+timings, and paths redacted to corpus case names under `.agent/test-results/`.
+Run the release binary in balanced mode, interrupt the first invocation after
+the ledger has durable candidates, and resume the same job:
+
+    cargo build --release --locked
+    target/release/pstforge info "$SOURCE" --json > "$EVIDENCE/source-info.json"
+    /usr/bin/time -v -o "$EVIDENCE/interrupted.time" \
+      target/release/pstforge split "$SOURCE" --output "$JOB" \
+      --max-pst-size 4GiB --json > "$EVIDENCE/interrupted.json"
+    /usr/bin/time -v -o "$EVIDENCE/resumed.time" \
+      target/release/pstforge split "$SOURCE" --output "$JOB" \
+      --max-pst-size 4GiB --resume --json > "$EVIDENCE/resumed.json"
+
+Use SIGTERM for the normal interruption. The automated external gate covers
+SIGKILL and proves the parser child receives the Linux parent-death signal; a
+human SIGKILL rehearsal is optional on the 19 GB source unless the automated
+gate fails on this host. After completion, compare the final source identity
+with `source-info.json`, verify every part hash and sidecar, and run the full
+independent-reader gate. On Windows, run ScanPST against every part before
+opening any part in Outlook. Record whether ScanPST reports clean, optional
+minor inconsistencies, repairable errors, a fatal error, or a crash; preserve
+logs and repaired comparisons outside the repository. Only after ScanPST is
+complete, open each original part independently in Outlook, then import each
+into the dedicated MailPlus test mailbox and compare folder/message counts,
+unread/deleted placement, sampled bodies, and attachments.
 
 ### Milestone 9: Version 0.5.0 - Operational UX and Debian Packaging
 

@@ -93,6 +93,9 @@ Without `--resume`, an existing nonempty job directory is an error. With
 `--resume`, the source SHA-256, source identity, job schema, recovery mode,
 part-size policy, writer format, and compatible tool major version must match.
 A mismatch is refused and neither existing parts nor state are changed.
+Fresh jobs require three times the source size as available output capacity.
+On resume, validated allocation already consumed by the matching job is
+credited against that conservative requirement.
 
 Balanced recovery processes the normal tree, `libpff` deleted/recovered items,
 and orphan items. Aggressive recovery also sets the `libpff` flags to ignore
@@ -171,6 +174,24 @@ recovery index, and occurrence discriminator. The packer reproduces the
 necessary folder hierarchy in every part and assigns each writable item to
 exactly one part.
 
+The visible folder path in an output part is the visible source path. PST
+infrastructure nodes such as the store root and the IPM subtree are not emitted
+as artificial parents, and PSTForge does not add a recovery wrapper around
+ordinary reachable mail. Folder roles are identified from source metadata, not
+display-name comparison: a user-created folder named `Deleted items` remains an
+ordinary folder even when the store also has its well-known Deleted Items
+folder. Source display names and hierarchy are otherwise preserved exactly.
+
+The default part target remains 4 GiB. For every non-final normal part, the
+packer takes the longest deterministic ordered prefix whose validated
+serialized PST fits the requested size. It observes the difference between
+estimated and actual PST size and extends or reduces that same prefix until the
+next indivisible message would exceed the target. It does not publish
+diagnostic halves or arbitrary large chunks. A normal non-final part may be
+smaller than the target only by the serialized size of the next indivisible
+message; the final remainder may be smaller. A message that cannot fit by
+itself is preserved in a marked oversize part and makes the result partial.
+
 Each output store receives a deterministic identity derived from the source
 SHA-256, immutable job configuration, and part index. Node and block allocation
 is deterministic. Source creation and modification timestamps are preserved
@@ -239,17 +260,55 @@ summary. Part sidecars contain size, SHA-256, store identity, counts,
 oversize status, and bounded error totals. The SQLite ledger and spool are
 private implementation data and are not an interchange format.
 
-On successful completion, the spool and partial directory are deleted unless
-`--keep-work` was specified. The ledger remains so reports and validation can
-be reproduced. Interrupted and failed jobs retain enough work to resume.
+On successful completion, private spool payloads and stale partial output are
+deleted unless `--keep-work` was specified. Empty private directories and the
+ledger remain so reports and validation can be reproduced. Interrupted and
+failed jobs retain enough work to resume.
+
+Recovered property and attachment bytes are appended to one private,
+job-local payload pack. The ledger stores checked pack offsets, lengths, and
+SHA-256 values rather than payload copies or one file per property. The pack is
+synced before a bounded candidate batch is committed; resume truncates any
+uncommitted tail. SIGINT or SIGTERM checkpoints completed candidates in the
+current batch, while abrupt process or host failure may replay only that
+bounded batch. This private representation does not change output PST content.
+
+Candidate and event metadata are consumed in one deterministic ordered pass.
+PSTForge starts publishing validated parts from completed top-level messages
+without first reconstructing the entire recovered mailbox in memory or through
+per-candidate database queries.
+
+Without `--keep-work`, packed payloads are securely removed and the ledger is
+compacted after finalized parts and accounting are durable. Independent-reader
+extraction scratch is created only beneath `.pstforge/partial/` on the selected
+job filesystem and is removed after validation. PST construction checks for
+interruption between streamed messages and blocks; an active independent
+validator process group is terminated when interruption is requested. A
+validator also arms parent-death containment before launching its reader, so
+forced supervisor termination cannot leave the reader or its descendants
+running against private job scratch.
+Ledger integrity, migration, deletion, and compaction observe the same
+interruption flag. An interrupted compaction remains durably marked pending and
+is retried by the next matching resume.
+Canonical catalog reconstruction, event and ownership reads, candidate
+prefilter translation, and source-blob verification observe that flag as well.
 
 ## Reporting And Privacy
 
-Reports include source identity and format, corruption observation, recovery
-mode, elapsed time, peak memory, bytes read/written, folders and candidates by
+Split reports include source identity, recovery mode, invocation elapsed time,
+logical source and finalized output bytes, average end-to-end source
+throughput, and peak sampled RSS across the supervisor and parser workers.
+Reports also include corruption observation, folders and candidates by
 provenance, items by completeness and status, attachment totals, unsupported
 item/property totals, part sizes and hashes, retries, worker crashes, bounded
 error summaries, and whether the source identity remained unchanged.
+
+Default progress events report only operation state, part index, counts, byte
+sizes, elapsed time, and interruption state. They never include mailbox names,
+subjects, addresses, bodies, attachment names, or payload data.
+Recovery emits a periodic active event while parser data is arriving. Parts
+are published only after recovery traversal and candidate packing complete, so
+an empty `parts/` directory during active recovery is not itself a stall.
 
 Default logs use item keys, numeric node identifiers, operation names, and
 error categories. They do not include subjects, addresses, bodies, attachment

@@ -1,5 +1,6 @@
 #![deny(unsafe_code)]
 
+use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
 use std::fs::{self, File, OpenOptions};
@@ -7,17 +8,25 @@ use std::io::{ErrorKind, Read, Seek as _, Write as _};
 use std::os::fd::{AsRawFd, RawFd};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::thread;
+use std::time::Duration;
 
 use libpff_sys::{
     CatalogEvent, CatalogProvenance, CatalogSink, PropertyDescriptor, PropertyOwner, RecoveryUnit,
 };
-use rusqlite::{Connection, OpenFlags, params};
+use rusqlite::{Connection, ErrorCode, OpenFlags, OptionalExtension, params};
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 use sha2::{Digest, Sha256};
 use tempfile::NamedTempFile;
 use thiserror::Error;
 
-const JOB_SCHEMA_VERSION: i64 = 4;
+const JOB_SCHEMA_VERSION: i64 = 5;
+const INLINE_BLOB_MAX_BYTES: u64 = 64 * 1024;
+const INLINE_CACHE_DIRECTORY: &str = ".pstforge-inline-cache";
+const PAYLOAD_PACK_FILENAME: &str = "payload.pack";
+const CANDIDATE_CHECKPOINT_BATCH: u32 = 128;
 
 #[derive(Debug, Error)]
 pub enum JobError {
@@ -27,6 +36,10 @@ pub enum JobError {
     UnsafePath(PathBuf),
     #[error("job ledger integrity check failed: {0}")]
     Integrity(String),
+    #[error("resume configuration does not match the existing job: {0}")]
+    ResumeMismatch(&'static str),
+    #[error("job validation was interrupted")]
+    Interrupted,
     #[error("invalid catalog event sequence: {0}")]
     EventSequence(String),
     #[error("blob length mismatch: expected {expected}, wrote {actual}")]
@@ -58,6 +71,7 @@ pub struct JobSummary {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReplayCandidate {
+    pub item_key: String,
     pub id: u32,
     pub provenance: CatalogProvenance,
     pub recovery_index: Option<u64>,
@@ -78,6 +92,7 @@ pub struct SpooledFolder {
 pub struct SpooledBlob {
     pub sha256: String,
     pub byte_len: u64,
+    pub pack_offset: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -148,7 +163,8 @@ pub struct WorkerEvent {
     pub category: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct JobSourceIdentity {
     pub canonical_path: String,
     pub device: u64,
@@ -156,6 +172,36 @@ pub struct JobSourceIdentity {
     pub size_bytes: u64,
     pub modified_at: String,
     pub sha256: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct JobConfiguration {
+    pub tool_compatibility_major: u64,
+    pub split_schema_version: String,
+    pub recovery_mode: String,
+    pub maximum_pst_bytes: u64,
+    pub part_size_policy: String,
+    pub writer_format: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RecoveryCompletion {
+    pub normal_items: u64,
+    pub recovered_items: u64,
+    pub orphan_items: u64,
+    pub fragment_items: u64,
+    pub issues: u64,
+    pub issues_dropped: u64,
+    pub peak_worker_rss_bytes: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PublishedPartRecord {
+    pub part: PublishedPart,
+    pub sidecar: PartSidecar,
+    pub item_count: u64,
 }
 
 pub struct DurableCatalogSink {
@@ -168,18 +214,26 @@ pub struct DurableCatalogSink {
     _parts_directory: File,
     private_root: PathBuf,
     spool: PathBuf,
+    payload_pack_path: PathBuf,
+    payload_pack: File,
     partial: PathBuf,
     parts: PathBuf,
+    inline_cache_directory: RefCell<Option<File>>,
+    batch_open: Cell<bool>,
+    batch_candidates: Cell<u32>,
+    batch_pack_start: Cell<u64>,
     active: Option<ActiveCandidate>,
     property: Option<ActiveProperty>,
     attachment: Option<ActiveAttachment>,
     unit: Option<RecoveryUnit>,
     recent_candidates: HashMap<Vec<u32>, String>,
+    replayed_source_ids: HashMap<u32, u32>,
 }
 
 struct ActiveCandidate {
     key: String,
     message_id: u32,
+    pack_start: u64,
     sequence: u64,
     recipients: HashSet<u32>,
     supported: bool,
@@ -212,12 +266,45 @@ struct ActiveAttachment {
 }
 
 struct BlobWriter {
-    file: NamedTempFile,
+    start_offset: u64,
     hasher: Sha256,
     bytes: u64,
 }
 
 impl DurableCatalogSink {
+    pub fn validate_resume(
+        job_directory: &Path,
+        source: &JobSourceIdentity,
+        configuration: &JobConfiguration,
+    ) -> Result<(), JobError> {
+        let parent_path = job_parent(job_directory);
+        let parent_directory = open_directory(parent_path)?;
+        let job_name = job_directory
+            .file_name()
+            .ok_or_else(|| JobError::UnsafePath(job_directory.to_path_buf()))?;
+        let held_job_path = fd_path(parent_directory.as_raw_fd()).join(job_name);
+        let job_handle = open_directory(&held_job_path)?;
+        let held_job_path = fd_path(job_handle.as_raw_fd());
+        validate_private_directory(&job_handle, &held_job_path)?;
+        let private_directory = open_directory(&held_job_path.join(".pstforge"))?;
+        let private_root = fd_path(private_directory.as_raw_fd());
+        validate_private_directory(&private_directory, &private_root)?;
+        let database = private_root.join("job.sqlite3");
+        validate_private_file(&database, true)?;
+        let connection = Connection::open_with_flags(&database, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        let schema = read_schema_version(&connection)?;
+        if schema != JOB_SCHEMA_VERSION {
+            return Err(JobError::ResumeMismatch("job schema version"));
+        }
+        let integrity = connection.query_row("PRAGMA integrity_check(1)", [], |row| {
+            row.get::<_, String>(0)
+        })?;
+        if integrity != "ok" {
+            return Err(JobError::Integrity(integrity));
+        }
+        validate_resume_metadata(&connection, source, configuration)
+    }
+
     pub fn create(job_directory: &Path) -> Result<Self, JobError> {
         let parent_path = job_parent(job_directory);
         let parent_directory = open_directory(parent_path)?;
@@ -264,6 +351,14 @@ impl DurableCatalogSink {
         let private_root = fd_path(private_directory.as_raw_fd());
         let spool_directory = open_directory(&private_root.join("spool"))?;
         let spool = fd_path(spool_directory.as_raw_fd());
+        let payload_pack_path = spool.join(PAYLOAD_PACK_FILENAME);
+        let payload_pack = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&payload_pack_path)
+            .map_err(|source| io_error(&payload_pack_path, source))?;
         let partial_directory = open_directory(&private_root.join("partial"))?;
         let partial = fd_path(partial_directory.as_raw_fd());
         let parts_directory = open_directory(&parts)?;
@@ -293,17 +388,60 @@ impl DurableCatalogSink {
             _parts_directory: parts_directory,
             private_root,
             spool,
+            payload_pack_path,
+            payload_pack,
             partial,
             parts,
+            inline_cache_directory: RefCell::new(None),
+            batch_open: Cell::new(false),
+            batch_candidates: Cell::new(0),
+            batch_pack_start: Cell::new(0),
             active: None,
             property: None,
             attachment: None,
             unit: None,
             recent_candidates: HashMap::new(),
+            replayed_source_ids: HashMap::new(),
         })
     }
 
     pub fn open(job_directory: &Path) -> Result<Self, JobError> {
+        Self::open_expected(job_directory, None, None)
+    }
+
+    pub fn open_interruptible(
+        job_directory: &Path,
+        interrupted: &AtomicBool,
+    ) -> Result<Self, JobError> {
+        Self::open_expected(job_directory, None, Some(interrupted))
+    }
+
+    pub fn open_resume(
+        job_directory: &Path,
+        source: &JobSourceIdentity,
+        configuration: &JobConfiguration,
+    ) -> Result<Self, JobError> {
+        Self::open_expected(job_directory, Some((source, configuration)), None)
+    }
+
+    pub fn open_resume_interruptible(
+        job_directory: &Path,
+        source: &JobSourceIdentity,
+        configuration: &JobConfiguration,
+        interrupted: &AtomicBool,
+    ) -> Result<Self, JobError> {
+        Self::open_expected(
+            job_directory,
+            Some((source, configuration)),
+            Some(interrupted),
+        )
+    }
+
+    fn open_expected(
+        job_directory: &Path,
+        expected: Option<(&JobSourceIdentity, &JobConfiguration)>,
+        interrupted: Option<&AtomicBool>,
+    ) -> Result<Self, JobError> {
         let parent_path = job_parent(job_directory);
         let parent_directory = open_directory(parent_path)?;
         let job_name = job_directory
@@ -329,43 +467,89 @@ impl DurableCatalogSink {
         validate_private_file(&database, true)?;
         validate_private_file(&private_root.join("job.sqlite3-wal"), false)?;
         validate_private_file(&private_root.join("job.sqlite3-shm"), false)?;
+        validate_private_root_entries(&private_root)?;
         let mut connection =
             Connection::open_with_flags(&database, OpenFlags::SQLITE_OPEN_READ_WRITE)?;
-        configure(&connection)?;
+        connection.execute_batch("PRAGMA trusted_schema = OFF; PRAGMA busy_timeout = 5000;")?;
+        if expected.is_some() {
+            connection.execute_batch("PRAGMA query_only = ON;")?;
+        }
         validate_private_file(&database, true)?;
         validate_private_file(&private_root.join("job.sqlite3-wal"), false)?;
         validate_private_file(&private_root.join("job.sqlite3-shm"), false)?;
-        let schema = connection
-            .query_row(
-                "SELECT value FROM job_metadata WHERE key = 'schema_version'",
-                [],
-                |row| row.get::<_, String>(0),
-            )?
-            .parse::<i64>()
-            .map_err(|_| JobError::Integrity("invalid schema version".to_owned()))?;
+        let schema = read_schema_version(&connection)?;
         if schema != JOB_SCHEMA_VERSION {
-            return Err(JobError::Integrity(format!(
-                "unsupported schema version {schema}"
-            )));
+            return Err(if expected.is_some() {
+                JobError::ResumeMismatch("job schema version")
+            } else {
+                JobError::Integrity(format!("unsupported schema version {schema}"))
+            });
         }
-        let integrity = connection.query_row("PRAGMA integrity_check(1)", [], |row| {
-            row.get::<_, String>(0)
+        if let Some((source, configuration)) = expected {
+            validate_resume_metadata(&connection, source, configuration)?;
+        }
+        let integrity = run_sql_interruptible(&mut connection, interrupted, |connection| {
+            Ok(
+                connection.query_row("PRAGMA integrity_check(1)", [], |row| {
+                    row.get::<_, String>(0)
+                })?,
+            )
         })?;
         if integrity != "ok" {
             return Err(JobError::Integrity(integrity));
         }
-        reconcile_publications(
-            &mut connection,
-            &partial_directory,
-            &parts_directory,
-            &partial,
-            &parts,
-        )?;
-        validate_foreign_keys(&connection)?;
-        validate_blob_store(&connection, &spool)?;
-        validate_part_store(&connection, &parts)?;
-        remove_temporary_blobs(&spool)?;
-        remove_unreferenced_blobs(&connection, &spool)?;
+        if expected.is_some() {
+            connection.execute_batch("PRAGMA query_only = OFF;")?;
+        }
+        configure(&connection)?;
+        run_sql_interruptible(&mut connection, interrupted, |connection| {
+            ensure_inline_blob_table(connection)
+        })?;
+        run_sql_interruptible(&mut connection, interrupted, |connection| {
+            ensure_pack_offset_column(connection)
+        })?;
+        let payload_pack_path = spool.join(PAYLOAD_PACK_FILENAME);
+        let pack_exists = match payload_pack_path.symlink_metadata() {
+            Ok(_) => {
+                validate_private_file(&payload_pack_path, true)?;
+                true
+            }
+            Err(error) if error.kind() == ErrorKind::NotFound => false,
+            Err(source) => return Err(io_error(&payload_pack_path, source)),
+        };
+        let mut options = OpenOptions::new();
+        options
+            .read(true)
+            .write(true)
+            .mode(0o600)
+            .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW);
+        if pack_exists {
+            options.create(false);
+        } else {
+            options.create_new(true);
+        }
+        let mut payload_pack = options
+            .open(&payload_pack_path)
+            .map_err(|source| io_error(&payload_pack_path, source))?;
+        reconcile_payload_pack(&connection, &mut payload_pack, &payload_pack_path)?;
+        run_sql_interruptible(&mut connection, interrupted, |connection| {
+            reconcile_publications(
+                connection,
+                &partial_directory,
+                &parts_directory,
+                &partial,
+                &parts,
+                interrupted,
+            )
+        })?;
+        remove_stale_partials(&partial_directory, &partial, interrupted)?;
+        run_sql_interruptible(&mut connection, interrupted, |connection| {
+            validate_foreign_keys(connection)
+        })?;
+        validate_blob_store(&connection, &spool, interrupted)?;
+        validate_part_store(&connection, &parts, interrupted)?;
+        remove_temporary_blobs(&spool, interrupted)?;
+        remove_unreferenced_blobs(&connection, &spool, interrupted)?;
         Ok(Self {
             connection,
             _parent_directory: parent_directory,
@@ -376,14 +560,26 @@ impl DurableCatalogSink {
             _parts_directory: parts_directory,
             private_root,
             spool,
+            payload_pack_path,
+            payload_pack,
             partial,
             parts,
+            inline_cache_directory: RefCell::new(None),
+            batch_open: Cell::new(false),
+            batch_candidates: Cell::new(0),
+            batch_pack_start: Cell::new(0),
             active: None,
             property: None,
             attachment: None,
             unit: None,
             recent_candidates: HashMap::new(),
+            replayed_source_ids: HashMap::new(),
         })
+    }
+
+    pub fn allocated_bytes(&self) -> Result<u64, JobError> {
+        Ok(allocated_private_bytes(&self.private_root)?
+            .saturating_add(allocated_tree_bytes(&self.parts, true)?))
     }
 
     pub fn checkpoint(&self) -> Result<(), JobError> {
@@ -392,9 +588,208 @@ impl DurableCatalogSink {
                 "cannot checkpoint during an active candidate".to_owned(),
             ));
         }
+        self.commit_candidate_batch()?;
         self.connection
             .execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")?;
         sync_directory(&self.private_root)
+    }
+
+    fn begin_candidate(&self) -> Result<(), JobError> {
+        if !self.batch_open.get() {
+            self.connection.execute_batch("BEGIN IMMEDIATE")?;
+            self.batch_open.set(true);
+            self.batch_candidates.set(0);
+            self.batch_pack_start.set(self.payload_pack_len()?);
+        }
+        self.connection
+            .execute_batch("SAVEPOINT active_candidate")?;
+        Ok(())
+    }
+
+    fn finish_candidate(&self) -> Result<(), JobError> {
+        self.connection.execute_batch("RELEASE active_candidate")?;
+        let candidates = self.batch_candidates.get().saturating_add(1);
+        self.batch_candidates.set(candidates);
+        if candidates >= CANDIDATE_CHECKPOINT_BATCH {
+            self.commit_candidate_batch()?;
+        }
+        Ok(())
+    }
+
+    fn abort_candidate(&self) -> Result<(), JobError> {
+        self.connection
+            .execute_batch("ROLLBACK TO active_candidate; RELEASE active_candidate;")?;
+        Ok(())
+    }
+
+    fn commit_candidate_batch(&self) -> Result<(), JobError> {
+        if self.batch_open.get() {
+            self.payload_pack
+                .sync_all()
+                .map_err(|source| io_error(&self.payload_pack_path, source))?;
+            self.connection.execute_batch("COMMIT")?;
+            self.batch_open.set(false);
+            self.batch_candidates.set(0);
+            self.batch_pack_start.set(self.payload_pack_len()?);
+        }
+        Ok(())
+    }
+
+    fn payload_pack_len(&self) -> Result<u64, JobError> {
+        self.payload_pack
+            .metadata()
+            .map(|metadata| metadata.len())
+            .map_err(|source| io_error(&self.payload_pack_path, source))
+    }
+
+    fn truncate_payload_pack(&mut self, length: u64) -> Result<(), JobError> {
+        self.payload_pack
+            .set_len(length)
+            .map_err(|source| io_error(&self.payload_pack_path, source))?;
+        self.payload_pack
+            .seek(std::io::SeekFrom::Start(length))
+            .map_err(|source| io_error(&self.payload_pack_path, source))?;
+        Ok(())
+    }
+
+    pub fn finalize_private_work(&mut self, keep_work: bool) -> Result<(), JobError> {
+        self.finalize_private_work_expected(keep_work, None)
+    }
+
+    pub fn finalize_private_work_interruptible(
+        &mut self,
+        keep_work: bool,
+        interrupted: &AtomicBool,
+    ) -> Result<(), JobError> {
+        self.finalize_private_work_expected(keep_work, Some(interrupted))
+    }
+
+    fn finalize_private_work_expected(
+        &mut self,
+        keep_work: bool,
+        interrupted: Option<&AtomicBool>,
+    ) -> Result<(), JobError> {
+        check_job_interrupted(interrupted)?;
+        if self.active.is_some() {
+            return Err(JobError::EventSequence(
+                "cannot finalize private work during an active candidate".to_owned(),
+            ));
+        }
+        self.commit_candidate_batch()?;
+        let unfinished = self.connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM candidates WHERE status IN ('pending', 'spooled', 'failed')) \
+             OR EXISTS(SELECT 1 FROM publication_intents)",
+            [],
+            |row| row.get::<_, bool>(0),
+        )?;
+        if unfinished {
+            return Err(JobError::EventSequence(
+                "cannot remove private work before every candidate is finalized".to_owned(),
+            ));
+        }
+        remove_stale_partials(&self._partial_directory, &self.partial, interrupted)?;
+        if keep_work {
+            self.connection.execute(
+                "INSERT OR REPLACE INTO job_metadata(key, value) VALUES ('work_retained', 'true')",
+                [],
+            )?;
+            return self.checkpoint();
+        }
+        let (live_blob_count, live_blob_bytes) = self.connection.query_row(
+            "SELECT COUNT(*), COALESCE(SUM(byte_len), 0) FROM blobs",
+            [],
+            |row| Ok((row.get::<_, u64>(0)?, row.get::<_, u64>(1)?)),
+        )?;
+        let final_blob_count = read_optional_metadata_u64(&self.connection, "final_blob_count")?;
+        let final_blob_bytes = read_optional_metadata_u64(&self.connection, "final_blob_bytes")?;
+        let (blob_count, blob_bytes) = match (final_blob_count, final_blob_bytes) {
+            (None, None) => (live_blob_count, live_blob_bytes),
+            (Some(_), Some(_)) if live_blob_count == 0 && live_blob_bytes == 0 => {
+                let compaction_pending = self
+                    .connection
+                    .query_row(
+                        "SELECT value FROM job_metadata \
+                         WHERE key = 'cleanup_compaction_pending'",
+                        [],
+                        |row| row.get::<_, String>(0),
+                    )
+                    .optional()?
+                    .is_some_and(|value| value == "true");
+                if compaction_pending {
+                    self.compact_private_ledger(interrupted)?;
+                }
+                remove_spool_contents(&self._spool_directory, &self.spool, interrupted)?;
+                self.checkpoint()?;
+                return Ok(());
+            }
+            _ => {
+                return Err(JobError::Integrity(
+                    "final spool metrics disagree with retained work".to_owned(),
+                ));
+            }
+        };
+        run_sql_interruptible(&mut self.connection, interrupted, |connection| {
+            connection.execute_batch("PRAGMA secure_delete = ON;")?;
+            let transaction = connection.transaction()?;
+            transaction.execute(
+                "UPDATE candidate_events SET blob_sha256 = NULL, byte_len = NULL \
+                 WHERE blob_sha256 IS NOT NULL",
+                [],
+            )?;
+            transaction.execute("DELETE FROM blobs", [])?;
+            for (key, value) in [
+                ("final_blob_count", blob_count.to_string()),
+                ("final_blob_bytes", blob_bytes.to_string()),
+                ("work_retained", "false".to_owned()),
+                ("cleanup_compaction_pending", "true".to_owned()),
+            ] {
+                transaction.execute(
+                    "INSERT OR REPLACE INTO job_metadata(key, value) VALUES (?1, ?2)",
+                    params![key, value],
+                )?;
+            }
+            transaction.commit()?;
+            Ok(())
+        })?;
+        self.compact_private_ledger(interrupted)?;
+        remove_spool_contents(&self._spool_directory, &self.spool, interrupted)?;
+        Ok(())
+    }
+
+    fn compact_private_ledger(&mut self, interrupted: Option<&AtomicBool>) -> Result<(), JobError> {
+        self.checkpoint()?;
+        if std::env::var_os("PSTFORGE_TEST_LONG_CLEANUP_SQL").is_some() {
+            let marker = self.partial.join("cleanup-test-marker.partial");
+            fs::write(&marker, b"cleanup SQL active")
+                .map_err(|source| io_error(&marker, source))?;
+            set_mode(&marker, 0o600)?;
+            sync_file(&self._partial_directory, &self.partial)?;
+            run_sql_interruptible(&mut self.connection, interrupted, |connection| {
+                connection.query_row(
+                    "WITH RECURSIVE count(value) AS (\
+                         SELECT 1 UNION ALL SELECT value + 1 FROM count WHERE value < 100000000\
+                     ) SELECT SUM(value) FROM count",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )?;
+                Ok(())
+            })?;
+            fs::remove_file(&marker).map_err(|source| io_error(&marker, source))?;
+            sync_file(&self._partial_directory, &self.partial)?;
+        }
+        run_sql_interruptible(&mut self.connection, interrupted, |connection| {
+            connection.execute_batch("VACUUM;")?;
+            Ok(())
+        })?;
+        run_sql_interruptible(&mut self.connection, interrupted, |connection| {
+            connection.execute(
+                "INSERT OR REPLACE INTO job_metadata(key, value) \
+                 VALUES ('cleanup_compaction_pending', 'false')",
+                [],
+            )?;
+            Ok(())
+        })?;
+        self.checkpoint()
     }
 
     pub fn mark_candidates_unsupported(&mut self, item_keys: &[String]) -> Result<(), JobError> {
@@ -403,6 +798,7 @@ impl DurableCatalogSink {
                 "cannot reject an empty candidate set during an active candidate".to_owned(),
             ));
         }
+        self.commit_candidate_batch()?;
         let transaction = self.connection.transaction()?;
         for item_key in item_keys {
             let changed = transaction.execute(
@@ -433,10 +829,17 @@ impl DurableCatalogSink {
         self.attachment = None;
         self.unit = None;
         self.recent_candidates.clear();
-        if self.active.take().is_some() {
-            self.connection.execute_batch("ROLLBACK")?;
+        if let Some(active) = self.active.take() {
+            self.truncate_payload_pack(active.pack_start)?;
+            if let Err(error) = self.abort_candidate() {
+                let _ = self.connection.execute_batch("ROLLBACK");
+                let _ = self.truncate_payload_pack(self.batch_pack_start.get());
+                self.batch_open.set(false);
+                self.batch_candidates.set(0);
+                return Err(error);
+            }
         }
-        Ok(())
+        self.commit_candidate_batch()
     }
 
     pub fn bind_source(&self, source: &JobSourceIdentity) -> Result<(), JobError> {
@@ -461,6 +864,19 @@ impl DurableCatalogSink {
         self.connection.execute(
             "INSERT INTO job_metadata(key, value) VALUES ('recovery_mode', ?1)",
             [mode],
+        )?;
+        Ok(())
+    }
+
+    pub fn bind_configuration(&self, configuration: &JobConfiguration) -> Result<(), JobError> {
+        if self.active.is_some() {
+            return Err(JobError::EventSequence(
+                "cannot bind configuration during an active candidate".to_owned(),
+            ));
+        }
+        self.connection.execute(
+            "INSERT INTO job_metadata(key, value) VALUES ('job_configuration', ?1)",
+            [serde_json::to_string(configuration)?],
         )?;
         Ok(())
     }
@@ -500,6 +916,108 @@ impl DurableCatalogSink {
             [],
         )?;
         Ok(())
+    }
+
+    pub fn clear_interrupted(&self) -> Result<(), JobError> {
+        if self.active.is_some() {
+            return Err(JobError::EventSequence(
+                "cannot clear interruption during an active candidate".to_owned(),
+            ));
+        }
+        self.connection
+            .execute("DELETE FROM job_metadata WHERE key = 'interrupted'", [])?;
+        Ok(())
+    }
+
+    pub fn worker_supervision(&self) -> Result<(u32, u32), JobError> {
+        let attempts = read_optional_metadata_u32(&self.connection, "worker_attempts")?;
+        let failures = read_optional_metadata_u32(&self.connection, "worker_failures")?;
+        Ok((attempts, failures))
+    }
+
+    pub fn record_recovery_completion(
+        &self,
+        completion: &RecoveryCompletion,
+    ) -> Result<(), JobError> {
+        if self.active.is_some() {
+            return Err(JobError::EventSequence(
+                "cannot complete recovery during an active candidate".to_owned(),
+            ));
+        }
+        self.connection.execute(
+            "INSERT OR REPLACE INTO job_metadata(key, value) VALUES ('recovery_completion', ?1)",
+            [serde_json::to_string(completion)?],
+        )?;
+        Ok(())
+    }
+
+    pub fn recovery_completion(&self) -> Result<Option<RecoveryCompletion>, JobError> {
+        let value = self
+            .connection
+            .query_row(
+                "SELECT value FROM job_metadata WHERE key = 'recovery_completion'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        value
+            .map(|value| serde_json::from_str(&value).map_err(JobError::from))
+            .transpose()
+    }
+
+    pub fn isolated_units(&self) -> Result<Vec<(RecoveryUnit, u32)>, JobError> {
+        let mut statement = self
+            .connection
+            .prepare("SELECT unit_json, failures FROM isolated_units ORDER BY unit_json")?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        rows.into_iter()
+            .map(|(unit, failures)| {
+                Ok((
+                    serde_json::from_str(&unit)?,
+                    checked_u32(failures, "isolated unit failures")?,
+                ))
+            })
+            .collect()
+    }
+
+    pub fn published_parts(&self) -> Result<Vec<PublishedPartRecord>, JobError> {
+        let mut statement = self.connection.prepare(
+            "SELECT p.part_index, p.filename, p.byte_len, p.sha256, p.oversize, \
+                    p.sidecar_json, COUNT(i.item_key) \
+             FROM parts p JOIN part_items i ON i.part_index = p.part_index \
+             GROUP BY p.part_index, p.filename, p.byte_len, p.sha256, p.oversize, p.sidecar_json \
+             ORDER BY p.part_index",
+        )?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((
+                    PublishedPart {
+                        index: row.get(0)?,
+                        filename: row.get(1)?,
+                        byte_len: row.get(2)?,
+                        sha256: row.get(3)?,
+                        oversize: row.get(4)?,
+                    },
+                    row.get::<_, String>(5)?,
+                    row.get::<_, u64>(6)?,
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        rows.into_iter()
+            .map(|(part, sidecar, item_count)| {
+                let sidecar = serde_json::from_str(&sidecar)?;
+                validate_sidecar(&part, &sidecar)?;
+                Ok(PublishedPartRecord {
+                    part,
+                    sidecar,
+                    item_count,
+                })
+            })
+            .collect()
     }
 
     pub fn record_worker_event(
@@ -572,11 +1090,24 @@ impl DurableCatalogSink {
                     ))
                 },
             )?;
-        let (blob_count, blob_bytes) = self.connection.query_row(
+        let (live_blob_count, live_blob_bytes) = self.connection.query_row(
             "SELECT COUNT(*), COALESCE(SUM(byte_len), 0) FROM blobs",
             [],
             |row| Ok((row.get::<_, u64>(0)?, row.get::<_, u64>(1)?)),
         )?;
+        let final_blob_count = read_optional_metadata_u64(&self.connection, "final_blob_count")?;
+        let final_blob_bytes = read_optional_metadata_u64(&self.connection, "final_blob_bytes")?;
+        let (blob_count, blob_bytes) = match (final_blob_count, final_blob_bytes) {
+            (Some(count), Some(bytes)) if live_blob_count == 0 && live_blob_bytes == 0 => {
+                (count, bytes)
+            }
+            (None, None) => (live_blob_count, live_blob_bytes),
+            _ => {
+                return Err(JobError::Integrity(
+                    "final spool metrics disagree with retained work".to_owned(),
+                ));
+            }
+        };
         Ok(JobSummary {
             committed_candidates: committed,
             recovered_candidates: recovered,
@@ -592,7 +1123,7 @@ impl DurableCatalogSink {
 
     pub fn replay_candidates(&self) -> Result<Vec<ReplayCandidate>, JobError> {
         let mut statement = self.connection.prepare(
-            "SELECT provenance, source_node_id, recovery_index, occurrence, metadata_json, recovery_unit_json \
+            "SELECT item_key, provenance, source_node_id, recovery_index, occurrence, metadata_json, recovery_unit_json \
              FROM candidates \
              WHERE status IN ('spooled', 'written', 'unsupported') ORDER BY rowid",
         )?;
@@ -600,17 +1131,26 @@ impl DurableCatalogSink {
             .query_map([], |row| {
                 Ok((
                     row.get::<_, String>(0)?,
-                    row.get::<_, Option<i64>>(1)?,
+                    row.get::<_, String>(1)?,
                     row.get::<_, Option<i64>>(2)?,
-                    row.get::<_, i64>(3)?,
-                    row.get::<_, String>(4)?,
-                    row.get::<_, Option<String>>(5)?,
+                    row.get::<_, Option<i64>>(3)?,
+                    row.get::<_, i64>(4)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, Option<String>>(6)?,
                 ))
             })?
             .collect::<Result<Vec<_>, _>>()?;
         rows.into_iter()
             .map(
-                |(provenance, source_node_id, recovery_index, occurrence, metadata, unit)| {
+                |(
+                    item_key,
+                    provenance,
+                    source_node_id,
+                    recovery_index,
+                    occurrence,
+                    metadata,
+                    unit,
+                )| {
                     let provenance = match provenance.as_str() {
                         "normal" => CatalogProvenance::Normal,
                         "recovered" => CatalogProvenance::Recovered,
@@ -623,6 +1163,7 @@ impl DurableCatalogSink {
                         }
                     };
                     Ok(ReplayCandidate {
+                        item_key,
                         id: source_node_id
                             .map(u32::try_from)
                             .transpose()
@@ -676,6 +1217,20 @@ impl DurableCatalogSink {
     }
 
     pub fn spooled_candidates(&self) -> Result<Vec<SpooledCandidate>, JobError> {
+        self.spooled_candidates_expected(None)
+    }
+
+    pub fn spooled_candidates_interruptible(
+        &self,
+        interrupted: &AtomicBool,
+    ) -> Result<Vec<SpooledCandidate>, JobError> {
+        self.spooled_candidates_expected(Some(interrupted))
+    }
+
+    fn spooled_candidates_expected(
+        &self,
+        interrupted: Option<&AtomicBool>,
+    ) -> Result<Vec<SpooledCandidate>, JobError> {
         let mut statement = self.connection.prepare(
             "SELECT item_key, provenance, source_node_id, recovery_index, occurrence, \
                     completeness, metadata_json, parent_item_key, parent_attachment_index, \
@@ -683,87 +1238,111 @@ impl DurableCatalogSink {
              FROM candidates WHERE status = 'spooled' \
              ORDER BY provenance, source_node_id, recovery_index, occurrence, item_key",
         )?;
-        let rows = statement
-            .query_map([], |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, Option<i64>>(2)?,
-                    row.get::<_, Option<i64>>(3)?,
-                    row.get::<_, i64>(4)?,
-                    row.get::<_, String>(5)?,
-                    row.get::<_, String>(6)?,
-                    row.get::<_, Option<String>>(7)?,
-                    row.get::<_, Option<i64>>(8)?,
-                    row.get::<_, Option<String>>(9)?,
-                ))
-            })?
-            .collect::<Result<Vec<_>, _>>()?;
-        rows.into_iter()
-            .map(
-                |(
-                    item_key,
-                    provenance,
-                    source_node_id,
-                    recovery_index,
-                    occurrence,
-                    completeness,
-                    metadata,
-                    parent_item_key,
-                    parent_attachment_index,
-                    unit,
-                )| {
-                    let provenance = parse_provenance(&provenance)?;
-                    let source_node_id = source_node_id
-                        .map(|value| checked_u32(value, "candidate source node id"))
-                        .transpose()?;
-                    let recovery_index = recovery_index
-                        .map(|value| checked_u64(value, "candidate recovery index"))
-                        .transpose()?;
-                    let occurrence = checked_u32(occurrence, "candidate occurrence")?;
-                    let metadata = serde_json::from_str(&metadata)?;
-                    let parent_attachment_index = parent_attachment_index
-                        .map(|value| checked_u32(value, "parent attachment index"))
-                        .transpose()?;
-                    let unit = unit.map(|value| serde_json::from_str(&value)).transpose()?;
-                    let events = self.spooled_events(&item_key)?;
-                    Ok(SpooledCandidate {
-                        item_key,
-                        provenance,
-                        source_node_id,
-                        recovery_index,
-                        occurrence,
-                        parent_item_key,
-                        parent_attachment_index,
-                        unit,
-                        completeness,
-                        metadata,
-                        events,
-                    })
-                },
-            )
-            .collect()
+        let mut query = statement.query([])?;
+        let mut rows = Vec::new();
+        while let Some(row) = query.next()? {
+            check_job_interrupted(interrupted)?;
+            rows.push((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, Option<i64>>(2)?,
+                row.get::<_, Option<i64>>(3)?,
+                row.get::<_, i64>(4)?,
+                row.get::<_, String>(5)?,
+                row.get::<_, String>(6)?,
+                row.get::<_, Option<String>>(7)?,
+                row.get::<_, Option<i64>>(8)?,
+                row.get::<_, Option<String>>(9)?,
+            ));
+        }
+        drop(query);
+        drop(statement);
+        let mut events_by_candidate = self.spooled_events_by_candidate(interrupted)?;
+        let mut candidates = Vec::with_capacity(rows.len());
+        for (
+            item_key,
+            provenance,
+            source_node_id,
+            recovery_index,
+            occurrence,
+            completeness,
+            metadata,
+            parent_item_key,
+            parent_attachment_index,
+            unit,
+        ) in rows
+        {
+            check_job_interrupted(interrupted)?;
+            let provenance = parse_provenance(&provenance)?;
+            let source_node_id = source_node_id
+                .map(|value| checked_u32(value, "candidate source node id"))
+                .transpose()?;
+            let recovery_index = recovery_index
+                .map(|value| checked_u64(value, "candidate recovery index"))
+                .transpose()?;
+            let occurrence = checked_u32(occurrence, "candidate occurrence")?;
+            let metadata = serde_json::from_str(&metadata)?;
+            let parent_attachment_index = parent_attachment_index
+                .map(|value| checked_u32(value, "parent attachment index"))
+                .transpose()?;
+            let unit = unit.map(|value| serde_json::from_str(&value)).transpose()?;
+            let events = events_by_candidate.remove(&item_key).unwrap_or_default();
+            candidates.push(SpooledCandidate {
+                item_key,
+                provenance,
+                source_node_id,
+                recovery_index,
+                occurrence,
+                parent_item_key,
+                parent_attachment_index,
+                unit,
+                completeness,
+                metadata,
+                events,
+            });
+        }
+        if !events_by_candidate.is_empty() {
+            return Err(JobError::Integrity(
+                "spooled events refer to an unclaimed candidate".to_owned(),
+            ));
+        }
+        Ok(candidates)
     }
 
     pub fn candidate_ownerships(&self) -> Result<Vec<CandidateOwnership>, JobError> {
+        self.candidate_ownerships_expected(None)
+    }
+
+    pub fn candidate_ownerships_interruptible(
+        &self,
+        interrupted: &AtomicBool,
+    ) -> Result<Vec<CandidateOwnership>, JobError> {
+        self.candidate_ownerships_expected(Some(interrupted))
+    }
+
+    fn candidate_ownerships_expected(
+        &self,
+        interrupted: Option<&AtomicBool>,
+    ) -> Result<Vec<CandidateOwnership>, JobError> {
         let mut statement = self.connection.prepare(
             "SELECT item_key, source_node_id, status, parent_item_key, \
                     parent_attachment_index, embedded_path_json, metadata_json \
-             FROM candidates WHERE status IN ('spooled', 'unsupported') ORDER BY item_key",
+             FROM candidates WHERE status IN ('spooled', 'written', 'unsupported') ORDER BY item_key",
         )?;
-        let rows = statement
-            .query_map([], |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, Option<i64>>(1)?,
-                    row.get::<_, String>(2)?,
-                    row.get::<_, Option<String>>(3)?,
-                    row.get::<_, Option<i64>>(4)?,
-                    row.get::<_, String>(5)?,
-                    row.get::<_, String>(6)?,
-                ))
-            })?
-            .collect::<Result<Vec<_>, _>>()?;
+        let mut query = statement.query([])?;
+        let mut rows = Vec::new();
+        while let Some(row) = query.next()? {
+            check_job_interrupted(interrupted)?;
+            rows.push((
+                row.get::<_, String>(0)?,
+                row.get::<_, Option<i64>>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, Option<String>>(3)?,
+                row.get::<_, Option<i64>>(4)?,
+                row.get::<_, String>(5)?,
+                row.get::<_, String>(6)?,
+            ));
+        }
         rows.into_iter()
             .map(
                 |(
@@ -799,33 +1378,207 @@ impl DurableCatalogSink {
     }
 
     pub fn open_blob(&self, blob: &SpooledBlob) -> Result<File, JobError> {
-        if blob.sha256.len() != 64
-            || !blob
-                .sha256
-                .bytes()
-                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-        {
-            return Err(JobError::Integrity("invalid spool blob digest".to_owned()));
+        self.open_blob_expected(blob, None)
+    }
+
+    pub fn open_blob_interruptible(
+        &self,
+        blob: &SpooledBlob,
+        interrupted: &AtomicBool,
+    ) -> Result<File, JobError> {
+        self.open_blob_expected(blob, Some(interrupted))
+    }
+
+    fn open_blob_expected(
+        &self,
+        blob: &SpooledBlob,
+        interrupted: Option<&AtomicBool>,
+    ) -> Result<File, JobError> {
+        check_job_interrupted(interrupted)?;
+        if let Some(offset) = blob.pack_offset {
+            if !valid_blob_hash(&blob.sha256) {
+                return Err(JobError::Integrity(
+                    "invalid payload pack digest".to_owned(),
+                ));
+            }
+            let end = offset
+                .checked_add(blob.byte_len)
+                .ok_or_else(|| JobError::Integrity("payload pack range overflow".to_owned()))?;
+            let mut file = OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
+                .open(&self.payload_pack_path)
+                .map_err(|source| io_error(&self.payload_pack_path, source))?;
+            if file
+                .metadata()
+                .map_err(|source| io_error(&self.payload_pack_path, source))?
+                .len()
+                < end
+            {
+                return Err(JobError::Integrity(
+                    "payload pack range exceeds the durable file".to_owned(),
+                ));
+            }
+            file.seek(std::io::SeekFrom::Start(offset))
+                .map_err(|source| io_error(&self.payload_pack_path, source))?;
+            return Ok(file);
         }
-        let expected = self.connection.query_row(
-            "SELECT byte_len FROM blobs WHERE sha256 = ?1",
-            [&blob.sha256],
-            |row| row.get::<_, u64>(0),
-        )?;
+        let (expected, inline) = self.blob_record(blob)?;
         if expected != blob.byte_len {
             return Err(JobError::Integrity(format!(
                 "spool blob {} length disagrees with the ledger",
                 blob.sha256
             )));
         }
-        open_verified_blob(&self.spool.join(&blob.sha256), &blob.sha256, blob.byte_len)
+        if let Some(data) = inline {
+            let file_path = self.spool.join(&blob.sha256);
+            if file_path
+                .try_exists()
+                .map_err(|source| io_error(&file_path, source))?
+            {
+                return Err(JobError::Integrity(format!(
+                    "blob {} has multiple storage representations",
+                    blob.sha256
+                )));
+            }
+            verify_blob_bytes(&blob.sha256, blob.byte_len, &data)?;
+            let owned =
+                rustix::fs::memfd_create("pstforge-inline-blob", rustix::fs::MemfdFlags::CLOEXEC)
+                    .map_err(|source| io_error(&self.partial, source.into()))?;
+            let mut file = File::from(owned);
+            file.write_all(&data)
+                .map_err(|source| io_error(&self.partial, source))?;
+            file.seek(std::io::SeekFrom::Start(0))
+                .map_err(|source| io_error(&self.partial, source))?;
+            check_job_interrupted(interrupted)?;
+            return Ok(file);
+        }
+        open_verified_blob_with_interrupt(
+            &self.spool.join(&blob.sha256),
+            &blob.sha256,
+            blob.byte_len,
+            interrupted,
+        )
     }
 
-    /// Return a path rooted at the held private spool directory after verifying
-    /// that the ledger entry and immutable blob still agree.
+    /// Return a held private path after verifying that the ledger and payload
+    /// agree. Inline data is materialized only as disposable writer scratch.
     pub fn verified_blob_path(&self, blob: &SpooledBlob) -> Result<PathBuf, JobError> {
-        drop(self.open_blob(blob)?);
-        Ok(self.spool.join(&blob.sha256))
+        self.verified_blob_path_expected(blob, None)
+    }
+
+    pub fn verified_blob_path_interruptible(
+        &self,
+        blob: &SpooledBlob,
+        interrupted: &AtomicBool,
+    ) -> Result<PathBuf, JobError> {
+        self.verified_blob_path_expected(blob, Some(interrupted))
+    }
+
+    fn verified_blob_path_expected(
+        &self,
+        blob: &SpooledBlob,
+        interrupted: Option<&AtomicBool>,
+    ) -> Result<PathBuf, JobError> {
+        check_job_interrupted(interrupted)?;
+        if let Some(offset) = blob.pack_offset {
+            let end = offset
+                .checked_add(blob.byte_len)
+                .ok_or_else(|| JobError::Integrity("payload pack range overflow".to_owned()))?;
+            if !valid_blob_hash(&blob.sha256) || end > self.payload_pack_len()? {
+                return Err(JobError::Integrity(
+                    "payload pack blob has an invalid range".to_owned(),
+                ));
+            }
+            return Ok(self.payload_pack_path.clone());
+        }
+        let (expected, inline) = self.blob_record(blob)?;
+        if expected != blob.byte_len {
+            return Err(JobError::Integrity(format!(
+                "spool blob {} length disagrees with the ledger",
+                blob.sha256
+            )));
+        }
+        let Some(data) = inline else {
+            drop(self.open_blob_expected(blob, interrupted)?);
+            return Ok(self.spool.join(&blob.sha256));
+        };
+        verify_blob_bytes(&blob.sha256, blob.byte_len, &data)?;
+        let cache = self.inline_cache_path()?;
+        let destination = cache.join(format!(".tmp-{}", blob.sha256));
+        match destination.symlink_metadata() {
+            Ok(_) => verify_blob(&destination, &blob.sha256, blob.byte_len)?,
+            Err(error) if error.kind() == ErrorKind::NotFound => {
+                let mut temporary =
+                    NamedTempFile::new_in(&cache).map_err(|source| io_error(&cache, source))?;
+                temporary
+                    .write_all(&data)
+                    .map_err(|source| io_error(temporary.path(), source))?;
+                temporary
+                    .flush()
+                    .map_err(|source| io_error(temporary.path(), source))?;
+                temporary
+                    .persist_noclobber(&destination)
+                    .map_err(|error| io_error(&destination, error.error))?;
+                verify_blob(&destination, &blob.sha256, blob.byte_len)?;
+            }
+            Err(source) => return Err(io_error(&destination, source)),
+        }
+        check_job_interrupted(interrupted)?;
+        Ok(destination)
+    }
+
+    fn blob_record(&self, blob: &SpooledBlob) -> Result<(u64, Option<Vec<u8>>), JobError> {
+        if !valid_blob_hash(&blob.sha256) {
+            return Err(JobError::Integrity("invalid spool blob digest".to_owned()));
+        }
+        let (expected, inline_len, data) = self.connection.query_row(
+            "SELECT b.byte_len, length(i.data), \
+                    CASE WHEN length(i.data) <= ?2 THEN i.data END \
+             FROM blobs b LEFT JOIN inline_blobs i ON i.sha256 = b.sha256 \
+             WHERE b.sha256 = ?1",
+            params![&blob.sha256, INLINE_BLOB_MAX_BYTES],
+            |row| {
+                Ok((
+                    row.get::<_, u64>(0)?,
+                    row.get::<_, Option<u64>>(1)?,
+                    row.get::<_, Option<Vec<u8>>>(2)?,
+                ))
+            },
+        )?;
+        match (inline_len, data) {
+            (None, None) => Ok((expected, None)),
+            (Some(length), Some(data))
+                if length == expected
+                    && length <= INLINE_BLOB_MAX_BYTES
+                    && u64::try_from(data.len()).ok() == Some(length) =>
+            {
+                Ok((expected, Some(data)))
+            }
+            _ => Err(JobError::Integrity(format!(
+                "inline blob {} has an invalid bounded representation",
+                blob.sha256
+            ))),
+        }
+    }
+
+    fn inline_cache_path(&self) -> Result<PathBuf, JobError> {
+        let mut cache = self.inline_cache_directory.borrow_mut();
+        if cache.is_none() {
+            let path = self.partial.join(INLINE_CACHE_DIRECTORY);
+            match fs::create_dir(&path) {
+                Ok(()) => set_mode(&path, 0o700)?,
+                Err(error) if error.kind() == ErrorKind::AlreadyExists => {}
+                Err(source) => return Err(io_error(&path, source)),
+            }
+            let directory = open_directory(&path)?;
+            validate_private_directory(&directory, &path)?;
+            *cache = Some(directory);
+        }
+        let directory = cache
+            .as_ref()
+            .ok_or_else(|| JobError::Integrity("inline cache handle is missing".to_owned()))?;
+        Ok(fd_path(directory.as_raw_fd()))
     }
 
     pub fn staged_part_path(&self, filename: &str) -> Result<PathBuf, JobError> {
@@ -842,10 +1595,40 @@ impl DurableCatalogSink {
         sidecar: &PartSidecar,
         item_keys: &[String],
     ) -> Result<(), JobError> {
+        self.publish_validated_part_with_interrupt(staged_filename, part, sidecar, item_keys, None)
+    }
+
+    pub fn publish_validated_part_interruptible(
+        &mut self,
+        staged_filename: &str,
+        part: &PublishedPart,
+        sidecar: &PartSidecar,
+        item_keys: &[String],
+        interrupted: &AtomicBool,
+    ) -> Result<(), JobError> {
+        self.publish_validated_part_with_interrupt(
+            staged_filename,
+            part,
+            sidecar,
+            item_keys,
+            Some(interrupted),
+        )
+    }
+
+    fn publish_validated_part_with_interrupt(
+        &mut self,
+        staged_filename: &str,
+        part: &PublishedPart,
+        sidecar: &PartSidecar,
+        item_keys: &[String],
+        interrupted: Option<&AtomicBool>,
+    ) -> Result<(), JobError> {
+        self.commit_candidate_batch()?;
         validate_part_record(part)?;
         validate_sidecar(part, sidecar)?;
         let staged = self.staged_part_path(staged_filename)?;
-        verify_part_artifact(&staged, part)?;
+        verify_part_artifact(&staged, part, interrupted)?;
+        check_interrupted(interrupted)?;
         let final_path = self.parts.join(&part.filename);
         let sidecar_filename = part.filename.trim_end_matches(".pst").to_owned() + ".json";
         let sidecar_path = self.parts.join(&sidecar_filename);
@@ -856,6 +1639,7 @@ impl DurableCatalogSink {
         refuse_existing(&staged_sidecar_path)?;
         write_sidecar_partial(&staged_sidecar_path, sidecar)?;
 
+        check_interrupted(interrupted)?;
         self.record_publication_intent(part, sidecar, item_keys)?;
 
         rename_noclobber(
@@ -866,7 +1650,9 @@ impl DurableCatalogSink {
             &final_path,
         )?;
         sync_file(&self._parts_directory, &self.parts)?;
-        verify_part_artifact(&final_path, part)?;
+        check_interrupted(interrupted)?;
+        verify_part_artifact(&final_path, part, interrupted)?;
+        check_interrupted(interrupted)?;
         rename_noclobber(
             &self._partial_directory,
             Path::new(&staged_sidecar_filename),
@@ -875,7 +1661,9 @@ impl DurableCatalogSink {
             &sidecar_path,
         )?;
         sync_file(&self._parts_directory, &self.parts)?;
+        check_interrupted(interrupted)?;
         verify_sidecar_artifact(&sidecar_path, sidecar)?;
+        check_interrupted(interrupted)?;
         commit_published_part_transaction(&mut self.connection, part, sidecar, item_keys, true)
     }
 
@@ -926,55 +1714,62 @@ impl DurableCatalogSink {
                 "cannot commit an empty part during an active candidate".to_owned(),
             ));
         }
+        self.commit_candidate_batch()?;
         validate_part_record(part)?;
         validate_sidecar(part, sidecar)?;
-        verify_part_artifact(&self.parts.join(&part.filename), part)?;
+        verify_part_artifact(&self.parts.join(&part.filename), part, None)?;
         commit_published_part_transaction(&mut self.connection, part, sidecar, item_keys, false)
     }
 
-    fn spooled_events(&self, item_key: &str) -> Result<Vec<SpooledEvent>, JobError> {
+    fn spooled_events_by_candidate(
+        &self,
+        interrupted: Option<&AtomicBool>,
+    ) -> Result<HashMap<String, Vec<SpooledEvent>>, JobError> {
         let mut statement = self.connection.prepare(
-            "SELECT sequence, kind, metadata_json, blob_sha256, byte_len \
-             FROM candidate_events WHERE item_key = ?1 ORDER BY sequence",
+            "SELECT e.item_key, e.sequence, e.kind, e.metadata_json, \
+                    e.blob_sha256, e.byte_len, \
+                    b.pack_offset \
+             FROM candidate_events e \
+             JOIN candidates c ON c.item_key = e.item_key \
+             LEFT JOIN blobs b ON b.sha256 = e.blob_sha256 \
+             WHERE c.status = 'spooled' ORDER BY e.item_key, e.sequence",
         )?;
-        let rows = statement
-            .query_map([item_key], |row| {
-                Ok((
-                    row.get::<_, i64>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
-                    row.get::<_, Option<String>>(3)?,
-                    row.get::<_, Option<i64>>(4)?,
-                ))
-            })?
-            .collect::<Result<Vec<_>, _>>()?;
-        rows.into_iter()
-            .map(|(sequence, kind, metadata, sha256, byte_len)| {
-                let blob = match (sha256, byte_len) {
-                    (Some(sha256), Some(byte_len)) => Some(SpooledBlob {
-                        sha256,
-                        byte_len: checked_u64(byte_len, "candidate event byte length")?,
-                    }),
-                    (None, None) => None,
-                    _ => {
-                        return Err(JobError::Integrity(
-                            "candidate event has an incomplete blob reference".to_owned(),
-                        ));
-                    }
-                };
-                Ok(SpooledEvent {
-                    sequence: checked_u64(sequence, "candidate event sequence")?,
-                    kind,
-                    metadata: serde_json::from_str(&metadata)?,
-                    blob,
-                })
-            })
-            .collect()
+        let mut query = statement.query([])?;
+        let mut events = HashMap::<String, Vec<SpooledEvent>>::new();
+        while let Some(row) = query.next()? {
+            check_job_interrupted(interrupted)?;
+            let item_key = row.get::<_, String>(0)?;
+            let sha256 = row.get::<_, Option<String>>(4)?;
+            let byte_len = row.get::<_, Option<i64>>(5)?;
+            let pack_offset = row.get::<_, Option<i64>>(6)?;
+            let blob = match (sha256, byte_len) {
+                (Some(sha256), Some(byte_len)) => Some(SpooledBlob {
+                    sha256,
+                    byte_len: checked_u64(byte_len, "candidate event byte length")?,
+                    pack_offset: pack_offset
+                        .map(|value| checked_u64(value, "payload pack offset"))
+                        .transpose()?,
+                }),
+                (None, None) if pack_offset.is_none() => None,
+                _ => {
+                    return Err(JobError::Integrity(
+                        "candidate event has an incomplete blob reference".to_owned(),
+                    ));
+                }
+            };
+            events.entry(item_key).or_default().push(SpooledEvent {
+                sequence: checked_u64(row.get::<_, i64>(1)?, "candidate event sequence")?,
+                kind: row.get(2)?,
+                metadata: serde_json::from_str(&row.get::<_, String>(3)?)?,
+                blob,
+            });
+        }
+        Ok(events)
     }
 
     fn start_candidate(&mut self, start: CandidateStart) -> Result<(), JobError> {
         let CandidateStart {
-            metadata,
+            mut metadata,
             id,
             provenance,
             recovery_index,
@@ -1053,12 +1848,24 @@ impl DurableCatalogSink {
                     })
             })
             .transpose()?;
+        if let Some(parent_id) = parent_message_id
+            && let Some(durable_parent_id) = self.replayed_source_ids.get(&parent_id)
+        {
+            metadata["parent_message_id"] = serde_json::json!(durable_parent_id);
+        }
         if parent_item_key.is_some() != parent_attachment_index.is_some() {
             return Err(JobError::EventSequence(
                 "embedded message parent attachment is incomplete".to_owned(),
             ));
         }
-        self.connection.execute_batch("BEGIN IMMEDIATE")?;
+        let metadata_json = serde_json::to_string(&metadata)?;
+        let unit_json = self
+            .unit
+            .map(|unit| serde_json::to_string(&unit))
+            .transpose()?;
+        let embedded_path_json = serde_json::to_string(&embedded_path)?;
+        let pack_start = self.payload_pack_len()?;
+        self.begin_candidate()?;
         let result = self.connection.execute(
             "INSERT INTO candidates(\
                 item_key, provenance, source_node_id, recovery_index, occurrence,\
@@ -1071,22 +1878,21 @@ impl DurableCatalogSink {
                 source_node_id,
                 recovery_index,
                 occurrence,
-                serde_json::to_string(&metadata)?,
-                self.unit
-                    .map(|unit| serde_json::to_string(&unit))
-                    .transpose()?,
+                metadata_json,
+                unit_json,
                 parent_item_key,
                 parent_attachment_index,
-                serde_json::to_string(&embedded_path)?,
+                embedded_path_json,
             ],
         );
         if let Err(error) = result {
-            let _ = self.connection.execute_batch("ROLLBACK");
+            let _ = self.abort_candidate();
             return Err(error.into());
         }
         self.active = Some(ActiveCandidate {
             key,
             message_id: id,
+            pack_start,
             sequence: 0,
             recipients: HashSet::new(),
             supported,
@@ -1138,7 +1944,7 @@ impl DurableCatalogSink {
             let blob = self.finish_blob(active.blob, Some(descriptor.data_size))?;
             self.record_event("property", property_json(descriptor), Some(blob))
         } else {
-            discard_blob(active.blob, descriptor.data_size)
+            self.discard_blob(active.blob, descriptor.data_size)
         }
     }
 
@@ -1166,7 +1972,7 @@ impl DurableCatalogSink {
         } else if complete && active.attachment_type == Some(i32::from(b'i')) {
             return Ok(());
         } else if complete && active.expected == Some(0) {
-            let blob = BlobWriter::new(&self.spool)?;
+            let blob = BlobWriter::new(&mut self.payload_pack, &self.payload_pack_path)?;
             let blob = self.finish_blob(blob, Some(0))?;
             self.record_event(
                 "attachment_data",
@@ -1198,16 +2004,9 @@ impl DurableCatalogSink {
 
     fn finish_blob(
         &mut self,
-        mut blob: BlobWriter,
+        blob: BlobWriter,
         expected: Option<u64>,
     ) -> Result<BlobRef, JobError> {
-        blob.file
-            .flush()
-            .map_err(|source| io_error(blob.file.path(), source))?;
-        blob.file
-            .as_file()
-            .sync_all()
-            .map_err(|source| io_error(blob.file.path(), source))?;
         if let Some(expected) = expected {
             if expected != blob.bytes {
                 return Err(JobError::BlobLength {
@@ -1216,27 +2015,85 @@ impl DurableCatalogSink {
                 });
             }
         }
-        let sha256 = digest_hex(blob.hasher.finalize().as_slice());
-        let destination = self.spool.join(&sha256);
-        match destination.symlink_metadata() {
-            Ok(_) => verify_blob(&destination, &sha256, blob.bytes)?,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                blob.file
-                    .persist_noclobber(&destination)
-                    .map_err(|error| io_error(&destination, error.error))?;
-                sync_directory(&self.spool)?;
-            }
-            Err(source) => return Err(io_error(&destination, source)),
+        let sha256 = digest_hex(blob.hasher.clone().finalize().as_slice());
+        let expected_end = blob
+            .start_offset
+            .checked_add(blob.bytes)
+            .ok_or_else(|| JobError::Integrity("payload pack offset overflow".to_owned()))?;
+        if self.payload_pack_len()? != expected_end {
+            return Err(JobError::Integrity(
+                "payload pack changed during an active blob".to_owned(),
+            ));
         }
-        verify_blob(&destination, &sha256, blob.bytes)?;
-        self.connection.execute(
-            "INSERT OR IGNORE INTO blobs(sha256, byte_len) VALUES (?1, ?2)",
-            params![sha256, blob.bytes],
-        )?;
+        let stored = self
+            .connection
+            .query_row(
+                "SELECT b.byte_len, b.pack_offset, EXISTS(\
+                    SELECT 1 FROM inline_blobs i WHERE i.sha256 = b.sha256\
+                 ) FROM blobs b WHERE b.sha256 = ?1",
+                [&sha256],
+                |row| {
+                    Ok((
+                        row.get::<_, u64>(0)?,
+                        row.get::<_, Option<u64>>(1)?,
+                        row.get::<_, bool>(2)?,
+                    ))
+                },
+            )
+            .optional()?;
+        if let Some((stored_len, pack_offset, inline)) = stored {
+            if stored_len != blob.bytes {
+                return Err(JobError::Integrity(format!(
+                    "blob {sha256} length disagrees with the ledger"
+                )));
+            }
+            match (pack_offset, inline) {
+                (Some(offset), false) => verify_pack_range(
+                    &mut self.payload_pack,
+                    &self.payload_pack_path,
+                    expected_end,
+                    offset,
+                    stored_len,
+                    &sha256,
+                    None,
+                )?,
+                (None, _) => {
+                    drop(self.open_blob_expected(
+                        &SpooledBlob {
+                            sha256: sha256.clone(),
+                            byte_len: stored_len,
+                            pack_offset: None,
+                        },
+                        None,
+                    )?);
+                }
+                (Some(_), true) => {
+                    return Err(JobError::Integrity(format!(
+                        "blob {sha256} has multiple storage representations"
+                    )));
+                }
+            }
+            self.truncate_payload_pack(blob.start_offset)?;
+        } else {
+            self.connection.execute(
+                "INSERT INTO blobs(sha256, byte_len, pack_offset) VALUES (?1, ?2, ?3)",
+                params![&sha256, blob.bytes, blob.start_offset],
+            )?;
+        }
         Ok(BlobRef {
             sha256,
             bytes: blob.bytes,
         })
+    }
+
+    fn discard_blob(&mut self, blob: BlobWriter, expected: u64) -> Result<(), JobError> {
+        if blob.bytes != expected {
+            return Err(JobError::BlobLength {
+                expected,
+                actual: blob.bytes,
+            });
+        }
+        self.truncate_payload_pack(blob.start_offset)
     }
 
     fn rollback(&mut self) {
@@ -1244,8 +2101,13 @@ impl DurableCatalogSink {
         self.attachment = None;
         self.unit = None;
         self.recent_candidates.clear();
-        if self.active.take().is_some() {
+        self.replayed_source_ids.clear();
+        self.active = None;
+        if self.batch_open.get() {
             let _ = self.connection.execute_batch("ROLLBACK");
+            let _ = self.truncate_payload_pack(self.batch_pack_start.get());
+            self.batch_open.set(false);
+            self.batch_candidates.set(0);
         }
     }
 }
@@ -1257,6 +2119,45 @@ impl CatalogSink for DurableCatalogSink {
 }
 
 impl DurableCatalogSink {
+    pub fn record_replayed_candidate(
+        &mut self,
+        candidate: &ReplayCandidate,
+        observed_id: u32,
+    ) -> Result<(), JobError> {
+        if self.active.is_some() || self.unit != candidate.unit {
+            return Err(JobError::EventSequence(
+                "replayed candidate is outside its durable recovery unit".to_owned(),
+            ));
+        }
+        let embedded_path = candidate.metadata["embedded_path"]
+            .as_array()
+            .ok_or_else(|| {
+                JobError::Integrity("replayed candidate embedded path is invalid".to_owned())
+            })?
+            .iter()
+            .map(|value| {
+                value.as_u64().ok_or_else(|| {
+                    JobError::Integrity(
+                        "replayed candidate embedded path element is invalid".to_owned(),
+                    )
+                })
+            })
+            .map(|value| {
+                value.and_then(|value| {
+                    u32::try_from(value).map_err(|_| {
+                        JobError::Integrity(
+                            "replayed candidate embedded path element is too large".to_owned(),
+                        )
+                    })
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        self.recent_candidates
+            .insert(embedded_path, candidate.item_key.clone());
+        self.replayed_source_ids.insert(observed_id, candidate.id);
+        Ok(())
+    }
+
     fn handle_event(&mut self, event: CatalogEvent<'_>) -> Result<(), JobError> {
         match event {
             CatalogEvent::UnitStart(unit) => {
@@ -1271,6 +2172,7 @@ impl DurableCatalogSink {
                     ));
                 }
                 self.recent_candidates.clear();
+                self.replayed_source_ids.clear();
             }
             CatalogEvent::UnitEnd(unit) => {
                 if self.active.is_some() || self.unit.take() != Some(unit) {
@@ -1278,6 +2180,7 @@ impl DurableCatalogSink {
                         "recovery unit ended out of sequence".to_owned(),
                     ));
                 }
+                self.replayed_source_ids.clear();
             }
             CatalogEvent::Folder {
                 id,
@@ -1434,13 +2337,16 @@ impl DurableCatalogSink {
                     ));
                 }
                 if attachment.blob.is_none() {
-                    attachment.blob = Some(BlobWriter::new(&self.spool)?);
+                    attachment.blob = Some(BlobWriter::new(
+                        &mut self.payload_pack,
+                        &self.payload_pack_path,
+                    )?);
                 }
                 attachment
                     .blob
                     .as_mut()
                     .ok_or_else(|| JobError::EventSequence("attachment blob missing".to_owned()))?
-                    .write(bytes)?;
+                    .write(&mut self.payload_pack, &self.payload_pack_path, bytes)?;
             }
             CatalogEvent::AttachmentEnd { message_id, index } => {
                 require_message(self.active.as_ref(), message_id)?;
@@ -1479,7 +2385,7 @@ impl DurableCatalogSink {
                 )?;
                 self.property = Some(ActiveProperty {
                     descriptor,
-                    blob: BlobWriter::new(&self.spool)?,
+                    blob: BlobWriter::new(&mut self.payload_pack, &self.payload_pack_path)?,
                     record: !matches!(descriptor.owner, PropertyOwner::Folder(_)),
                 });
             }
@@ -1492,7 +2398,9 @@ impl DurableCatalogSink {
                         "property data does not match active property".to_owned(),
                     ));
                 }
-                property.blob.write(bytes)?;
+                property
+                    .blob
+                    .write(&mut self.payload_pack, &self.payload_pack_path, bytes)?;
             }
             CatalogEvent::PropertyEnd(descriptor) => self.finish_property(descriptor)?,
             CatalogEvent::PropertyAbort { descriptor, reason } => {
@@ -1504,6 +2412,7 @@ impl DurableCatalogSink {
                         "property abort does not match active property".to_owned(),
                     ));
                 }
+                self.truncate_payload_pack(property.blob.start_offset)?;
                 if property.record {
                     self.record_event(
                         "property_incomplete",
@@ -1529,6 +2438,7 @@ impl DurableCatalogSink {
                 }
                 if !complete {
                     if let Some(property) = self.property.take() {
+                        self.truncate_payload_pack(property.blob.start_offset)?;
                         self.record_event(
                             "property_incomplete",
                             json!({
@@ -1557,9 +2467,12 @@ impl DurableCatalogSink {
                         active.key
                     ],
                 )?;
-                if let Err(error) = self.connection.execute_batch("COMMIT") {
+                if let Err(error) = self.finish_candidate() {
                     let _ = self.connection.execute_batch("ROLLBACK");
-                    return Err(error.into());
+                    let _ = self.truncate_payload_pack(self.batch_pack_start.get());
+                    self.batch_open.set(false);
+                    self.batch_candidates.set(0);
+                    return Err(error);
                 }
                 self.recent_candidates
                     .insert(active.embedded_path, active.key.clone());
@@ -1576,19 +2489,32 @@ impl Drop for DurableCatalogSink {
 }
 
 impl BlobWriter {
-    fn new(spool: &Path) -> Result<Self, JobError> {
-        let file = NamedTempFile::new_in(spool).map_err(|source| io_error(spool, source))?;
+    fn new(pack: &mut File, path: &Path) -> Result<Self, JobError> {
+        let start_offset = pack
+            .seek(std::io::SeekFrom::End(0))
+            .map_err(|source| io_error(path, source))?;
         Ok(Self {
-            file,
+            start_offset,
             hasher: Sha256::new(),
             bytes: 0,
         })
     }
 
-    fn write(&mut self, bytes: &[u8]) -> Result<(), JobError> {
-        write_hashed(&mut self.file, &mut self.hasher, &mut self.bytes, bytes)
-            .map_err(|source| io_error(self.file.path(), source))
+    fn write(&mut self, pack: &mut File, path: &Path, bytes: &[u8]) -> Result<(), JobError> {
+        write_hashed(pack, &mut self.hasher, &mut self.bytes, bytes)
+            .map_err(|source| io_error(path, source))
     }
+}
+
+fn verify_blob_bytes(expected_hash: &str, expected_len: u64, data: &[u8]) -> Result<(), JobError> {
+    if u64::try_from(data.len()).ok() != Some(expected_len)
+        || digest_hex(Sha256::digest(data).as_slice()) != expected_hash
+    {
+        return Err(JobError::Integrity(format!(
+            "inline blob {expected_hash} failed SHA-256 validation"
+        )));
+    }
+    Ok(())
 }
 
 fn write_hashed<W: std::io::Write>(
@@ -1619,6 +2545,189 @@ struct BlobRef {
     bytes: u64,
 }
 
+fn read_schema_version(connection: &Connection) -> Result<i64, JobError> {
+    connection
+        .query_row(
+            "SELECT value FROM job_metadata WHERE key = 'schema_version'",
+            [],
+            |row| row.get::<_, String>(0),
+        )?
+        .parse::<i64>()
+        .map_err(|_| JobError::Integrity("invalid schema version".to_owned()))
+}
+
+fn read_metadata_json<T: serde::de::DeserializeOwned>(
+    connection: &Connection,
+    key: &'static str,
+) -> Result<T, JobError> {
+    let value = connection
+        .query_row(
+            "SELECT value FROM job_metadata WHERE key = ?1",
+            [key],
+            |row| row.get::<_, String>(0),
+        )
+        .map_err(|error| match error {
+            rusqlite::Error::QueryReturnedNoRows => {
+                JobError::ResumeMismatch("required immutable metadata")
+            }
+            other => other.into(),
+        })?;
+    Ok(serde_json::from_str(&value)?)
+}
+
+fn validate_resume_metadata(
+    connection: &Connection,
+    source: &JobSourceIdentity,
+    configuration: &JobConfiguration,
+) -> Result<(), JobError> {
+    let stored_source: JobSourceIdentity = read_metadata_json(connection, "source_identity")?;
+    if &stored_source != source {
+        return Err(JobError::ResumeMismatch("source identity or SHA-256"));
+    }
+    let stored_configuration: JobConfiguration =
+        read_metadata_json(connection, "job_configuration")?;
+    if stored_configuration.tool_compatibility_major != configuration.tool_compatibility_major {
+        return Err(JobError::ResumeMismatch("tool compatibility major version"));
+    }
+    if stored_configuration.split_schema_version != configuration.split_schema_version {
+        return Err(JobError::ResumeMismatch("split report schema version"));
+    }
+    if stored_configuration.recovery_mode != configuration.recovery_mode {
+        return Err(JobError::ResumeMismatch("recovery mode"));
+    }
+    if stored_configuration.maximum_pst_bytes != configuration.maximum_pst_bytes
+        || stored_configuration.part_size_policy != configuration.part_size_policy
+    {
+        return Err(JobError::ResumeMismatch("part-size policy"));
+    }
+    if stored_configuration.writer_format != configuration.writer_format {
+        return Err(JobError::ResumeMismatch("writer format"));
+    }
+    Ok(())
+}
+
+fn allocated_tree_bytes(path: &Path, held_root: bool) -> Result<u64, JobError> {
+    let metadata = if held_root {
+        path.metadata()
+    } else {
+        path.symlink_metadata()
+    }
+    .map_err(|source| io_error(path, source))?;
+    if metadata.file_type().is_symlink()
+        || (!metadata.is_dir() && !metadata.is_file())
+        || metadata.uid() != rustix::process::getuid().as_raw()
+    {
+        return Err(JobError::UnsafePath(path.to_path_buf()));
+    }
+    let mut bytes = metadata.blocks().saturating_mul(512);
+    if metadata.is_dir() {
+        for entry in fs::read_dir(path).map_err(|source| io_error(path, source))? {
+            let entry = entry.map_err(|source| io_error(path, source))?;
+            bytes = bytes.saturating_add(allocated_tree_bytes(&entry.path(), false)?);
+        }
+    }
+    Ok(bytes)
+}
+
+fn allocated_private_bytes(private_root: &Path) -> Result<u64, JobError> {
+    let mut bytes = allocated_node_bytes(private_root, true)?;
+    for entry in fs::read_dir(private_root).map_err(|source| io_error(private_root, source))? {
+        let entry = entry.map_err(|source| io_error(private_root, source))?;
+        let name = entry
+            .file_name()
+            .into_string()
+            .map_err(|_| JobError::UnsafePath(entry.path()))?;
+        if !matches!(
+            name.as_str(),
+            "job.sqlite3" | "job.sqlite3-wal" | "job.sqlite3-shm" | "spool" | "partial"
+        ) {
+            return Err(JobError::UnsafePath(entry.path()));
+        }
+        bytes = bytes.saturating_add(if name == "partial" {
+            // Validator-failure scratch is retained as evidence, not trusted output.
+            let metadata = entry
+                .path()
+                .symlink_metadata()
+                .map_err(|source| io_error(&entry.path(), source))?;
+            if !metadata.is_dir() {
+                return Err(JobError::UnsafePath(entry.path()));
+            }
+            allocated_node_bytes(&entry.path(), false)?
+        } else {
+            allocated_tree_bytes(&entry.path(), false)?
+        });
+    }
+    Ok(bytes)
+}
+
+fn allocated_node_bytes(path: &Path, held_root: bool) -> Result<u64, JobError> {
+    let metadata = if held_root {
+        path.metadata()
+    } else {
+        path.symlink_metadata()
+    }
+    .map_err(|source| io_error(path, source))?;
+    if metadata.file_type().is_symlink()
+        || (!metadata.is_dir() && !metadata.is_file())
+        || metadata.uid() != rustix::process::getuid().as_raw()
+    {
+        return Err(JobError::UnsafePath(path.to_path_buf()));
+    }
+    Ok(metadata.blocks().saturating_mul(512))
+}
+
+fn validate_private_root_entries(private_root: &Path) -> Result<(), JobError> {
+    for entry in fs::read_dir(private_root).map_err(|source| io_error(private_root, source))? {
+        let entry = entry.map_err(|source| io_error(private_root, source))?;
+        let name = entry
+            .file_name()
+            .into_string()
+            .map_err(|_| JobError::UnsafePath(entry.path()))?;
+        if !matches!(
+            name.as_str(),
+            "job.sqlite3" | "job.sqlite3-wal" | "job.sqlite3-shm" | "spool" | "partial"
+        ) {
+            return Err(JobError::UnsafePath(entry.path()));
+        }
+    }
+    Ok(())
+}
+
+fn read_optional_metadata_u32(connection: &Connection, key: &'static str) -> Result<u32, JobError> {
+    let value = connection
+        .query_row(
+            "SELECT value FROM job_metadata WHERE key = ?1",
+            [key],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?;
+    value.map_or(Ok(0), |value| {
+        value
+            .parse::<u32>()
+            .map_err(|_| JobError::Integrity(format!("invalid {key}")))
+    })
+}
+
+fn read_optional_metadata_u64(
+    connection: &Connection,
+    key: &'static str,
+) -> Result<Option<u64>, JobError> {
+    let value = connection
+        .query_row(
+            "SELECT value FROM job_metadata WHERE key = ?1",
+            [key],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?;
+    value
+        .map(|value| {
+            value
+                .parse::<u64>()
+                .map_err(|_| JobError::Integrity(format!("invalid {key}")))
+        })
+        .transpose()
+}
+
 fn configure(connection: &Connection) -> Result<(), JobError> {
     connection.execute_batch(
         "PRAGMA journal_mode = WAL;\
@@ -1627,6 +2736,121 @@ fn configure(connection: &Connection) -> Result<(), JobError> {
          PRAGMA trusted_schema = OFF;\
          PRAGMA busy_timeout = 5000;",
     )?;
+    Ok(())
+}
+
+fn run_sql_interruptible<T>(
+    connection: &mut Connection,
+    interrupted: Option<&AtomicBool>,
+    operation: impl FnOnce(&mut Connection) -> Result<T, JobError>,
+) -> Result<T, JobError> {
+    let Some(interrupted) = interrupted else {
+        return operation(connection);
+    };
+    if interrupted.load(Ordering::Relaxed) {
+        return Err(JobError::Interrupted);
+    }
+    let handle = connection.get_interrupt_handle();
+    let finished = AtomicBool::new(false);
+    let result = thread::scope(|scope| {
+        scope.spawn(|| {
+            while !finished.load(Ordering::Relaxed) {
+                if interrupted.load(Ordering::Relaxed) {
+                    handle.interrupt();
+                    break;
+                }
+                thread::sleep(Duration::from_millis(10));
+            }
+        });
+        let result = operation(connection);
+        finished.store(true, Ordering::Relaxed);
+        result
+    });
+    if interrupted.load(Ordering::Relaxed) {
+        return Err(JobError::Interrupted);
+    }
+    match result {
+        Err(JobError::Sql(error))
+            if error.sqlite_error_code() == Some(ErrorCode::OperationInterrupted) =>
+        {
+            Err(JobError::Interrupted)
+        }
+        other => other,
+    }
+}
+
+fn ensure_inline_blob_table(connection: &Connection) -> Result<(), JobError> {
+    connection.execute_batch(
+        "CREATE TABLE IF NOT EXISTS inline_blobs(\
+            sha256 TEXT PRIMARY KEY REFERENCES blobs(sha256) ON DELETE CASCADE,\
+            data BLOB NOT NULL\
+         ) STRICT;\
+         CREATE INDEX IF NOT EXISTS candidate_events_blob_sha256 \
+         ON candidate_events(blob_sha256) WHERE blob_sha256 IS NOT NULL;\
+         CREATE INDEX IF NOT EXISTS candidates_occurrence \
+         ON candidates(provenance, source_node_id, recovery_index);",
+    )?;
+    Ok(())
+}
+
+fn ensure_pack_offset_column(connection: &Connection) -> Result<(), JobError> {
+    let mut statement = connection.prepare("PRAGMA table_info(blobs)")?;
+    let columns = statement
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<Result<Vec<_>, _>>()?;
+    if !columns.iter().any(|column| column == "pack_offset") {
+        connection.execute_batch(
+            "ALTER TABLE blobs ADD COLUMN pack_offset INTEGER CHECK(pack_offset >= 0);",
+        )?;
+    }
+    Ok(())
+}
+
+fn reconcile_payload_pack(
+    connection: &Connection,
+    pack: &mut File,
+    path: &Path,
+) -> Result<(), JobError> {
+    let overlapping = connection.query_row(
+        "SELECT EXISTS(\
+             SELECT 1 FROM (\
+                 SELECT pack_offset,\
+                        LAG(pack_offset + byte_len) OVER (\
+                            ORDER BY pack_offset, sha256\
+                        ) AS previous_end \
+                 FROM blobs WHERE pack_offset IS NOT NULL AND byte_len > 0\
+             ) WHERE pack_offset < previous_end\
+         )",
+        [],
+        |row| row.get::<_, bool>(0),
+    )?;
+    if overlapping {
+        return Err(JobError::Integrity(
+            "payload pack ledger contains overlapping ranges".to_owned(),
+        ));
+    }
+    let committed_end = connection.query_row(
+        "SELECT COALESCE(MAX(pack_offset + byte_len), 0) FROM blobs \
+         WHERE pack_offset IS NOT NULL",
+        [],
+        |row| row.get::<_, u64>(0),
+    )?;
+    let actual = pack
+        .metadata()
+        .map_err(|source| io_error(path, source))?
+        .len();
+    if actual < committed_end {
+        return Err(JobError::Integrity(
+            "payload pack is shorter than its committed ledger ranges".to_owned(),
+        ));
+    }
+    if actual > committed_end {
+        pack.set_len(committed_end)
+            .map_err(|source| io_error(path, source))?;
+        pack.sync_all().map_err(|source| io_error(path, source))?;
+    }
+    pack.seek(std::io::SeekFrom::End(0))
+        .map_err(|source| io_error(path, source))?;
     Ok(())
 }
 
@@ -1661,7 +2885,12 @@ fn create_schema(connection: &Connection) -> Result<(), JobError> {
             sha256 TEXT PRIMARY KEY CHECK(\
                 length(sha256) = 64 AND sha256 NOT GLOB '*[^0-9a-f]*'\
             ),\
-            byte_len INTEGER NOT NULL CHECK(byte_len >= 0)\
+            byte_len INTEGER NOT NULL CHECK(byte_len >= 0),\
+            pack_offset INTEGER CHECK(pack_offset >= 0)\
+         ) STRICT;\
+         CREATE TABLE inline_blobs(\
+            sha256 TEXT PRIMARY KEY REFERENCES blobs(sha256) ON DELETE CASCADE,\
+            data BLOB NOT NULL\
          ) STRICT;\
          CREATE TABLE candidate_events(\
             item_key TEXT NOT NULL REFERENCES candidates(item_key) ON DELETE CASCADE,\
@@ -1673,6 +2902,10 @@ fn create_schema(connection: &Connection) -> Result<(), JobError> {
             CHECK((blob_sha256 IS NULL) = (byte_len IS NULL)),\
             PRIMARY KEY(item_key, sequence)\
          ) STRICT;\
+         CREATE INDEX candidate_events_blob_sha256 \
+         ON candidate_events(blob_sha256) WHERE blob_sha256 IS NOT NULL;\
+         CREATE INDEX candidates_occurrence \
+         ON candidates(provenance, source_node_id, recovery_index);\
          CREATE TABLE worker_events(\
             sequence INTEGER PRIMARY KEY AUTOINCREMENT,\
             kind TEXT NOT NULL CHECK(kind IN ('started','failure')),\
@@ -1805,6 +3038,7 @@ fn reconcile_publications(
     parts_directory: &File,
     partial: &Path,
     parts: &Path,
+    interrupted: Option<&AtomicBool>,
 ) -> Result<(), JobError> {
     let intents = {
         let mut statement = connection.prepare(
@@ -1857,7 +3091,7 @@ fn reconcile_publications(
             )?;
             continue;
         }
-        verify_part_artifact(&final_path, &part)?;
+        verify_part_artifact(&final_path, &part, interrupted)?;
         if sidecar_exists {
             verify_sidecar_artifact(&sidecar_path, &sidecar)?;
         } else {
@@ -2245,23 +3479,163 @@ fn validate_foreign_keys(connection: &Connection) -> Result<(), JobError> {
     Ok(())
 }
 
-fn validate_blob_store(connection: &Connection, spool: &Path) -> Result<(), JobError> {
-    let mut statement = connection.prepare("SELECT sha256, byte_len FROM blobs ORDER BY sha256")?;
-    let mut rows = statement.query([])?;
+fn validate_blob_store(
+    connection: &Connection,
+    spool: &Path,
+    interrupted: Option<&AtomicBool>,
+) -> Result<(), JobError> {
+    let pack_path = spool.join(PAYLOAD_PACK_FILENAME);
+    let pack_metadata = pack_path
+        .symlink_metadata()
+        .map_err(|source| io_error(&pack_path, source))?;
+    if pack_metadata.file_type().is_symlink()
+        || !private_state_attributes_valid(
+            pack_metadata.is_file(),
+            pack_metadata.uid(),
+            pack_metadata.mode(),
+            Some(pack_metadata.nlink()),
+        )
+    {
+        return Err(JobError::Integrity(
+            "payload pack has invalid private-file attributes".to_owned(),
+        ));
+    }
+    let mut pack = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
+        .open(&pack_path)
+        .map_err(|source| io_error(&pack_path, source))?;
+    let opened_pack = pack
+        .metadata()
+        .map_err(|source| io_error(&pack_path, source))?;
+    if opened_pack.dev() != pack_metadata.dev()
+        || opened_pack.ino() != pack_metadata.ino()
+        || opened_pack.len() != pack_metadata.len()
+    {
+        return Err(JobError::Integrity(
+            "payload pack changed while opening".to_owned(),
+        ));
+    }
+    let mut statement = connection.prepare(
+        "SELECT b.sha256, b.byte_len, b.pack_offset, length(i.data), \
+                CASE WHEN length(i.data) <= ?1 THEN i.data END \
+         FROM blobs b LEFT JOIN inline_blobs i ON i.sha256 = b.sha256 \
+         ORDER BY b.pack_offset IS NULL, b.pack_offset, b.sha256",
+    )?;
+    let mut rows = statement.query([INLINE_BLOB_MAX_BYTES])?;
     while let Some(row) = rows.next()? {
         let sha256 = row.get::<_, String>(0)?;
         let byte_len = row.get::<_, u64>(1)?;
+        let pack_offset = row.get::<_, Option<u64>>(2)?;
+        let inline_len = row.get::<_, Option<u64>>(3)?;
+        let inline = row.get::<_, Option<Vec<u8>>>(4)?;
         if !valid_blob_hash(&sha256) {
             return Err(JobError::Integrity(
                 "blob key is not lowercase SHA-256".to_owned(),
             ));
         }
-        verify_blob(&spool.join(&sha256), &sha256, byte_len)?;
+        check_interrupted(interrupted)?;
+        let legacy_path = spool.join(&sha256);
+        let legacy_exists = legacy_path
+            .try_exists()
+            .map_err(|source| io_error(&legacy_path, source))?;
+        if let Some(offset) = pack_offset {
+            if inline_len.is_some() || inline.is_some() || legacy_exists {
+                return Err(JobError::Integrity(format!(
+                    "blob {sha256} has multiple storage representations"
+                )));
+            }
+            verify_pack_range(
+                &mut pack,
+                &pack_path,
+                pack_metadata.len(),
+                offset,
+                byte_len,
+                &sha256,
+                interrupted,
+            )?;
+        } else if let Some(inline_len) = inline_len {
+            if inline_len != byte_len || inline_len > INLINE_BLOB_MAX_BYTES {
+                return Err(JobError::Integrity(format!(
+                    "inline blob {sha256} has an invalid bounded length"
+                )));
+            }
+            if legacy_exists {
+                return Err(JobError::Integrity(format!(
+                    "blob {sha256} has multiple storage representations"
+                )));
+            }
+            let data = inline.ok_or_else(|| {
+                JobError::Integrity(format!("inline blob {sha256} payload is unavailable"))
+            })?;
+            verify_blob_bytes(&sha256, byte_len, &data)?;
+        } else {
+            if inline.is_some() {
+                return Err(JobError::Integrity(format!(
+                    "file blob {sha256} has unexpected inline data"
+                )));
+            }
+            open_verified_blob_with_interrupt(&legacy_path, &sha256, byte_len, interrupted)?;
+        }
     }
     Ok(())
 }
 
-fn validate_part_store(connection: &Connection, parts: &Path) -> Result<(), JobError> {
+fn verify_pack_range(
+    pack: &mut File,
+    path: &Path,
+    pack_len: u64,
+    offset: u64,
+    byte_len: u64,
+    expected_hash: &str,
+    interrupted: Option<&AtomicBool>,
+) -> Result<(), JobError> {
+    let end = offset
+        .checked_add(byte_len)
+        .ok_or_else(|| JobError::Integrity("payload pack range overflow".to_owned()))?;
+    if end > pack_len {
+        return Err(JobError::Integrity(format!(
+            "payload pack range for {expected_hash} exceeds the durable file"
+        )));
+    }
+    pack.seek(std::io::SeekFrom::Start(offset))
+        .map_err(|source| io_error(path, source))?;
+    let mut remaining = byte_len;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    while remaining > 0 {
+        check_interrupted(interrupted)?;
+        let limit = usize::try_from(remaining.min(buffer.len() as u64))
+            .map_err(|_| JobError::Integrity("payload pack read length overflow".to_owned()))?;
+        let read = pack
+            .read(&mut buffer[..limit])
+            .map_err(|source| io_error(path, source))?;
+        if read == 0 {
+            return Err(JobError::Integrity(format!(
+                "payload pack range for {expected_hash} ended early"
+            )));
+        }
+        hasher.update(&buffer[..read]);
+        remaining =
+            remaining
+                .checked_sub(u64::try_from(read).map_err(|_| {
+                    JobError::Integrity("payload pack read length overflow".to_owned())
+                })?)
+                .ok_or_else(|| JobError::Integrity("payload pack read underflow".to_owned()))?;
+    }
+    if digest_hex(hasher.finalize().as_slice()) != expected_hash {
+        return Err(JobError::Integrity(format!(
+            "payload pack range for {expected_hash} failed SHA-256 validation"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_part_store(
+    connection: &Connection,
+    parts: &Path,
+    interrupted: Option<&AtomicBool>,
+) -> Result<(), JobError> {
     let mut statement = connection.prepare(
         "SELECT part_index, filename, byte_len, sha256, oversize, sidecar_json \
          FROM parts ORDER BY part_index",
@@ -2284,7 +3658,7 @@ fn validate_part_store(connection: &Connection, parts: &Path) -> Result<(), JobE
     let mut accounted_sidecars = HashSet::new();
     for (part, sidecar_json) in rows {
         validate_part_record(&part)?;
-        verify_part_artifact(&parts.join(&part.filename), &part)?;
+        verify_part_artifact(&parts.join(&part.filename), &part, interrupted)?;
         let sidecar_filename = part.filename.trim_end_matches(".pst").to_owned() + ".json";
         let expected_sidecar: PartSidecar = serde_json::from_str(&sidecar_json)?;
         validate_sidecar(&part, &expected_sidecar)?;
@@ -2304,12 +3678,21 @@ fn validate_part_store(connection: &Connection, parts: &Path) -> Result<(), JobE
             return Err(JobError::Integrity(format!(
                 "finalized sidecar {name:?} has no ledger record"
             )));
+        } else if !accounted.contains(name.as_ref()) && !accounted_sidecars.contains(name.as_ref())
+        {
+            return Err(JobError::Integrity(format!(
+                "unrecognized finalized-part entry {name:?}"
+            )));
         }
     }
     Ok(())
 }
 
-fn verify_part_artifact(path: &Path, part: &PublishedPart) -> Result<(), JobError> {
+fn verify_part_artifact(
+    path: &Path,
+    part: &PublishedPart,
+    interrupted: Option<&AtomicBool>,
+) -> Result<(), JobError> {
     let metadata = path
         .symlink_metadata()
         .map_err(|source| io_error(path, source))?;
@@ -2351,6 +3734,9 @@ fn verify_part_artifact(path: &Path, part: &PublishedPart) -> Result<(), JobErro
     let mut hasher = Sha256::new();
     let mut buffer = vec![0_u8; 1024 * 1024];
     loop {
+        if interrupted.is_some_and(|flag| flag.load(Ordering::Relaxed)) {
+            return Err(JobError::Interrupted);
+        }
         let read = file
             .read(&mut buffer)
             .map_err(|source| io_error(path, source))?;
@@ -2368,6 +3754,14 @@ fn verify_part_artifact(path: &Path, part: &PublishedPart) -> Result<(), JobErro
     Ok(())
 }
 
+fn check_interrupted(interrupted: Option<&AtomicBool>) -> Result<(), JobError> {
+    if interrupted.is_some_and(|flag| flag.load(Ordering::Relaxed)) {
+        Err(JobError::Interrupted)
+    } else {
+        Ok(())
+    }
+}
+
 fn valid_blob_hash(value: &str) -> bool {
     value.len() == 64
         && value
@@ -2376,13 +3770,14 @@ fn valid_blob_hash(value: &str) -> bool {
 }
 
 fn verify_blob(path: &Path, expected_hash: &str, expected_len: u64) -> Result<(), JobError> {
-    open_verified_blob(path, expected_hash, expected_len).map(|_| ())
+    open_verified_blob_with_interrupt(path, expected_hash, expected_len, None).map(|_| ())
 }
 
-fn open_verified_blob(
+fn open_verified_blob_with_interrupt(
     path: &Path,
     expected_hash: &str,
     expected_len: u64,
+    interrupted: Option<&AtomicBool>,
 ) -> Result<File, JobError> {
     let metadata = path
         .symlink_metadata()
@@ -2421,6 +3816,9 @@ fn open_verified_blob(
     let mut hasher = Sha256::new();
     let mut buffer = vec![0_u8; 1024 * 1024];
     loop {
+        if interrupted.is_some_and(|flag| flag.load(Ordering::Relaxed)) {
+            return Err(JobError::Interrupted);
+        }
         let read = file
             .read(&mut buffer)
             .map_err(|source| io_error(path, source))?;
@@ -2440,8 +3838,17 @@ fn open_verified_blob(
     Ok(file)
 }
 
-fn remove_temporary_blobs(spool: &Path) -> Result<(), JobError> {
+fn check_job_interrupted(interrupted: Option<&AtomicBool>) -> Result<(), JobError> {
+    if interrupted.is_some_and(|flag| flag.load(Ordering::Relaxed)) {
+        Err(JobError::Interrupted)
+    } else {
+        Ok(())
+    }
+}
+
+fn remove_temporary_blobs(spool: &Path, interrupted: Option<&AtomicBool>) -> Result<(), JobError> {
     for entry in fs::read_dir(spool).map_err(|source| io_error(spool, source))? {
+        check_job_interrupted(interrupted)?;
         let entry = entry.map_err(|source| io_error(spool, source))?;
         let name = entry.file_name();
         if name.to_string_lossy().starts_with(".tmp") {
@@ -2451,13 +3858,260 @@ fn remove_temporary_blobs(spool: &Path) -> Result<(), JobError> {
     Ok(())
 }
 
-fn remove_unreferenced_blobs(connection: &Connection, spool: &Path) -> Result<(), JobError> {
+fn remove_stale_partials(
+    directory: &File,
+    partial: &Path,
+    interrupted: Option<&AtomicBool>,
+) -> Result<(), JobError> {
+    let mut removed = false;
+    for entry in fs::read_dir(partial).map_err(|source| io_error(partial, source))? {
+        check_job_interrupted(interrupted)?;
+        let entry = entry.map_err(|source| io_error(partial, source))?;
+        let name = entry
+            .file_name()
+            .into_string()
+            .map_err(|_| JobError::UnsafePath(entry.path()))?;
+        let stat = rustix::fs::statat(
+            directory,
+            Path::new(&name),
+            rustix::fs::AtFlags::SYMLINK_NOFOLLOW,
+        )
+        .map_err(|source| io_error(&entry.path(), source.into()))?;
+        match rustix::fs::FileType::from_raw_mode(stat.st_mode) {
+            rustix::fs::FileType::RegularFile
+                if valid_leaf_name(&name) && name.ends_with(".partial") =>
+            {
+                validate_private_stat(&entry.path(), &stat)?;
+                rustix::fs::unlinkat(directory, Path::new(&name), rustix::fs::AtFlags::empty())
+                    .map_err(|source| io_error(&entry.path(), source.into()))?;
+                removed = true;
+            }
+            rustix::fs::FileType::Directory if name.starts_with(".pstforge-") => {
+                if !private_state_attributes_valid(true, stat.st_uid, stat.st_mode, None) {
+                    return Err(JobError::UnsafePath(entry.path()));
+                }
+                removed |= remove_writer_scratch(directory, partial, &name, interrupted)?;
+            }
+            _ => return Err(JobError::UnsafePath(entry.path())),
+        }
+    }
+    if removed {
+        sync_file(directory, partial)?;
+    }
+    Ok(())
+}
+
+fn remove_writer_scratch(
+    parent: &File,
+    partial: &Path,
+    name: &str,
+    interrupted: Option<&AtomicBool>,
+) -> Result<bool, JobError> {
+    let owned = rustix::fs::openat(
+        parent,
+        Path::new(name),
+        rustix::fs::OFlags::RDONLY
+            | rustix::fs::OFlags::DIRECTORY
+            | rustix::fs::OFlags::NOFOLLOW
+            | rustix::fs::OFlags::CLOEXEC,
+        rustix::fs::Mode::empty(),
+    )
+    .map_err(|source| io_error(&partial.join(name), source.into()))?;
+    let directory = File::from(owned);
+    let path = fd_path(directory.as_raw_fd());
+    validate_private_directory(&directory, &path)?;
+    let mut temporary_names = Vec::new();
+    let mut retain_diagnostic = false;
+    for entry in fs::read_dir(&path).map_err(|source| io_error(&path, source))? {
+        check_job_interrupted(interrupted)?;
+        let entry = entry.map_err(|source| io_error(&path, source))?;
+        let child_name = entry
+            .file_name()
+            .into_string()
+            .map_err(|_| JobError::UnsafePath(entry.path()))?;
+        let stat = rustix::fs::statat(
+            &directory,
+            Path::new(&child_name),
+            rustix::fs::AtFlags::SYMLINK_NOFOLLOW,
+        )
+        .map_err(|source| io_error(&entry.path(), source.into()))?;
+        if child_name == "validator-failure.log" {
+            retain_diagnostic = true;
+        } else if child_name.starts_with(".readpst-")
+            && rustix::fs::FileType::from_raw_mode(stat.st_mode) == rustix::fs::FileType::Directory
+        {
+            remove_private_tree(
+                &directory,
+                Path::new(&child_name),
+                &path.join(&child_name),
+                interrupted,
+                0,
+            )?;
+            continue;
+        } else if !child_name.starts_with(".tmp") {
+            return Err(JobError::UnsafePath(entry.path()));
+        }
+        if rustix::fs::FileType::from_raw_mode(stat.st_mode) != rustix::fs::FileType::RegularFile {
+            return Err(JobError::UnsafePath(entry.path()));
+        }
+        validate_private_stat(&entry.path(), &stat)?;
+        temporary_names.push(child_name);
+    }
+    if retain_diagnostic {
+        return Ok(false);
+    }
+    for child_name in temporary_names {
+        check_job_interrupted(interrupted)?;
+        rustix::fs::unlinkat(
+            &directory,
+            Path::new(&child_name),
+            rustix::fs::AtFlags::empty(),
+        )
+        .map_err(|source| io_error(&path.join(&child_name), source.into()))?;
+    }
+    sync_file(&directory, &path)?;
+    rustix::fs::unlinkat(parent, Path::new(name), rustix::fs::AtFlags::REMOVEDIR)
+        .map_err(|source| io_error(&partial.join(name), source.into()))?;
+    Ok(true)
+}
+
+fn remove_private_tree(
+    parent: &File,
+    name: &Path,
+    logical_path: &Path,
+    interrupted: Option<&AtomicBool>,
+    depth: u32,
+) -> Result<(), JobError> {
+    if depth >= 64 {
+        return Err(JobError::UnsafePath(logical_path.to_path_buf()));
+    }
+    let owned = rustix::fs::openat(
+        parent,
+        name,
+        rustix::fs::OFlags::RDONLY
+            | rustix::fs::OFlags::DIRECTORY
+            | rustix::fs::OFlags::NOFOLLOW
+            | rustix::fs::OFlags::CLOEXEC,
+        rustix::fs::Mode::empty(),
+    )
+    .map_err(|source| io_error(logical_path, source.into()))?;
+    let directory = File::from(owned);
+    let path = fd_path(directory.as_raw_fd());
+    for entry in fs::read_dir(&path).map_err(|source| io_error(&path, source))? {
+        check_job_interrupted(interrupted)?;
+        let entry = entry.map_err(|source| io_error(&path, source))?;
+        let child_name = entry.file_name();
+        let child_path = logical_path.join(&child_name);
+        let stat = rustix::fs::statat(
+            &directory,
+            Path::new(&child_name),
+            rustix::fs::AtFlags::SYMLINK_NOFOLLOW,
+        )
+        .map_err(|source| io_error(&child_path, source.into()))?;
+        match rustix::fs::FileType::from_raw_mode(stat.st_mode) {
+            rustix::fs::FileType::RegularFile
+                if stat.st_uid == rustix::process::geteuid().as_raw() && stat.st_nlink == 1 =>
+            {
+                rustix::fs::unlinkat(
+                    &directory,
+                    Path::new(&child_name),
+                    rustix::fs::AtFlags::empty(),
+                )
+                .map_err(|source| io_error(&child_path, source.into()))?;
+            }
+            rustix::fs::FileType::Directory
+                if stat.st_uid == rustix::process::geteuid().as_raw() =>
+            {
+                remove_private_tree(
+                    &directory,
+                    Path::new(&child_name),
+                    &child_path,
+                    interrupted,
+                    depth + 1,
+                )?;
+            }
+            _ => return Err(JobError::UnsafePath(child_path)),
+        }
+    }
+    sync_file(&directory, &path)?;
+    rustix::fs::unlinkat(parent, name, rustix::fs::AtFlags::REMOVEDIR)
+        .map_err(|source| io_error(logical_path, source.into()))?;
+    Ok(())
+}
+
+fn validate_private_stat(path: &Path, stat: &rustix::fs::Stat) -> Result<(), JobError> {
+    if !private_state_attributes_valid(true, stat.st_uid, stat.st_mode, Some(stat.st_nlink)) {
+        return Err(JobError::UnsafePath(path.to_path_buf()));
+    }
+    Ok(())
+}
+
+fn remove_spool_contents(
+    directory: &File,
+    spool: &Path,
+    interrupted: Option<&AtomicBool>,
+) -> Result<(), JobError> {
+    remove_private_regular_files(
+        directory,
+        spool,
+        |name| valid_blob_hash(name) || name.starts_with(".tmp") || name == PAYLOAD_PACK_FILENAME,
+        interrupted,
+    )
+}
+
+fn remove_private_regular_files(
+    directory: &File,
+    path: &Path,
+    accepted_name: impl Fn(&str) -> bool,
+    interrupted: Option<&AtomicBool>,
+) -> Result<(), JobError> {
+    let mut removed = false;
+    for entry in fs::read_dir(path).map_err(|source| io_error(path, source))? {
+        check_job_interrupted(interrupted)?;
+        let entry = entry.map_err(|source| io_error(path, source))?;
+        let name = entry
+            .file_name()
+            .into_string()
+            .map_err(|_| JobError::UnsafePath(entry.path()))?;
+        if !accepted_name(&name) {
+            return Err(JobError::UnsafePath(entry.path()));
+        }
+        let stat = rustix::fs::statat(
+            directory,
+            Path::new(&name),
+            rustix::fs::AtFlags::SYMLINK_NOFOLLOW,
+        )
+        .map_err(|source| io_error(&entry.path(), source.into()))?;
+        if rustix::fs::FileType::from_raw_mode(stat.st_mode) != rustix::fs::FileType::RegularFile
+            || !private_state_attributes_valid(true, stat.st_uid, stat.st_mode, Some(stat.st_nlink))
+        {
+            return Err(JobError::UnsafePath(entry.path()));
+        }
+        rustix::fs::unlinkat(directory, Path::new(&name), rustix::fs::AtFlags::empty())
+            .map_err(|source| io_error(&entry.path(), source.into()))?;
+        removed = true;
+    }
+    if removed {
+        sync_file(directory, path)?;
+    }
+    Ok(())
+}
+
+fn remove_unreferenced_blobs(
+    connection: &Connection,
+    spool: &Path,
+    interrupted: Option<&AtomicBool>,
+) -> Result<(), JobError> {
     for entry in fs::read_dir(spool).map_err(|source| io_error(spool, source))? {
+        check_job_interrupted(interrupted)?;
         let entry = entry.map_err(|source| io_error(spool, source))?;
         let name = entry.file_name();
         let name = name.to_string_lossy();
-        if !valid_blob_hash(&name) {
+        if name == PAYLOAD_PACK_FILENAME {
             continue;
+        }
+        if !valid_blob_hash(&name) {
+            return Err(JobError::UnsafePath(entry.path()));
         }
         let referenced = connection.query_row(
             "SELECT EXISTS(SELECT 1 FROM blobs WHERE sha256 = ?1)",
@@ -2471,16 +4125,6 @@ fn remove_unreferenced_blobs(connection: &Connection, spool: &Path) -> Result<()
     Ok(())
 }
 
-fn discard_blob(blob: BlobWriter, expected: u64) -> Result<(), JobError> {
-    if blob.bytes != expected {
-        return Err(JobError::BlobLength {
-            expected,
-            actual: blob.bytes,
-        });
-    }
-    Ok(())
-}
-
 fn io_error(path: &Path, source: std::io::Error) -> JobError {
     JobError::Io {
         path: path.to_path_buf(),
@@ -2490,10 +4134,13 @@ fn io_error(path: &Path, source: std::io::Error) -> JobError {
 
 #[cfg(test)]
 mod tests {
+    use std::fs::OpenOptions;
     use std::io::Write as _;
     use std::io::{BufRead, BufReader, Read as _};
-    use std::os::unix::fs::{PermissionsExt, symlink};
+    use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
     use std::process::{Command, Stdio};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::thread;
     use std::time::Duration;
 
     use libpff_sys::{
@@ -2505,12 +4152,193 @@ mod tests {
     use sha2::{Digest, Sha256};
 
     use super::{
-        DurableCatalogSink, JobError, PartSidecar, PublishedPart, WorkerEvent, digest_hex,
-        private_state_attributes_valid, write_hashed, write_sidecar_partial,
+        CANDIDATE_CHECKPOINT_BATCH, DurableCatalogSink, INLINE_BLOB_MAX_BYTES,
+        INLINE_CACHE_DIRECTORY, JobConfiguration, JobError, JobSourceIdentity,
+        PAYLOAD_PACK_FILENAME, PartSidecar, PublishedPart, WorkerEvent, digest_hex,
+        private_state_attributes_valid, run_sql_interruptible, validate_blob_store, write_hashed,
+        write_sidecar_partial,
     };
 
     struct PrefixThenError {
         remaining: usize,
+    }
+
+    #[test]
+    fn resume_configuration_is_exact_and_mismatch_validation_is_read_only()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempdir()?;
+        let job = directory.path().join("job");
+        let sink = DurableCatalogSink::create(&job)?;
+        let source = JobSourceIdentity {
+            canonical_path: "/external/mail.pst".to_owned(),
+            device: 1,
+            inode: 2,
+            size_bytes: 3,
+            modified_at: "2026-07-16T00:00:00Z".to_owned(),
+            sha256: "a".repeat(64),
+        };
+        let configuration = JobConfiguration {
+            tool_compatibility_major: 0,
+            split_schema_version: "0.4.1".to_owned(),
+            recovery_mode: "balanced".to_owned(),
+            maximum_pst_bytes: 4_294_967_296,
+            part_size_policy: "hard-maximum-v1".to_owned(),
+            writer_format: "unicode-pst-v23".to_owned(),
+        };
+        sink.bind_source(&source)?;
+        sink.bind_recovery_mode("balanced")?;
+        sink.bind_configuration(&configuration)?;
+        sink.checkpoint()?;
+        drop(sink);
+
+        DurableCatalogSink::validate_resume(&job, &source, &configuration)?;
+        let resumed = DurableCatalogSink::open_resume(&job, &source, &configuration)?;
+        assert!(resumed.allocated_bytes()? > 0);
+        drop(resumed);
+        let database = job.join(".pstforge/job.sqlite3");
+        let before = Sha256::digest(std::fs::read(&database)?);
+        let mut mismatch = configuration.clone();
+        mismatch.maximum_pst_bytes -= 1;
+        assert!(matches!(
+            DurableCatalogSink::validate_resume(&job, &source, &mismatch),
+            Err(JobError::ResumeMismatch("part-size policy"))
+        ));
+        assert!(matches!(
+            DurableCatalogSink::open_resume(&job, &source, &mismatch),
+            Err(JobError::ResumeMismatch("part-size policy"))
+        ));
+        let mut wrong_source = source.clone();
+        wrong_source.sha256 = "b".repeat(64);
+        assert!(matches!(
+            DurableCatalogSink::validate_resume(&job, &wrong_source, &configuration),
+            Err(JobError::ResumeMismatch("source identity or SHA-256"))
+        ));
+        let after = Sha256::digest(std::fs::read(&database)?);
+        assert_eq!(before, after);
+        Ok(())
+    }
+
+    #[test]
+    fn resume_rejects_untracked_part_storage_before_capacity_credit()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempdir()?;
+        let job = directory.path().join("job");
+        let sink = DurableCatalogSink::create(&job)?;
+        sink.checkpoint()?;
+        drop(sink);
+        let untracked = job.join("parts/untracked.bin");
+        std::fs::write(&untracked, vec![0_u8; 4096])?;
+        std::fs::set_permissions(&untracked, std::fs::Permissions::from_mode(0o600))?;
+        assert!(matches!(
+            DurableCatalogSink::open(&job),
+            Err(JobError::Integrity(message)) if message.contains("unrecognized")
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn resume_rejects_untracked_private_storage_before_capacity_credit()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempdir()?;
+        let job = directory.path().join("job");
+        let sink = DurableCatalogSink::create(&job)?;
+        sink.checkpoint()?;
+        drop(sink);
+        let untracked = job.join(".pstforge/untracked.bin");
+        std::fs::write(&untracked, vec![0_u8; 4096])?;
+        std::fs::set_permissions(&untracked, std::fs::Permissions::from_mode(0o600))?;
+        assert!(matches!(
+            DurableCatalogSink::open(&job),
+            Err(JobError::UnsafePath(path)) if path.ends_with("untracked.bin")
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn resume_rejects_untracked_spool_storage_before_capacity_credit()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempdir()?;
+        let job = directory.path().join("job");
+        let sink = DurableCatalogSink::create(&job)?;
+        sink.checkpoint()?;
+        drop(sink);
+        let untracked = job.join(".pstforge/spool/untracked.bin");
+        std::fs::write(&untracked, vec![0_u8; 4096])?;
+        std::fs::set_permissions(&untracked, std::fs::Permissions::from_mode(0o600))?;
+        assert!(matches!(
+            DurableCatalogSink::open(&job),
+            Err(JobError::UnsafePath(path)) if path.ends_with("untracked.bin")
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn resume_capacity_does_not_credit_retained_validator_scratch()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempdir()?;
+        let job = directory.path().join("job");
+        let sink = DurableCatalogSink::create(&job)?;
+        sink.checkpoint()?;
+        let before = sink.allocated_bytes()?;
+        let scratch = job.join(".pstforge/partial/.pstforge-validator-failure");
+        std::fs::create_dir(&scratch)?;
+        std::fs::set_permissions(&scratch, std::fs::Permissions::from_mode(0o700))?;
+        let failed_part = scratch.join(".tmp-retained.pst");
+        std::fs::write(&failed_part, vec![0_u8; 1024 * 1024])?;
+        std::fs::set_permissions(&failed_part, std::fs::Permissions::from_mode(0o600))?;
+        let diagnostic = scratch.join("validator-failure.log");
+        std::fs::write(&diagnostic, b"independent validator rejected the part")?;
+        std::fs::set_permissions(&diagnostic, std::fs::Permissions::from_mode(0o600))?;
+        let failed_allocation = failed_part.metadata()?.blocks().saturating_mul(512);
+
+        let after = sink.allocated_bytes()?;
+        assert!(failed_allocation > 0);
+        assert!(after.saturating_sub(before) < failed_allocation);
+        drop(sink);
+
+        let resumed = DurableCatalogSink::open(&job)?;
+        assert!(scratch.exists());
+        assert!(resumed.allocated_bytes()?.saturating_sub(before) < failed_allocation);
+        Ok(())
+    }
+
+    #[test]
+    fn reopen_removes_validated_stale_partials_and_refuses_symlinks()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempdir()?;
+        let job = directory.path().join("job");
+        let sink = DurableCatalogSink::create(&job)?;
+        sink.checkpoint()?;
+        drop(sink);
+        let stale = job.join(".pstforge/partial/part-0001-attempt-1.pst.partial");
+        std::fs::write(&stale, b"incomplete")?;
+        std::fs::set_permissions(&stale, std::fs::Permissions::from_mode(0o600))?;
+        drop(DurableCatalogSink::open(&job)?);
+        assert!(!stale.exists());
+
+        let scratch = job.join(".pstforge/partial/.pstforge-stale");
+        std::fs::create_dir(&scratch)?;
+        std::fs::set_permissions(&scratch, std::fs::Permissions::from_mode(0o700))?;
+        let temporary = scratch.join(".tmp-output");
+        std::fs::write(&temporary, b"incomplete")?;
+        std::fs::set_permissions(&temporary, std::fs::Permissions::from_mode(0o600))?;
+        drop(DurableCatalogSink::open(&job)?);
+        assert!(!scratch.exists());
+
+        let scratch = job.join(".pstforge/partial/.pstforge-readpst-crash");
+        let extracted = scratch.join(".readpst-output/Inbox/nested");
+        std::fs::create_dir_all(&extracted)?;
+        std::fs::set_permissions(&scratch, std::fs::Permissions::from_mode(0o700))?;
+        std::fs::write(extracted.join("message.eml"), b"private recovered mail")?;
+        drop(DurableCatalogSink::open(&job)?);
+        assert!(!scratch.exists());
+
+        symlink("/dev/null", &stale)?;
+        assert!(matches!(
+            DurableCatalogSink::open(&job),
+            Err(JobError::UnsafePath(_))
+        ));
+        Ok(())
     }
 
     impl std::io::Write for PrefixThenError {
@@ -2804,8 +4632,11 @@ mod tests {
 
         let blob_path = job.join(".pstforge/spool").join(&blob.sha256);
         std::fs::write(&blob_path, b"evil")?;
-        assert!(matches!(sink.open_blob(blob), Err(JobError::Integrity(_))));
-        std::fs::write(&blob_path, b"body")?;
+        assert!(matches!(
+            validate_blob_store(&sink.connection, &sink.spool, None),
+            Err(JobError::Integrity(_))
+        ));
+        std::fs::remove_file(&blob_path)?;
 
         let part_bytes = vec![0_u8; 1024];
         let part_path = job.join("parts/part-0001.pst");
@@ -2818,6 +4649,11 @@ mod tests {
             sha256: digest_hex(Sha256::digest(&part_bytes).as_slice()),
             oversize: false,
         };
+        let interrupted = AtomicBool::new(true);
+        assert!(matches!(
+            super::verify_part_artifact(&part_path, &part, Some(&interrupted)),
+            Err(JobError::Interrupted)
+        ));
         let sidecar = PartSidecar {
             schema_version: "1.0.0".to_owned(),
             producer_version: "0.4.0".to_owned(),
@@ -2865,8 +4701,31 @@ mod tests {
             sink.commit_published_part(&part, &sidecar, &["normal:10:-:0".to_owned()],)
                 .is_err()
         );
+        sink.finalize_private_work(true)?;
+        assert_eq!(sink.summary()?.blob_count, 1);
+        assert_eq!(std::fs::read_dir(job.join(".pstforge/spool"))?.count(), 1);
+        assert_eq!(
+            sink.connection
+                .query_row("SELECT COUNT(*) FROM inline_blobs", [], |row| row
+                    .get::<_, u64>(0))?,
+            0
+        );
+        sink.finalize_private_work(false)?;
+        assert_eq!(sink.summary()?.blob_count, 1);
+        assert_eq!(sink.summary()?.blob_bytes, 4);
+        assert_eq!(std::fs::read_dir(job.join(".pstforge/spool"))?.count(), 0);
+        assert_eq!(
+            sink.connection
+                .query_row("SELECT COUNT(*) FROM inline_blobs", [], |row| row
+                    .get::<_, u64>(0))?,
+            0
+        );
         sink.checkpoint()?;
         drop(sink);
+        assert!(matches!(
+            DurableCatalogSink::open_interruptible(&job, &AtomicBool::new(true)),
+            Err(JobError::Interrupted)
+        ));
         let reopened = DurableCatalogSink::open(&job)?;
         drop(reopened);
         let mut wrong_sidecar = sidecar.clone();
@@ -2886,6 +4745,186 @@ mod tests {
     }
 
     #[test]
+    fn small_blobs_are_transactional_and_writer_scratch_is_disposable()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempdir()?;
+        let job = directory.path().join("job");
+        let mut sink = DurableCatalogSink::create(&job)?;
+        message_start(&mut sink, 10)?;
+        let descriptor = body_descriptor(10, 4);
+        sink.event(CatalogEvent::PropertyStart(descriptor))?;
+        sink.event(CatalogEvent::PropertyData {
+            descriptor,
+            bytes: b"body",
+        })?;
+        sink.event(CatalogEvent::PropertyEnd(descriptor))?;
+        sink.event(CatalogEvent::MessageEnd {
+            id: 10,
+            complete: true,
+        })?;
+
+        assert_eq!(std::fs::read_dir(job.join(".pstforge/spool"))?.count(), 1);
+        assert_eq!(
+            sink.connection
+                .query_row("SELECT COUNT(*) FROM inline_blobs", [], |row| row
+                    .get::<_, u64>(0))?,
+            0
+        );
+        let candidate = sink.spooled_candidates()?.remove(0);
+        let blob = candidate.events[0].blob.as_ref().ok_or("missing blob")?;
+        let mut payload = Vec::new();
+        sink.open_blob(blob)?.read_to_end(&mut payload)?;
+        assert_eq!(payload, b"body");
+        let materialized = sink.verified_blob_path(blob)?;
+        assert_eq!(
+            materialized.file_name().and_then(|name| name.to_str()),
+            Some(PAYLOAD_PACK_FILENAME)
+        );
+        assert_eq!(std::fs::read(&materialized)?, b"body");
+        assert!(
+            !job.join(".pstforge/partial")
+                .join(INLINE_CACHE_DIRECTORY)
+                .exists()
+        );
+        sink.checkpoint()?;
+        drop(sink);
+
+        let reopened = DurableCatalogSink::open(&job)?;
+        assert!(
+            !job.join(".pstforge/partial")
+                .join(INLINE_CACHE_DIRECTORY)
+                .exists()
+        );
+        let blob = reopened.spooled_candidates()?.remove(0).events[0]
+            .blob
+            .clone()
+            .ok_or("missing reopened blob")?;
+        let mut payload = Vec::new();
+        reopened.open_blob(&blob)?.read_to_end(&mut payload)?;
+        assert_eq!(payload, b"body");
+        Ok(())
+    }
+
+    #[test]
+    fn empty_pack_range_may_share_the_next_payload_offset() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let directory = tempdir()?;
+        let job = directory.path().join("job");
+        let mut sink = DurableCatalogSink::create(&job)?;
+        message_start(&mut sink, 10)?;
+        let empty = body_descriptor(10, 0);
+        sink.event(CatalogEvent::PropertyStart(empty))?;
+        sink.event(CatalogEvent::PropertyEnd(empty))?;
+        let body = PropertyDescriptor {
+            entry_index: 1,
+            ..body_descriptor(10, 4)
+        };
+        sink.event(CatalogEvent::PropertyStart(body))?;
+        sink.event(CatalogEvent::PropertyData {
+            descriptor: body,
+            bytes: b"body",
+        })?;
+        sink.event(CatalogEvent::PropertyEnd(body))?;
+        sink.event(CatalogEvent::MessageEnd {
+            id: 10,
+            complete: true,
+        })?;
+        sink.checkpoint()?;
+        drop(sink);
+
+        let reopened = DurableCatalogSink::open(&job)?;
+        assert_eq!(reopened.summary()?.blob_count, 2);
+        assert_eq!(reopened.summary()?.blob_bytes, 4);
+        Ok(())
+    }
+
+    #[test]
+    fn normal_cleanup_erases_payload_pack_and_private_bytes()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempdir()?;
+        let job = directory.path().join("job");
+        let database = job.join(".pstforge/job.sqlite3");
+        let mut sink = DurableCatalogSink::create(&job)?;
+        message_start(&mut sink, 10)?;
+        let mut payload = Vec::with_capacity(usize::try_from(INLINE_BLOB_MAX_BYTES)?);
+        while payload.len() < usize::try_from(INLINE_BLOB_MAX_BYTES)? {
+            payload.extend_from_slice(b"pstforge-private-inline-sentinel-");
+        }
+        payload.truncate(usize::try_from(INLINE_BLOB_MAX_BYTES)?);
+        let descriptor = body_descriptor(10, u64::try_from(payload.len())?);
+        sink.event(CatalogEvent::PropertyStart(descriptor))?;
+        sink.event(CatalogEvent::PropertyData {
+            descriptor,
+            bytes: &payload,
+        })?;
+        sink.event(CatalogEvent::PropertyEnd(descriptor))?;
+        sink.event(CatalogEvent::MessageEnd {
+            id: 10,
+            complete: true,
+        })?;
+        sink.checkpoint()?;
+        let pack = job.join(".pstforge/spool").join(PAYLOAD_PACK_FILENAME);
+        assert!(
+            std::fs::read(&pack)?
+                .windows(b"pstforge-private-inline-sentinel".len())
+                .any(|window| window == b"pstforge-private-inline-sentinel")
+        );
+        sink.mark_candidates_unsupported(&["normal:10:-:0".to_owned()])?;
+        sink.finalize_private_work(false)?;
+        assert!(!pack.exists());
+        sink.connection.execute(
+            "UPDATE job_metadata SET value = 'true' \
+             WHERE key = 'cleanup_compaction_pending'",
+            [],
+        )?;
+        sink.finalize_private_work(false)?;
+        drop(sink);
+        let database_bytes = std::fs::read(database)?;
+        assert!(
+            !database_bytes
+                .windows(b"pstforge-private-inline-sentinel".len())
+                .any(|window| window == b"pstforge-private-inline-sentinel")
+        );
+        let connection = Connection::open(job.join(".pstforge/job.sqlite3"))?;
+        assert_eq!(
+            connection.query_row(
+                "SELECT value FROM job_metadata \
+                 WHERE key = 'cleanup_compaction_pending'",
+                [],
+                |row| row.get::<_, String>(0),
+            )?,
+            "false"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn long_sql_operation_honors_interruption() -> Result<(), Box<dyn std::error::Error>> {
+        let mut connection = Connection::open_in_memory()?;
+        let interrupted = AtomicBool::new(false);
+        let started = std::time::Instant::now();
+        let result = thread::scope(|scope| {
+            scope.spawn(|| {
+                thread::sleep(Duration::from_millis(25));
+                interrupted.store(true, Ordering::Relaxed);
+            });
+            run_sql_interruptible(&mut connection, Some(&interrupted), |connection| {
+                connection.query_row(
+                    "WITH RECURSIVE count(value) AS (\
+                         SELECT 1 UNION ALL SELECT value + 1 FROM count WHERE value < 100000000\
+                     ) SELECT SUM(value) FROM count",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )?;
+                Ok(())
+            })
+        });
+        assert!(matches!(result, Err(JobError::Interrupted)));
+        assert!(started.elapsed() < Duration::from_secs(2));
+        Ok(())
+    }
+
+    #[test]
     fn publication_intent_recovers_every_cross_resource_crash_state()
     -> Result<(), Box<dyn std::error::Error>> {
         for publication_step in 0..=2 {
@@ -2897,6 +4936,7 @@ mod tests {
                 id: 10,
                 complete: true,
             })?;
+            sink.checkpoint()?;
             let item_key = sink.spooled_candidates()?[0].item_key.clone();
             let bytes = b"validated part checkpoint";
             let part = PublishedPart {
@@ -2950,8 +4990,8 @@ mod tests {
                 assert_eq!(reopened.spooled_candidates()?.len(), 1);
                 assert!(!job.join("parts/part-0001.pst").exists());
                 assert!(
-                    job.join(".pstforge/partial/part-0001.json.partial")
-                        .is_file()
+                    !job.join(".pstforge/partial/part-0001.json.partial")
+                        .exists()
                 );
             } else {
                 assert!(reopened.spooled_candidates()?.is_empty());
@@ -2979,7 +5019,14 @@ mod tests {
         let reopened = DurableCatalogSink::open(&job)?;
         assert_eq!(reopened.summary()?.committed_candidates, 0);
         assert_eq!(reopened.summary()?.blob_count, 0);
-        assert_eq!(std::fs::read_dir(job.join(".pstforge/spool"))?.count(), 0);
+        assert_eq!(std::fs::read_dir(job.join(".pstforge/spool"))?.count(), 1);
+        assert_eq!(
+            job.join(".pstforge/spool")
+                .join(PAYLOAD_PACK_FILENAME)
+                .metadata()?
+                .len(),
+            0
+        );
         Ok(())
     }
 
@@ -3341,11 +5388,12 @@ mod tests {
             let job = directory.path().join("job");
             let mut sink = DurableCatalogSink::create(&job)?;
             message_start(&mut sink, 10)?;
-            let descriptor = body_descriptor(10, 4);
+            let payload = vec![0x5a; usize::try_from(INLINE_BLOB_MAX_BYTES)? + 1];
+            let descriptor = body_descriptor(10, u64::try_from(payload.len())?);
             sink.event(CatalogEvent::PropertyStart(descriptor))?;
             sink.event(CatalogEvent::PropertyData {
                 descriptor,
-                bytes: b"body",
+                bytes: &payload,
             })?;
             sink.event(CatalogEvent::PropertyEnd(descriptor))?;
             sink.event(CatalogEvent::MessageEnd {
@@ -3373,6 +5421,131 @@ mod tests {
     }
 
     #[test]
+    fn existing_schema_gains_pack_column_and_indexes_on_resume()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempdir()?;
+        let job = directory.path().join("job");
+        let mut sink = DurableCatalogSink::create(&job)?;
+        message_start(&mut sink, 10)?;
+        let payload = vec![0x5a; usize::try_from(INLINE_BLOB_MAX_BYTES)? + 1];
+        let descriptor = body_descriptor(10, u64::try_from(payload.len())?);
+        sink.event(CatalogEvent::PropertyStart(descriptor))?;
+        sink.event(CatalogEvent::PropertyData {
+            descriptor,
+            bytes: &payload,
+        })?;
+        sink.event(CatalogEvent::PropertyEnd(descriptor))?;
+        sink.event(CatalogEvent::MessageEnd {
+            id: 10,
+            complete: true,
+        })?;
+        sink.checkpoint()?;
+        drop(sink);
+        let connection = Connection::open(job.join(".pstforge/job.sqlite3"))?;
+        connection.execute_batch(
+            "DROP TABLE inline_blobs;\
+             DROP INDEX candidate_events_blob_sha256;\
+             DROP INDEX candidates_occurrence;",
+        )?;
+        drop(connection);
+
+        let mut resumed = DurableCatalogSink::open(&job)?;
+        assert_eq!(
+            resumed
+                .connection
+                .query_row("SELECT COUNT(*) FROM inline_blobs", [], |row| row
+                    .get::<_, u64>(0))?,
+            0
+        );
+        let mut plan = resumed.connection.prepare(
+            "EXPLAIN QUERY PLAN SELECT 1 FROM blobs b WHERE NOT EXISTS(\
+                SELECT 1 FROM candidate_events e WHERE e.blob_sha256 = b.sha256\
+             )",
+        )?;
+        let details = plan
+            .query_map([], |row| row.get::<_, String>(3))?
+            .collect::<Result<Vec<_>, _>>()?;
+        assert!(
+            details
+                .iter()
+                .any(|detail| detail.contains("candidate_events_blob_sha256")),
+            "orphan-blob validation must use its blob-reference index: {details:?}"
+        );
+        drop(plan);
+        let mut plan = resumed.connection.prepare(
+            "EXPLAIN QUERY PLAN SELECT COUNT(*) FROM candidates \
+             WHERE provenance = ?1 AND source_node_id IS ?2 AND recovery_index IS ?3",
+        )?;
+        let details = plan
+            .query_map(rusqlite::params!["normal", 10_i64, None::<i64>], |row| {
+                row.get::<_, String>(3)
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        assert!(
+            details
+                .iter()
+                .any(|detail| detail.contains("candidates_occurrence")),
+            "candidate occurrence assignment must use its identity index: {details:?}"
+        );
+        drop(plan);
+        message_start(&mut resumed, 11)?;
+        let descriptor = body_descriptor(11, 4);
+        resumed.event(CatalogEvent::PropertyStart(descriptor))?;
+        resumed.event(CatalogEvent::PropertyData {
+            descriptor,
+            bytes: b"body",
+        })?;
+        resumed.event(CatalogEvent::PropertyEnd(descriptor))?;
+        resumed.event(CatalogEvent::MessageEnd {
+            id: 11,
+            complete: true,
+        })?;
+        assert_eq!(
+            resumed
+                .connection
+                .query_row("SELECT COUNT(*) FROM inline_blobs", [], |row| row
+                    .get::<_, u64>(0))?,
+            0
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn corrupt_legacy_inline_blob_is_refused_on_reopen() -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempdir()?;
+        let job = directory.path().join("job");
+        let mut sink = DurableCatalogSink::create(&job)?;
+        message_start(&mut sink, 10)?;
+        let descriptor = body_descriptor(10, 4);
+        sink.event(CatalogEvent::PropertyStart(descriptor))?;
+        sink.event(CatalogEvent::PropertyData {
+            descriptor,
+            bytes: b"body",
+        })?;
+        sink.event(CatalogEvent::PropertyEnd(descriptor))?;
+        sink.event(CatalogEvent::MessageEnd {
+            id: 10,
+            complete: true,
+        })?;
+        sink.checkpoint()?;
+        drop(sink);
+        let connection = Connection::open(job.join(".pstforge/job.sqlite3"))?;
+        connection.execute("UPDATE blobs SET pack_offset = NULL", [])?;
+        connection.execute(
+            "INSERT INTO inline_blobs(sha256, data) \
+             SELECT sha256, ?1 FROM blobs",
+            [b"evil".as_slice()],
+        )?;
+        drop(connection);
+        std::fs::write(job.join(".pstforge/spool").join(PAYLOAD_PACK_FILENAME), [])?;
+        assert!(matches!(
+            DurableCatalogSink::open(&job),
+            Err(JobError::Integrity(_))
+        ));
+        Ok(())
+    }
+
+    #[test]
     fn corrupt_existing_blob_is_not_reused() -> Result<(), Box<dyn std::error::Error>> {
         let directory = tempdir()?;
         let job = directory.path().join("job");
@@ -3389,12 +5562,12 @@ mod tests {
             id: 10,
             complete: true,
         })?;
-        let spool = job.join(".pstforge/spool");
-        let blob = std::fs::read_dir(&spool)?
-            .next()
-            .ok_or("missing committed blob")??
-            .path();
-        std::fs::write(blob, b"evil")?;
+        {
+            let mut pack = OpenOptions::new()
+                .write(true)
+                .open(job.join(".pstforge/spool").join(PAYLOAD_PACK_FILENAME))?;
+            pack.write_all(b"evil")?;
+        }
 
         message_start(&mut sink, 11)?;
         let second = body_descriptor(11, 4);
@@ -3621,7 +5794,7 @@ mod tests {
         let mut sink = DurableCatalogSink::create(&job)?;
         let outside = body_descriptor(10, 4);
         assert!(sink.event(CatalogEvent::PropertyStart(outside)).is_err());
-        assert_eq!(std::fs::read_dir(job.join(".pstforge/spool"))?.count(), 0);
+        assert_eq!(std::fs::read_dir(job.join(".pstforge/spool"))?.count(), 1);
 
         message_start(&mut sink, 10)?;
         let wrong_message = body_descriptor(11, 4);
@@ -3675,11 +5848,12 @@ mod tests {
             let job = directory.path().join("job");
             let mut sink = DurableCatalogSink::create(&job)?;
             message_start(&mut sink, 10)?;
-            let descriptor = body_descriptor(10, 4);
+            let payload = vec![0x5a; usize::try_from(INLINE_BLOB_MAX_BYTES)? + 1];
+            let descriptor = body_descriptor(10, u64::try_from(payload.len())?);
             sink.event(CatalogEvent::PropertyStart(descriptor))?;
             sink.event(CatalogEvent::PropertyData {
                 descriptor,
-                bytes: b"body",
+                bytes: &payload,
             })?;
             sink.event(CatalogEvent::PropertyEnd(descriptor))?;
             sink.event(CatalogEvent::MessageEnd {
@@ -3688,19 +5862,17 @@ mod tests {
             })?;
             sink.checkpoint()?;
             drop(sink);
-            let blob = std::fs::read_dir(job.join(".pstforge/spool"))?
-                .next()
-                .ok_or("missing blob")??
-                .path();
+            let blob = job.join(".pstforge/spool").join(PAYLOAD_PACK_FILENAME);
             if hard_link {
                 std::fs::hard_link(&blob, directory.path().join("outside-blob"))?;
             } else {
                 std::fs::set_permissions(&blob, std::fs::Permissions::from_mode(0o644))?;
             }
-            assert!(matches!(
-                DurableCatalogSink::open(&job),
-                Err(JobError::Integrity(_))
-            ));
+            match DurableCatalogSink::open(&job) {
+                Err(JobError::Integrity(_) | JobError::UnsafePath(_)) => {}
+                Err(error) => panic!("modified payload pack returned wrong error: {error}"),
+                Ok(_) => panic!("modified payload pack was not refused"),
+            }
         }
         Ok(())
     }
@@ -3715,6 +5887,7 @@ mod tests {
                 id: 10,
                 complete: true,
             })?;
+            sink.checkpoint()?;
             println!("PSTFORGE_COMMITTED");
             std::io::stdout().flush()?;
             std::thread::sleep(Duration::from_secs(60));
@@ -3746,6 +5919,26 @@ mod tests {
         let _ = child.wait()?;
         let reopened = DurableCatalogSink::open(&job)?;
         assert_eq!(reopened.summary()?.committed_candidates, 1);
+        Ok(())
+    }
+
+    #[test]
+    fn automatic_candidate_checkpoint_bounds_sigkill_replay()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempdir()?;
+        let job = directory.path().join("job");
+        let mut sink = DurableCatalogSink::create(&job)?;
+        for id in 1..=CANDIDATE_CHECKPOINT_BATCH + 1 {
+            message_start(&mut sink, id)?;
+            sink.event(CatalogEvent::MessageEnd { id, complete: true })?;
+        }
+        drop(sink);
+
+        let reopened = DurableCatalogSink::open(&job)?;
+        assert_eq!(
+            reopened.summary()?.committed_candidates,
+            u64::from(CANDIDATE_CHECKPOINT_BATCH)
+        );
         Ok(())
     }
 }

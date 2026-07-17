@@ -63,16 +63,25 @@ allocation metadata while keeping balanced recovery as the default.
 
 Implement deterministic packing into independently valid PST parts with a
 user-configurable maximum and a 4 GiB default. Replicate the required folder
-hierarchy in each part, assign every writable message exactly once, validate
+hierarchy in each part without artificial recovery or store-root wrappers,
+assign every writable message exactly once, and fill each normal non-final part
+to the target unless the next indivisible message would exceed it. Validate
 before atomic publication, and preserve an indivisible oversize message in a
 clearly marked oversize part.
 
 ### 8. Version 0.4.1 - Resume and 50 GB Qualification
 
 Extend the transactional job ledger and private recovery spool with explicit
-compatible resume, graceful interruption, progress, disk-space checks, and cleanup. Run
-the real 50 GB corrupt PST end to end and show that forced termination cannot
-damage the source or already finalized parts.
+compatible resume, graceful interruption, progress, disk-space checks, and
+cleanup. Qualify first with the owner's 19 GB corrupt PST to reduce test-data
+movement, then run the real 50 GB corrupt PST end to end. Show that forced
+termination cannot damage the source or already finalized parts. The 19 GB
+qualification must finish within the owner's 20-minute operational target on
+the current host. Version 0.4.1 records measured peak RSS; the owner accepted
+the 5,317,328,896-byte result as a known limitation, while the 2 GiB objective
+remains for later optimization and release-scale qualification. Content
+fidelity findings discovered during qualification are planned separately as
+version 0.4.2 and are not folded into the accepted splitting branch.
 
 ### 9. Version 0.5.0 - Operational UX and Debian Packaging
 

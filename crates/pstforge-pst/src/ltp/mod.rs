@@ -103,6 +103,8 @@ pub enum LtpError {
     },
     #[error("TCROWID index key 0x{expected:08X} references matrix row 0x{actual:08X}")]
     TableRowIdMismatch { expected: u32, actual: u32 },
+    #[error("TC row matrix size {size} is not divisible by row size {row_size}")]
+    InvalidTableRowMatrixSize { size: usize, row_size: usize },
 }
 
 impl From<LtpError> for io::Error {

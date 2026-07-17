@@ -1,6 +1,7 @@
 use std::fs::{File, Metadata, OpenOptions};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -25,6 +26,8 @@ pub enum SourceError {
     InvalidTimestamp(PathBuf),
     #[error("source canonical path is not valid UTF-8: {0:?}")]
     NonUtf8Path(PathBuf),
+    #[error("source hashing was interrupted")]
+    Interrupted,
     #[error("cannot {operation} source {path}: {source}")]
     Io {
         operation: &'static str,
@@ -62,6 +65,20 @@ pub struct SourceFile {
 
 impl SourceFile {
     pub fn open(path: &Path) -> Result<Self, SourceError> {
+        Self::open_with_interrupt(path, None)
+    }
+
+    pub(crate) fn open_interruptible(
+        path: &Path,
+        interrupted: &AtomicBool,
+    ) -> Result<Self, SourceError> {
+        Self::open_with_interrupt(path, Some(interrupted))
+    }
+
+    fn open_with_interrupt(
+        path: &Path,
+        interrupted: Option<&AtomicBool>,
+    ) -> Result<Self, SourceError> {
         let initial = path
             .symlink_metadata()
             .map_err(|source| io("inspect", path, source))?;
@@ -96,7 +113,7 @@ impl SourceFile {
         }
 
         let modified_at = timestamp(&canonical_path, stat)?;
-        let sha256 = hash_file_at(&file, &canonical_path)?;
+        let sha256 = hash_file_at_interruptible(&file, &canonical_path, interrupted)?;
         let after_hash = file
             .metadata()
             .map_err(|source| io("recheck after hashing", &canonical_path, source))?;
@@ -136,7 +153,22 @@ impl SourceFile {
         self.verify_unchanged_observing(|_| {})
     }
 
+    pub(crate) fn verify_unchanged_interruptible(
+        &self,
+        interrupted: &AtomicBool,
+    ) -> Result<(), SourceError> {
+        self.verify_unchanged_with_interrupt(Some(interrupted), |_| {})
+    }
+
     fn verify_unchanged_observing(&self, observer: impl FnMut(u64)) -> Result<(), SourceError> {
+        self.verify_unchanged_with_interrupt(None, observer)
+    }
+
+    fn verify_unchanged_with_interrupt(
+        &self,
+        interrupted: Option<&AtomicBool>,
+        observer: impl FnMut(u64),
+    ) -> Result<(), SourceError> {
         let fd_metadata = self
             .file
             .metadata()
@@ -151,7 +183,9 @@ impl SourceFile {
         {
             return Err(SourceError::Changed(self.path.clone()));
         }
-        if hash_file_at_observing(&self.file, &self.path, observer)? != self.identity.sha256 {
+        if hash_file_at_interruptible_observing(&self.file, &self.path, interrupted, observer)?
+            != self.identity.sha256
+        {
             return Err(SourceError::Changed(self.path.clone()));
         }
         let final_fd_metadata = self
@@ -210,13 +244,18 @@ fn canonicalize_existing_ancestor(path: &Path) -> Result<PathBuf, SourceError> {
     Ok(result)
 }
 
-fn hash_file_at(file: &File, path: &Path) -> Result<String, SourceError> {
-    hash_file_at_observing(file, path, |_| {})
-}
-
-fn hash_file_at_observing(
+fn hash_file_at_interruptible(
     file: &File,
     path: &Path,
+    interrupted: Option<&AtomicBool>,
+) -> Result<String, SourceError> {
+    hash_file_at_interruptible_observing(file, path, interrupted, |_| {})
+}
+
+fn hash_file_at_interruptible_observing(
+    file: &File,
+    path: &Path,
+    interrupted: Option<&AtomicBool>,
     mut observer: impl FnMut(u64),
 ) -> Result<String, SourceError> {
     use std::os::unix::fs::FileExt;
@@ -225,6 +264,9 @@ fn hash_file_at_observing(
     let mut buffer = vec![0_u8; HASH_BUFFER_SIZE];
     let mut offset = 0_u64;
     loop {
+        if interrupted.is_some_and(|flag| flag.load(Ordering::Relaxed)) {
+            return Err(SourceError::Interrupted);
+        }
         let read = file
             .read_at(&mut buffer, offset)
             .map_err(|source| io("hash", path, source))?;
@@ -272,6 +314,7 @@ impl From<&Metadata> for StatIdentity {
 mod tests {
     use std::fs;
     use std::os::unix::fs::symlink;
+    use std::sync::atomic::AtomicBool;
 
     use tempfile::tempdir;
 
@@ -291,6 +334,20 @@ mod tests {
         assert!(matches!(
             source.verify_unchanged(),
             Err(SourceError::Changed(_))
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn source_hashing_honors_an_already_requested_interruption()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempdir()?;
+        let path = directory.path().join("mail.pst");
+        fs::write(&path, vec![0_u8; 2 * 1024 * 1024])?;
+        let interrupted = AtomicBool::new(true);
+        assert!(matches!(
+            SourceFile::open_interruptible(&path, &interrupted),
+            Err(SourceError::Interrupted)
         ));
         Ok(())
     }

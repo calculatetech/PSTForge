@@ -1,7 +1,11 @@
 #![deny(unsafe_code)]
 
+use std::ffi::OsString;
 use std::io::Write;
 use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 
 use clap::{ArgAction, Parser, Subcommand, ValueEnum};
 use pstforge_core::{
@@ -70,6 +74,10 @@ pub enum Command {
         #[arg(long, value_enum, default_value_t = RecoveryModeArg::Balanced)]
         recovery: RecoveryModeArg,
         #[arg(long)]
+        resume: bool,
+        #[arg(long)]
+        keep_work: bool,
+        #[arg(long)]
         json: bool,
     },
     #[command(name = "__worker", hide = true)]
@@ -79,6 +87,14 @@ pub enum Command {
         skipped_units: String,
         #[arg(value_enum)]
         recovery: RecoveryModeArg,
+    },
+    #[command(name = "__validator", hide = true)]
+    Validator {
+        expected_parent: i32,
+        #[arg(value_enum)]
+        tool: ValidatorToolArg,
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        arguments: Vec<OsString>,
     },
 }
 
@@ -106,6 +122,12 @@ pub enum RecoveryModeArg {
     Aggressive,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum ValidatorToolArg {
+    Pffinfo,
+    Readpst,
+}
+
 impl From<RecoveryModeArg> for RecoveryMode {
     fn from(value: RecoveryModeArg) -> Self {
         match value {
@@ -131,6 +153,8 @@ pub enum CliError {
     Json(#[from] serde_json::Error),
     #[error("cannot locate the pstforge executable: {0}")]
     Executable(std::io::Error),
+    #[error("cannot supervise the independent PST validator: {0}")]
+    Validator(std::io::Error),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -172,11 +196,13 @@ impl CliError {
                 | RecoveryError::MissingWorkerOutput
                 | RecoveryError::WorkerExit { .. }
                 | RecoveryError::WorkerStalled
-                | RecoveryError::InconsistentCounters,
+                | RecoveryError::InconsistentCounters
+                | RecoveryError::ResumeConfigurationRequired,
             )
             | Self::Worker(_)
             | Self::Json(_)
-            | Self::Executable(_) => 6,
+            | Self::Executable(_)
+            | Self::Validator(_) => 6,
         }
     }
 }
@@ -236,6 +262,8 @@ pub fn execute(cli: &Cli, output: &mut dyn Write) -> Result<CommandStatus, CliEr
             output: job_directory,
             max_pst_size,
             recovery,
+            resume,
+            keep_work,
             json,
         } => {
             let executable = std::env::current_exe().map_err(CliError::Executable)?;
@@ -245,6 +273,8 @@ pub fn execute(cli: &Cli, output: &mut dyn Write) -> Result<CommandStatus, CliEr
                 &executable,
                 (*recovery).into(),
                 *max_pst_size,
+                *resume,
+                *keep_work,
             )?;
             if *json {
                 write_json(output, &report)?;
@@ -275,6 +305,61 @@ pub fn execute(cli: &Cli, output: &mut dyn Write) -> Result<CommandStatus, CliEr
                 output,
             )?;
             Ok(CommandStatus::Complete)
+        }
+        Command::Validator {
+            expected_parent,
+            tool,
+            arguments,
+        } => {
+            let parent_died = Arc::new(AtomicBool::new(false));
+            signal_hook::flag::register(
+                signal_hook::consts::signal::SIGTERM,
+                Arc::clone(&parent_died),
+            )
+            .map_err(CliError::Validator)?;
+            rustix::process::set_parent_process_death_signal(Some(rustix::process::Signal::TERM))
+                .map_err(|source| CliError::Validator(source.into()))?;
+            let actual_parent = rustix::process::Pid::as_raw(rustix::process::getppid());
+            if actual_parent != *expected_parent {
+                return Err(CliError::Validator(std::io::Error::other(
+                    "validator supervisor exited during startup",
+                )));
+            }
+            let mut command = if std::env::var_os("PSTFORGE_TEST_STALL_VALIDATOR").is_some() {
+                let mut command = std::process::Command::new("sh");
+                command.args(["-c", "(sleep 30) >&1 2>&2 & wait"]);
+                command
+            } else {
+                let program = match tool {
+                    ValidatorToolArg::Pffinfo => "pffinfo",
+                    ValidatorToolArg::Readpst => "readpst",
+                };
+                let mut command = std::process::Command::new(program);
+                command.args(arguments);
+                command
+            };
+            let mut child = command.spawn().map_err(CliError::Validator)?;
+            loop {
+                if parent_died.load(Ordering::Relaxed) {
+                    let _ = rustix::process::kill_process_group(
+                        rustix::process::getpid(),
+                        rustix::process::Signal::KILL,
+                    );
+                    return Err(CliError::Validator(std::io::Error::other(
+                        "validator supervisor exited",
+                    )));
+                }
+                if let Some(status) = child.try_wait().map_err(CliError::Validator)? {
+                    return if status.success() {
+                        Ok(CommandStatus::Complete)
+                    } else {
+                        Err(CliError::Validator(std::io::Error::other(format!(
+                            "validator exited with {status}"
+                        ))))
+                    };
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
         }
     }
 }
@@ -392,6 +477,11 @@ fn write_recovery(output: &mut dyn Write, report: &RecoveryReport) -> Result<(),
     writeln!(output, "Worker attempts: {}", report.worker_attempts)?;
     writeln!(output, "Worker failures: {}", report.worker_failures)?;
     writeln!(output, "Isolated units: {}", report.isolated_units)?;
+    writeln!(
+        output,
+        "Peak worker RSS: {} bytes",
+        report.peak_worker_rss_bytes
+    )?;
     writeln!(output, "Interrupted: {}", yes_no(report.interrupted))?;
     writeln!(
         output,
@@ -415,6 +505,27 @@ fn write_split(output: &mut dyn Write, report: &SplitReport) -> Result<(), std::
         output,
         "Maximum part size: {} bytes",
         report.maximum_pst_bytes
+    )?;
+    writeln!(output, "Resumed: {}", yes_no(report.resumed))?;
+    writeln!(output, "Keep private work: {}", yes_no(report.keep_work))?;
+    writeln!(
+        output,
+        "Disk preflight: {} bytes available, {} bytes remaining required, {} bytes in existing job",
+        report.disk_preflight.available_bytes,
+        report.disk_preflight.required_bytes,
+        report.disk_preflight.existing_job_bytes
+    )?;
+    writeln!(output, "Elapsed: {} ms", report.metrics.elapsed_millis)?;
+    writeln!(
+        output,
+        "Average source throughput: {} bytes/s",
+        report.metrics.average_source_bytes_per_second
+    )?;
+    writeln!(output, "Output bytes: {}", report.metrics.output_bytes)?;
+    writeln!(
+        output,
+        "Peak process RSS: {} bytes",
+        report.metrics.peak_process_rss_bytes
     )?;
     writeln!(output, "Written candidates: {}", report.written_candidates)?;
     writeln!(output, "Parts: {}", report.parts.len())?;
@@ -628,6 +739,23 @@ mod tests {
         assert_eq!(parse_byte_size("4GiB"), Ok(4_294_967_296));
         assert!(parse_byte_size("0").is_err());
         assert!(parse_byte_size("1.5GiB").is_err());
+        let resume = Cli::try_parse_from([
+            "pstforge",
+            "split",
+            "mail.pst",
+            "--output",
+            "job",
+            "--resume",
+            "--keep-work",
+        ])?;
+        assert!(matches!(
+            resume.command,
+            Command::Split {
+                resume: true,
+                keep_work: true,
+                ..
+            }
+        ));
         Ok(())
     }
 

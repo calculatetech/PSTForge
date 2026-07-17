@@ -1,16 +1,17 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::Read;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use pstforge_job::{DurableCatalogSink, JobError, SpooledBlob};
 use pstforge_pst::writer::{
-    AttachmentContent, AttachmentSpec, FileBlobSpec, MailFolderSpec, MailStoreSpec, MessageSpec,
-    NativeBody, RawProperty, RawPropertyValue, RecipientKind, RecipientSpec, SpooledPropertySpec,
-    UnsupportedProperty,
+    AttachmentContent, AttachmentSpec, FileBlobSpec, MailFolderRole, MailFolderSpec, MailStoreSpec,
+    MessageSpec, NativeBody, RawProperty, RawPropertyValue, RecipientKind, RecipientSpec,
+    SpooledPropertySpec, UnsupportedProperty,
 };
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
-use crate::{CanonicalAttachment, CanonicalMail, CanonicalProperty};
+use crate::{CanonicalAttachment, CanonicalFolderRole, CanonicalMail, CanonicalProperty};
 
 #[derive(Debug, Error)]
 pub enum CanonicalWriteError {
@@ -50,25 +51,68 @@ pub fn build_part_writer_input(
     maximum_pst_bytes: u64,
     part_index: u32,
 ) -> Result<PartWriterInput, CanonicalWriteError> {
+    build_part_writer_input_expected(
+        job,
+        messages,
+        source_sha256,
+        recovery_mode,
+        maximum_pst_bytes,
+        part_index,
+        None,
+    )
+}
+
+pub fn build_part_writer_input_interruptible(
+    job: &DurableCatalogSink,
+    messages: &[&CanonicalMail],
+    source_sha256: &str,
+    recovery_mode: &str,
+    maximum_pst_bytes: u64,
+    part_index: u32,
+    interrupted: &AtomicBool,
+) -> Result<PartWriterInput, CanonicalWriteError> {
+    build_part_writer_input_expected(
+        job,
+        messages,
+        source_sha256,
+        recovery_mode,
+        maximum_pst_bytes,
+        part_index,
+        Some(interrupted),
+    )
+}
+
+fn build_part_writer_input_expected(
+    job: &DurableCatalogSink,
+    messages: &[&CanonicalMail],
+    source_sha256: &str,
+    recovery_mode: &str,
+    maximum_pst_bytes: u64,
+    part_index: u32,
+    interrupted: Option<&AtomicBool>,
+) -> Result<PartWriterInput, CanonicalWriteError> {
+    let source = TranslationSource { job, interrupted };
+    source.check_interrupted()?;
     if messages.is_empty() {
         return Err(CanonicalWriteError::InvalidCandidate {
             item_key: "<part>".to_owned(),
             detail: "part has no messages".to_owned(),
         });
     }
-    let mut folders = BTreeMap::<Vec<String>, Vec<MessageSpec>>::new();
+    let mut folders = BTreeMap::<(Vec<String>, CanonicalFolderRole), Vec<MessageSpec>>::new();
     let mut item_keys = Vec::with_capacity(messages.len());
     let mut unsupported_item_keys = Vec::new();
     let mut partial = false;
     let mut omitted_properties = 0_u64;
     let mut omitted_attachments = 0_u64;
     for mail in messages {
-        let translated = translate_message(job, mail, true)?;
+        source.check_interrupted()?;
+        let translated = translate_message(&source, mail, true)?;
         partial |= translated.partial;
         omitted_properties = omitted_properties.saturating_add(translated.omitted_properties);
         omitted_attachments = omitted_attachments.saturating_add(translated.omitted_attachments);
         folders
-            .entry(mail.folder_path.clone())
+            .entry((mail.folder_path.clone(), mail.folder_role))
             .or_default()
             .push(translated.message);
         item_keys.extend(translated.item_keys);
@@ -76,7 +120,14 @@ pub fn build_part_writer_input(
     }
     let folders = folders
         .into_iter()
-        .map(|(path, messages)| MailFolderSpec { path, messages })
+        .map(|((path, role), messages)| MailFolderSpec {
+            path,
+            role: match role {
+                CanonicalFolderRole::Ordinary => MailFolderRole::Ordinary,
+                CanonicalFolderRole::DeletedItems => MailFolderRole::DeletedItems,
+            },
+            messages,
+        })
         .collect();
     unsupported_item_keys.sort();
     unsupported_item_keys.dedup();
@@ -99,6 +150,38 @@ pub fn build_part_writer_input(
     })
 }
 
+struct TranslationSource<'a> {
+    job: &'a DurableCatalogSink,
+    interrupted: Option<&'a AtomicBool>,
+}
+
+impl TranslationSource<'_> {
+    fn check_interrupted(&self) -> Result<(), CanonicalWriteError> {
+        if self
+            .interrupted
+            .is_some_and(|flag| flag.load(Ordering::Relaxed))
+        {
+            Err(JobError::Interrupted.into())
+        } else {
+            Ok(())
+        }
+    }
+
+    fn open_blob(&self, blob: &SpooledBlob) -> Result<std::fs::File, JobError> {
+        match self.interrupted {
+            Some(flag) => self.job.open_blob_interruptible(blob, flag),
+            None => self.job.open_blob(blob),
+        }
+    }
+
+    fn verified_blob_path(&self, blob: &SpooledBlob) -> Result<std::path::PathBuf, JobError> {
+        match self.interrupted {
+            Some(flag) => self.job.verified_blob_path_interruptible(blob, flag),
+            None => self.job.verified_blob_path(blob),
+        }
+    }
+}
+
 struct TranslatedMessage {
     message: MessageSpec,
     item_keys: Vec<String>,
@@ -109,7 +192,7 @@ struct TranslatedMessage {
 }
 
 fn translate_message(
-    job: &DurableCatalogSink,
+    job: &TranslationSource<'_>,
     mail: &CanonicalMail,
     include_attachments: bool,
 ) -> Result<TranslatedMessage, CanonicalWriteError> {
@@ -266,6 +349,28 @@ fn translate_message(
                         id,
                         property_type,
                         byte_len: property.blob.byte_len,
+                    });
+                }
+            }
+            continue;
+        }
+        if property.blob.byte_len == 0 {
+            match property_type {
+                0x001F => raw_properties.push(RawProperty {
+                    id,
+                    value: RawPropertyValue::Unicode(String::new()),
+                }),
+                0x0102 => raw_properties.push(RawProperty {
+                    id,
+                    value: RawPropertyValue::Binary(Vec::new()),
+                }),
+                _ => {
+                    partial = true;
+                    omitted_properties = omitted_properties.saturating_add(1);
+                    unsupported_properties.push(UnsupportedProperty {
+                        id,
+                        property_type,
+                        byte_len: 0,
                     });
                 }
             }
@@ -512,7 +617,7 @@ fn copied_contents_property_type(id: u16) -> Option<u16> {
 }
 
 fn materialize_copied_contents_property(
-    job: &DurableCatalogSink,
+    job: &TranslationSource<'_>,
     mail: &CanonicalMail,
     property: &CanonicalProperty,
     id: u16,
@@ -542,7 +647,7 @@ struct TranslatedAttachment {
 }
 
 fn translate_attachment(
-    job: &DurableCatalogSink,
+    job: &TranslationSource<'_>,
     mail: &CanonicalMail,
     attachment: &CanonicalAttachment,
 ) -> Result<Option<TranslatedAttachment>, CanonicalWriteError> {
@@ -616,14 +721,12 @@ fn translate_attachment(
         if data.byte_len > 2_147_483_647 {
             return Ok(None);
         }
-        (
-            AttachmentContent::Spooled(file_blob(job, data)?),
-            Vec::new(),
-            Vec::new(),
-            false,
-            0,
-            0,
-        )
+        let content = if data.byte_len == 0 {
+            AttachmentContent::Binary(Vec::new())
+        } else {
+            AttachmentContent::Spooled(file_blob(job, data)?)
+        };
+        (content, Vec::new(), Vec::new(), false, 0, 0)
     } else {
         return Ok(None);
     };
@@ -674,7 +777,7 @@ fn collect_message_item_keys(message: &CanonicalMail, item_keys: &mut Vec<String
 }
 
 fn scalar_property(
-    job: &DurableCatalogSink,
+    job: &TranslationSource<'_>,
     mail: &CanonicalMail,
     property: &CanonicalProperty,
     id: u16,
@@ -714,7 +817,7 @@ fn scalar_property(
 }
 
 fn read_boolean(
-    job: &DurableCatalogSink,
+    job: &TranslationSource<'_>,
     mail: &CanonicalMail,
     property: &CanonicalProperty,
 ) -> Result<bool, CanonicalWriteError> {
@@ -726,7 +829,7 @@ fn read_boolean(
 }
 
 fn read_i32(
-    job: &DurableCatalogSink,
+    job: &TranslationSource<'_>,
     mail: &CanonicalMail,
     property: &CanonicalProperty,
 ) -> Result<i32, CanonicalWriteError> {
@@ -742,7 +845,7 @@ fn read_i32(
 }
 
 fn read_unicode(
-    job: &DurableCatalogSink,
+    job: &TranslationSource<'_>,
     mail: &CanonicalMail,
     property: &CanonicalProperty,
 ) -> Result<Option<String>, CanonicalWriteError> {
@@ -769,7 +872,7 @@ fn read_unicode(
 }
 
 fn read_blob(
-    job: &DurableCatalogSink,
+    job: &TranslationSource<'_>,
     mail: &CanonicalMail,
     property: &CanonicalProperty,
     maximum: u64,
@@ -780,7 +883,7 @@ fn read_blob(
             "fixed-width property exceeds its materialization bound",
         );
     }
-    let mut file = job.open_blob(&property.blob)?;
+    let file = job.open_blob(&property.blob)?;
     let capacity = usize::try_from(property.blob.byte_len).map_err(|_| {
         CanonicalWriteError::InvalidCandidate {
             item_key: mail.durable_item_key.clone(),
@@ -788,7 +891,8 @@ fn read_blob(
         }
     })?;
     let mut bytes = Vec::with_capacity(capacity);
-    file.read_to_end(&mut bytes)
+    file.take(property.blob.byte_len)
+        .read_to_end(&mut bytes)
         .map_err(|source| CanonicalWriteError::BlobRead {
             item_key: mail.durable_item_key.clone(),
             source,
@@ -800,11 +904,12 @@ fn read_blob(
 }
 
 fn file_blob(
-    job: &DurableCatalogSink,
+    job: &TranslationSource<'_>,
     blob: &SpooledBlob,
 ) -> Result<FileBlobSpec, CanonicalWriteError> {
     Ok(FileBlobSpec {
         path: job.verified_blob_path(blob)?,
+        offset: blob.pack_offset.unwrap_or(0),
         byte_len: blob.byte_len,
         sha256: decode_sha256(&blob.sha256)?,
     })
@@ -900,7 +1005,7 @@ fn class_descends_from(value: &str, root: &str) -> bool {
 }
 
 fn validate_streamed_property(
-    job: &DurableCatalogSink,
+    job: &TranslationSource<'_>,
     mail: &CanonicalMail,
     property: &CanonicalProperty,
     id: u16,
@@ -924,9 +1029,10 @@ fn validate_streamed_property(
             });
     }
 
-    let mut file = job.open_blob(&property.blob)?;
+    let file = job.open_blob(&property.blob)?;
+    let mut reader = file.take(property.blob.byte_len);
     let valid = match property_type {
-        0x001F => valid_utf16_stream(&mut file)?,
+        0x001F => valid_utf16_stream(&mut reader)?,
         // String8 uses the message code page, and Binary has no internal PST
         // structure. Their bytes are safe to preserve without reinterpretation.
         0x001E | 0x0102 => true,
@@ -1051,12 +1157,15 @@ fn valid_utf16_stream(reader: &mut impl Read) -> Result<bool, CanonicalWriteErro
 }
 
 fn valid_utf8_property(
-    job: &DurableCatalogSink,
+    job: &TranslationSource<'_>,
     mail: &CanonicalMail,
     property: &CanonicalProperty,
 ) -> Result<bool, CanonicalWriteError> {
-    let mut file = job.open_blob(&property.blob)?;
-    valid_utf8_stream(&mut file, &mail.durable_item_key)
+    let file = job.open_blob(&property.blob)?;
+    valid_utf8_stream(
+        &mut file.take(property.blob.byte_len),
+        &mail.durable_item_key,
+    )
 }
 
 fn valid_utf8_stream(reader: &mut impl Read, item_key: &str) -> Result<bool, CanonicalWriteError> {
@@ -1246,10 +1355,10 @@ mod tests {
         writer_stream_type_is_supported,
     };
     use crate::{
-        CanonicalAttachment, CanonicalMail, CanonicalProperty, ContentCompleteness, ItemKey,
-        RecoveryProvenance,
+        CanonicalAttachment, CanonicalFolderRole, CanonicalMail, CanonicalProperty,
+        ContentCompleteness, ItemKey, RecoveryProvenance,
     };
-    use pstforge_pst::writer::NativeBody;
+    use pstforge_pst::writer::{AttachmentContent, NativeBody};
 
     #[test]
     fn attachment_larger_than_writer_field_is_omitted_without_losing_parent()
@@ -1265,6 +1374,7 @@ mod tests {
                 occurrence: 0,
             },
             folder_path: vec!["Inbox".to_owned()],
+            folder_role: CanonicalFolderRole::Ordinary,
             message_class: Some("IPM.Note".to_owned()),
             subject: Some("large attachment".to_owned()),
             sender_name: Some("Sender".to_owned()),
@@ -1280,6 +1390,7 @@ mod tests {
                 data: Some(SpooledBlob {
                     sha256: "0".repeat(64),
                     byte_len: 2_147_483_648,
+                    pack_offset: None,
                 }),
                 data_complete: true,
                 properties: Vec::new(),
@@ -1306,6 +1417,7 @@ mod tests {
         truncated.attachments[0].data = Some(SpooledBlob {
             sha256: "0".repeat(64),
             byte_len: 2,
+            pack_offset: None,
         });
         truncated.attachments[0].data_complete = false;
         let truncated_input = build_part_writer_input(
@@ -1323,6 +1435,25 @@ mod tests {
                 .attachments
                 .is_empty()
         );
+        let mut empty = mail.clone();
+        empty.attachments[0].declared_size = Some(0);
+        empty.attachments[0].data = Some(SpooledBlob {
+            sha256: "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855".to_owned(),
+            byte_len: 0,
+            pack_offset: Some(0),
+        });
+        let empty_input = build_part_writer_input(
+            &job,
+            &[&empty],
+            &"0".repeat(64),
+            "balanced",
+            4_294_967_296,
+            1,
+        )?;
+        assert!(matches!(
+            &empty_input.store.folders[0].messages[0].attachments[0].content,
+            AttachmentContent::Binary(data) if data.is_empty()
+        ));
         let aggressive = build_part_writer_input(
             &job,
             &[&mail],
@@ -1359,6 +1490,7 @@ mod tests {
             blob: SpooledBlob {
                 sha256: "0".repeat(64),
                 byte_len,
+                pack_offset: None,
             },
         };
         let mail = CanonicalMail {
@@ -1370,6 +1502,7 @@ mod tests {
                 occurrence: 0,
             },
             folder_path: vec!["Inbox".to_owned()],
+            folder_role: CanonicalFolderRole::Ordinary,
             message_class: Some("IPM.Note".to_owned()),
             subject: Some("contained properties".to_owned()),
             sender_name: Some("Sender".to_owned()),
@@ -1522,6 +1655,7 @@ mod tests {
                 occurrence: 0,
             },
             folder_path: vec!["Inbox".to_owned()],
+            folder_role: CanonicalFolderRole::Ordinary,
             message_class: Some(class.to_owned()),
             subject: Some(format!("message {id}")),
             sender_name: Some("Sender".to_owned()),
@@ -1556,6 +1690,7 @@ mod tests {
                     blob: SpooledBlob {
                         sha256: "0".repeat(64),
                         byte_len: 0,
+                        pack_offset: None,
                     },
                 })
                 .collect(),

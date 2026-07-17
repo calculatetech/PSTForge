@@ -13,9 +13,8 @@ use libpff_sys::{CatalogEvent, CatalogSink, PropertyOwner};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
-const WRITER_MANDATORY_FOLDER_COUNT: u64 = 6;
-const OUTPUT_ROOT_FOLDER_NAME: &str = "Recovered Folder 290";
-const OUTPUT_SOURCE_FOLDER_PREFIX: &str = "Top of Personal Folders";
+const WRITER_MANDATORY_FOLDER_COUNT: u64 = 5;
+const NID_IPM_SUBTREE: u32 = 0x8022;
 type MatchedSourceMessages = (Vec<Vec<String>>, usize);
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -109,7 +108,10 @@ impl CatalogSink for IndependentMessageSink {
                         .ok_or_else(|| "folder preceded its parent".to_owned())?,
                     None => Vec::new(),
                 };
-                if let Some(name) = name {
+                if parent_id.is_some()
+                    && id != NID_IPM_SUBTREE
+                    && let Some(name) = name
+                {
                     path.push(name);
                 }
                 if self.folder_paths.insert(id, path).is_some() {
@@ -526,9 +528,7 @@ fn match_source_messages(
         {
             let categories = unmatched
                 .iter()
-                .find(|source| {
-                    generated.folder_path.get(2..) == Some(source.folder_path.as_slice())
-                })
+                .find(|source| generated.folder_path == source.folder_path)
                 .map(|source| {
                     let mut difference =
                         fingerprint_difference(&source.content, &generated.content);
@@ -540,9 +540,7 @@ fn match_source_messages(
                 .unwrap_or_else(|| vec!["folder candidate"]);
             let body_ids = unmatched
                 .iter()
-                .find(|source| {
-                    generated.folder_path.get(2..) == Some(source.folder_path.as_slice())
-                })
+                .find(|source| generated.folder_path == source.folder_path)
                 .map(|source| {
                     (
                         source
@@ -566,16 +564,7 @@ fn match_source_messages(
             .into());
         }
         let Some(position) = unmatched.iter().position(|source| {
-            if source.content != generated.content
-                || generated.folder_path.len() != source.folder_path.len().saturating_add(2)
-                || generated.folder_path.get(2..) != Some(source.folder_path.as_slice())
-                || generated.folder_path.first().map(String::as_str)
-                    != Some(OUTPUT_SOURCE_FOLDER_PREFIX)
-                || generated.folder_path.get(1).map(String::as_str) != Some(OUTPUT_ROOT_FOLDER_NAME)
-            {
-                return false;
-            }
-            true
+            source.content == generated.content && generated.folder_path == source.folder_path
         }) else {
             let source_depth = unmatched
                 .iter()
@@ -810,6 +799,73 @@ fn milestone_0_4_real_pst_splits_deterministically_without_mutation()
                 }
             }
             drop(pstforge_job::DurableCatalogSink::open(&job)?);
+            let initial_attempts = report["recovery"]["worker_attempts"]
+                .as_u64()
+                .ok_or("split report worker attempts are absent")?;
+            let initial_blob_count = report["recovery"]["blob_count"]
+                .as_u64()
+                .ok_or("split report blob count is absent")?;
+            let initial_blob_bytes = report["recovery"]["blob_bytes"]
+                .as_u64()
+                .ok_or("split report blob bytes are absent")?;
+            let initial_parts = report["parts"].clone();
+            let resume = Command::new(env!("CARGO_BIN_EXE_pstforge"))
+                .arg("split")
+                .arg(&case.path)
+                .arg("--output")
+                .arg(&job)
+                .arg("--max-pst-size")
+                .arg(case.milestone_0_4_max_pst_bytes.to_string())
+                .arg("--resume")
+                .arg("--json")
+                .arg("--color")
+                .arg("never")
+                .output()?;
+            if !resume.status.success() && resume.status.code() != Some(1) {
+                return Err(format!(
+                    "completed resume failed for {}: {}",
+                    case.name,
+                    String::from_utf8_lossy(&resume.stderr)
+                )
+                .into());
+            }
+            let resumed: serde_json::Value = serde_json::from_slice(&resume.stdout)?;
+            if resumed["resumed"].as_bool() != Some(true)
+                || resumed["parts"] != initial_parts
+                || resumed["recovery"]["worker_attempts"].as_u64() != Some(initial_attempts)
+                || resumed["recovery"]["blob_count"].as_u64() != Some(initial_blob_count)
+                || resumed["recovery"]["blob_bytes"].as_u64() != Some(initial_blob_bytes)
+            {
+                return Err(format!(
+                    "{} completed resume changed parts, metrics, or restarted parsing",
+                    case.name
+                )
+                .into());
+            }
+            let ledger = job.join(".pstforge/job.sqlite3");
+            let before_mismatch = Sha256::digest(fs::read(&ledger)?);
+            let mismatch = Command::new(env!("CARGO_BIN_EXE_pstforge"))
+                .arg("split")
+                .arg(&case.path)
+                .arg("--output")
+                .arg(&job)
+                .arg("--max-pst-size")
+                .arg(
+                    case.milestone_0_4_max_pst_bytes
+                        .saturating_add(1)
+                        .to_string(),
+                )
+                .arg("--resume")
+                .arg("--json")
+                .arg("--color")
+                .arg("never")
+                .output()?;
+            if mismatch.status.code() != Some(4) {
+                return Err(format!("{} accepted a mismatched resume", case.name).into());
+            }
+            if Sha256::digest(fs::read(&ledger)?) != before_mismatch {
+                return Err(format!("{} mismatch validation mutated its ledger", case.name).into());
+            }
             runs.push(identities);
         }
         if runs[0] != runs[1] {
@@ -826,6 +882,347 @@ fn milestone_0_4_real_pst_splits_deterministically_without_mutation()
         {
             return Err(format!("{} changed during deterministic splitting", case.name).into());
         }
+    }
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires PSTFORGE_CORPUS_MANIFEST with external real PST files"]
+fn milestone_0_4_1_interruption_and_sigkill_resume_without_orphan_worker()
+-> Result<(), Box<dyn std::error::Error>> {
+    let manifest_path = std::env::var_os("PSTFORGE_CORPUS_MANIFEST")
+        .ok_or("PSTFORGE_CORPUS_MANIFEST is required")?;
+    let manifest: Manifest = toml::from_str(&fs::read_to_string(&manifest_path)?)?;
+    let case = manifest
+        .cases
+        .iter()
+        .filter(|case| case.milestone_0_4)
+        .min_by_key(|case| fs::metadata(&case.path).map_or(u64::MAX, |metadata| metadata.len()))
+        .ok_or("manifest has no milestone_0_4 split case")?;
+    let before = pstforge_core::SourceFile::open(&case.path)?
+        .identity()
+        .clone();
+
+    for signal in [rustix::process::Signal::TERM, rustix::process::Signal::KILL] {
+        let directory = tempfile::tempdir()?;
+        let job = directory.path().join("job");
+        let mut child = Command::new(env!("CARGO_BIN_EXE_pstforge"))
+            .arg("split")
+            .arg(&case.path)
+            .arg("--output")
+            .arg(&job)
+            .arg("--max-pst-size")
+            .arg(case.milestone_0_4_max_pst_bytes.to_string())
+            .arg("--json")
+            .arg("--color")
+            .arg("never")
+            .env("PSTFORGE_TEST_STALL_AFTER_CANDIDATES", "1")
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()?;
+        let supervisor_id = child.id();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let worker_id = loop {
+            let children_path = format!("/proc/{supervisor_id}/task/{supervisor_id}/children");
+            if let Ok(children) = fs::read_to_string(children_path)
+                && let Some(worker) = children
+                    .split_ascii_whitespace()
+                    .next()
+                    .and_then(|value| value.parse::<u32>().ok())
+            {
+                break worker;
+            }
+            if Instant::now() >= deadline {
+                let _ = child.kill();
+                return Err("split worker did not start before signal deadline".into());
+            }
+            thread::sleep(Duration::from_millis(25));
+        };
+        while !job.join(".pstforge/job.sqlite3").is_file() {
+            if Instant::now() >= deadline {
+                let _ = child.kill();
+                return Err("split ledger did not become durable before signal deadline".into());
+            }
+            thread::sleep(Duration::from_millis(25));
+        }
+        let supervisor_pid = i32::try_from(supervisor_id)
+            .ok()
+            .and_then(rustix::process::Pid::from_raw)
+            .ok_or("supervisor PID is out of range")?;
+        rustix::process::kill_process(supervisor_pid, signal)?;
+        let stopped = child.wait_with_output()?;
+        if signal == rustix::process::Signal::TERM {
+            if stopped.status.code() != Some(130) {
+                return Err("SIGTERM did not produce interrupted status".into());
+            }
+            let report: serde_json::Value = serde_json::from_slice(&stopped.stdout)?;
+            if report["recovery"]["interrupted"].as_bool() != Some(true) {
+                return Err("SIGTERM report did not record interruption".into());
+            }
+        } else if stopped.status.success() {
+            return Err("SIGKILL unexpectedly reported success".into());
+        }
+        let worker_deadline = Instant::now() + Duration::from_secs(5);
+        while PathBuf::from(format!("/proc/{worker_id}")).exists() {
+            if Instant::now() >= worker_deadline {
+                return Err("parser worker outlived its killed supervisor".into());
+            }
+            thread::sleep(Duration::from_millis(25));
+        }
+        let resumed = Command::new(env!("CARGO_BIN_EXE_pstforge"))
+            .arg("split")
+            .arg(&case.path)
+            .arg("--output")
+            .arg(&job)
+            .arg("--max-pst-size")
+            .arg(case.milestone_0_4_max_pst_bytes.to_string())
+            .arg("--resume")
+            .arg("--json")
+            .arg("--color")
+            .arg("never")
+            .output()?;
+        if !resumed.status.success() && resumed.status.code() != Some(1) {
+            return Err(String::from_utf8_lossy(&resumed.stderr).into_owned().into());
+        }
+        let report: serde_json::Value = serde_json::from_slice(&resumed.stdout)?;
+        if report["parts"].as_array().is_none_or(Vec::is_empty)
+            || report["recovery"]["source_unchanged"].as_bool() != Some(true)
+        {
+            return Err("resumed split did not finalize source-safe parts".into());
+        }
+    }
+    let directory = tempfile::tempdir()?;
+    let job = directory.path().join("job");
+    let mut child = Command::new(env!("CARGO_BIN_EXE_pstforge"))
+        .arg("split")
+        .arg(&case.path)
+        .arg("--output")
+        .arg(&job)
+        .arg("--max-pst-size")
+        .arg(case.milestone_0_4_max_pst_bytes.to_string())
+        .arg("--json")
+        .arg("--color")
+        .arg("never")
+        .env("PSTFORGE_TEST_PAUSE_AFTER_PART_MS", "5000")
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()?;
+    let first_part = job.join("parts/part-0001.pst");
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while !first_part.is_file() {
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            return Err("split did not publish its first part before signal deadline".into());
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
+    let first_part_hash = Sha256::digest(fs::read(&first_part)?);
+    let supervisor_pid = i32::try_from(child.id())
+        .ok()
+        .and_then(rustix::process::Pid::from_raw)
+        .ok_or("supervisor PID is out of range")?;
+    rustix::process::kill_process(supervisor_pid, rustix::process::Signal::TERM)?;
+    let stopped = child.wait_with_output()?;
+    if stopped.status.code() != Some(130) {
+        return Err("post-publication SIGTERM did not produce interrupted status".into());
+    }
+    let interrupted: serde_json::Value = serde_json::from_slice(&stopped.stdout)?;
+    if interrupted["parts"].as_array().is_none_or(Vec::is_empty)
+        || interrupted["recovery"]["interrupted"].as_bool() != Some(true)
+        || Sha256::digest(fs::read(&first_part)?) != first_part_hash
+    {
+        return Err("post-publication interruption lost its finalized part".into());
+    }
+    let resumed = Command::new(env!("CARGO_BIN_EXE_pstforge"))
+        .arg("split")
+        .arg(&case.path)
+        .arg("--output")
+        .arg(&job)
+        .arg("--max-pst-size")
+        .arg(case.milestone_0_4_max_pst_bytes.to_string())
+        .arg("--resume")
+        .arg("--json")
+        .arg("--color")
+        .arg("never")
+        .output()?;
+    if !resumed.status.success() && resumed.status.code() != Some(1) {
+        return Err(String::from_utf8_lossy(&resumed.stderr).into_owned().into());
+    }
+    let resumed: serde_json::Value = serde_json::from_slice(&resumed.stdout)?;
+    if resumed["parts"]
+        .as_array()
+        .is_none_or(|parts| parts.len() < 2)
+        || Sha256::digest(fs::read(&first_part)?) != first_part_hash
+    {
+        return Err("resume did not preserve and continue after finalized part".into());
+    }
+
+    let directory = tempfile::tempdir()?;
+    let job = directory.path().join("job");
+    let mut child = Command::new(env!("CARGO_BIN_EXE_pstforge"))
+        .arg("split")
+        .arg(&case.path)
+        .arg("--output")
+        .arg(&job)
+        .arg("--max-pst-size")
+        .arg("4GiB")
+        .arg("--json")
+        .arg("--color")
+        .arg("never")
+        .env("PSTFORGE_TEST_PAUSE_AT_PREFILTER_MS", "5000")
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()?;
+    let prefilter_marker = job.join(".pstforge/partial/prefilter-test-marker.partial");
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while !prefilter_marker.is_file() {
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            return Err("split did not enter candidate prefilter before signal deadline".into());
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
+    let supervisor_pid = i32::try_from(child.id())
+        .ok()
+        .and_then(rustix::process::Pid::from_raw)
+        .ok_or("supervisor PID is out of range")?;
+    rustix::process::kill_process(supervisor_pid, rustix::process::Signal::TERM)?;
+    let stopped = child.wait_with_output()?;
+    if stopped.status.code() != Some(130) {
+        return Err("candidate prefilter SIGTERM did not produce interrupted status".into());
+    }
+    let interrupted: serde_json::Value = serde_json::from_slice(&stopped.stdout)?;
+    if interrupted["recovery"]["interrupted"].as_bool() != Some(true) {
+        return Err("candidate prefilter interruption was not reported".into());
+    }
+    let resumed = Command::new(env!("CARGO_BIN_EXE_pstforge"))
+        .arg("split")
+        .arg(&case.path)
+        .arg("--output")
+        .arg(&job)
+        .arg("--max-pst-size")
+        .arg("4GiB")
+        .arg("--resume")
+        .arg("--json")
+        .arg("--color")
+        .arg("never")
+        .output()?;
+    if !resumed.status.success() && resumed.status.code() != Some(1) {
+        return Err(String::from_utf8_lossy(&resumed.stderr).into_owned().into());
+    }
+    if prefilter_marker.exists() {
+        return Err("resumed split retained its prefilter interruption marker".into());
+    }
+
+    let directory = tempfile::tempdir()?;
+    let job = directory.path().join("job");
+    let mut child = Command::new(env!("CARGO_BIN_EXE_pstforge"))
+        .arg("split")
+        .arg(&case.path)
+        .arg("--output")
+        .arg(&job)
+        .arg("--max-pst-size")
+        .arg("4GiB")
+        .arg("--json")
+        .arg("--color")
+        .arg("never")
+        .env("PSTFORGE_TEST_LONG_CLEANUP_SQL", "1")
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()?;
+    let cleanup_marker = job.join(".pstforge/partial/cleanup-test-marker.partial");
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while !cleanup_marker.is_file() {
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            return Err("split did not enter cleanup SQL before signal deadline".into());
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
+    let supervisor_pid = i32::try_from(child.id())
+        .ok()
+        .and_then(rustix::process::Pid::from_raw)
+        .ok_or("supervisor PID is out of range")?;
+    rustix::process::kill_process(supervisor_pid, rustix::process::Signal::TERM)?;
+    let stopped = child.wait_with_output()?;
+    if stopped.status.code() != Some(130) {
+        return Err("cleanup SQL SIGTERM did not produce interrupted status".into());
+    }
+    let interrupted: serde_json::Value = serde_json::from_slice(&stopped.stdout)?;
+    if interrupted["recovery"]["interrupted"].as_bool() != Some(true) {
+        return Err("cleanup SQL interruption was not reported".into());
+    }
+    let resumed = Command::new(env!("CARGO_BIN_EXE_pstforge"))
+        .arg("split")
+        .arg(&case.path)
+        .arg("--output")
+        .arg(&job)
+        .arg("--max-pst-size")
+        .arg("4GiB")
+        .arg("--resume")
+        .arg("--json")
+        .arg("--color")
+        .arg("never")
+        .output()?;
+    if !resumed.status.success() && resumed.status.code() != Some(1) {
+        return Err(String::from_utf8_lossy(&resumed.stderr).into_owned().into());
+    }
+    if cleanup_marker.exists() {
+        return Err("resumed cleanup retained its interruption marker".into());
+    }
+    if pstforge_core::SourceFile::open(&case.path)?.identity() != &before {
+        return Err("interruption qualification changed the source".into());
+    }
+    Ok(())
+}
+
+#[test]
+fn validator_process_group_dies_when_its_supervisor_disappears()
+-> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempfile::tempdir()?;
+    let wrapper_file = directory.path().join("wrapper.pid");
+    let child_file = directory.path().join("child.pid");
+    let launcher = Command::new("sh")
+        .arg("-c")
+        .arg(
+            r#"
+setsid "$PSTFORGE_BIN" __validator "$$" pffinfo > /dev/null 2>&1 &
+wrapper=$!
+printf '%s\n' "$wrapper" > "$1"
+child_file=$2
+attempt=0
+while [ "$attempt" -lt 400 ]; do
+    children=$(cat "/proc/$wrapper/task/$wrapper/children" 2>/dev/null || true)
+    if [ -n "$children" ]; then
+        set -- $children
+        printf '%s\n' "$1" > "$child_file"
+        exit 0
+    fi
+    attempt=$((attempt + 1))
+    sleep 0.01
+done
+exit 1
+"#,
+        )
+        .arg("validator-launcher")
+        .arg(&wrapper_file)
+        .arg(&child_file)
+        .env("PSTFORGE_BIN", env!("CARGO_BIN_EXE_pstforge"))
+        .env("PSTFORGE_TEST_STALL_VALIDATOR", "1")
+        .status()?;
+    if !launcher.success() {
+        return Err("validator descendant did not start before its supervisor exited".into());
+    }
+    let wrapper_id: u32 = fs::read_to_string(&wrapper_file)?.trim().parse()?;
+    let child_id: u32 = fs::read_to_string(&child_file)?.trim().parse()?;
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while PathBuf::from(format!("/proc/{wrapper_id}")).exists()
+        || PathBuf::from(format!("/proc/{child_id}")).exists()
+    {
+        if Instant::now() >= deadline {
+            return Err("validator process group outlived its supervisor".into());
+        }
+        thread::sleep(Duration::from_millis(25));
     }
     Ok(())
 }
@@ -1120,8 +1517,8 @@ fn milestone_0_3_repeated_unit_crash_is_isolated() -> Result<(), Box<dyn std::er
         .output()?;
     assert_eq!(output.status.code(), Some(1));
     let report: serde_json::Value = serde_json::from_slice(&output.stdout)?;
-    assert_eq!(report["worker_attempts"], 5);
-    assert_eq!(report["worker_failures"], 4);
+    assert_eq!(report["worker_attempts"], 2);
+    assert_eq!(report["worker_failures"], 1);
     assert_eq!(report["isolated_units"], 1);
     assert!(report["committed_candidates"].as_u64().unwrap_or_default() > 1);
     assert!(report["issues"].as_u64().unwrap_or_default() >= 1);
@@ -1161,8 +1558,8 @@ fn milestone_0_3_replayed_candidate_does_not_prevent_unit_isolation()
         .output()?;
     assert_eq!(output.status.code(), Some(1));
     let report: serde_json::Value = serde_json::from_slice(&output.stdout)?;
-    assert_eq!(report["worker_attempts"], 5);
-    assert_eq!(report["worker_failures"], 4);
+    assert_eq!(report["worker_attempts"], 2);
+    assert_eq!(report["worker_failures"], 1);
     assert_eq!(report["isolated_units"], 1);
     assert!(report["committed_candidates"].as_u64().unwrap_or_default() > 1);
     assert_eq!(
@@ -1198,8 +1595,8 @@ fn milestone_0_3_sigsegv_is_contained_and_isolated() -> Result<(), Box<dyn std::
         .output()?;
     assert_eq!(output.status.code(), Some(1));
     let report: serde_json::Value = serde_json::from_slice(&output.stdout)?;
-    assert_eq!(report["worker_attempts"], 5);
-    assert_eq!(report["worker_failures"], 4);
+    assert_eq!(report["worker_attempts"], 2);
+    assert_eq!(report["worker_failures"], 1);
     assert_eq!(report["isolated_units"], 1);
     assert!(report["committed_candidates"].as_u64().unwrap_or_default() > 1);
     assert!(job.join(".pstforge/job.sqlite3").is_file());
@@ -1212,7 +1609,7 @@ fn milestone_0_3_sigsegv_is_contained_and_isolated() -> Result<(), Box<dyn std::
 
 #[test]
 #[ignore = "requires PSTFORGE_CORPUS_MANIFEST with external real PST files"]
-fn milestone_0_3_parser_error_after_commit_replays_and_continues()
+fn milestone_0_3_parser_error_after_commit_is_contained_without_rescan()
 -> Result<(), Box<dyn std::error::Error>> {
     let manifest_path = std::env::var_os("PSTFORGE_CORPUS_MANIFEST")
         .ok_or("PSTFORGE_CORPUS_MANIFEST is required")?;
@@ -1241,9 +1638,9 @@ fn milestone_0_3_parser_error_after_commit_replays_and_continues()
         return Err(String::from_utf8_lossy(&output.stderr).into_owned().into());
     }
     let report: serde_json::Value = serde_json::from_slice(&output.stdout)?;
-    assert_eq!(report["worker_attempts"], 2);
+    assert_eq!(report["worker_attempts"], 1);
     assert_eq!(report["worker_failures"], 1);
-    assert!(report["committed_candidates"].as_u64().unwrap_or_default() > 1);
+    assert!(report["committed_candidates"].as_u64().unwrap_or_default() >= 1);
     assert_eq!(
         pstforge_core::SourceFile::open(&case.path)?.identity(),
         &before

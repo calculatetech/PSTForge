@@ -7,9 +7,11 @@ use std::{
     io::{self, Read, Seek, SeekFrom, Write},
     ops::Range,
     os::fd::AsRawFd,
+    os::unix::fs::{MetadataExt, PermissionsExt},
     os::unix::process::CommandExt,
     path::{Path, PathBuf},
     process::{Command, Stdio},
+    sync::atomic::{AtomicBool, Ordering},
     thread,
     time::{Duration, Instant},
 };
@@ -148,6 +150,7 @@ pub enum AttachmentContent {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FileBlobSpec {
     pub path: PathBuf,
+    pub offset: u64,
     pub byte_len: u64,
     pub sha256: [u8; 32],
 }
@@ -287,7 +290,16 @@ pub struct FidelityStore {
 pub struct MailFolderSpec {
     /// Non-empty path below the PST's mandatory IPM root.
     pub path: Vec<String>,
+    pub role: MailFolderRole,
     pub messages: Vec<MessageSpec>,
+}
+
+/// A source folder's structural role, independent of its display name.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
+pub enum MailFolderRole {
+    #[default]
+    Ordinary,
+    DeletedItems,
 }
 
 /// Deterministic multi-folder input for size-limited output parts.
@@ -499,6 +511,8 @@ impl Default for MinimalStore {
 
 #[derive(Debug, Error)]
 pub enum WriterError {
+    #[error("PST creation was interrupted")]
+    Interrupted,
     #[error("output already exists: {0}")]
     OutputExists(PathBuf),
     #[error("output was published at {path}, but its directory sync failed: {source}")]
@@ -685,12 +699,17 @@ struct BlockStream<'a> {
     file: &'a mut std::fs::File,
     cursor: &'a mut u64,
     written: &'a mut Vec<WrittenBlock>,
+    interrupted: &'a AtomicBool,
 }
 
 impl BlockStream<'_> {
     fn emit(&mut self, block: BlockSpec) -> Result<(), WriterError> {
-        self.written
-            .extend(write_blocks(self.file, &[block], self.cursor)?);
+        self.written.extend(write_blocks(
+            self.file,
+            &[block],
+            self.cursor,
+            self.interrupted,
+        )?);
         Ok(())
     }
 }
@@ -712,6 +731,15 @@ const MAX_DATA_TREE_ENTRIES: usize = 1021;
 const MAX_FIDELITY_PROPERTY_BYTES: usize = 16 * 1024;
 const MAX_FIDELITY_COLLECTION_ITEMS: usize = MAX_FIDELITY_PROPERTY_BYTES / 8;
 const MAX_FIDELITY_CUSTOM_PROPERTY_BYTES: usize = 64 * 1024;
+static NEVER_INTERRUPTED: AtomicBool = AtomicBool::new(false);
+
+fn check_interrupted(interrupted: &AtomicBool) -> Result<(), WriterError> {
+    if interrupted.load(Ordering::Relaxed) {
+        Err(WriterError::Interrupted)
+    } else {
+        Ok(())
+    }
+}
 
 fn externalize_large_properties(
     properties: &mut [(u16, PropertyValue)],
@@ -752,17 +780,40 @@ fn append_data_tree(
     append_data_tree_sized(bytes, MAX_DATA_BLOCK_PAYLOAD, next_block_index, blocks)
 }
 
-fn append_data_tree_aligned(
+fn append_row_matrix_data_tree(
     bytes: &[u8],
-    alignment: usize,
+    row_size: usize,
     next_block_index: &mut u64,
     blocks: &mut Vec<BlockSpec>,
 ) -> Result<UnicodeBlockId, WriterError> {
-    if alignment == 0 || alignment > MAX_DATA_BLOCK_PAYLOAD {
-        return Err(WriterError::ValueTooLarge("data-tree alignment"));
+    if row_size == 0 || row_size > MAX_DATA_BLOCK_PAYLOAD {
+        return Err(WriterError::ValueTooLarge("table row size"));
     }
-    let chunk_size = (MAX_DATA_BLOCK_PAYLOAD / alignment) * alignment;
-    append_data_tree_sized(bytes, chunk_size, next_block_index, blocks)
+    let chunk_size = (MAX_DATA_BLOCK_PAYLOAD / row_size) * row_size;
+    let chunk_count = bytes.len().div_ceil(chunk_size);
+    let padding_capacity = chunk_count
+        .saturating_sub(1)
+        .checked_mul(MAX_DATA_BLOCK_PAYLOAD - chunk_size)
+        .ok_or(WriterError::ValueTooLarge("row matrix padding"))?;
+    let mut framed = Vec::with_capacity(
+        bytes
+            .len()
+            .checked_add(padding_capacity)
+            .ok_or(WriterError::ValueTooLarge("row matrix padding"))?,
+    );
+    for (index, chunk) in bytes.chunks(chunk_size).enumerate() {
+        framed.extend_from_slice(chunk);
+        if index + 1 < chunk_count {
+            framed.resize(
+                framed
+                    .len()
+                    .checked_add(MAX_DATA_BLOCK_PAYLOAD - chunk.len())
+                    .ok_or(WriterError::ValueTooLarge("row matrix padding"))?,
+                0,
+            );
+        }
+    }
+    append_data_tree(&framed, next_block_index, blocks)
 }
 
 fn append_data_tree_sized(
@@ -895,11 +946,16 @@ fn append_spooled_data_tree(
         .custom_flags(nofollow)
         .open(&blob.path)?;
     let metadata = file.metadata()?;
-    if !metadata.file_type().is_file() || metadata.len() != blob.byte_len {
+    let end = blob
+        .offset
+        .checked_add(blob.byte_len)
+        .ok_or(WriterError::ValueTooLarge("spooled attachment range"))?;
+    if !metadata.file_type().is_file() || metadata.len() < end {
         return Err(WriterError::InvalidStructure(
             "spooled attachment identity mismatch".to_owned(),
         ));
     }
+    file.seek(std::io::SeekFrom::Start(blob.offset))?;
 
     let mut remaining = blob.byte_len;
     let mut leaves = Vec::with_capacity(MAX_DATA_TREE_ENTRIES);
@@ -951,9 +1007,8 @@ fn append_spooled_data_tree(
             leaves.clear();
         }
     }
-    let mut trailing = [0_u8; 1];
     let actual_hash: [u8; 32] = hasher.finalize().into();
-    if file.read(&mut trailing)? != 0 || actual_hash != blob.sha256 {
+    if actual_hash != blob.sha256 {
         return Err(WriterError::InvalidStructure(
             "spooled attachment hash mismatch".to_owned(),
         ));
@@ -1214,6 +1269,7 @@ fn plan_folders<'a>(
     folders: Option<&'a [MailFolderSpec]>,
 ) -> Result<Vec<FolderPlan<'a>>, WriterError> {
     let mut paths = BTreeMap::<Vec<String>, Vec<&MessageSpec>>::new();
+    let mut roles = BTreeMap::<Vec<String>, MailFolderRole>::new();
     if let Some(folders) = folders {
         let mut explicit_paths = BTreeSet::new();
         for folder in folders {
@@ -1227,13 +1283,29 @@ fn plan_folders<'a>(
                     "duplicate mail folder path".to_owned(),
                 ));
             }
+            if folder.role == MailFolderRole::DeletedItems && folder.path.len() != 1 {
+                return Err(WriterError::InvalidStructure(
+                    "the Deleted Items role must identify a top-level folder".to_owned(),
+                ));
+            }
             for depth in 1..=folder.path.len() {
                 paths.entry(folder.path[..depth].to_vec()).or_default();
             }
+            roles.insert(folder.path.clone(), folder.role);
             let messages = paths.get_mut(&folder.path).ok_or_else(|| {
                 WriterError::InvalidStructure("mail folder path was not planned".to_owned())
             })?;
             messages.extend(folder.messages.iter());
+        }
+        if roles
+            .values()
+            .filter(|role| **role == MailFolderRole::DeletedItems)
+            .count()
+            > 1
+        {
+            return Err(WriterError::InvalidStructure(
+                "multiple folders claim the Deleted Items role".to_owned(),
+            ));
         }
     } else {
         paths.insert(vec![fallback_name.to_owned()], fallback_messages.to_vec());
@@ -1258,15 +1330,21 @@ fn plan_folders<'a>(
             let parent = (path.len() > 1)
                 .then(|| path_indexes.get(&path[..path.len() - 1]).copied())
                 .flatten();
-            Ok(FolderPlan {
-                path,
-                messages,
-                node: node(
+            let role = roles.get(&path).copied().unwrap_or_default();
+            let node = if role == MailFolderRole::DeletedItems {
+                node(NodeIdType::NormalFolder, DELETED_FOLDER_INDEX)?
+            } else {
+                node(
                     NodeIdType::NormalFolder,
                     MAIL_FOLDER_INDEX
                         .checked_add(index)
                         .ok_or(WriterError::ValueTooLarge("folder node"))?,
-                )?,
+                )?
+            };
+            Ok(FolderPlan {
+                path,
+                messages,
+                node,
                 parent,
                 children: Vec::new(),
             })
@@ -1577,6 +1655,8 @@ pub fn create_fidelity_store(
         },
         &[&spec.message],
         None,
+        &NEVER_INTERRUPTED,
+        None,
     )
 }
 
@@ -1588,6 +1668,40 @@ pub fn create_mail_store(
     path: impl AsRef<Path>,
     spec: &MailStoreSpec,
 ) -> Result<FidelityWriteReport, WriterError> {
+    create_mail_store_expected(path.as_ref(), spec, &NEVER_INTERRUPTED, None)
+}
+
+/// Create a deterministic PST part while honoring an operator interruption.
+pub fn create_mail_store_interruptible(
+    path: impl AsRef<Path>,
+    spec: &MailStoreSpec,
+    interrupted: &AtomicBool,
+) -> Result<FidelityWriteReport, WriterError> {
+    create_mail_store_expected(path.as_ref(), spec, interrupted, None)
+}
+
+/// Create a PST part with validators supervised by the PSTForge executable.
+pub fn create_mail_store_supervised(
+    path: impl AsRef<Path>,
+    spec: &MailStoreSpec,
+    interrupted: &AtomicBool,
+    supervisor_executable: &Path,
+) -> Result<FidelityWriteReport, WriterError> {
+    create_mail_store_expected(
+        path.as_ref(),
+        spec,
+        interrupted,
+        Some(supervisor_executable),
+    )
+}
+
+fn create_mail_store_expected(
+    path: &Path,
+    spec: &MailStoreSpec,
+    interrupted: &AtomicBool,
+    supervisor_executable: Option<&Path>,
+) -> Result<FidelityWriteReport, WriterError> {
+    check_interrupted(interrupted)?;
     validate_mail_store_input(spec)?;
     let first_folder = spec
         .folders
@@ -1613,7 +1727,14 @@ pub fn create_mail_store(
         .iter()
         .flat_map(|folder| folder.messages.iter())
         .collect::<Vec<_>>();
-    create_flat_store(path.as_ref(), &input, &messages, Some(&spec.folders))
+    create_flat_store(
+        path,
+        &input,
+        &messages,
+        Some(&spec.folders),
+        interrupted,
+        supervisor_executable,
+    )
 }
 
 /// Validate every source-controlled mail-store shape without creating output.
@@ -1677,8 +1798,25 @@ fn validate_folder_hierarchy_shapes(folders: &[FolderPlan<'_>]) -> Result<(), Wr
         table_context(&columns, &rows)?;
     }
     let deleted = node(NodeIdType::NormalFolder, DELETED_FOLDER_INDEX)?;
-    let mut rows = vec![folder_table_row(deleted, "Deleted Items", 0, false)];
-    for folder in folders.iter().filter(|folder| folder.parent.is_none()) {
+    let deleted_plan = folders.iter().find(|folder| folder.node == deleted);
+    let mut rows = match deleted_plan {
+        Some(folder) => vec![folder_table_row_with_unread(
+            deleted,
+            folder
+                .path
+                .last()
+                .ok_or_else(|| WriterError::InvalidStructure("folder path is empty".to_owned()))?,
+            i32::try_from(folder.messages.len())
+                .map_err(|_| WriterError::ValueTooLarge("folder message count"))?,
+            folder_unread_count(&folder.messages)?,
+            !folder.children.is_empty(),
+        )],
+        None => vec![folder_table_row(deleted, "Deleted Items", 0, false)],
+    };
+    for folder in folders
+        .iter()
+        .filter(|folder| folder.parent.is_none() && folder.node != deleted)
+    {
         rows.push(folder_table_row_with_unread(
             folder.node,
             folder
@@ -1788,7 +1926,10 @@ fn create_flat_store(
     spec: &StoreInput<'_>,
     messages: &[&MessageSpec],
     folders: Option<&[MailFolderSpec]>,
+    interrupted: &AtomicBool,
+    validator_supervisor: Option<&Path>,
 ) -> Result<FidelityWriteReport, WriterError> {
+    check_interrupted(interrupted)?;
     let folder_plans = plan_folders(spec.folder_name, messages, folders)?;
     let messages = folder_plans
         .iter()
@@ -1854,6 +1995,7 @@ fn create_flat_store(
         .flat_map(|folder| std::iter::repeat_n(folder.node, folder.messages.len()))
         .collect::<Vec<_>>();
     for (message_position, message_spec) in messages.iter().enumerate() {
+        check_interrupted(interrupted)?;
         let index = u32::try_from(message_position)
             .map_err(|_| WriterError::ValueTooLarge("message count"))?;
         let message_node = node(
@@ -1882,6 +2024,7 @@ fn create_flat_store(
             file: &mut *file,
             cursor: &mut allocation_cursor,
             written: &mut written,
+            interrupted,
         });
         let message = build_message_blocks(
             message_spec,
@@ -1933,25 +2076,31 @@ fn create_flat_store(
     let mut top_folders = Vec::with_capacity(folder_plans.len());
     let mut row_start = 0_usize;
     for (index, folder) in folder_plans.iter().enumerate() {
+        check_interrupted(interrupted)?;
         let unread_count = folder_unread_count(&folder.messages)?;
-        let property_block = if index == 0 {
+        let is_deleted = folder.node == deleted_folder;
+        let property_block = if is_deleted {
+            leaf_bid(8)?
+        } else if index == 0 {
             leaf_bid(10)?
         } else {
             take_block_id(&mut next_block_index, false)?
         };
-        folder_blocks.push(BlockSpec {
-            id: property_block,
-            payload: BlockPayload::Data(property_context(&folder_properties_with_unread(
-                folder.path.last().ok_or_else(|| {
-                    WriterError::InvalidStructure("folder path is empty".to_owned())
-                })?,
-                i32::try_from(folder.messages.len())
-                    .map_err(|_| WriterError::ValueTooLarge("folder message count"))?,
-                unread_count,
-                !folder.children.is_empty(),
-            ))?),
-            ref_count: 2,
-        });
+        if !is_deleted {
+            folder_blocks.push(BlockSpec {
+                id: property_block,
+                payload: BlockPayload::Data(property_context(&folder_properties_with_unread(
+                    folder.path.last().ok_or_else(|| {
+                        WriterError::InvalidStructure("folder path is empty".to_owned())
+                    })?,
+                    i32::try_from(folder.messages.len())
+                        .map_err(|_| WriterError::ValueTooLarge("folder message count"))?,
+                    unread_count,
+                    !folder.children.is_empty(),
+                ))?),
+                ref_count: 2,
+            });
+        }
 
         let hierarchy_block = if folder.children.is_empty() {
             leaf_bid(9)?
@@ -2020,8 +2169,27 @@ fn create_flat_store(
             contents_subnode,
         });
     }
-    let mut ipm_rows = vec![folder_table_row(deleted_folder, "Deleted Items", 0, false)];
-    for folder in folder_plans.iter().filter(|folder| folder.parent.is_none()) {
+    let deleted_plan = folder_plans
+        .iter()
+        .find(|folder| folder.node == deleted_folder);
+    let mut ipm_rows = match deleted_plan {
+        Some(folder) => vec![folder_table_row_with_unread(
+            deleted_folder,
+            folder
+                .path
+                .last()
+                .ok_or_else(|| WriterError::InvalidStructure("folder path is empty".to_owned()))?,
+            i32::try_from(folder.messages.len())
+                .map_err(|_| WriterError::ValueTooLarge("folder message count"))?,
+            folder_unread_count(&folder.messages)?,
+            !folder.children.is_empty(),
+        )],
+        None => vec![folder_table_row(deleted_folder, "Deleted Items", 0, false)],
+    };
+    for folder in folder_plans
+        .iter()
+        .filter(|folder| folder.parent.is_none() && folder.node != deleted_folder)
+    {
         ipm_rows.push(folder_table_row_with_unread(
             folder.node,
             folder
@@ -2036,12 +2204,16 @@ fn create_flat_store(
     }
     let empty_contents = folder_plans
         .iter()
-        .filter(|folder| folder.messages.is_empty())
+        .filter(|folder| folder.node != deleted_folder && folder.messages.is_empty())
         .count();
     let empty_hierarchies = folder_plans
         .iter()
-        .filter(|folder| folder.children.is_empty())
+        .filter(|folder| folder.node != deleted_folder && folder.children.is_empty())
         .count();
+    let deleted_uses_shared_contents = deleted_plan.is_none_or(|folder| folder.messages.is_empty());
+    let deleted_uses_shared_hierarchy =
+        deleted_plan.is_none_or(|folder| folder.children.is_empty());
+    // BBT cRef includes one ownership count beyond the NBT references.
     let shared_ref_count = |base: usize, extra: usize| {
         u16::try_from(base.saturating_add(extra))
             .map_err(|_| WriterError::ValueTooLarge("shared block reference count"))
@@ -2082,7 +2254,10 @@ fn create_flat_store(
         BlockSpec {
             id: leaf_bid(5)?,
             payload: BlockPayload::Data(table_context(&contents_columns, &[])?),
-            ref_count: shared_ref_count(6, empty_contents)?,
+            ref_count: shared_ref_count(
+                5 + usize::from(deleted_uses_shared_contents),
+                empty_contents,
+            )?,
         },
         BlockSpec {
             id: leaf_bid(6)?,
@@ -2100,22 +2275,38 @@ fn create_flat_store(
         },
         BlockSpec {
             id: leaf_bid(8)?,
-            payload: BlockPayload::Data(property_context(&folder_properties(
-                "Deleted Items",
-                0,
-                false,
-            ))?),
+            payload: BlockPayload::Data(property_context(&match deleted_plan {
+                Some(folder) => folder_properties_with_unread(
+                    folder.path.last().ok_or_else(|| {
+                        WriterError::InvalidStructure("folder path is empty".to_owned())
+                    })?,
+                    i32::try_from(folder.messages.len())
+                        .map_err(|_| WriterError::ValueTooLarge("folder message count"))?,
+                    folder_unread_count(&folder.messages)?,
+                    !folder.children.is_empty(),
+                ),
+                None => folder_properties("Deleted Items", 0, false),
+            })?),
             ref_count: 2,
         },
         BlockSpec {
             id: leaf_bid(9)?,
             payload: BlockPayload::Data(table_context(&hierarchy_columns, &[])?),
-            ref_count: shared_ref_count(4, empty_hierarchies)?,
+            ref_count: shared_ref_count(
+                3 + usize::from(deleted_uses_shared_hierarchy),
+                empty_hierarchies,
+            )?,
         },
         BlockSpec {
             id: leaf_bid(13)?,
             payload: BlockPayload::Data(table_context(&associated_columns, &[])?),
-            ref_count: shared_ref_count(6, folder_plans.len())?,
+            ref_count: shared_ref_count(
+                6,
+                folder_plans
+                    .iter()
+                    .filter(|folder| folder.node != deleted_folder)
+                    .count(),
+            )?,
         },
         BlockSpec {
             id: leaf_bid(14)?,
@@ -2205,7 +2396,12 @@ fn create_flat_store(
     }
     blocks.sort_by_key(|block| u64::from(block.id));
 
-    written.extend(write_blocks(&mut *file, &blocks, &mut allocation_cursor)?);
+    written.extend(write_blocks(
+        &mut *file,
+        &blocks,
+        &mut allocation_cursor,
+        interrupted,
+    )?);
     written.sort_by_key(|block| u64::from(block.id));
     let page_offset = align_up(allocation_cursor, PAGE_SIZE);
     let (bbt, nbt_offset, next_page_id) = write_bbt(&mut *file, page_offset, 0x100, &written)?;
@@ -2238,6 +2434,7 @@ fn create_flat_store(
         dynamic_allocation,
     )?;
     file.sync_all()?;
+    check_interrupted(interrupted)?;
     let validated_path = PathBuf::from(format!(
         "/proc/{}/fd/{}",
         std::process::id(),
@@ -2255,11 +2452,20 @@ fn create_flat_store(
         })()
         .map_err(completed_validation_error)?;
     }
+    check_interrupted(interrupted)?;
     validate_completed_store(&validated_path, spec, message_parents[0])
         .map_err(completed_validation_error)?;
+    check_interrupted(interrupted)?;
     validate_completed_folder_store(&validated_path, spec.record_key, &folder_plans)
         .map_err(completed_validation_error)?;
-    validate_with_independent_readers(&validated_path, &mut temporary)?;
+    check_interrupted(interrupted)?;
+    validate_with_independent_readers(
+        &validated_path,
+        &mut temporary,
+        interrupted,
+        validator_supervisor,
+    )?;
+    check_interrupted(interrupted)?;
     publish_noclobber(
         temporary.source_name(),
         &temporary.directory,
@@ -2337,7 +2543,11 @@ fn capture_bounded(mut input: impl Read) -> io::Result<(Vec<u8>, bool)> {
     Ok((retained, truncated))
 }
 
-fn run_validator(command: &mut Command, timeout: Duration) -> io::Result<ValidatorOutput> {
+fn run_validator(
+    command: &mut Command,
+    timeout: Duration,
+    interrupted: &AtomicBool,
+) -> io::Result<ValidatorOutput> {
     command.process_group(0);
     let mut child = command
         .stdin(Stdio::null())
@@ -2368,7 +2578,7 @@ fn run_validator(command: &mut Command, timeout: Duration) -> io::Result<Validat
     let mut status = None;
     let mut stdout_result = None;
     let mut stderr_result = None;
-    let timed_out = loop {
+    let (timed_out, was_interrupted) = loop {
         if status.is_none() {
             status = child.try_wait()?;
         }
@@ -2379,9 +2589,10 @@ fn run_validator(command: &mut Command, timeout: Duration) -> io::Result<Validat
             stderr_result = stderr_receiver.try_recv().ok();
         }
         if status.is_some() && stdout_result.is_some() && stderr_result.is_some() {
-            break false;
+            break (false, false);
         }
-        if Instant::now() >= deadline {
+        let signal_observed = interrupted.load(Ordering::Relaxed);
+        if signal_observed || Instant::now() >= deadline {
             if let Err(error) =
                 rustix::process::kill_process_group(pid, rustix::process::Signal::KILL)
                 && error != rustix::io::Errno::SRCH
@@ -2405,7 +2616,7 @@ fn run_validator(command: &mut Command, timeout: Duration) -> io::Result<Validat
             }
             stdout_result.get_or_insert_with(|| Ok((Vec::new(), true)));
             stderr_result.get_or_insert_with(|| Ok((Vec::new(), true)));
-            break true;
+            break (!signal_observed, signal_observed);
         }
         thread::sleep(Duration::from_millis(10));
     };
@@ -2414,6 +2625,12 @@ fn run_validator(command: &mut Command, timeout: Duration) -> io::Result<Validat
         .ok_or_else(|| io::Error::other("validator stdout result is unavailable"))??;
     let (stderr, stderr_truncated) = stderr_result
         .ok_or_else(|| io::Error::other("validator stderr result is unavailable"))??;
+    if was_interrupted {
+        return Err(io::Error::new(
+            io::ErrorKind::Interrupted,
+            "PST validation was interrupted",
+        ));
+    }
     Ok(ValidatorOutput {
         success: status.success() && !timed_out,
         timed_out,
@@ -2427,15 +2644,22 @@ fn run_validator(command: &mut Command, timeout: Duration) -> io::Result<Validat
 fn validate_with_independent_readers(
     path: &Path,
     temporary: &mut PublicationTemporary,
+    interrupted: &AtomicBool,
+    supervisor_executable: Option<&Path>,
 ) -> Result<(), WriterError> {
-    let mut pffinfo = Command::new("pffinfo");
+    let mut pffinfo = validator_command("pffinfo", supervisor_executable);
     pffinfo.arg(path);
-    let outcome = run_validator(&mut pffinfo, VALIDATOR_TIMEOUT).map_err(|source| {
-        WriterError::IndependentValidatorIo {
-            tool: "pffinfo",
-            source,
-        }
-    })?;
+    let outcome =
+        run_validator(&mut pffinfo, VALIDATOR_TIMEOUT, interrupted).map_err(|source| {
+            if source.kind() == io::ErrorKind::Interrupted {
+                WriterError::Interrupted
+            } else {
+                WriterError::IndependentValidatorIo {
+                    tool: "pffinfo",
+                    source,
+                }
+            }
+        })?;
     if !outcome.success {
         let evidence = temporary.retain_validation_failure("pffinfo", &outcome)?;
         return Err(WriterError::IndependentValidation {
@@ -2444,21 +2668,34 @@ fn validate_with_independent_readers(
         });
     }
 
-    let output = tempfile::tempdir().map_err(|source| WriterError::IndependentValidatorIo {
-        tool: "readpst scratch directory",
-        source,
-    })?;
-    let mut readpst = Command::new("readpst");
-    readpst
-        .args(["-q", "-r", "-o"])
-        .arg(output.path())
-        .arg(path);
-    let outcome = run_validator(&mut readpst, VALIDATOR_TIMEOUT).map_err(|source| {
-        WriterError::IndependentValidatorIo {
-            tool: "readpst",
-            source,
-        }
-    })?;
+    let output =
+        temporary
+            .validator_scratch()
+            .map_err(|source| WriterError::IndependentValidatorIo {
+                tool: "readpst scratch directory",
+                source,
+            })?;
+    let output_path =
+        output
+            .path()
+            .canonicalize()
+            .map_err(|source| WriterError::IndependentValidatorIo {
+                tool: "readpst scratch directory",
+                source,
+            })?;
+    let mut readpst = validator_command("readpst", supervisor_executable);
+    readpst.args(["-q", "-r", "-o"]).arg(output_path).arg(path);
+    let outcome =
+        run_validator(&mut readpst, VALIDATOR_TIMEOUT, interrupted).map_err(|source| {
+            if source.kind() == io::ErrorKind::Interrupted {
+                WriterError::Interrupted
+            } else {
+                WriterError::IndependentValidatorIo {
+                    tool: "readpst",
+                    source,
+                }
+            }
+        })?;
     if !outcome.success {
         let evidence = temporary.retain_validation_failure("readpst", &outcome)?;
         return Err(WriterError::IndependentValidation {
@@ -2469,10 +2706,25 @@ fn validate_with_independent_readers(
     Ok(())
 }
 
+fn validator_command(tool: &'static str, supervisor_executable: Option<&Path>) -> Command {
+    let Some(supervisor_executable) = supervisor_executable else {
+        return Command::new(tool);
+    };
+    let mut command = Command::new(supervisor_executable);
+    command
+        .arg("__validator")
+        .arg(std::process::id().to_string())
+        .arg(tool)
+        .arg("--");
+    command
+}
+
 struct PublicationTemporary {
     file: std::fs::File,
     source_name: std::ffi::OsString,
     directory: std::fs::File,
+    directory_name: std::ffi::OsString,
+    parent_directory: std::fs::File,
     retain: bool,
 }
 
@@ -2481,6 +2733,15 @@ impl PublicationTemporary {
         let directory = tempfile::Builder::new()
             .prefix(".pstforge-")
             .tempdir_in(parent)?;
+        std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700))?;
+        let directory_name = directory
+            .path()
+            .file_name()
+            .ok_or_else(|| {
+                WriterError::InvalidStructure("temporary directory has no name".to_owned())
+            })?
+            .to_owned();
+        let parent_directory = std::fs::File::open(parent)?;
         let directory_handle = std::fs::File::open(directory.path())?;
         let temporary = tempfile::NamedTempFile::new_in(directory.path())?;
         let (file, file_path) = temporary
@@ -2497,6 +2758,8 @@ impl PublicationTemporary {
             file,
             source_name,
             directory: directory_handle,
+            directory_name,
+            parent_directory,
             retain: false,
         })
     }
@@ -2507,6 +2770,12 @@ impl PublicationTemporary {
 
     fn directory_path(&self) -> io::Result<PathBuf> {
         std::fs::read_link(format!("/proc/self/fd/{}", self.directory.as_raw_fd()))
+    }
+
+    fn validator_scratch(&self) -> io::Result<tempfile::TempDir> {
+        tempfile::Builder::new()
+            .prefix(".readpst-")
+            .tempdir_in(format!("/proc/self/fd/{}", self.directory.as_raw_fd()))
     }
 
     fn retain_validation_failure(
@@ -2534,6 +2803,7 @@ impl PublicationTemporary {
             .extend_from_slice(format!("stderr bytes: {}\n", outcome.stderr.len()).as_bytes());
         diagnostic.extend_from_slice(b"validator output redacted to protect recovered mail data\n");
         let diagnostic_file = std::fs::File::create(diagnostic_path)?;
+        diagnostic_file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
         (&diagnostic_file).write_all(&diagnostic)?;
         diagnostic_file.sync_all()?;
         self.directory.sync_all()?;
@@ -2552,6 +2822,22 @@ impl Drop for PublicationTemporary {
             self.source_name(),
             rustix::fs::AtFlags::empty(),
         );
+        let held = self.directory.metadata();
+        let named = rustix::fs::statat(
+            &self.parent_directory,
+            &self.directory_name,
+            rustix::fs::AtFlags::SYMLINK_NOFOLLOW,
+        );
+        if let (Ok(held), Ok(named)) = (held, named)
+            && held.dev() == named.st_dev
+            && held.ino() == named.st_ino
+        {
+            let _ = rustix::fs::unlinkat(
+                &self.parent_directory,
+                &self.directory_name,
+                rustix::fs::AtFlags::REMOVEDIR,
+            );
+        }
     }
 }
 
@@ -3417,11 +3703,7 @@ fn validate_unicode(name: &'static str, value: &str) -> Result<(), WriterError> 
 }
 
 fn validate_raw_value(value: &RawPropertyValue) -> Result<(), WriterError> {
-    if matches!(
-        value,
-        RawPropertyValue::Unicode(value) if value.is_empty()
-    ) || matches!(value, RawPropertyValue::Binary(value) if value.is_empty())
-        || matches!(value, RawPropertyValue::MultipleInteger16(value) if value.is_empty())
+    if matches!(value, RawPropertyValue::MultipleInteger16(value) if value.is_empty())
         || matches!(value, RawPropertyValue::MultipleInteger32(value) if value.is_empty())
         || matches!(value, RawPropertyValue::MultipleInteger64(value) if value.is_empty())
     {
@@ -5781,7 +6063,7 @@ fn table_context_external(
         matrix.extend_from_slice(&bytes);
     }
 
-    let matrix_root = append_data_tree_aligned(
+    let matrix_root = append_row_matrix_data_tree(
         &matrix,
         usize::from(end_bitmap),
         next_block_index,
@@ -6317,9 +6599,11 @@ fn write_blocks(
     file: &mut std::fs::File,
     blocks: &[BlockSpec],
     cursor: &mut u64,
+    interrupted: &AtomicBool,
 ) -> Result<Vec<WrittenBlock>, WriterError> {
     let mut written = Vec::with_capacity(blocks.len());
     for block in blocks {
+        check_interrupted(interrupted)?;
         let size = u16::try_from(block.payload.logical_size())
             .map_err(|_| WriterError::ValueTooLarge("data block"))?;
         let physical_size = u64::from(block_size(size.saturating_add(16))?);
@@ -6553,6 +6837,11 @@ fn node_entries(
     folders: &[TopFolderNode],
     messages: &[TopMessageNode],
 ) -> Result<Vec<UnicodeNodeBTreeEntry>, WriterError> {
+    let deleted_override = folders.iter().find(|folder| folder.node == deleted);
+    let deleted_property = deleted_override.map_or(leaf_bid(8)?, |folder| folder.property_block);
+    let deleted_hierarchy = deleted_override.map_or(leaf_bid(9)?, |folder| folder.hierarchy_block);
+    let deleted_contents = deleted_override.map_or(leaf_bid(5)?, |folder| folder.contents_block);
+    let deleted_contents_subnode = deleted_override.and_then(|folder| folder.contents_subnode);
     let mut entries = vec![
         UnicodeNodeBTreeEntry::new(NID_MESSAGE_STORE, leaf_bid(1)?, None, None),
         UnicodeNodeBTreeEntry::new(NID_NAME_TO_ID_MAP, leaf_bid(2)?, None, None),
@@ -6652,9 +6941,14 @@ fn node_entries(
             NodeIdType::AssociatedContentsTable,
             leaf_bid(13)?,
         )?,
-        UnicodeNodeBTreeEntry::new(deleted, leaf_bid(8)?, None, Some(ipm)),
-        table_node(deleted, NodeIdType::HierarchyTable, leaf_bid(9)?)?,
-        table_node(deleted, NodeIdType::ContentsTable, leaf_bid(5)?)?,
+        UnicodeNodeBTreeEntry::new(deleted, deleted_property, None, Some(ipm)),
+        table_node(deleted, NodeIdType::HierarchyTable, deleted_hierarchy)?,
+        table_node_with_subnode(
+            deleted,
+            NodeIdType::ContentsTable,
+            deleted_contents,
+            deleted_contents_subnode,
+        )?,
         table_node(deleted, NodeIdType::AssociatedContentsTable, leaf_bid(13)?)?,
         UnicodeNodeBTreeEntry::new(spam_search, leaf_bid(15)?, None, Some(root)),
         UnicodeNodeBTreeEntry::new(
@@ -6676,7 +6970,7 @@ fn node_entries(
             None,
         ),
     ];
-    for folder in folders {
+    for folder in folders.iter().filter(|folder| folder.node != deleted) {
         entries.extend([
             UnicodeNodeBTreeEntry::new(
                 folder.node,
@@ -7512,6 +7806,7 @@ mod tests {
             record_key: base.record_key,
             folders: vec![MailFolderSpec {
                 path: vec![base.folder_name.clone()],
+                role: MailFolderRole::Ordinary,
                 messages: vec![base.message.clone(), second],
             }],
         };
@@ -7579,6 +7874,7 @@ mod tests {
             folders: (0..1_000)
                 .map(|index| MailFolderSpec {
                     path: vec![format!("Folder {index:04}")],
+                    role: MailFolderRole::Ordinary,
                     messages: vec![base.message.clone()],
                 })
                 .collect(),
@@ -7598,6 +7894,7 @@ mod tests {
             flags: 0,
             content: AttachmentContent::Spooled(FileBlobSpec {
                 path: PathBuf::from("/dev/null"),
+                offset: 0,
                 byte_len: i32::MAX as u64,
                 sha256: [0; 32],
             }),
@@ -7607,6 +7904,7 @@ mod tests {
             record_key: *b"PSTForgeHugeBlob",
             folders: vec![MailFolderSpec {
                 path: vec!["Inbox".to_owned()],
+                role: MailFolderRole::Ordinary,
                 messages: vec![huge_message],
             }],
         };
@@ -7642,6 +7940,7 @@ mod tests {
         spec.message.attachments.truncate(1);
         spec.message.attachments[0].content = AttachmentContent::Spooled(FileBlobSpec {
             path: source,
+            offset: 0,
             byte_len: u64::try_from(payload.len())?,
             sha256,
         });
@@ -7678,6 +7977,7 @@ mod tests {
         spec.message.attachments.truncate(1);
         spec.message.attachments[0].content = AttachmentContent::Spooled(FileBlobSpec {
             path: source,
+            offset: 0,
             byte_len: u64::try_from(payload.len())?,
             sha256: [0_u8; 32],
         });
@@ -7695,8 +7995,8 @@ mod tests {
         blob.sha256 = Sha256::digest(&payload).into();
         blob.byte_len = blob
             .byte_len
-            .checked_sub(1)
-            .ok_or("test payload length underflow")?;
+            .checked_add(1)
+            .ok_or("test payload length overflow")?;
         let bad_length = directory.path().join("bad-length.pst");
         assert!(matches!(
             create_fidelity_store(&bad_length, &spec),
@@ -7732,6 +8032,7 @@ mod tests {
             file.sync_all()?;
             Ok(FileBlobSpec {
                 path,
+                offset: 0,
                 byte_len,
                 sha256: hasher.finalize().into(),
             })
@@ -7782,6 +8083,7 @@ mod tests {
             flags: 0,
             content: AttachmentContent::Spooled(FileBlobSpec {
                 path: source,
+                offset: 0,
                 byte_len: u64::try_from(payload.len())?,
                 sha256: Sha256::digest(&payload).into(),
             }),
@@ -7791,6 +8093,7 @@ mod tests {
             record_key: base.record_key,
             folders: vec![MailFolderSpec {
                 path: vec![base.folder_name],
+                role: MailFolderRole::Ordinary,
                 messages: vec![first, second],
             }],
         };
@@ -7830,10 +8133,67 @@ mod tests {
         spec.message.attachments.truncate(1);
         spec.message.attachments[0].content = AttachmentContent::Spooled(FileBlobSpec {
             path: source,
+            offset: 0,
             byte_len: 129 * 1024 * 1024,
             sha256: hasher.finalize().into(),
         });
         create_fidelity_store(directory.path().join("large.pst"), &spec)?;
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "writes and independently validates a PST larger than the first FPMap boundary"]
+    fn spooled_attachment_validates_across_first_fpmap_boundary()
+    -> Result<(), Box<dyn std::error::Error>> {
+        const BYTE_LEN: u64 = 2_081_000_000;
+        let directory = tempfile::tempdir()?;
+        let source = directory.path().join("sparse-zeroes.bin");
+        let source_file = std::fs::File::create(&source)?;
+        source_file.set_len(BYTE_LEN)?;
+        source_file.sync_all()?;
+        drop(source_file);
+
+        let zeroes = vec![0_u8; 1024 * 1024];
+        let mut remaining = BYTE_LEN;
+        let mut hasher = Sha256::new();
+        while remaining != 0 {
+            let length_u64 = remaining.min(u64::try_from(zeroes.len())?);
+            let length = usize::try_from(length_u64)?;
+            hasher.update(&zeroes[..length]);
+            remaining = remaining
+                .checked_sub(length_u64)
+                .ok_or("hash length underflow")?;
+        }
+
+        let mut spec = FidelityStore::default();
+        spec.message.attachments.truncate(1);
+        spec.message.attachments[0].content = AttachmentContent::Spooled(FileBlobSpec {
+            path: source,
+            offset: 0,
+            byte_len: BYTE_LEN,
+            sha256: hasher.finalize().into(),
+        });
+        let output = directory.path().join("crosses-first-fpmap.pst");
+        create_fidelity_store(&output, &spec)?;
+        assert!(output.metadata()?.len() > crate::FPMAP_FIRST_OFFSET);
+        let pst = UnicodePstFile::open(&output)?;
+        assert_eq!(
+            output.metadata()?.len(),
+            pst.header().root().file_eof_index().index()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn first_fpmap_region_reserves_the_fpmap_before_message_data()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let region = FIRST_AMAP
+            .checked_add(FPMAP_FIRST_AMAP * AMAP_DATA_SIZE)
+            .ok_or("FPMap region overflow")?;
+        let mut cursor = region;
+        let allocated = allocate_extent(&mut cursor, SLOT_SIZE, SLOT_SIZE)?;
+        assert_eq!(crate::FPMAP_FIRST_OFFSET, region + 2 * PAGE_SIZE);
+        assert_eq!(allocated, region + 3 * PAGE_SIZE);
         Ok(())
     }
 
@@ -7862,6 +8222,7 @@ mod tests {
             record_key: base.record_key,
             folders: vec![MailFolderSpec {
                 path: vec![base.folder_name.clone()],
+                role: MailFolderRole::Ordinary,
                 messages,
             }],
         };
@@ -7882,14 +8243,25 @@ mod tests {
                 .properties()
                 .make_entry_id(node(NodeIdType::NormalFolder, MAIL_FOLDER_INDEX)?)?,
         )?;
-        assert_eq!(
-            folder
-                .contents_table()
-                .ok_or("missing contents table")?
-                .rows_matrix()
-                .count(),
-            1100
-        );
+        let contents = folder.contents_table().ok_or("missing contents table")?;
+        assert_eq!(contents.rows_matrix().count(), 1100);
+        let rows_per_block =
+            MAX_DATA_BLOCK_PAYLOAD / usize::from(contents.context().end_existence_bitmap());
+        for index in [rows_per_block - 1, rows_per_block] {
+            let expected = crate::ltp::table_context::TableRowId::new(u32::from(node(
+                NodeIdType::NormalMessage,
+                MESSAGE_INDEX + u32::try_from(index)?,
+            )?));
+            assert_eq!(
+                contents
+                    .rows_matrix()
+                    .nth(index)
+                    .ok_or("missing boundary matrix row")?
+                    .id(),
+                expected
+            );
+            assert_eq!(contents.find_row(expected)?.id(), expected);
+        }
         Ok(())
     }
 
@@ -8013,6 +8385,37 @@ mod tests {
                 .iter()
                 .all(|level| *level == HeapFillLevel::Empty)
         );
+        for tree in external.blocks.iter().filter_map(|block| {
+            let BlockPayload::DataTree {
+                level: 1, entries, ..
+            } = &block.payload
+            else {
+                return None;
+            };
+            (entries.len() > 1).then_some(entries)
+        }) {
+            let child_sizes = tree
+                .iter()
+                .map(|entry| {
+                    let id = UnicodeBlockId::from(*entry);
+                    let block = external
+                        .blocks
+                        .iter()
+                        .find(|block| block.id == id)
+                        .ok_or("missing XBLOCK child")?;
+                    let BlockPayload::Data(data) = &block.payload else {
+                        return Err("XBLOCK child is not a data block");
+                    };
+                    Ok(data.len())
+                })
+                .collect::<Result<Vec<_>, &str>>()?;
+            assert!(
+                child_sizes[..child_sizes.len() - 1]
+                    .iter()
+                    .all(|size| *size == MAX_DATA_BLOCK_PAYLOAD),
+                "every non-final XBLOCK child must use the maximum payload"
+            );
+        }
         Ok(())
     }
 
@@ -8040,20 +8443,35 @@ mod tests {
             record_key: base.record_key,
             folders: vec![
                 MailFolderSpec {
+                    path: vec!["Deleted Items".to_owned()],
+                    role: MailFolderRole::DeletedItems,
+                    messages: vec![message("deleted")],
+                },
+                MailFolderSpec {
+                    path: vec!["Deleted items".to_owned()],
+                    role: MailFolderRole::Ordinary,
+                    messages: vec![message("user-created deleted items")],
+                },
+                MailFolderSpec {
                     path: vec!["Inbox".to_owned(), "Projects".to_owned()],
+                    role: MailFolderRole::Ordinary,
                     messages: vec![message("projects")],
                 },
                 MailFolderSpec {
                     path: vec!["Archive".to_owned()],
+                    role: MailFolderRole::Ordinary,
                     messages: vec![message("archive")],
                 },
                 MailFolderSpec {
                     path: vec!["Inbox".to_owned(), "Personal".to_owned()],
+                    role: MailFolderRole::Ordinary,
                     messages: vec![message("personal")],
                 },
             ],
         };
         create_mail_store(&path, &spec)?;
+        assert_eq!(stored_block_ref_count(&path, leaf_bid(5)?)?, 6);
+        assert_eq!(stored_block_ref_count(&path, leaf_bid(9)?)?, 8);
 
         let store = open_store(&path)?;
         let ipm = store.open_folder(
@@ -8062,8 +8480,31 @@ mod tests {
                 .make_entry_id(node(NodeIdType::NormalFolder, IPM_FOLDER_INDEX)?)?,
         )?;
         let ipm_hierarchy = ipm.hierarchy_table().ok_or("missing IPM hierarchy")?;
-        assert_eq!(ipm_hierarchy.rows_matrix().count(), 3);
-        let inbox_node = node(NodeIdType::NormalFolder, MAIL_FOLDER_INDEX + 1)?;
+        assert_eq!(ipm_hierarchy.rows_matrix().count(), 4);
+        let deleted_node = node(NodeIdType::NormalFolder, DELETED_FOLDER_INDEX)?;
+        let deleted = store.open_folder(&store.properties().make_entry_id(deleted_node)?)?;
+        assert_eq!(deleted.properties().display_name()?, "Deleted Items");
+        assert_eq!(
+            deleted
+                .contents_table()
+                .ok_or("missing Deleted Items contents")?
+                .rows_matrix()
+                .count(),
+            1
+        );
+        let user_deleted_node = node(NodeIdType::NormalFolder, MAIL_FOLDER_INDEX + 2)?;
+        let user_deleted =
+            store.open_folder(&store.properties().make_entry_id(user_deleted_node)?)?;
+        assert_eq!(user_deleted.properties().display_name()?, "Deleted items");
+        assert_eq!(
+            user_deleted
+                .contents_table()
+                .ok_or("missing user-created Deleted items contents")?
+                .rows_matrix()
+                .count(),
+            1
+        );
+        let inbox_node = node(NodeIdType::NormalFolder, MAIL_FOLDER_INDEX + 3)?;
         let inbox = store.open_folder(&store.properties().make_entry_id(inbox_node)?)?;
         assert_eq!(inbox.properties().display_name()?, "Inbox");
         assert_eq!(
@@ -8076,13 +8517,77 @@ mod tests {
         );
         let children = inbox.hierarchy_table().ok_or("missing Inbox hierarchy")?;
         assert_eq!(children.rows_matrix().count(), 2);
-        for index in [MAIL_FOLDER_INDEX + 2, MAIL_FOLDER_INDEX + 3] {
+        for index in [MAIL_FOLDER_INDEX + 4, MAIL_FOLDER_INDEX + 5] {
             children.find_row(crate::ltp::table_context::TableRowId::new(u32::from(node(
                 NodeIdType::NormalFolder,
                 index,
             )?)))?;
         }
+
         Ok(())
+    }
+
+    #[test]
+    fn explicit_deleted_items_children_do_not_count_default_shared_tables()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("deleted-children.pst");
+        let base = FidelityStore::default();
+        let message = |subject: &str| MessageSpec {
+            subject: subject.to_owned(),
+            ..base.message.clone()
+        };
+        let mut spec = MailStoreSpec {
+            store_name: "PSTForge Deleted Items hierarchy".to_owned(),
+            record_key: base.record_key,
+            folders: vec![
+                MailFolderSpec {
+                    path: vec!["Deleted Items".to_owned()],
+                    role: MailFolderRole::DeletedItems,
+                    messages: vec![message("deleted")],
+                },
+                MailFolderSpec {
+                    path: vec!["Deleted Items".to_owned(), "Child".to_owned()],
+                    role: MailFolderRole::Ordinary,
+                    messages: vec![message("deleted child")],
+                },
+                MailFolderSpec {
+                    path: vec!["Inbox".to_owned()],
+                    role: MailFolderRole::Ordinary,
+                    messages: vec![message("inbox")],
+                },
+            ],
+        };
+        create_mail_store(&path, &spec)?;
+        assert_eq!(stored_block_ref_count(&path, leaf_bid(5)?)?, 5);
+        assert_eq!(stored_block_ref_count(&path, leaf_bid(9)?)?, 5);
+
+        spec.folders[0].messages.clear();
+        let empty_deleted_path = directory.path().join("empty-deleted-with-child.pst");
+        create_mail_store(&empty_deleted_path, &spec)?;
+        assert_eq!(
+            stored_block_ref_count(&empty_deleted_path, leaf_bid(5)?)?,
+            6
+        );
+        assert_eq!(
+            stored_block_ref_count(&empty_deleted_path, leaf_bid(9)?)?,
+            5
+        );
+        Ok(())
+    }
+
+    fn stored_block_ref_count(
+        path: &Path,
+        block: UnicodeBlockId,
+    ) -> Result<u16, Box<dyn std::error::Error>> {
+        let pst = UnicodePstFile::open(path)?;
+        let root = pst.header().root();
+        let mut reader = pst.reader().lock().map_err(|_| "reader lock failed")?;
+        let bbt = crate::ndb::page::UnicodeBlockBTree::read(&mut *reader, *root.block_btree())?;
+        let mut cache = Default::default();
+        Ok(bbt
+            .find_entry(&mut *reader, block.search_key(), &mut cache)?
+            .ref_count())
     }
 
     #[test]
@@ -8369,7 +8874,7 @@ mod tests {
         let mut command = Command::new("sh");
         command.args(["-c", "printf checkpoint; (sleep 5) >&1 2>&2 & exit 0"]);
         let started = Instant::now();
-        let output = run_validator(&mut command, Duration::from_millis(25))?;
+        let output = run_validator(&mut command, Duration::from_millis(25), &NEVER_INTERRUPTED)?;
         assert!(output.timed_out);
         assert!(!output.success);
         assert!(started.elapsed() < Duration::from_secs(2));
@@ -8379,6 +8884,33 @@ mod tests {
         let (captured, truncated) = capture_bounded(input.as_slice())?;
         assert_eq!(captured.len(), MAX_VALIDATOR_DIAGNOSTIC_BYTES);
         assert!(truncated);
+        Ok(())
+    }
+
+    #[test]
+    fn validator_scratch_stays_beneath_publication_directory()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let temporary = PublicationTemporary::new(directory.path())?;
+        let publication = temporary.directory_path()?.canonicalize()?;
+        let scratch = temporary.validator_scratch()?;
+        assert!(scratch.path().canonicalize()?.starts_with(publication));
+        Ok(())
+    }
+
+    #[test]
+    fn validator_interruption_terminates_its_process_group()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let interrupted = AtomicBool::new(true);
+        let mut command = Command::new("sh");
+        command.args(["-c", "(sleep 30) >&1 2>&2 & wait"]);
+        let started = Instant::now();
+        let error = match run_validator(&mut command, Duration::from_secs(60), &interrupted) {
+            Ok(_) => return Err("the validator ignored the interruption".into()),
+            Err(error) => error,
+        };
+        assert_eq!(error.kind(), io::ErrorKind::Interrupted);
+        assert!(started.elapsed() < Duration::from_secs(2));
         Ok(())
     }
 
@@ -8525,7 +9057,8 @@ mod tests {
     }
 
     #[test]
-    fn fidelity_validation_rejects_ambiguous_inputs() -> Result<(), Box<dyn std::error::Error>> {
+    fn fidelity_validation_handles_empty_raw_values_and_rejects_ambiguous_inputs()
+    -> Result<(), Box<dyn std::error::Error>> {
         let mut empty_body = FidelityStore::default();
         empty_body.message.body_text = Some(String::new());
         assert!(matches!(
@@ -8538,10 +9071,11 @@ mod tests {
             id: 0x1101,
             value: RawPropertyValue::Binary(Vec::new()),
         });
-        assert!(matches!(
-            validate_spec(&empty_raw),
-            Err(WriterError::InvalidStructure(_))
-        ));
+        empty_raw.message.raw_properties.push(RawProperty {
+            id: 0x1102,
+            value: RawPropertyValue::Unicode(String::new()),
+        });
+        validate_spec(&empty_raw)?;
 
         let mut invalid_html = FidelityStore::default();
         invalid_html.message.body_html = Some(vec![0xFF]);

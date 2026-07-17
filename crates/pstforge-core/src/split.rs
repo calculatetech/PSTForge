@@ -1,25 +1,35 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fs::{self, File};
 use std::io::Read;
+use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
 
 use libpff_sys::RecoveryMode;
-use pstforge_job::{DurableCatalogSink, JobError, PartSidecar, PublishedPart};
+use pstforge_job::{
+    DurableCatalogSink, JobConfiguration, JobError, JobSourceIdentity, PartSidecar, PublishedPart,
+    PublishedPartRecord,
+};
 use pstforge_pst::writer::{
-    AttachmentContent, MessageSpec, WriterError, create_mail_store, validate_mail_store_input,
+    AttachmentContent, MessageSpec, WriterError, create_mail_store_interruptible,
+    create_mail_store_supervised, validate_mail_store_input,
 };
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
+use crate::recovery::{InterruptHandler, recover_for_split};
 use crate::{
     CanonicalError, CanonicalWriteError, PackCandidate, PackingError, PartSizeEstimator,
-    RecoveryError, RecoveryReport, SourceError, SourceFile, build_part_writer_input,
-    load_canonical_mail, pack_candidates,
+    RecoveryError, RecoveryReport, SourceError, SourceFile, build_part_writer_input_interruptible,
+    load_canonical_mail_interruptible,
 };
 
-pub const SPLIT_SCHEMA_VERSION: &str = "0.4.0";
-const MAX_SAFETY_RESERVE: u64 = 64 * 1024 * 1024;
+pub const SPLIT_SCHEMA_VERSION: &str = "0.4.1";
+const TOOL_COMPATIBILITY_MAJOR: u64 = 0;
+const PART_SIZE_POLICY: &str = "hard-maximum-v1";
+const WRITER_FORMAT: &str = "unicode-pst-v23";
 const ESTIMATED_STORE_BYTES: u64 = 1024 * 1024;
 const ESTIMATED_MESSAGE_BYTES: u64 = 64 * 1024;
 const ESTIMATED_FOLDER_BYTES: u64 = 16 * 1024;
@@ -50,6 +60,27 @@ pub enum SplitError {
     },
     #[error("part counter exceeds the supported range")]
     TooManyParts,
+    #[error(
+        "part {part_index} serialized to {byte_len} bytes, exceeding the configured maximum of {maximum_bytes} bytes"
+    )]
+    PartExceedsMaximum {
+        part_index: u32,
+        byte_len: u64,
+        maximum_bytes: u64,
+    },
+    #[error(
+        "insufficient output space: {available_bytes} bytes available, {required_bytes} bytes required"
+    )]
+    InsufficientDiskSpace {
+        required_bytes: u64,
+        available_bytes: u64,
+    },
+    #[error("cannot inspect available space for {path}: {source}")]
+    DiskSpaceIo {
+        path: String,
+        #[source]
+        source: std::io::Error,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -68,6 +99,8 @@ impl SplitError {
             | Self::Recovery(RecoveryError::Job(_))
             | Self::Recovery(RecoveryError::WorkerProtocol(crate::WorkerProtocolError::Sink(_)))
             | Self::Job(_)
+            | Self::InsufficientDiskSpace { .. }
+            | Self::DiskSpaceIo { .. }
             | Self::StagedIo { .. }
             | Self::Writer(
                 WriterError::OutputExists(_)
@@ -76,8 +109,11 @@ impl SplitError {
                 | WriterError::Io(_),
             ) => SplitFailureKind::Output,
             Self::Recovery(RecoveryError::Source(_)) => SplitFailureKind::Source,
-            Self::Recovery(RecoveryError::Interrupted) => SplitFailureKind::Interrupted,
-            Self::Writer(
+            Self::Recovery(RecoveryError::Interrupted) | Self::Writer(WriterError::Interrupted) => {
+                SplitFailureKind::Interrupted
+            }
+            Self::PartExceedsMaximum { .. }
+            | Self::Writer(
                 WriterError::IndependentValidation { .. }
                 | WriterError::InputRejected(_)
                 | WriterError::CompletedValidation(_)
@@ -94,6 +130,22 @@ impl SplitError {
             | Self::TooManyParts => SplitFailureKind::Internal,
         }
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct DiskPreflight {
+    pub required_bytes: u64,
+    pub available_bytes: u64,
+    pub existing_job_bytes: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ExecutionMetrics {
+    pub elapsed_millis: u64,
+    pub source_bytes: u64,
+    pub output_bytes: u64,
+    pub average_source_bytes_per_second: u64,
+    pub peak_process_rss_bytes: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -115,6 +167,10 @@ pub struct SplitReport {
     pub schema_version: String,
     pub command: String,
     pub maximum_pst_bytes: u64,
+    pub resumed: bool,
+    pub keep_work: bool,
+    pub disk_preflight: DiskPreflight,
+    pub metrics: ExecutionMetrics,
     pub recovery: RecoveryReport,
     pub parts: Vec<PartReport>,
     pub written_candidates: u64,
@@ -127,45 +183,185 @@ pub fn split(
     worker_executable: &Path,
     mode: RecoveryMode,
     maximum_pst_bytes: u64,
+    resume: bool,
+    keep_work: bool,
 ) -> Result<SplitReport, SplitError> {
+    let started = Instant::now();
     if maximum_pst_bytes == 0 {
         return Err(SplitError::ZeroMaximumSize);
     }
-    let mut recovery = crate::recover(source_path, job_directory, worker_executable, mode)?;
+    let interrupt = InterruptHandler::install()?;
+    let interrupt_flag = interrupt.flag();
+    crate::validate_output_relationship(source_path, job_directory)
+        .map_err(RecoveryError::Source)?;
+    let source = SourceFile::open_interruptible(source_path, &interrupt_flag).map_err(|error| {
+        if matches!(error, SourceError::Interrupted) {
+            RecoveryError::Interrupted
+        } else {
+            RecoveryError::Source(error)
+        }
+    })?;
+    let configuration = JobConfiguration {
+        tool_compatibility_major: TOOL_COMPATIBILITY_MAJOR,
+        split_schema_version: SPLIT_SCHEMA_VERSION.to_owned(),
+        recovery_mode: recovery_mode_name(mode).to_owned(),
+        maximum_pst_bytes,
+        part_size_policy: PART_SIZE_POLICY.to_owned(),
+        writer_format: WRITER_FORMAT.to_owned(),
+    };
+    let existing_job_bytes = if resume {
+        let source_identity = JobSourceIdentity {
+            canonical_path: source.identity().canonical_path.clone(),
+            device: source.identity().device,
+            inode: source.identity().inode,
+            size_bytes: source.identity().size_bytes,
+            modified_at: source.identity().modified_at.clone(),
+            sha256: source.identity().sha256.clone(),
+        };
+        match DurableCatalogSink::open_resume_interruptible(
+            job_directory,
+            &source_identity,
+            &configuration,
+            &interrupt_flag,
+        ) {
+            Ok(job) => job.allocated_bytes()?,
+            Err(JobError::Interrupted) => return Err(RecoveryError::Interrupted.into()),
+            Err(error) => return Err(error.into()),
+        }
+    } else {
+        0
+    };
+    let disk_preflight = disk_preflight(
+        job_directory,
+        source.identity().size_bytes,
+        existing_job_bytes,
+    )?;
+    tracing::info!(
+        required_bytes = disk_preflight.required_bytes,
+        available_bytes = disk_preflight.available_bytes,
+        existing_job_bytes = disk_preflight.existing_job_bytes,
+        "output space preflight passed"
+    );
+    let mut recovery = recover_for_split(
+        &source,
+        job_directory,
+        worker_executable,
+        mode,
+        resume,
+        &configuration,
+        std::sync::Arc::clone(&interrupt_flag),
+    )?;
     if recovery.interrupted {
+        let parts = Vec::new();
+        let written_candidates = 0;
+        let metrics = execution_metrics(
+            started,
+            source.identity().size_bytes,
+            &parts,
+            recovery.peak_worker_rss_bytes,
+        );
         return Ok(SplitReport {
             schema_version: SPLIT_SCHEMA_VERSION.to_owned(),
             command: "split".to_owned(),
             maximum_pst_bytes,
+            resumed: resume,
+            keep_work,
+            disk_preflight,
+            metrics,
             recovery,
-            parts: Vec::new(),
-            written_candidates: 0,
+            parts,
+            written_candidates,
             partial: true,
         });
     }
-    let source = SourceFile::open(source_path).map_err(RecoveryError::Source)?;
     if source.identity() != &recovery.source {
         return Err(RecoveryError::Source(SourceError::Changed(source_path.to_path_buf())).into());
     }
-    let (parts, written_candidates, output_partial) = split_recovered_job(
-        job_directory,
-        &recovery.source.sha256,
-        mode,
-        maximum_pst_bytes,
-    )?;
-    recovery.unsupported_candidates = DurableCatalogSink::open(job_directory)?
+    let (parts, written_candidates, output_partial, split_interrupted) =
+        split_recovered_job_with_interrupt(
+            job_directory,
+            &recovery.source.sha256,
+            mode,
+            maximum_pst_bytes,
+            &interrupt_flag,
+            Some(worker_executable),
+        )?;
+    recovery.interrupted |= split_interrupted;
+    if split_interrupted {
+        let metrics = execution_metrics(
+            started,
+            source.identity().size_bytes,
+            &parts,
+            recovery.peak_worker_rss_bytes,
+        );
+        return Ok(SplitReport {
+            schema_version: SPLIT_SCHEMA_VERSION.to_owned(),
+            command: "split".to_owned(),
+            maximum_pst_bytes,
+            resumed: resume,
+            keep_work,
+            disk_preflight,
+            metrics,
+            recovery,
+            parts,
+            written_candidates,
+            partial: true,
+        });
+    }
+    recovery.unsupported_candidates = open_job_interruptible(job_directory, &interrupt_flag)?
         .summary()?
         .unsupported_candidates;
-    source.verify_unchanged().map_err(RecoveryError::Source)?;
+    match source.verify_unchanged_interruptible(&interrupt_flag) {
+        Ok(()) => {}
+        Err(SourceError::Interrupted) => {
+            recovery.interrupted = true;
+            recovery.source_unchanged = false;
+        }
+        Err(error) => return Err(RecoveryError::Source(error).into()),
+    }
+    if interrupt_flag.load(Ordering::Relaxed) && !recovery.interrupted {
+        recovery.interrupted = true;
+    }
+    if !recovery.interrupted {
+        match open_job_interruptible(job_directory, &interrupt_flag)?
+            .finalize_private_work_interruptible(keep_work, &interrupt_flag)
+        {
+            Ok(()) => {}
+            Err(JobError::Interrupted) => recovery.interrupted = true,
+            Err(error) => return Err(error.into()),
+        }
+    }
+    if interrupt_flag.load(Ordering::Relaxed) && !recovery.interrupted {
+        recovery.interrupted = true;
+    }
     let partial = output_partial
         || recovery.partial_candidates != 0
         || recovery.unsupported_candidates != 0
         || recovery.issues != 0
-        || recovery.issues_dropped != 0;
+        || recovery.issues_dropped != 0
+        || recovery.interrupted;
+    let metrics = execution_metrics(
+        started,
+        source.identity().size_bytes,
+        &parts,
+        recovery.peak_worker_rss_bytes,
+    );
+    tracing::info!(
+        parts = parts.len(),
+        written_candidates,
+        output_bytes = metrics.output_bytes,
+        elapsed_millis = metrics.elapsed_millis,
+        interrupted = recovery.interrupted,
+        "split invocation complete"
+    );
     Ok(SplitReport {
         schema_version: SPLIT_SCHEMA_VERSION.to_owned(),
         command: "split".to_owned(),
         maximum_pst_bytes,
+        resumed: resume,
+        keep_work,
+        disk_preflight,
+        metrics,
         recovery,
         parts,
         written_candidates,
@@ -179,19 +375,127 @@ pub fn split_recovered_job(
     recovery_mode: RecoveryMode,
     maximum_pst_bytes: u64,
 ) -> Result<(Vec<PartReport>, u64, bool), SplitError> {
+    let interrupted = AtomicBool::new(false);
+    let (parts, written, partial, _) = split_recovered_job_with_interrupt(
+        job_directory,
+        source_sha256,
+        recovery_mode,
+        maximum_pst_bytes,
+        &interrupted,
+        None,
+    )?;
+    Ok((parts, written, partial))
+}
+
+fn split_recovered_job_with_interrupt(
+    job_directory: &Path,
+    source_sha256: &str,
+    recovery_mode: RecoveryMode,
+    maximum_pst_bytes: u64,
+    interrupted: &AtomicBool,
+    validator_supervisor: Option<&Path>,
+) -> Result<(Vec<PartReport>, u64, bool, bool), SplitError> {
     if maximum_pst_bytes == 0 {
         return Err(SplitError::ZeroMaximumSize);
     }
-    let mut job = DurableCatalogSink::open(job_directory)?;
-    let mail = load_canonical_mail(&job)?;
-    if mail.is_empty() {
-        return Ok((Vec::new(), 0, false));
-    }
-    let by_key = mail
+    let mut job = match DurableCatalogSink::open_interruptible(job_directory, interrupted) {
+        Ok(job) => job,
+        Err(JobError::Interrupted) => return Ok((Vec::new(), 0, true, true)),
+        Err(error) => return Err(error.into()),
+    };
+    let existing = job.published_parts()?;
+    let mut reports = existing
         .iter()
-        .map(|message| (message.key, message))
+        .map(part_report)
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut written_candidates = existing
+        .iter()
+        .map(|record| record.item_count)
+        .fold(0_u64, u64::saturating_add);
+    let mut any_partial = reports
+        .iter()
+        .any(|report| report.partial || report.oversize);
+    let mut part_index = existing.last().map_or(Ok(1_u32), |record| {
+        record
+            .part
+            .index
+            .checked_add(1)
+            .ok_or(SplitError::TooManyParts)
+    })?;
+    let mail = match load_canonical_mail_interruptible(&job, interrupted) {
+        Ok(mail) => mail,
+        Err(CanonicalError::Job(JobError::Interrupted)) => {
+            job.record_interrupted()?;
+            job.checkpoint()?;
+            return Ok((reports, written_candidates, true, true));
+        }
+        Err(error) => return Err(error.into()),
+    };
+    if mail.is_empty() {
+        job.checkpoint()?;
+        return Ok((reports, written_candidates, any_partial, false));
+    }
+    if test_pause_at_prefilter(&job, interrupted)? {
+        job.record_interrupted()?;
+        job.checkpoint()?;
+        return Ok((reports, written_candidates, true, true));
+    }
+    let mode_name = match recovery_mode {
+        RecoveryMode::Balanced => "balanced",
+        RecoveryMode::Aggressive => "aggressive",
+    };
+    let mut writable_mail = Vec::with_capacity(mail.len());
+    for message in &mail {
+        if interrupted.load(Ordering::Relaxed) {
+            job.record_interrupted()?;
+            job.checkpoint()?;
+            return Ok((reports, written_candidates, true, true));
+        }
+        let messages = [message];
+        let input = match build_part_writer_input_interruptible(
+            &job,
+            &messages,
+            source_sha256,
+            mode_name,
+            maximum_pst_bytes,
+            part_index,
+            interrupted,
+        ) {
+            Err(CanonicalWriteError::Job(JobError::Interrupted)) => {
+                job.record_interrupted()?;
+                job.checkpoint()?;
+                return Ok((reports, written_candidates, true, true));
+            }
+            Ok(input) => input,
+            Err(error) if candidate_local_translation_error(&error) => {
+                let mut item_keys = Vec::new();
+                collect_item_keys(message, &mut item_keys);
+                job.mark_candidates_unsupported(&item_keys)?;
+                any_partial = true;
+                continue;
+            }
+            Err(error) => return Err(error.into()),
+        };
+        match validate_mail_store_input(&input.store) {
+            Ok(()) => writable_mail.push(message),
+            Err(WriterError::InputRejected(_)) => {
+                let mut item_keys = Vec::new();
+                collect_item_keys(message, &mut item_keys);
+                job.mark_candidates_unsupported(&item_keys)?;
+                any_partial = true;
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
+    if writable_mail.is_empty() {
+        job.checkpoint()?;
+        return Ok((reports, written_candidates, true, false));
+    }
+    let by_key = writable_mail
+        .iter()
+        .map(|message| (message.key, *message))
         .collect::<BTreeMap<_, _>>();
-    let candidates = mail
+    let candidates = writable_mail
         .iter()
         .map(|message| PackCandidate {
             key: message.key,
@@ -199,80 +503,133 @@ pub fn split_recovered_job(
             payload_bytes: message.spooled_bytes,
         })
         .collect::<Vec<_>>();
-    let reserve = (maximum_pst_bytes / 20).min(MAX_SAFETY_RESERVE);
-    let assignments = pack_candidates(candidates, maximum_pst_bytes, reserve, &LayoutEstimator)?;
-    let mut queue = assignments
-        .into_iter()
-        .map(|assignment| assignment.candidates)
-        .collect::<VecDeque<_>>();
-    let mut reports = Vec::new();
-    let mut part_index = 1_u32;
+    let ordered = canonical_candidate_order(candidates)?;
+    let mut remaining = VecDeque::from(ordered);
+    let mut size_model = AdaptiveSizeModel::default();
     let mut attempt = 0_u64;
-    let mut written_candidates = 0_u64;
-    let mut any_partial = false;
 
-    while let Some(candidate_group) = queue.pop_front() {
-        attempt = attempt.saturating_add(1);
-        let messages = candidate_group
-            .iter()
-            .map(|candidate| {
-                by_key
-                    .get(&candidate.key)
-                    .copied()
-                    .ok_or(SplitError::UnknownAssignment)
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        let mode_name = match recovery_mode {
-            RecoveryMode::Balanced => "balanced",
-            RecoveryMode::Aggressive => "aggressive",
-        };
-        let input = match build_part_writer_input(
-            &job,
-            &messages,
-            source_sha256,
-            mode_name,
-            maximum_pst_bytes,
-            part_index,
-        ) {
-            Ok(input) => input,
-            Err(error) if candidate_local_translation_error(&error) => {
-                if isolate_or_reject(&mut job, &mut queue, &candidate_group, &messages)? {
-                    any_partial = true;
+    while !remaining.is_empty() {
+        let mut candidate_group =
+            take_fitting_prefix(&mut remaining, maximum_pst_bytes, &size_model)?;
+        let mut rejected_prefix_len = None;
+        let (input, staged_filename, staged_path, byte_len) = loop {
+            if interrupted.load(Ordering::Relaxed) {
+                job.record_interrupted()?;
+                job.checkpoint()?;
+                return Ok((reports, written_candidates, true, true));
+            }
+            attempt = attempt.saturating_add(1);
+            let messages = candidate_group
+                .iter()
+                .map(|candidate| {
+                    by_key
+                        .get(&candidate.key)
+                        .copied()
+                        .ok_or(SplitError::UnknownAssignment)
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            let input = match build_part_writer_input_interruptible(
+                &job,
+                &messages,
+                source_sha256,
+                mode_name,
+                maximum_pst_bytes,
+                part_index,
+                interrupted,
+            ) {
+                Err(CanonicalWriteError::Job(JobError::Interrupted)) => {
+                    job.record_interrupted()?;
+                    job.checkpoint()?;
+                    return Ok((reports, written_candidates, true, true));
                 }
+                Ok(input) => input,
+                Err(error) => return Err(error.into()),
+            };
+            let staged_filename = format!("part-{part_index:04}-attempt-{attempt}.pst.partial");
+            let staged_path = job.staged_part_path(&staged_filename)?;
+            match validate_mail_store_input(&input.store) {
+                Ok(()) => {}
+                Err(WriterError::InputRejected(detail)) => {
+                    return Err(WriterError::InputRejected(detail).into());
+                }
+                Err(error) => return Err(error.into()),
+            }
+            let write_result = match validator_supervisor {
+                Some(supervisor) => create_mail_store_supervised(
+                    &staged_path,
+                    &input.store,
+                    interrupted,
+                    supervisor,
+                ),
+                None => create_mail_store_interruptible(&staged_path, &input.store, interrupted),
+            };
+            match write_result {
+                Ok(_) => {}
+                Err(WriterError::Interrupted) => {
+                    job.record_interrupted()?;
+                    job.checkpoint()?;
+                    return Ok((reports, written_candidates, true, true));
+                }
+                Err(error) => return Err(error.into()),
+            }
+            if interrupted.load(Ordering::Relaxed) {
+                fs::remove_file(&staged_path).map_err(|source| staged_io(&staged_path, source))?;
+                job.record_interrupted()?;
+                job.checkpoint()?;
+                return Ok((reports, written_candidates, true, true));
+            }
+            let byte_len = staged_path
+                .metadata()
+                .map_err(|source| staged_io(&staged_path, source))?
+                .len();
+            let estimated_bytes = LayoutEstimator.estimate_part_bytes(&candidate_group)?;
+            size_model.observe(estimated_bytes, byte_len)?;
+            if byte_len > maximum_pst_bytes && candidate_group.len() > 1 {
+                fs::remove_file(&staged_path).map_err(|source| staged_io(&staged_path, source))?;
+                rejected_prefix_len = Some(
+                    rejected_prefix_len.map_or(candidate_group.len(), |known: usize| {
+                        known.min(candidate_group.len())
+                    }),
+                );
+                shrink_to_fitting_prefix(
+                    &mut candidate_group,
+                    &mut remaining,
+                    maximum_pst_bytes,
+                    &size_model,
+                )?;
                 continue;
             }
-            Err(error) => return Err(error.into()),
-        };
-        let staged_filename = format!("part-{part_index:04}-attempt-{attempt}.pst.partial");
-        let staged_path = job.staged_part_path(&staged_filename)?;
-        match validate_mail_store_input(&input.store) {
-            Ok(()) => {}
-            Err(WriterError::InputRejected(_)) => {
-                if isolate_or_reject(&mut job, &mut queue, &candidate_group, &messages)? {
-                    any_partial = true;
-                }
+            if byte_len <= maximum_pst_bytes
+                && extend_to_fitting_prefix(
+                    &mut candidate_group,
+                    &mut remaining,
+                    maximum_pst_bytes,
+                    &size_model,
+                    rejected_prefix_len,
+                )?
+            {
+                fs::remove_file(&staged_path).map_err(|source| staged_io(&staged_path, source))?;
                 continue;
             }
-            Err(error) => return Err(error.into()),
-        }
-        create_mail_store(&staged_path, &input.store)?;
-        let byte_len = staged_path
-            .metadata()
-            .map_err(|source| staged_io(&staged_path, source))?
-            .len();
-        if byte_len > maximum_pst_bytes && candidate_group.len() > 1 {
-            fs::remove_file(&staged_path).map_err(|source| staged_io(&staged_path, source))?;
-            let midpoint = candidate_group.len() / 2;
-            queue.push_front(candidate_group[midpoint..].to_vec());
-            queue.push_front(candidate_group[..midpoint].to_vec());
-            continue;
-        }
+            break (input, staged_filename, staged_path, byte_len);
+        };
         if !input.unsupported_item_keys.is_empty() {
             job.mark_candidates_unsupported(&input.unsupported_item_keys)?;
             any_partial = true;
         }
         let oversize = byte_len > maximum_pst_bytes;
-        let sha256 = hash_file(&staged_path)?;
+        let Some(sha256) = hash_file(&staged_path, interrupted)? else {
+            fs::remove_file(&staged_path).map_err(|source| staged_io(&staged_path, source))?;
+            job.record_interrupted()?;
+            job.checkpoint()?;
+            return Ok((reports, written_candidates, true, true));
+        };
+        if interrupted.load(Ordering::Relaxed) {
+            fs::remove_file(&staged_path).map_err(|source| staged_io(&staged_path, source))?;
+            job.record_interrupted()?;
+            job.checkpoint()?;
+            return Ok((reports, written_candidates, true, true));
+        }
         let filename = format!("part-{part_index:04}.pst");
         let published = PublishedPart {
             index: part_index,
@@ -308,7 +665,29 @@ pub fn split_recovered_job(
             omitted_properties,
             omitted_attachments: input.omitted_attachments,
         };
-        job.publish_validated_part(&staged_filename, &published, &sidecar, &input.item_keys)?;
+        match job.publish_validated_part_interruptible(
+            &staged_filename,
+            &published,
+            &sidecar,
+            &input.item_keys,
+            interrupted,
+        ) {
+            Ok(()) => {}
+            Err(JobError::Interrupted) => {
+                job.record_interrupted()?;
+                job.checkpoint()?;
+                return Ok((reports, written_candidates, true, true));
+            }
+            Err(error) => return Err(error.into()),
+        }
+        tracing::info!(
+            part_index,
+            byte_len,
+            message_count,
+            oversize,
+            partial,
+            "validated PST part published"
+        );
         reports.push(PartReport {
             index: part_index,
             filename,
@@ -325,9 +704,178 @@ pub fn split_recovered_job(
             written_candidates.saturating_add(saturating_len(input.item_keys.len()));
         any_partial |= partial || oversize;
         part_index = part_index.checked_add(1).ok_or(SplitError::TooManyParts)?;
+        if let Some(milliseconds) = test_pause_after_part() {
+            std::thread::sleep(std::time::Duration::from_millis(milliseconds));
+        }
+        if interrupted.load(Ordering::Relaxed) {
+            job.record_interrupted()?;
+            job.checkpoint()?;
+            return Ok((reports, written_candidates, true, true));
+        }
     }
+    if interrupted.load(Ordering::Relaxed) {
+        job.record_interrupted()?;
+        job.checkpoint()?;
+        return Ok((reports, written_candidates, true, true));
+    }
+    job.clear_interrupted()?;
     job.checkpoint()?;
-    Ok((reports, written_candidates, any_partial))
+    Ok((reports, written_candidates, any_partial, false))
+}
+
+fn test_pause_after_part() -> Option<u64> {
+    std::env::var("PSTFORGE_TEST_PAUSE_AFTER_PART_MS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+}
+
+fn test_pause_at_prefilter(
+    job: &DurableCatalogSink,
+    interrupted: &AtomicBool,
+) -> Result<bool, SplitError> {
+    let Some(milliseconds) = std::env::var("PSTFORGE_TEST_PAUSE_AT_PREFILTER_MS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+    else {
+        return Ok(false);
+    };
+    let marker = job.staged_part_path("prefilter-test-marker.partial")?;
+    fs::write(&marker, b"candidate prefilter active").map_err(|source| SplitError::StagedIo {
+        path: marker.display().to_string(),
+        source,
+    })?;
+    fs::set_permissions(&marker, fs::Permissions::from_mode(0o600)).map_err(|source| {
+        SplitError::StagedIo {
+            path: marker.display().to_string(),
+            source,
+        }
+    })?;
+    let deadline = Instant::now() + Duration::from_millis(milliseconds);
+    while Instant::now() < deadline && !interrupted.load(Ordering::Relaxed) {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    if !interrupted.load(Ordering::Relaxed) {
+        fs::remove_file(&marker).map_err(|source| SplitError::StagedIo {
+            path: marker.display().to_string(),
+            source,
+        })?;
+    }
+    Ok(interrupted.load(Ordering::Relaxed))
+}
+
+fn part_report(record: &PublishedPartRecord) -> Result<PartReport, SplitError> {
+    Ok(PartReport {
+        index: record.part.index,
+        filename: record.part.filename.clone(),
+        byte_len: record.part.byte_len,
+        sha256: record.part.sha256.clone(),
+        folder_count: record.sidecar.folder_count,
+        message_count: record.sidecar.message_count,
+        oversize: record.part.oversize,
+        partial: record.sidecar.partial,
+        omitted_properties: record.sidecar.omitted_properties,
+        omitted_attachments: record.sidecar.omitted_attachments,
+    })
+}
+
+fn recovery_mode_name(mode: RecoveryMode) -> &'static str {
+    match mode {
+        RecoveryMode::Balanced => "balanced",
+        RecoveryMode::Aggressive => "aggressive",
+    }
+}
+
+fn open_job_interruptible(
+    job_directory: &Path,
+    interrupted: &AtomicBool,
+) -> Result<DurableCatalogSink, SplitError> {
+    match DurableCatalogSink::open_interruptible(job_directory, interrupted) {
+        Ok(job) => Ok(job),
+        Err(JobError::Interrupted) => Err(RecoveryError::Interrupted.into()),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn disk_preflight(
+    job_directory: &Path,
+    source_bytes: u64,
+    existing_job_bytes: u64,
+) -> Result<DiskPreflight, SplitError> {
+    let required_bytes = source_bytes
+        .saturating_mul(3)
+        .saturating_sub(existing_job_bytes);
+    let path = preflight_filesystem_path(job_directory);
+    let stats = rustix::fs::statvfs(path).map_err(|source| SplitError::DiskSpaceIo {
+        path: path.display().to_string(),
+        source: source.into(),
+    })?;
+    let available_bytes = stats.f_bavail.saturating_mul(stats.f_frsize);
+    if available_bytes < required_bytes {
+        return Err(SplitError::InsufficientDiskSpace {
+            required_bytes,
+            available_bytes,
+        });
+    }
+    Ok(DiskPreflight {
+        required_bytes,
+        available_bytes,
+        existing_job_bytes,
+    })
+}
+
+fn preflight_filesystem_path(job_directory: &Path) -> &Path {
+    let mut path = job_directory;
+    while !path.exists() {
+        path = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+    }
+    path
+}
+
+fn execution_metrics(
+    started: Instant,
+    source_bytes: u64,
+    parts: &[PartReport],
+    peak_worker_rss_bytes: u64,
+) -> ExecutionMetrics {
+    let elapsed_millis = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+    let output_bytes = parts
+        .iter()
+        .map(|part| part.byte_len)
+        .fold(0_u64, u64::saturating_add);
+    let average_source_bytes_per_second = if elapsed_millis == 0 {
+        0
+    } else {
+        source_bytes
+            .saturating_mul(1000)
+            .checked_div(elapsed_millis)
+            .unwrap_or(0)
+    };
+    ExecutionMetrics {
+        elapsed_millis,
+        source_bytes,
+        output_bytes,
+        average_source_bytes_per_second,
+        peak_process_rss_bytes: peak_worker_rss_bytes.max(self_peak_rss_bytes()),
+    }
+}
+
+fn self_peak_rss_bytes() -> u64 {
+    std::fs::read_to_string("/proc/self/status")
+        .ok()
+        .and_then(|status| {
+            status.lines().find_map(|line| {
+                line.strip_prefix("VmHWM:")?
+                    .split_ascii_whitespace()
+                    .next()?
+                    .parse::<u64>()
+                    .ok()
+            })
+        })
+        .and_then(|kibibytes| kibibytes.checked_mul(1024))
+        .unwrap_or(0)
 }
 
 fn candidate_local_translation_error(error: &CanonicalWriteError) -> bool {
@@ -335,26 +883,6 @@ fn candidate_local_translation_error(error: &CanonicalWriteError) -> bool {
         error,
         CanonicalWriteError::InvalidCandidate { .. } | CanonicalWriteError::InvalidProperty { .. }
     )
-}
-
-fn isolate_or_reject(
-    job: &mut DurableCatalogSink,
-    queue: &mut VecDeque<Vec<PackCandidate>>,
-    candidate_group: &[PackCandidate],
-    messages: &[&crate::CanonicalMail],
-) -> Result<bool, SplitError> {
-    if candidate_group.len() > 1 {
-        let midpoint = candidate_group.len() / 2;
-        queue.push_front(candidate_group[midpoint..].to_vec());
-        queue.push_front(candidate_group[..midpoint].to_vec());
-        return Ok(false);
-    }
-    let mut item_keys = Vec::new();
-    for message in messages {
-        collect_item_keys(message, &mut item_keys);
-    }
-    job.mark_candidates_unsupported(&item_keys)?;
-    Ok(true)
 }
 
 fn collect_item_keys(message: &crate::CanonicalMail, item_keys: &mut Vec<String>) {
@@ -366,29 +894,198 @@ fn collect_item_keys(message: &crate::CanonicalMail, item_keys: &mut Vec<String>
     }
 }
 
+fn canonical_candidate_order(
+    mut candidates: Vec<PackCandidate>,
+) -> Result<Vec<PackCandidate>, PackingError> {
+    for candidate in &candidates {
+        if candidate.folder_path.iter().any(String::is_empty) {
+            return Err(PackingError::InvalidFolderPath);
+        }
+    }
+    candidates.sort_by(|left, right| {
+        left.folder_path
+            .cmp(&right.folder_path)
+            .then_with(|| left.key.cmp(&right.key))
+    });
+    let mut keys = BTreeSet::new();
+    for candidate in &candidates {
+        if !keys.insert(candidate.key) {
+            return Err(PackingError::DuplicateCandidate(candidate.key));
+        }
+    }
+    Ok(candidates)
+}
+
+#[derive(Default)]
+struct AdaptiveSizeModel {
+    observed: Option<(u64, u64)>,
+}
+
+impl AdaptiveSizeModel {
+    fn predict(&self, estimated_bytes: u64) -> Result<u64, PackingError> {
+        let Some((observed_estimate, observed_actual)) = self.observed else {
+            return Ok(estimated_bytes);
+        };
+        let numerator = u128::from(estimated_bytes)
+            .checked_mul(u128::from(observed_actual))
+            .ok_or(PackingError::SizeOverflow)?;
+        let predicted = numerator
+            .checked_add(u128::from(observed_estimate.saturating_sub(1)))
+            .ok_or(PackingError::SizeOverflow)?
+            / u128::from(observed_estimate);
+        u64::try_from(predicted).map_err(|_| PackingError::SizeOverflow)
+    }
+
+    fn observe(&mut self, estimated_bytes: u64, actual_bytes: u64) -> Result<(), PackingError> {
+        if estimated_bytes == 0 {
+            return Err(PackingError::Estimator(
+                "adaptive size observation has a zero estimate".to_owned(),
+            ));
+        }
+        self.observed = Some((estimated_bytes, actual_bytes));
+        Ok(())
+    }
+}
+
+fn fitting_prefix_len(
+    candidates: &[PackCandidate],
+    maximum_pst_bytes: u64,
+    model: &AdaptiveSizeModel,
+) -> Result<usize, PackingError> {
+    if candidates.is_empty() {
+        return Ok(0);
+    }
+    let fits = |length: usize| -> Result<bool, PackingError> {
+        let estimated = LayoutEstimator.estimate_part_bytes(&candidates[..length])?;
+        Ok(model.predict(estimated)? <= maximum_pst_bytes)
+    };
+    if !fits(1)? {
+        return Ok(1);
+    }
+    let mut low = 1_usize;
+    let mut high = candidates.len().saturating_add(1);
+    while low + 1 < high {
+        let middle = low + (high - low) / 2;
+        if fits(middle)? {
+            low = middle;
+        } else {
+            high = middle;
+        }
+    }
+    Ok(low)
+}
+
+fn take_fitting_prefix(
+    remaining: &mut VecDeque<PackCandidate>,
+    maximum_pst_bytes: u64,
+    model: &AdaptiveSizeModel,
+) -> Result<Vec<PackCandidate>, PackingError> {
+    let count = fitting_prefix_len(remaining.make_contiguous(), maximum_pst_bytes, model)?;
+    let mut selected = Vec::with_capacity(count);
+    for _ in 0..count {
+        selected.push(remaining.pop_front().ok_or_else(|| {
+            PackingError::Estimator("candidate queue changed during packing".to_owned())
+        })?);
+    }
+    Ok(selected)
+}
+
+fn extend_to_fitting_prefix(
+    selected: &mut Vec<PackCandidate>,
+    remaining: &mut VecDeque<PackCandidate>,
+    maximum_pst_bytes: u64,
+    model: &AdaptiveSizeModel,
+    rejected_prefix_len: Option<usize>,
+) -> Result<bool, PackingError> {
+    if remaining.is_empty() {
+        return Ok(false);
+    }
+    let selected_len = selected.len();
+    let maximum_count = rejected_prefix_len
+        .map(|count| count.saturating_sub(1))
+        .unwrap_or_else(|| selected_len.saturating_add(remaining.len()));
+    if maximum_count <= selected_len {
+        return Ok(false);
+    }
+    let maximum_additional = maximum_count
+        .saturating_sub(selected_len)
+        .min(remaining.len());
+    let fits = |additional: usize| -> Result<bool, PackingError> {
+        let estimated =
+            estimate_candidate_iter(selected.iter().chain(remaining.iter().take(additional)))?;
+        Ok(model.predict(estimated)? <= maximum_pst_bytes)
+    };
+    if maximum_additional == 0 || !fits(1)? {
+        return Ok(false);
+    }
+    let mut low = 1_usize;
+    let mut high = 2_usize.min(maximum_additional);
+    while high < maximum_additional && fits(high)? {
+        low = high;
+        high = high.saturating_mul(2).min(maximum_additional);
+    }
+    if fits(high)? {
+        low = high;
+    } else {
+        while low + 1 < high {
+            let middle = low + (high - low) / 2;
+            if fits(middle)? {
+                low = middle;
+            } else {
+                high = middle;
+            }
+        }
+    }
+    for _ in 0..low {
+        selected.push(remaining.pop_front().ok_or_else(|| {
+            PackingError::Estimator("candidate queue changed during expansion".to_owned())
+        })?);
+    }
+    Ok(true)
+}
+
+fn shrink_to_fitting_prefix(
+    selected: &mut Vec<PackCandidate>,
+    remaining: &mut VecDeque<PackCandidate>,
+    maximum_pst_bytes: u64,
+    model: &AdaptiveSizeModel,
+) -> Result<(), PackingError> {
+    let mut count = fitting_prefix_len(selected, maximum_pst_bytes, model)?;
+    if count >= selected.len() {
+        count = selected.len().saturating_sub(1).max(1);
+    }
+    let returned = selected.split_off(count);
+    for candidate in returned.into_iter().rev() {
+        remaining.push_front(candidate);
+    }
+    Ok(())
+}
+
 struct LayoutEstimator;
 
 impl PartSizeEstimator for LayoutEstimator {
     fn estimate_part_bytes(&self, candidates: &[PackCandidate]) -> Result<u64, PackingError> {
-        let folders = candidates
-            .iter()
-            .flat_map(|candidate| {
-                (1..=candidate.folder_path.len())
-                    .map(|length| candidate.folder_path[..length].to_vec())
-            })
-            .collect::<BTreeSet<_>>();
-        let estimated = candidates
-            .iter()
-            .try_fold(ESTIMATED_STORE_BYTES, |total, candidate| {
-                total
-                    .checked_add(candidate.payload_bytes)
-                    .and_then(|value| value.checked_add(ESTIMATED_MESSAGE_BYTES))
-                    .ok_or(PackingError::SizeOverflow)
-            })?;
-        estimated
-            .checked_add(saturating_len(folders.len()).saturating_mul(ESTIMATED_FOLDER_BYTES))
-            .ok_or(PackingError::SizeOverflow)
+        estimate_candidate_iter(candidates.iter())
     }
+}
+
+fn estimate_candidate_iter<'a>(
+    candidates: impl Iterator<Item = &'a PackCandidate>,
+) -> Result<u64, PackingError> {
+    let mut folders = BTreeSet::new();
+    let mut estimated = ESTIMATED_STORE_BYTES;
+    for candidate in candidates {
+        for length in 1..=candidate.folder_path.len() {
+            folders.insert(candidate.folder_path[..length].to_vec());
+        }
+        estimated = estimated
+            .checked_add(candidate.payload_bytes)
+            .and_then(|value| value.checked_add(ESTIMATED_MESSAGE_BYTES))
+            .ok_or(PackingError::SizeOverflow)?;
+    }
+    estimated
+        .checked_add(saturating_len(folders.len()).saturating_mul(ESTIMATED_FOLDER_BYTES))
+        .ok_or(PackingError::SizeOverflow)
 }
 
 fn count_messages(message: &MessageSpec) -> u64 {
@@ -401,11 +1098,14 @@ fn count_messages(message: &MessageSpec) -> u64 {
     })
 }
 
-fn hash_file(path: &Path) -> Result<String, SplitError> {
+fn hash_file(path: &Path, interrupted: &AtomicBool) -> Result<Option<String>, SplitError> {
     let mut file = File::open(path).map_err(|source| staged_io(path, source))?;
     let mut hasher = Sha256::new();
     let mut buffer = [0_u8; 1024 * 1024];
     loop {
+        if interrupted.load(Ordering::Relaxed) {
+            return Ok(None);
+        }
         let read = file
             .read(&mut buffer)
             .map_err(|source| staged_io(path, source))?;
@@ -414,7 +1114,7 @@ fn hash_file(path: &Path) -> Result<String, SplitError> {
         }
         hasher.update(&buffer[..read]);
     }
-    Ok(hex(&hasher.finalize()))
+    Ok(Some(hex(&hasher.finalize())))
 }
 
 fn hex(bytes: &[u8]) -> String {
@@ -440,14 +1140,37 @@ fn staged_io(path: &Path, source: std::io::Error) -> SplitError {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::VecDeque;
     use std::io;
     use std::path::PathBuf;
+    use std::sync::atomic::AtomicBool;
 
     use pstforge_job::JobError;
     use pstforge_pst::writer::WriterError;
 
-    use super::{SplitError, SplitFailureKind};
-    use crate::{RecoveryError, SourceError};
+    use tempfile::tempdir;
+
+    use super::{
+        AdaptiveSizeModel, LayoutEstimator, SplitError, SplitFailureKind, disk_preflight,
+        extend_to_fitting_prefix, hash_file, preflight_filesystem_path, shrink_to_fitting_prefix,
+        take_fitting_prefix,
+    };
+    use crate::{
+        ItemKey, PackCandidate, PartSizeEstimator, RecoveryError, RecoveryProvenance, SourceError,
+    };
+
+    fn packing_candidate(index: u32, payload_bytes: u64) -> PackCandidate {
+        PackCandidate {
+            key: ItemKey {
+                provenance: RecoveryProvenance::Normal,
+                source_node_id: Some(index),
+                recovery_index: None,
+                occurrence: 0,
+            },
+            folder_path: vec!["Inbox".to_owned()],
+            payload_bytes,
+        }
+    }
 
     #[test]
     fn failure_kinds_separate_source_output_and_conformance() {
@@ -469,5 +1192,152 @@ mod tests {
         let completed_validation = WriterError::CompletedValidation("bad output".to_owned());
         let invalid_output = SplitError::Writer(completed_validation);
         assert_eq!(invalid_output.failure_kind(), SplitFailureKind::Conformance);
+        let interrupted = SplitError::Writer(WriterError::Interrupted);
+        assert_eq!(interrupted.failure_kind(), SplitFailureKind::Interrupted);
+    }
+
+    #[test]
+    fn disk_preflight_refuses_impossible_capacity_without_creating_output()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempdir()?;
+        let job = directory.path().join("job");
+        let error = disk_preflight(&job, u64::MAX, 0).expect_err("capacity must be insufficient");
+        assert!(matches!(
+            error,
+            SplitError::InsufficientDiskSpace {
+                required_bytes: u64::MAX,
+                ..
+            }
+        ));
+        assert!(!job.exists());
+        Ok(())
+    }
+
+    #[test]
+    fn resume_preflight_credits_validated_existing_job_allocation()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempdir()?;
+        let job = directory.path().join("job");
+        let preflight = disk_preflight(&job, 1024, 2048)?;
+        assert_eq!(preflight.required_bytes, 1024);
+        assert_eq!(preflight.existing_job_bytes, 2048);
+        Ok(())
+    }
+
+    #[test]
+    fn preflight_measures_an_existing_job_directory_for_mountpoint_support()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempdir()?;
+        let job = directory.path().join("job");
+        std::fs::create_dir(&job)?;
+        assert_eq!(preflight_filesystem_path(&job), job);
+        let missing = directory.path().join("missing/job");
+        assert_eq!(preflight_filesystem_path(&missing), directory.path());
+        Ok(())
+    }
+
+    #[test]
+    fn staged_part_hashing_honors_interruption() -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempdir()?;
+        let part = directory.path().join("part.pst.partial");
+        std::fs::write(&part, vec![0_u8; 2 * 1024 * 1024])?;
+        assert_eq!(hash_file(&part, &AtomicBool::new(true))?, None);
+        Ok(())
+    }
+
+    #[test]
+    fn observed_underfill_extends_the_same_part_without_reordering()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let candidates = (1..=10)
+            .map(|index| packing_candidate(index, 256 * 1024))
+            .collect::<Vec<_>>();
+        let maximum = LayoutEstimator.estimate_part_bytes(&candidates[..4])?;
+        let mut remaining = candidates.clone().into();
+        let mut model = AdaptiveSizeModel::default();
+        let mut selected = take_fitting_prefix(&mut remaining, maximum, &model)?;
+        assert_eq!(selected.len(), 4);
+
+        let estimate = LayoutEstimator.estimate_part_bytes(&selected)?;
+        model.observe(estimate, estimate / 2)?;
+        assert!(extend_to_fitting_prefix(
+            &mut selected,
+            &mut remaining,
+            maximum,
+            &model,
+            None,
+        )?);
+        assert!(selected.len() > 4);
+        assert_eq!(
+            selected
+                .iter()
+                .map(|candidate| candidate.key.source_node_id)
+                .collect::<Vec<_>>(),
+            (1..=u32::try_from(selected.len())?)
+                .map(Some)
+                .collect::<Vec<_>>()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn observed_overrun_returns_only_the_ordered_tail() -> Result<(), Box<dyn std::error::Error>> {
+        let mut selected = (1..=10)
+            .map(|index| packing_candidate(index, 256 * 1024))
+            .collect::<Vec<_>>();
+        let maximum = LayoutEstimator.estimate_part_bytes(&selected[..4])?;
+        let full_estimate = LayoutEstimator.estimate_part_bytes(&selected)?;
+        let mut model = AdaptiveSizeModel::default();
+        model.observe(full_estimate, maximum.saturating_mul(2))?;
+        let mut remaining = VecDeque::new();
+        shrink_to_fitting_prefix(&mut selected, &mut remaining, maximum, &model)?;
+
+        assert!(!selected.is_empty());
+        assert!(selected.len() < 10);
+        let observed = selected
+            .iter()
+            .chain(remaining.iter())
+            .map(|candidate| candidate.key.source_node_id)
+            .collect::<Vec<_>>();
+        assert_eq!(observed, (1..=10).map(Some).collect::<Vec<_>>());
+        Ok(())
+    }
+
+    #[test]
+    fn rejected_prefix_is_never_reexpanded_after_nonlinear_overrun()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let candidates = (1..=12)
+            .map(|index| packing_candidate(index, 256 * 1024))
+            .collect::<Vec<_>>();
+        let maximum = LayoutEstimator.estimate_part_bytes(&candidates[..4])?;
+        let mut remaining = candidates.clone().into();
+        let mut model = AdaptiveSizeModel::default();
+        let mut selected = take_fitting_prefix(&mut remaining, maximum, &model)?;
+        let initial_estimate = LayoutEstimator.estimate_part_bytes(&selected)?;
+        model.observe(initial_estimate, initial_estimate / 2)?;
+        assert!(extend_to_fitting_prefix(
+            &mut selected,
+            &mut remaining,
+            maximum,
+            &model,
+            None,
+        )?);
+
+        let rejected = selected.len();
+        let rejected_estimate = LayoutEstimator.estimate_part_bytes(&selected)?;
+        model.observe(rejected_estimate, maximum.saturating_add(1))?;
+        shrink_to_fitting_prefix(&mut selected, &mut remaining, maximum, &model)?;
+        assert!(selected.len() < rejected);
+
+        let fitting_estimate = LayoutEstimator.estimate_part_bytes(&selected)?;
+        model.observe(fitting_estimate, fitting_estimate / 2)?;
+        let _ = extend_to_fitting_prefix(
+            &mut selected,
+            &mut remaining,
+            maximum,
+            &model,
+            Some(rejected),
+        )?;
+        assert!(selected.len() < rejected);
+        Ok(())
     }
 }

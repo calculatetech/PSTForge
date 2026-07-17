@@ -455,6 +455,7 @@ pub fn run_recovery_worker(
     mode: RecoveryMode,
     output: &mut dyn Write,
 ) -> Result<(), WorkerProtocolError> {
+    arm_parent_death_signal()?;
     let source = match SourceFile::open(source_path) {
         Ok(source) => source,
         Err(error) => return report_worker_error(output, WorkerFailureKind::Source, error.into()),
@@ -498,6 +499,26 @@ pub fn run_recovery_worker(
     sink.complete(catalog)
 }
 
+fn arm_parent_death_signal() -> Result<(), WorkerProtocolError> {
+    let expected_parent = std::env::var("PSTFORGE_INTERNAL_SUPERVISOR_PID")
+        .map_err(|_| {
+            WorkerProtocolError::Invalid("worker supervisor identity is absent".to_owned())
+        })?
+        .parse::<i32>()
+        .map_err(|_| {
+            WorkerProtocolError::Invalid("worker supervisor identity is invalid".to_owned())
+        })?;
+    rustix::process::set_parent_process_death_signal(Some(rustix::process::Signal::KILL))
+        .map_err(|source| WorkerProtocolError::Io(source.into()))?;
+    let actual_parent = rustix::process::Pid::as_raw(rustix::process::getppid());
+    if actual_parent != expected_parent {
+        return Err(WorkerProtocolError::Invalid(
+            "worker supervisor exited during startup".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
 fn report_worker_error(
     output: &mut dyn Write,
     kind: WorkerFailureKind,
@@ -517,7 +538,7 @@ fn report_worker_error(
 #[cfg(test)]
 pub(crate) fn receive_worker_catalog(
     input: &mut dyn Read,
-    sink: &mut dyn CatalogSink,
+    sink: &mut dyn ReplayCatalogSink,
 ) -> Result<WorkerCatalog, WorkerProtocolError> {
     receive_worker_hello(input)?;
     receive_worker_catalog_body(input, sink, &[])
@@ -539,7 +560,7 @@ pub(crate) fn receive_worker_hello(input: &mut dyn Read) -> Result<(), WorkerPro
 #[cfg(test)]
 pub(crate) fn receive_worker_catalog_body(
     input: &mut dyn Read,
-    sink: &mut dyn CatalogSink,
+    sink: &mut dyn ReplayCatalogSink,
     replay_candidates: &[ReplayCandidate],
 ) -> Result<WorkerCatalog, WorkerProtocolError> {
     receive_worker_catalog_body_with_progress(
@@ -555,7 +576,7 @@ pub(crate) fn receive_worker_catalog_body(
 
 pub(crate) fn receive_worker_catalog_body_with_progress(
     input: &mut dyn Read,
-    sink: &mut dyn CatalogSink,
+    sink: &mut dyn ReplayCatalogSink,
     replay_candidates: &[ReplayCandidate],
     active_unit: &mut Option<RecoveryUnit>,
     active_unit_replayed: &mut bool,
@@ -563,9 +584,21 @@ pub(crate) fn receive_worker_catalog_body_with_progress(
     progress: &mut dyn FnMut(),
 ) -> Result<WorkerCatalog, WorkerProtocolError> {
     let mut discarding_candidate = false;
-    let mut replay_index = 0_usize;
+    let mut replay_signatures = HashMap::<String, Vec<&ReplayCandidate>>::new();
+    for candidate in replay_candidates {
+        let signature = replay_signature(
+            candidate.provenance,
+            candidate.recovery_index,
+            candidate.unit,
+            &candidate.metadata,
+        )?;
+        replay_signatures
+            .entry(signature)
+            .or_default()
+            .push(candidate);
+    }
+    let mut replay_remaining = replay_candidates.len();
     let mut discarded_message_id = None;
-    let mut occurrences = HashMap::new();
     loop {
         let frame = read_control(input)?;
         progress();
@@ -647,11 +680,7 @@ pub(crate) fn receive_worker_catalog_body_with_progress(
             supported,
             ..
         } = &frame
-            && let Some(expected) = replay_candidates.get(replay_index)
         {
-            let occurrence = occurrences
-                .entry((*provenance, *id, *recovery_index))
-                .or_insert(0_u32);
             let metadata = json!({
                 "folder_id": folder_id,
                 "parent_message_id": parent_message_id,
@@ -666,22 +695,20 @@ pub(crate) fn receive_worker_catalog_body_with_progress(
                 "delivery_filetime": delivery_filetime,
                 "supported": supported,
             });
-            if *id != expected.id
-                || *provenance != expected.provenance
-                || *recovery_index != expected.recovery_index
-                || *occurrence != expected.occurrence
-                || metadata != expected.metadata
-            {
-                return Err(WorkerProtocolError::Invalid(
-                    "worker replay order does not match the durable ledger".to_owned(),
-                ));
+            let signature =
+                replay_signature(*provenance, *recovery_index, *active_unit, &metadata)?;
+            if let Some(candidate) = replay_signatures.get_mut(&signature).and_then(Vec::pop) {
+                replay_remaining = replay_remaining.checked_sub(1).ok_or_else(|| {
+                    WorkerProtocolError::Invalid(
+                        "worker replay candidate count underflow".to_owned(),
+                    )
+                })?;
+                sink.record_replayed_candidate(candidate, *id)?;
+                *active_unit_replayed = true;
+                discarding_candidate = true;
+                discarded_message_id = Some(*id);
+                continue;
             }
-            replay_index += 1;
-            *active_unit_replayed = true;
-            *occurrence = occurrence.saturating_add(1);
-            discarding_candidate = true;
-            discarded_message_id = Some(*id);
-            continue;
         }
         match frame {
             ControlFrame::Hello { .. } => {
@@ -690,7 +717,7 @@ pub(crate) fn receive_worker_catalog_body_with_progress(
                 ));
             }
             ControlFrame::Complete { catalog } => {
-                if replay_index != replay_candidates.len() {
+                if replay_remaining != 0 {
                     return Err(WorkerProtocolError::Invalid(
                         "worker completed before replayed candidates were observed".to_owned(),
                     ));
@@ -738,6 +765,39 @@ pub(crate) fn receive_worker_catalog_body_with_progress(
             }
         }
     }
+}
+
+pub(crate) trait ReplayCatalogSink: CatalogSink {
+    fn record_replayed_candidate(
+        &mut self,
+        candidate: &ReplayCandidate,
+        observed_id: u32,
+    ) -> Result<(), WorkerProtocolError>;
+}
+
+impl ReplayCatalogSink for pstforge_job::DurableCatalogSink {
+    fn record_replayed_candidate(
+        &mut self,
+        candidate: &ReplayCandidate,
+        observed_id: u32,
+    ) -> Result<(), WorkerProtocolError> {
+        self.record_replayed_candidate(candidate, observed_id)
+            .map_err(|error| WorkerProtocolError::Sink(error.to_string()))
+    }
+}
+
+fn replay_signature(
+    provenance: CatalogProvenance,
+    recovery_index: Option<u64>,
+    unit: Option<RecoveryUnit>,
+    metadata: &serde_json::Value,
+) -> Result<String, WorkerProtocolError> {
+    let mut stable_metadata = metadata.as_object().cloned().ok_or_else(|| {
+        WorkerProtocolError::Invalid("worker replay metadata is not an object".to_owned())
+    })?;
+    stable_metadata.remove("parent_message_id");
+    serde_json::to_string(&(provenance, recovery_index, unit, stable_metadata))
+        .map_err(WorkerProtocolError::Json)
 }
 
 fn send_control_to_sink(
@@ -921,8 +981,8 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        ControlFrame, ProtocolSink, receive_worker_catalog, receive_worker_catalog_body,
-        receive_worker_hello, write_control,
+        ControlFrame, ProtocolSink, ReplayCatalogSink, receive_worker_catalog,
+        receive_worker_catalog_body, receive_worker_hello, write_control,
     };
 
     #[derive(Default)]
@@ -940,6 +1000,16 @@ mod tests {
                 }
                 _ => {}
             }
+            Ok(())
+        }
+    }
+
+    impl ReplayCatalogSink for RecordingSink {
+        fn record_replayed_candidate(
+            &mut self,
+            _candidate: &ReplayCandidate,
+            _observed_id: u32,
+        ) -> Result<(), super::WorkerProtocolError> {
             Ok(())
         }
     }
@@ -1042,11 +1112,19 @@ mod tests {
     }
 
     #[test]
-    fn replay_skips_committed_candidate_frames_and_payloads() {
+    fn replay_processes_gap_before_committed_candidate_with_shifted_synthetic_id() {
         let mut input = Cursor::new({
             let mut bytes = Vec::new();
             let mut output = ProtocolSink::start(&mut bytes).expect("start protocol");
             for id in [1, 2] {
+                let unit = libpff_sys::RecoveryUnit::Normal {
+                    folder: libpff_sys::FolderAddress::root(),
+                    folder_id: 1,
+                    message_index: u64::from(id - 1),
+                };
+                output
+                    .event(CatalogEvent::UnitStart(unit))
+                    .expect("unit start");
                 output
                     .event(CatalogEvent::MessageStart {
                         id,
@@ -1069,6 +1147,7 @@ mod tests {
                 output
                     .event(CatalogEvent::MessageEnd { id, complete: true })
                     .expect("message end");
+                output.event(CatalogEvent::UnitEnd(unit)).expect("unit end");
             }
             output
                 .complete(RawCatalog {
@@ -1084,7 +1163,8 @@ mod tests {
             &mut input,
             &mut sink,
             &[ReplayCandidate {
-                id: 1,
+                item_key: "normal:99:-:0".to_owned(),
+                id: 99,
                 provenance: CatalogProvenance::Normal,
                 recovery_index: None,
                 occurrence: 0,
@@ -1102,11 +1182,15 @@ mod tests {
                     "delivery_filetime": null,
                     "supported": true,
                 }),
-                unit: None,
+                unit: Some(libpff_sys::RecoveryUnit::Normal {
+                    folder: libpff_sys::FolderAddress::root(),
+                    folder_id: 1,
+                    message_index: 1,
+                }),
             }],
         )
         .expect("replay protocol");
-        assert_eq!(sink.messages, vec![2]);
+        assert_eq!(sink.messages, vec![1]);
     }
 
     #[test]
@@ -1148,6 +1232,7 @@ mod tests {
         receive_worker_hello(&mut input).expect("hello");
         let mut sink = RecordingSink::default();
         let expected = ReplayCandidate {
+            item_key: "normal:-:-:0".to_owned(),
             id: 0,
             provenance: CatalogProvenance::Normal,
             recovery_index: None,
@@ -1169,5 +1254,216 @@ mod tests {
             unit: None,
         };
         assert!(receive_worker_catalog_body(&mut input, &mut sink, &[expected]).is_err());
+    }
+
+    #[test]
+    fn replay_matches_embedded_candidate_after_parent_identifier_shifts() {
+        let unit = libpff_sys::RecoveryUnit::Normal {
+            folder: libpff_sys::FolderAddress::root(),
+            folder_id: 1,
+            message_index: 4,
+        };
+        let mut bytes = Vec::new();
+        let mut output = ProtocolSink::start(&mut bytes).expect("start protocol");
+        output
+            .event(CatalogEvent::UnitStart(unit))
+            .expect("unit start");
+        for (id, parent_message_id, embedded_path) in
+            [(20, None, Vec::new()), (21, Some(20), vec![0])]
+        {
+            output
+                .event(CatalogEvent::MessageStart {
+                    id,
+                    provenance: CatalogProvenance::Normal,
+                    recovery_index: None,
+                    folder_id: parent_message_id.is_none().then_some(1),
+                    parent_message_id,
+                    parent_attachment_index: parent_message_id.map(|_| 0),
+                    embedded_path,
+                    item_type: Some(11),
+                    message_class: None,
+                    subject: None,
+                    sender_name: None,
+                    sender_email: None,
+                    submit_filetime: None,
+                    delivery_filetime: None,
+                    supported: true,
+                })
+                .expect("message start");
+            output
+                .event(CatalogEvent::MessageEnd { id, complete: true })
+                .expect("message end");
+        }
+        output.event(CatalogEvent::UnitEnd(unit)).expect("unit end");
+        output
+            .complete(RawCatalog {
+                messages: 2,
+                ..RawCatalog::default()
+            })
+            .expect("complete protocol");
+
+        let mut input = Cursor::new(bytes);
+        receive_worker_hello(&mut input).expect("hello");
+        let mut sink = RecordingSink::default();
+        receive_worker_catalog_body(
+            &mut input,
+            &mut sink,
+            &[ReplayCandidate {
+                item_key: "normal:99:-:0".to_owned(),
+                id: 99,
+                provenance: CatalogProvenance::Normal,
+                recovery_index: None,
+                occurrence: 0,
+                metadata: json!({
+                    "folder_id": null,
+                    "parent_message_id": 98,
+                    "parent_attachment_index": 0,
+                    "embedded_path": [0],
+                    "item_type": 11,
+                    "message_class": null,
+                    "subject": null,
+                    "sender_name": null,
+                    "sender_email": null,
+                    "submit_filetime": null,
+                    "delivery_filetime": null,
+                    "supported": true,
+                }),
+                unit: Some(unit),
+            }],
+        )
+        .expect("embedded replay protocol");
+        assert_eq!(sink.messages, vec![20]);
+    }
+
+    #[test]
+    fn replayed_parent_registers_shifted_identity_for_new_embedded_child()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let mut sink = pstforge_job::DurableCatalogSink::create(&directory.path().join("job"))?;
+        let unit = libpff_sys::RecoveryUnit::Normal {
+            folder: libpff_sys::FolderAddress::root(),
+            folder_id: 1,
+            message_index: 4,
+        };
+        sink.event(CatalogEvent::UnitStart(unit))?;
+        sink.event(CatalogEvent::MessageStart {
+            id: 99,
+            provenance: CatalogProvenance::Normal,
+            recovery_index: None,
+            folder_id: None,
+            parent_message_id: None,
+            parent_attachment_index: None,
+            embedded_path: Vec::new(),
+            item_type: Some(11),
+            message_class: None,
+            subject: None,
+            sender_name: None,
+            sender_email: None,
+            submit_filetime: None,
+            delivery_filetime: None,
+            supported: true,
+        })?;
+        sink.event(CatalogEvent::AttachmentStart {
+            message_id: 99,
+            index: 0,
+            attachment_type: Some(i32::from(b'i')),
+            data_size: None,
+            filename: None,
+        })?;
+        sink.event(CatalogEvent::AttachmentEnd {
+            message_id: 99,
+            index: 0,
+        })?;
+        sink.event(CatalogEvent::MessageEnd {
+            id: 99,
+            complete: true,
+        })?;
+        sink.event(CatalogEvent::UnitEnd(unit))?;
+        sink.checkpoint()?;
+        let replay = sink.replay_candidates()?;
+        assert_eq!(replay.len(), 1);
+
+        let mut bytes = Vec::new();
+        let mut output = ProtocolSink::start(&mut bytes)?;
+        output.event(CatalogEvent::UnitStart(unit))?;
+        output.event(CatalogEvent::MessageStart {
+            id: 20,
+            provenance: CatalogProvenance::Normal,
+            recovery_index: None,
+            folder_id: None,
+            parent_message_id: None,
+            parent_attachment_index: None,
+            embedded_path: Vec::new(),
+            item_type: Some(11),
+            message_class: None,
+            subject: None,
+            sender_name: None,
+            sender_email: None,
+            submit_filetime: None,
+            delivery_filetime: None,
+            supported: true,
+        })?;
+        output.event(CatalogEvent::AttachmentStart {
+            message_id: 20,
+            index: 0,
+            attachment_type: Some(i32::from(b'i')),
+            data_size: None,
+            filename: None,
+        })?;
+        output.event(CatalogEvent::AttachmentEnd {
+            message_id: 20,
+            index: 0,
+        })?;
+        output.event(CatalogEvent::MessageEnd {
+            id: 20,
+            complete: true,
+        })?;
+        output.event(CatalogEvent::MessageStart {
+            id: 21,
+            provenance: CatalogProvenance::Normal,
+            recovery_index: None,
+            folder_id: None,
+            parent_message_id: Some(20),
+            parent_attachment_index: Some(0),
+            embedded_path: vec![0],
+            item_type: Some(11),
+            message_class: None,
+            subject: None,
+            sender_name: None,
+            sender_email: None,
+            submit_filetime: None,
+            delivery_filetime: None,
+            supported: true,
+        })?;
+        output.event(CatalogEvent::MessageEnd {
+            id: 21,
+            complete: true,
+        })?;
+        output.event(CatalogEvent::UnitEnd(unit))?;
+        output.complete(RawCatalog {
+            messages: 2,
+            embedded_messages: 1,
+            ..RawCatalog::default()
+        })?;
+
+        let mut input = Cursor::new(bytes);
+        receive_worker_hello(&mut input)?;
+        receive_worker_catalog_body(&mut input, &mut sink, &replay)?;
+        sink.checkpoint()?;
+        let ownerships = sink.candidate_ownerships()?;
+        let child = ownerships
+            .iter()
+            .find(|candidate| candidate.source_node_id == Some(21))
+            .ok_or("new embedded child was not committed")?;
+        assert_eq!(
+            child.parent_item_key.as_deref(),
+            Some(replay[0].item_key.as_str())
+        );
+        assert_eq!(child.metadata["parent_message_id"], 99);
+        let mail = crate::canonical::load_canonical_mail(&sink)?;
+        assert_eq!(mail.len(), 1);
+        assert_eq!(mail[0].attachments.len(), 1);
+        assert!(mail[0].attachments[0].embedded.is_some());
+        Ok(())
     }
 }

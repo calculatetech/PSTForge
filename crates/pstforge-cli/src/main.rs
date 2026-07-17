@@ -30,9 +30,9 @@ fn init_logging(cli: &Cli) {
         "off"
     } else {
         match cli.verbose {
-            0 => "warn",
-            1 => "info",
-            2 => "debug",
+            0 => "info",
+            1 => "debug",
+            2 => "trace",
             _ => "trace",
         }
     };

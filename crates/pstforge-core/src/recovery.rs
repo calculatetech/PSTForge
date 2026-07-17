@@ -2,12 +2,15 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdout, Command, ExitStatus, Stdio};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{SyncSender, TrySendError, sync_channel};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use pstforge_job::{DurableCatalogSink, JobError, JobSourceIdentity, JobSummary};
+use pstforge_job::{
+    DurableCatalogSink, JobConfiguration, JobError, JobSourceIdentity, JobSummary,
+    RecoveryCompletion,
+};
 use serde::Serialize;
 use thiserror::Error;
 
@@ -18,8 +21,9 @@ use crate::{
 };
 use libpff_sys::{RecoveryMode, RecoveryUnit};
 
-pub const RECOVERY_SCHEMA_VERSION: &str = "0.3.1";
+pub const RECOVERY_SCHEMA_VERSION: &str = "0.4.1";
 const MAX_WORKER_RETRIES: u32 = 3;
+const MAX_UNIT_RETRIES: u32 = 0;
 
 #[derive(Debug, Error)]
 pub enum RecoveryError {
@@ -43,6 +47,8 @@ pub enum RecoveryError {
     Interrupted,
     #[error("recovery catalog counters are inconsistent")]
     InconsistentCounters,
+    #[error("resume requires an immutable job configuration")]
+    ResumeConfigurationRequired,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -67,6 +73,7 @@ pub struct RecoveryReport {
     pub worker_attempts: u32,
     pub worker_failures: u32,
     pub isolated_units: u64,
+    pub peak_worker_rss_bytes: u64,
     pub interrupted: bool,
     pub source_unchanged: bool,
 }
@@ -77,18 +84,146 @@ pub fn recover(
     worker_executable: &Path,
     mode: RecoveryMode,
 ) -> Result<RecoveryReport, RecoveryError> {
-    validate_output_relationship(source_path, job_directory)?;
-    let source = SourceFile::open(source_path)?;
     let interrupt = InterruptHandler::install()?;
+    let interrupted = interrupt.flag();
+    validate_output_relationship(source_path, job_directory)?;
+    let source = SourceFile::open_interruptible(source_path, &interrupted).map_err(|error| {
+        if matches!(error, SourceError::Interrupted) {
+            RecoveryError::Interrupted
+        } else {
+            RecoveryError::Source(error)
+        }
+    })?;
+    recover_source(
+        &source,
+        job_directory,
+        worker_executable,
+        mode,
+        false,
+        None,
+        interrupted,
+    )
+}
+
+pub(crate) fn recover_for_split(
+    source: &SourceFile,
+    job_directory: &Path,
+    worker_executable: &Path,
+    mode: RecoveryMode,
+    resume: bool,
+    configuration: &JobConfiguration,
+    interrupted: Arc<AtomicBool>,
+) -> Result<RecoveryReport, RecoveryError> {
+    recover_source(
+        source,
+        job_directory,
+        worker_executable,
+        mode,
+        resume,
+        Some(configuration),
+        interrupted,
+    )
+}
+
+fn recover_source(
+    source: &SourceFile,
+    job_directory: &Path,
+    worker_executable: &Path,
+    mode: RecoveryMode,
+    resume: bool,
+    configuration: Option<&JobConfiguration>,
+    interrupted: Arc<AtomicBool>,
+) -> Result<RecoveryReport, RecoveryError> {
+    let job_source = JobSourceIdentity {
+        canonical_path: source.identity().canonical_path.clone(),
+        device: source.identity().device,
+        inode: source.identity().inode,
+        size_bytes: source.identity().size_bytes,
+        modified_at: source.identity().modified_at.clone(),
+        sha256: source.identity().sha256.clone(),
+    };
+    let mut resumed_sink = if resume {
+        let configuration = configuration.ok_or(RecoveryError::ResumeConfigurationRequired)?;
+        match DurableCatalogSink::open_resume_interruptible(
+            job_directory,
+            &job_source,
+            configuration,
+            &interrupted,
+        ) {
+            Ok(job) => Some(job),
+            Err(JobError::Interrupted) => return Err(RecoveryError::Interrupted),
+            Err(error) => return Err(error.into()),
+        }
+    } else {
+        None
+    };
+    let (prior_worker_attempts, prior_worker_failures) = resumed_sink
+        .as_ref()
+        .map(DurableCatalogSink::worker_supervision)
+        .transpose()?
+        .unwrap_or((0, 0));
+    let mut skipped_units = resumed_sink
+        .as_ref()
+        .map(DurableCatalogSink::isolated_units)
+        .transpose()?
+        .unwrap_or_default()
+        .into_iter()
+        .map(|(unit, _)| unit)
+        .collect::<HashSet<_>>();
+    if let Some(completion) = resumed_sink
+        .as_ref()
+        .map(DurableCatalogSink::recovery_completion)
+        .transpose()?
+        .flatten()
+    {
+        let sink = resumed_sink.as_ref().ok_or_else(|| {
+            RecoveryError::Job(JobError::Integrity(
+                "completed recovery is missing its ledger".to_owned(),
+            ))
+        })?;
+        let summary = sink.summary()?;
+        verify_recovery_source(source, &interrupted, sink)?;
+        tracing::info!("completed recovery ledger reused without parser restart");
+        return Ok(RecoveryReport {
+            schema_version: RECOVERY_SCHEMA_VERSION.to_owned(),
+            command: "recover".to_owned(),
+            mode: recovery_mode_name(mode).to_owned(),
+            source: source.identity().clone(),
+            job_directory: canonical_job_directory(job_directory),
+            normal_items: completion.normal_items,
+            recovered_items: completion.recovered_items,
+            orphan_items: completion.orphan_items,
+            fragment_items: completion.fragment_items,
+            committed_candidates: summary.committed_candidates,
+            complete_candidates: summary.complete_candidates,
+            partial_candidates: summary.partial_candidates,
+            unsupported_candidates: summary.unsupported_candidates,
+            blob_count: summary.blob_count,
+            blob_bytes: summary.blob_bytes,
+            issues: completion.issues,
+            issues_dropped: completion.issues_dropped,
+            worker_attempts: prior_worker_attempts,
+            worker_failures: prior_worker_failures,
+            isolated_units: u64::try_from(skipped_units.len()).unwrap_or(u64::MAX),
+            peak_worker_rss_bytes: completion.peak_worker_rss_bytes,
+            interrupted: false,
+            source_unchanged: true,
+        });
+    }
     let worker_controls = WorkerControls {
         mode,
-        interrupted: interrupt.flag(),
+        interrupted,
+        peak_worker_rss_bytes: Arc::new(AtomicU64::new(0)),
     };
+    tracing::info!(
+        resume,
+        mode = recovery_mode_name(mode),
+        "recovery traversal starting"
+    );
     let expected_identity =
         serde_json::to_string(source.identity()).map_err(WorkerProtocolError::Json)?;
     let mut worker_attempts = 0_u32;
     let mut worker_failures = 0_u32;
-    let mut skipped_units = HashSet::new();
     let mut repeat_fault_unit = None;
     let mut worker = loop {
         worker_attempts += 1;
@@ -111,32 +246,34 @@ pub fn recover(
             Err(error) => return Err(error),
         }
     };
-    let mut sink = match DurableCatalogSink::create(job_directory) {
-        Ok(sink) => sink,
-        Err(error) => {
+    let mut sink = match resumed_sink.take() {
+        Some(sink) => sink,
+        None => match DurableCatalogSink::create(job_directory) {
+            Ok(sink) => sink,
+            Err(error) => {
+                worker.stop();
+                return Err(error.into());
+            }
+        },
+    };
+    if !resume {
+        if let Err(error) = sink.bind_source(&job_source) {
             worker.stop();
             return Err(error.into());
         }
-    };
-    if let Err(error) = sink.bind_source(&JobSourceIdentity {
-        canonical_path: source.identity().canonical_path.clone(),
-        device: source.identity().device,
-        inode: source.identity().inode,
-        size_bytes: source.identity().size_bytes,
-        modified_at: source.identity().modified_at.clone(),
-        sha256: source.identity().sha256.clone(),
-    }) {
-        worker.stop();
-        return Err(error.into());
+        sink.bind_recovery_mode(recovery_mode_name(mode))?;
+        if let Some(configuration) = configuration {
+            sink.bind_configuration(configuration)?;
+        }
     }
-    sink.bind_recovery_mode(recovery_mode_name(mode))?;
+    sink.clear_interrupted()?;
     sink.record_worker_event("started", worker_attempts, "parser")?;
     let mut retries_exhausted = false;
     let mut interrupted = false;
     let mut global_failures = worker_failures;
     let mut unit_failures = HashMap::<RecoveryUnit, u32>::new();
     let mut catalog = 'attempts: loop {
-        let (mut replay_candidates, isolated_candidates): (Vec<_>, Vec<_>) = sink
+        let (replay_candidates, isolated_candidates): (Vec<_>, Vec<_>) = sink
             .replay_candidates()?
             .into_iter()
             .partition(|candidate| {
@@ -144,7 +281,6 @@ pub fn recover(
                     .unit
                     .is_none_or(|unit| !skipped_units.contains(&unit))
             });
-        normalize_replay_occurrences(&mut replay_candidates);
         match finish_worker_attempt(worker, &mut sink, &replay_candidates) {
             Ok(mut catalog) => {
                 account_isolated_candidates(&mut catalog, &isolated_candidates)?;
@@ -166,9 +302,60 @@ pub fn recover(
                 };
             }
             Err(failure) if retryable_worker_failure(&failure.error) => {
+                if worker_controls.interrupted.load(Ordering::Relaxed) {
+                    sink.abort_worker_attempt()?;
+                    sink.record_interrupted()?;
+                    let summary = sink.summary()?;
+                    interrupted = true;
+                    break WorkerCatalog {
+                        messages: summary.committed_candidates,
+                        recovered_messages: summary.recovered_candidates,
+                        orphan_messages: summary.orphan_candidates,
+                        fragment_messages: summary.fragment_candidates,
+                        unsupported_messages: summary.unsupported_candidates,
+                        issues: 1,
+                        ..WorkerCatalog::default()
+                    };
+                }
+                tracing::warn!(
+                    worker_attempts,
+                    category = worker_failure_category(&failure.error),
+                    unit = ?failure.unit.as_deref(),
+                    error = %failure.error,
+                    "recovery worker failed inside a contained unit"
+                );
+                if failure.unit.is_none()
+                    && matches!(
+                        &failure.error,
+                        RecoveryError::WorkerProtocol(WorkerProtocolError::ReportedParser(_))
+                    )
+                {
+                    worker_failures = worker_failures.saturating_add(1);
+                    sink.abort_worker_attempt()?;
+                    sink.record_worker_event("failure", worker_attempts, "parser")?;
+                    let summary = sink.summary()?;
+                    retries_exhausted = true;
+                    break WorkerCatalog {
+                        messages: summary.committed_candidates,
+                        recovered_messages: summary.recovered_candidates,
+                        orphan_messages: summary.orphan_candidates,
+                        fragment_messages: summary.fragment_candidates,
+                        unsupported_messages: summary.unsupported_candidates,
+                        issues: 1,
+                        ..WorkerCatalog::default()
+                    };
+                }
                 worker_failures += 1;
+                sink.abort_worker_attempt()?;
                 drop(sink);
-                sink = DurableCatalogSink::open(job_directory)?;
+                sink = match DurableCatalogSink::open_interruptible(
+                    job_directory,
+                    &worker_controls.interrupted,
+                ) {
+                    Ok(sink) => sink,
+                    Err(JobError::Interrupted) => return Err(RecoveryError::Interrupted),
+                    Err(error) => return Err(error.into()),
+                };
                 let failed_unit = failure.unit.as_deref().copied();
                 if (std::env::var_os("PSTFORGE_TEST_ABORT_ON_UNIT_ORDINAL").is_some()
                     || std::env::var_os("PSTFORGE_TEST_ABORT_INSIDE_UNIT_AFTER_CANDIDATES")
@@ -186,11 +373,11 @@ pub fn recover(
                 let isolated = failed_unit.and_then(|unit| {
                     let failures = unit_failures.entry(unit).or_default();
                     *failures = failures.saturating_add(1);
-                    (*failures > MAX_WORKER_RETRIES).then_some(unit)
+                    (*failures > MAX_UNIT_RETRIES).then_some(unit)
                 });
                 if let Some(unit) = isolated {
                     skipped_units.insert(unit);
-                    sink.record_isolated_unit(unit, MAX_WORKER_RETRIES + 1)?;
+                    sink.record_isolated_unit(unit, MAX_UNIT_RETRIES + 1)?;
                 } else if failed_unit.is_none() {
                     global_failures = global_failures.saturating_add(1);
                 }
@@ -208,7 +395,7 @@ pub fn recover(
                     };
                 }
                 loop {
-                    worker_attempts += 1;
+                    worker_attempts = worker_attempts.saturating_add(1);
                     match spawn_worker(
                         worker_executable,
                         source.identity(),
@@ -218,8 +405,8 @@ pub fn recover(
                         worker_attempts,
                         &worker_controls,
                     ) {
-                        Ok(next_worker) => {
-                            worker = next_worker;
+                        Ok(new_worker) => {
+                            worker = new_worker;
                             sink.record_worker_event("started", worker_attempts, "parser")?;
                             break;
                         }
@@ -267,17 +454,28 @@ pub fn recover(
             Err(failure) => return Err(failure.error),
         }
     };
-    if interrupt.is_set() && !interrupted {
+    if worker_controls.interrupted.load(Ordering::Relaxed) && !interrupted {
         sink.abort_worker_attempt()?;
         sink.record_interrupted()?;
         interrupted = true;
         catalog.issues = catalog.issues.saturating_add(1);
     }
-    sink.record_worker_supervision(worker_attempts, worker_failures, retries_exhausted)?;
+    let total_worker_attempts = prior_worker_attempts.saturating_add(worker_attempts);
+    let total_worker_failures = prior_worker_failures.saturating_add(worker_failures);
+    sink.record_worker_supervision(
+        total_worker_attempts,
+        total_worker_failures,
+        retries_exhausted,
+    )?;
+    if !interrupted {
+        sink.clear_interrupted()?;
+    }
     sink.checkpoint()?;
     let summary = sink.summary()?;
-    source.verify_unchanged()?;
-    if interrupt.is_set() && !interrupted {
+    if !interrupted {
+        verify_recovery_source(source, &worker_controls.interrupted, &sink)?;
+    }
+    if worker_controls.interrupted.load(Ordering::Relaxed) && !interrupted {
         sink.record_interrupted()?;
         sink.checkpoint()?;
         interrupted = true;
@@ -290,17 +488,27 @@ pub fn recover(
         .and_then(|value| value.checked_sub(catalog.orphan_messages))
         .and_then(|value| value.checked_sub(catalog.fragment_messages))
         .ok_or(RecoveryError::InconsistentCounters)?;
-    let job_directory = job_directory
-        .canonicalize()
-        .unwrap_or_else(|_| PathBuf::from(job_directory))
-        .to_string_lossy()
-        .into_owned();
+    let peak_worker_rss_bytes = worker_controls
+        .peak_worker_rss_bytes
+        .load(Ordering::Relaxed);
+    if !interrupted && !retries_exhausted {
+        sink.record_recovery_completion(&RecoveryCompletion {
+            normal_items,
+            recovered_items: catalog.recovered_messages,
+            orphan_items: catalog.orphan_messages,
+            fragment_items: catalog.fragment_messages,
+            issues: catalog.issues,
+            issues_dropped: catalog.issues_dropped,
+            peak_worker_rss_bytes,
+        })?;
+        sink.checkpoint()?;
+    }
     Ok(RecoveryReport {
         schema_version: RECOVERY_SCHEMA_VERSION.to_owned(),
         command: "recover".to_owned(),
         mode: recovery_mode_name(mode).to_owned(),
         source: source.identity().clone(),
-        job_directory,
+        job_directory: canonical_job_directory(job_directory),
         normal_items,
         recovered_items: catalog.recovered_messages,
         orphan_items: catalog.orphan_messages,
@@ -313,12 +521,37 @@ pub fn recover(
         blob_bytes: summary.blob_bytes,
         issues: catalog.issues,
         issues_dropped: catalog.issues_dropped,
-        worker_attempts,
-        worker_failures,
+        worker_attempts: total_worker_attempts,
+        worker_failures: total_worker_failures,
         isolated_units: u64::try_from(skipped_units.len()).unwrap_or(u64::MAX),
+        peak_worker_rss_bytes,
         interrupted,
         source_unchanged: true,
     })
+}
+
+fn verify_recovery_source(
+    source: &SourceFile,
+    interrupted: &AtomicBool,
+    sink: &DurableCatalogSink,
+) -> Result<(), RecoveryError> {
+    match source.verify_unchanged_interruptible(interrupted) {
+        Ok(()) => Ok(()),
+        Err(SourceError::Interrupted) => {
+            sink.record_interrupted()?;
+            sink.checkpoint()?;
+            Err(RecoveryError::Interrupted)
+        }
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn canonical_job_directory(job_directory: &Path) -> String {
+    job_directory
+        .canonicalize()
+        .unwrap_or_else(|_| PathBuf::from(job_directory))
+        .to_string_lossy()
+        .into_owned()
 }
 
 struct WorkerProcess {
@@ -358,7 +591,11 @@ enum WatchdogOutcome {
 }
 
 impl AttemptWatchdog {
-    fn start(process_id: u32, interrupted: Arc<AtomicBool>) -> Result<Self, RecoveryError> {
+    fn start(
+        process_id: u32,
+        interrupted: Arc<AtomicBool>,
+        peak_worker_rss_bytes: Arc<AtomicU64>,
+    ) -> Result<Self, RecoveryError> {
         let pid = i32::try_from(process_id)
             .ok()
             .and_then(rustix::process::Pid::from_raw)
@@ -374,7 +611,14 @@ impl AttemptWatchdog {
             .name("pstforge-worker-watchdog".to_owned())
             .spawn(move || {
                 let mut last_progress = Instant::now();
+                let mut last_resource_sample = Instant::now() - Duration::from_secs(1);
                 loop {
+                    if last_resource_sample.elapsed() >= Duration::from_secs(1) {
+                        if let Some(rss_bytes) = process_rss_bytes(process_id) {
+                            peak_worker_rss_bytes.fetch_max(rss_bytes, Ordering::Relaxed);
+                        }
+                        last_resource_sample = Instant::now();
+                    }
                     match receiver.recv_timeout(poll_interval) {
                         Ok(WatchdogSignal::Progress) => last_progress = Instant::now(),
                         Ok(WatchdogSignal::Stop)
@@ -431,6 +675,18 @@ fn worker_stall_timeout() -> Duration {
         .unwrap_or(Duration::from_secs(15 * 60))
 }
 
+fn process_rss_bytes(process_id: u32) -> Option<u64> {
+    let status = std::fs::read_to_string(format!("/proc/{process_id}/status")).ok()?;
+    let kibibytes = status.lines().find_map(|line| {
+        line.strip_prefix("VmRSS:")?
+            .split_ascii_whitespace()
+            .next()?
+            .parse::<u64>()
+            .ok()
+    })?;
+    kibibytes.checked_mul(1024)
+}
+
 impl Drop for WorkerProcess {
     fn drop(&mut self) {
         self.stop();
@@ -456,6 +712,10 @@ fn spawn_worker(
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null());
+    command.env(
+        "PSTFORGE_INTERNAL_SUPERVISOR_PID",
+        std::process::id().to_string(),
+    );
     let abort_after = std::env::var_os("PSTFORGE_TEST_ABORT_EVERY_ATTEMPT_AFTER_CANDIDATES")
         .or_else(|| {
             (attempt == 1)
@@ -517,7 +777,11 @@ fn spawn_worker(
         );
     }
     let mut child = command.spawn().map_err(RecoveryError::WorkerSpawn)?;
-    let mut watchdog = match AttemptWatchdog::start(child.id(), Arc::clone(&controls.interrupted)) {
+    let mut watchdog = match AttemptWatchdog::start(
+        child.id(),
+        Arc::clone(&controls.interrupted),
+        Arc::clone(&controls.peak_worker_rss_bytes),
+    ) {
         Ok(watchdog) => watchdog,
         Err(error) => {
             let _ = child.kill();
@@ -558,6 +822,8 @@ fn finish_worker_attempt(
     let mut active_unit = None;
     let mut active_unit_replayed = false;
     let mut active_unit_committed = false;
+    let attempt_started = Instant::now();
+    let mut last_progress_log = Instant::now();
     let catalog = match receive_worker_catalog_body_with_progress(
         &mut worker.output,
         sink,
@@ -565,7 +831,17 @@ fn finish_worker_attempt(
         &mut active_unit,
         &mut active_unit_replayed,
         &mut active_unit_committed,
-        &mut || worker.watchdog.progress(),
+        &mut || {
+            worker.watchdog.progress();
+            if last_progress_log.elapsed() >= Duration::from_secs(5) {
+                tracing::info!(
+                    elapsed_millis =
+                        u64::try_from(attempt_started.elapsed().as_millis()).unwrap_or(u64::MAX),
+                    "recovery traversal active"
+                );
+                last_progress_log = Instant::now();
+            }
+        },
     ) {
         Ok(catalog) => catalog,
         Err(error) => {
@@ -628,6 +904,7 @@ struct AttemptFailure {
 struct WorkerControls {
     mode: RecoveryMode,
     interrupted: Arc<AtomicBool>,
+    peak_worker_rss_bytes: Arc<AtomicU64>,
 }
 
 fn retryable_worker_failure(error: &RecoveryError) -> bool {
@@ -646,13 +923,13 @@ fn retryable_worker_failure(error: &RecoveryError) -> bool {
     )
 }
 
-struct InterruptHandler {
+pub(crate) struct InterruptHandler {
     interrupted: Arc<AtomicBool>,
     registrations: Vec<signal_hook::SigId>,
 }
 
 impl InterruptHandler {
-    fn install() -> Result<Self, RecoveryError> {
+    pub(crate) fn install() -> Result<Self, RecoveryError> {
         let interrupted = Arc::new(AtomicBool::new(false));
         let mut registrations = Vec::new();
         for signal in [
@@ -675,12 +952,8 @@ impl InterruptHandler {
         })
     }
 
-    fn flag(&self) -> Arc<AtomicBool> {
+    pub(crate) fn flag(&self) -> Arc<AtomicBool> {
         Arc::clone(&self.interrupted)
-    }
-
-    fn is_set(&self) -> bool {
-        self.interrupted.load(Ordering::Relaxed)
     }
 }
 
@@ -753,17 +1026,6 @@ fn account_isolated_candidates(
         }
     }
     Ok(())
-}
-
-fn normalize_replay_occurrences(candidates: &mut [pstforge_job::ReplayCandidate]) {
-    let mut occurrences = HashMap::new();
-    for candidate in candidates {
-        let occurrence = occurrences
-            .entry((candidate.provenance, candidate.id, candidate.recovery_index))
-            .or_insert(0_u32);
-        candidate.occurrence = *occurrence;
-        *occurrence = occurrence.saturating_add(1);
-    }
 }
 
 fn recovery_mode_name(mode: RecoveryMode) -> &'static str {
