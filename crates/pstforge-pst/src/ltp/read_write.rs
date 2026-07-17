@@ -62,6 +62,14 @@ where
         value: PropertyTreeRecordValue,
         budget: Option<&mut PropertyMaterializationBudget>,
     ) -> io::Result<PropertyValue>;
+    fn stream_property_identity<R: PstReader>(
+        &self,
+        f: &mut R,
+        encoding: NdbCryptMethod,
+        block_btree: &PstFileReadWriteBlockBTree<Pst>,
+        page_cache: &mut RootBTreePageCache<<Pst as PstFile>::BlockBTree>,
+        value: PropertyTreeRecordValue,
+    ) -> io::Result<(u16, u64, [u8; 32])>;
 }
 
 pub trait TableContextInfoReadWrite: Sized {

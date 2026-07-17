@@ -1,9 +1,9 @@
 #![deny(unsafe_code)]
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
 use std::fs::{self, File, OpenOptions};
-use std::io::{ErrorKind, Read, Write as _};
+use std::io::{ErrorKind, Read, Seek as _, Write as _};
 use std::os::fd::{AsRawFd, RawFd};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
@@ -17,7 +17,7 @@ use sha2::{Digest, Sha256};
 use tempfile::NamedTempFile;
 use thiserror::Error;
 
-const JOB_SCHEMA_VERSION: i64 = 3;
+const JOB_SCHEMA_VERSION: i64 = 4;
 
 #[derive(Debug, Error)]
 pub enum JobError {
@@ -67,6 +67,81 @@ pub struct ReplayCandidate {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SpooledFolder {
+    pub address: Option<libpff_sys::FolderAddress>,
+    pub source_id: u32,
+    pub parent_source_id: Option<u32>,
+    pub name: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SpooledBlob {
+    pub sha256: String,
+    pub byte_len: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SpooledEvent {
+    pub sequence: u64,
+    pub kind: String,
+    pub metadata: serde_json::Value,
+    pub blob: Option<SpooledBlob>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SpooledCandidate {
+    pub item_key: String,
+    pub provenance: CatalogProvenance,
+    pub source_node_id: Option<u32>,
+    pub recovery_index: Option<u64>,
+    pub occurrence: u32,
+    pub parent_item_key: Option<String>,
+    pub parent_attachment_index: Option<u32>,
+    pub unit: Option<RecoveryUnit>,
+    pub completeness: String,
+    pub metadata: serde_json::Value,
+    pub events: Vec<SpooledEvent>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CandidateOwnership {
+    pub item_key: String,
+    pub source_node_id: Option<u32>,
+    pub writable: bool,
+    pub parent_item_key: Option<String>,
+    pub parent_attachment_index: Option<u32>,
+    pub embedded_path: Vec<u32>,
+    pub metadata: serde_json::Value,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct PublishedPart {
+    pub index: u32,
+    pub filename: String,
+    pub byte_len: u64,
+    pub sha256: String,
+    pub oversize: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PartSidecar {
+    pub schema_version: String,
+    pub producer_version: String,
+    pub index: u32,
+    pub filename: String,
+    pub byte_len: u64,
+    pub sha256: String,
+    pub store_record_key: String,
+    pub folder_count: u64,
+    pub message_count: u64,
+    pub oversize: bool,
+    pub partial: bool,
+    pub omitted_properties: u64,
+    pub omitted_attachments: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorkerEvent {
     pub kind: String,
     pub attempt: u32,
@@ -89,12 +164,17 @@ pub struct DurableCatalogSink {
     _job_directory: File,
     _private_directory: File,
     _spool_directory: File,
+    _partial_directory: File,
+    _parts_directory: File,
     private_root: PathBuf,
     spool: PathBuf,
+    partial: PathBuf,
+    parts: PathBuf,
     active: Option<ActiveCandidate>,
     property: Option<ActiveProperty>,
     attachment: Option<ActiveAttachment>,
     unit: Option<RecoveryUnit>,
+    recent_candidates: HashMap<Vec<u32>, String>,
 }
 
 struct ActiveCandidate {
@@ -102,6 +182,18 @@ struct ActiveCandidate {
     message_id: u32,
     sequence: u64,
     recipients: HashSet<u32>,
+    supported: bool,
+    embedded_path: Vec<u32>,
+}
+
+struct CandidateStart {
+    metadata: serde_json::Value,
+    id: u32,
+    provenance: CatalogProvenance,
+    recovery_index: Option<u64>,
+    parent_message_id: Option<u32>,
+    parent_attachment_index: Option<u32>,
+    embedded_path: Vec<u32>,
     supported: bool,
 }
 
@@ -114,6 +206,7 @@ struct ActiveProperty {
 struct ActiveAttachment {
     message_id: u32,
     index: u32,
+    attachment_type: Option<i32>,
     expected: Option<u64>,
     blob: Option<BlobWriter>,
 }
@@ -164,10 +257,17 @@ impl DurableCatalogSink {
             fs::create_dir(directory).map_err(|source| io_error(directory, source))?;
             set_mode(directory, 0o700)?;
         }
+        let parts = held_job_path.join("parts");
+        fs::create_dir(&parts).map_err(|source| io_error(&parts, source))?;
+        set_mode(&parts, 0o700)?;
         let private_directory = open_directory(&private_root)?;
         let private_root = fd_path(private_directory.as_raw_fd());
         let spool_directory = open_directory(&private_root.join("spool"))?;
         let spool = fd_path(spool_directory.as_raw_fd());
+        let partial_directory = open_directory(&private_root.join("partial"))?;
+        let partial = fd_path(partial_directory.as_raw_fd());
+        let parts_directory = open_directory(&parts)?;
+        let parts = fd_path(parts_directory.as_raw_fd());
         let database = private_root.join("job.sqlite3");
         let connection = Connection::open_with_flags(
             &database,
@@ -189,12 +289,17 @@ impl DurableCatalogSink {
             _job_directory: job_handle,
             _private_directory: private_directory,
             _spool_directory: spool_directory,
+            _partial_directory: partial_directory,
+            _parts_directory: parts_directory,
             private_root,
             spool,
+            partial,
+            parts,
             active: None,
             property: None,
             attachment: None,
             unit: None,
+            recent_candidates: HashMap::new(),
         })
     }
 
@@ -214,13 +319,18 @@ impl DurableCatalogSink {
         let spool_directory = open_directory(&private_root.join("spool"))?;
         let spool = fd_path(spool_directory.as_raw_fd());
         validate_private_directory(&spool_directory, &spool)?;
-        let partial = open_directory(&private_root.join("partial"))?;
-        validate_private_directory(&partial, &private_root.join("partial"))?;
+        let parts_directory = open_directory(&held_job_path.join("parts"))?;
+        let parts = fd_path(parts_directory.as_raw_fd());
+        validate_private_directory(&parts_directory, &parts)?;
+        let partial_directory = open_directory(&private_root.join("partial"))?;
+        validate_private_directory(&partial_directory, &private_root.join("partial"))?;
+        let partial = fd_path(partial_directory.as_raw_fd());
         let database = private_root.join("job.sqlite3");
         validate_private_file(&database, true)?;
         validate_private_file(&private_root.join("job.sqlite3-wal"), false)?;
         validate_private_file(&private_root.join("job.sqlite3-shm"), false)?;
-        let connection = Connection::open_with_flags(&database, OpenFlags::SQLITE_OPEN_READ_WRITE)?;
+        let mut connection =
+            Connection::open_with_flags(&database, OpenFlags::SQLITE_OPEN_READ_WRITE)?;
         configure(&connection)?;
         validate_private_file(&database, true)?;
         validate_private_file(&private_root.join("job.sqlite3-wal"), false)?;
@@ -244,8 +354,16 @@ impl DurableCatalogSink {
         if integrity != "ok" {
             return Err(JobError::Integrity(integrity));
         }
+        reconcile_publications(
+            &mut connection,
+            &partial_directory,
+            &parts_directory,
+            &partial,
+            &parts,
+        )?;
         validate_foreign_keys(&connection)?;
         validate_blob_store(&connection, &spool)?;
+        validate_part_store(&connection, &parts)?;
         remove_temporary_blobs(&spool)?;
         remove_unreferenced_blobs(&connection, &spool)?;
         Ok(Self {
@@ -254,12 +372,17 @@ impl DurableCatalogSink {
             _job_directory: job_handle,
             _private_directory: private_directory,
             _spool_directory: spool_directory,
+            _partial_directory: partial_directory,
+            _parts_directory: parts_directory,
             private_root,
             spool,
+            partial,
+            parts,
             active: None,
             property: None,
             attachment: None,
             unit: None,
+            recent_candidates: HashMap::new(),
         })
     }
 
@@ -274,10 +397,42 @@ impl DurableCatalogSink {
         sync_directory(&self.private_root)
     }
 
+    pub fn mark_candidates_unsupported(&mut self, item_keys: &[String]) -> Result<(), JobError> {
+        if self.active.is_some() || item_keys.is_empty() {
+            return Err(JobError::EventSequence(
+                "cannot reject an empty candidate set during an active candidate".to_owned(),
+            ));
+        }
+        let transaction = self.connection.transaction()?;
+        for item_key in item_keys {
+            let changed = transaction.execute(
+                "UPDATE candidates SET status = 'unsupported' \
+                 WHERE item_key = ?1 AND status = 'spooled'",
+                [item_key],
+            )?;
+            if changed != 1 {
+                return Err(JobError::Integrity(format!(
+                    "candidate {item_key} is not available for rejection"
+                )));
+            }
+            transaction.execute(
+                "INSERT INTO candidate_events(\
+                    item_key, sequence, kind, metadata_json, blob_sha256, byte_len\
+                 ) SELECT ?1, COALESCE(MAX(sequence), 0) + 1, \
+                          'output_unrepresentable', '{}', NULL, NULL \
+                   FROM candidate_events WHERE item_key = ?1",
+                [item_key],
+            )?;
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
     pub fn abort_worker_attempt(&mut self) -> Result<(), JobError> {
         self.property = None;
         self.attachment = None;
         self.unit = None;
+        self.recent_candidates.clear();
         if self.active.take().is_some() {
             self.connection.execute_batch("ROLLBACK")?;
         }
@@ -403,7 +558,7 @@ impl DurableCatalogSink {
                     COALESCE(SUM(completeness = 'complete'), 0),\
                     COALESCE(SUM(completeness = 'partial'), 0),\
                     COALESCE(SUM(status = 'unsupported'), 0)\
-             FROM candidates WHERE status IN ('spooled', 'unsupported')",
+             FROM candidates WHERE status IN ('spooled', 'written', 'unsupported')",
                 [],
                 |row| {
                     Ok((
@@ -439,7 +594,7 @@ impl DurableCatalogSink {
         let mut statement = self.connection.prepare(
             "SELECT provenance, source_node_id, recovery_index, occurrence, metadata_json, recovery_unit_json \
              FROM candidates \
-             WHERE status IN ('spooled', 'unsupported') ORDER BY rowid",
+             WHERE status IN ('spooled', 'written', 'unsupported') ORDER BY rowid",
         )?;
         let rows = statement
             .query_map([], |row| {
@@ -487,14 +642,347 @@ impl DurableCatalogSink {
             .collect()
     }
 
-    fn start_candidate(
+    pub fn spooled_folders(&self) -> Result<Vec<SpooledFolder>, JobError> {
+        let mut statement = self.connection.prepare(
+            "SELECT source_id, parent_source_id, name, address_json \
+                 FROM folders ORDER BY folder_key",
+        )?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, Option<i64>>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        rows.into_iter()
+            .map(|(source_id, parent_source_id, name, address)| {
+                let source_id = checked_u32(source_id, "folder source id")?;
+                let parent_source_id = parent_source_id
+                    .map(|value| checked_u32(value, "folder parent source id"))
+                    .transpose()?;
+                Ok(SpooledFolder {
+                    address: address
+                        .map(|value| serde_json::from_str(&value))
+                        .transpose()?,
+                    source_id,
+                    parent_source_id,
+                    name,
+                })
+            })
+            .collect()
+    }
+
+    pub fn spooled_candidates(&self) -> Result<Vec<SpooledCandidate>, JobError> {
+        let mut statement = self.connection.prepare(
+            "SELECT item_key, provenance, source_node_id, recovery_index, occurrence, \
+                    completeness, metadata_json, parent_item_key, parent_attachment_index, \
+                    recovery_unit_json \
+             FROM candidates WHERE status = 'spooled' \
+             ORDER BY provenance, source_node_id, recovery_index, occurrence, item_key",
+        )?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Option<i64>>(2)?,
+                    row.get::<_, Option<i64>>(3)?,
+                    row.get::<_, i64>(4)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, String>(6)?,
+                    row.get::<_, Option<String>>(7)?,
+                    row.get::<_, Option<i64>>(8)?,
+                    row.get::<_, Option<String>>(9)?,
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        rows.into_iter()
+            .map(
+                |(
+                    item_key,
+                    provenance,
+                    source_node_id,
+                    recovery_index,
+                    occurrence,
+                    completeness,
+                    metadata,
+                    parent_item_key,
+                    parent_attachment_index,
+                    unit,
+                )| {
+                    let provenance = parse_provenance(&provenance)?;
+                    let source_node_id = source_node_id
+                        .map(|value| checked_u32(value, "candidate source node id"))
+                        .transpose()?;
+                    let recovery_index = recovery_index
+                        .map(|value| checked_u64(value, "candidate recovery index"))
+                        .transpose()?;
+                    let occurrence = checked_u32(occurrence, "candidate occurrence")?;
+                    let metadata = serde_json::from_str(&metadata)?;
+                    let parent_attachment_index = parent_attachment_index
+                        .map(|value| checked_u32(value, "parent attachment index"))
+                        .transpose()?;
+                    let unit = unit.map(|value| serde_json::from_str(&value)).transpose()?;
+                    let events = self.spooled_events(&item_key)?;
+                    Ok(SpooledCandidate {
+                        item_key,
+                        provenance,
+                        source_node_id,
+                        recovery_index,
+                        occurrence,
+                        parent_item_key,
+                        parent_attachment_index,
+                        unit,
+                        completeness,
+                        metadata,
+                        events,
+                    })
+                },
+            )
+            .collect()
+    }
+
+    pub fn candidate_ownerships(&self) -> Result<Vec<CandidateOwnership>, JobError> {
+        let mut statement = self.connection.prepare(
+            "SELECT item_key, source_node_id, status, parent_item_key, \
+                    parent_attachment_index, embedded_path_json, metadata_json \
+             FROM candidates WHERE status IN ('spooled', 'unsupported') ORDER BY item_key",
+        )?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Option<i64>>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                    row.get::<_, Option<i64>>(4)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, String>(6)?,
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        rows.into_iter()
+            .map(
+                |(
+                    item_key,
+                    source_node_id,
+                    status,
+                    parent_item_key,
+                    parent_attachment_index,
+                    embedded_path,
+                    metadata,
+                )| {
+                    if parent_item_key.is_some() != parent_attachment_index.is_some() {
+                        return Err(JobError::Integrity(
+                            "candidate has incomplete embedded ownership".to_owned(),
+                        ));
+                    }
+                    Ok(CandidateOwnership {
+                        item_key,
+                        source_node_id: source_node_id
+                            .map(|value| checked_u32(value, "candidate source node id"))
+                            .transpose()?,
+                        writable: status == "spooled",
+                        parent_item_key,
+                        parent_attachment_index: parent_attachment_index
+                            .map(|value| checked_u32(value, "parent attachment index"))
+                            .transpose()?,
+                        embedded_path: serde_json::from_str(&embedded_path)?,
+                        metadata: serde_json::from_str(&metadata)?,
+                    })
+                },
+            )
+            .collect()
+    }
+
+    pub fn open_blob(&self, blob: &SpooledBlob) -> Result<File, JobError> {
+        if blob.sha256.len() != 64
+            || !blob
+                .sha256
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        {
+            return Err(JobError::Integrity("invalid spool blob digest".to_owned()));
+        }
+        let expected = self.connection.query_row(
+            "SELECT byte_len FROM blobs WHERE sha256 = ?1",
+            [&blob.sha256],
+            |row| row.get::<_, u64>(0),
+        )?;
+        if expected != blob.byte_len {
+            return Err(JobError::Integrity(format!(
+                "spool blob {} length disagrees with the ledger",
+                blob.sha256
+            )));
+        }
+        open_verified_blob(&self.spool.join(&blob.sha256), &blob.sha256, blob.byte_len)
+    }
+
+    /// Return a path rooted at the held private spool directory after verifying
+    /// that the ledger entry and immutable blob still agree.
+    pub fn verified_blob_path(&self, blob: &SpooledBlob) -> Result<PathBuf, JobError> {
+        drop(self.open_blob(blob)?);
+        Ok(self.spool.join(&blob.sha256))
+    }
+
+    pub fn staged_part_path(&self, filename: &str) -> Result<PathBuf, JobError> {
+        if !valid_leaf_name(filename) || !filename.ends_with(".partial") {
+            return Err(JobError::UnsafePath(PathBuf::from(filename)));
+        }
+        Ok(self.partial.join(filename))
+    }
+
+    pub fn publish_validated_part(
         &mut self,
-        metadata: serde_json::Value,
-        id: u32,
-        provenance: CatalogProvenance,
-        recovery_index: Option<u64>,
-        supported: bool,
+        staged_filename: &str,
+        part: &PublishedPart,
+        sidecar: &PartSidecar,
+        item_keys: &[String],
     ) -> Result<(), JobError> {
+        validate_part_record(part)?;
+        validate_sidecar(part, sidecar)?;
+        let staged = self.staged_part_path(staged_filename)?;
+        verify_part_artifact(&staged, part)?;
+        let final_path = self.parts.join(&part.filename);
+        let sidecar_filename = part.filename.trim_end_matches(".pst").to_owned() + ".json";
+        let sidecar_path = self.parts.join(&sidecar_filename);
+        let staged_sidecar_filename = sidecar_filename.clone() + ".partial";
+        let staged_sidecar_path = self.partial.join(&staged_sidecar_filename);
+        refuse_existing(&final_path)?;
+        refuse_existing(&sidecar_path)?;
+        refuse_existing(&staged_sidecar_path)?;
+        write_sidecar_partial(&staged_sidecar_path, sidecar)?;
+
+        self.record_publication_intent(part, sidecar, item_keys)?;
+
+        rename_noclobber(
+            &self._partial_directory,
+            Path::new(staged_filename),
+            &self._parts_directory,
+            Path::new(&part.filename),
+            &final_path,
+        )?;
+        sync_file(&self._parts_directory, &self.parts)?;
+        verify_part_artifact(&final_path, part)?;
+        rename_noclobber(
+            &self._partial_directory,
+            Path::new(&staged_sidecar_filename),
+            &self._parts_directory,
+            Path::new(&sidecar_filename),
+            &sidecar_path,
+        )?;
+        sync_file(&self._parts_directory, &self.parts)?;
+        verify_sidecar_artifact(&sidecar_path, sidecar)?;
+        commit_published_part_transaction(&mut self.connection, part, sidecar, item_keys, true)
+    }
+
+    fn record_publication_intent(
+        &self,
+        part: &PublishedPart,
+        sidecar: &PartSidecar,
+        item_keys: &[String],
+    ) -> Result<(), JobError> {
+        if self.active.is_some() || item_keys.is_empty() {
+            return Err(JobError::EventSequence(
+                "cannot publish an empty part during an active candidate".to_owned(),
+            ));
+        }
+        for item_key in item_keys {
+            let available = self.connection.query_row(
+                "SELECT status = 'spooled' FROM candidates WHERE item_key = ?1",
+                [item_key],
+                |row| row.get::<_, bool>(0),
+            )?;
+            if !available {
+                return Err(JobError::Integrity(format!(
+                    "candidate {item_key} is not available for part assignment"
+                )));
+            }
+        }
+        self.connection.execute(
+            "INSERT INTO publication_intents(part_index, part_json, sidecar_json, item_keys_json) \
+             VALUES (?1, ?2, ?3, ?4)",
+            params![
+                part.index,
+                serde_json::to_string(part)?,
+                serde_json::to_string(sidecar)?,
+                serde_json::to_string(item_keys)?,
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn commit_published_part(
+        &mut self,
+        part: &PublishedPart,
+        sidecar: &PartSidecar,
+        item_keys: &[String],
+    ) -> Result<(), JobError> {
+        if self.active.is_some() || item_keys.is_empty() {
+            return Err(JobError::EventSequence(
+                "cannot commit an empty part during an active candidate".to_owned(),
+            ));
+        }
+        validate_part_record(part)?;
+        validate_sidecar(part, sidecar)?;
+        verify_part_artifact(&self.parts.join(&part.filename), part)?;
+        commit_published_part_transaction(&mut self.connection, part, sidecar, item_keys, false)
+    }
+
+    fn spooled_events(&self, item_key: &str) -> Result<Vec<SpooledEvent>, JobError> {
+        let mut statement = self.connection.prepare(
+            "SELECT sequence, kind, metadata_json, blob_sha256, byte_len \
+             FROM candidate_events WHERE item_key = ?1 ORDER BY sequence",
+        )?;
+        let rows = statement
+            .query_map([item_key], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                    row.get::<_, Option<i64>>(4)?,
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        rows.into_iter()
+            .map(|(sequence, kind, metadata, sha256, byte_len)| {
+                let blob = match (sha256, byte_len) {
+                    (Some(sha256), Some(byte_len)) => Some(SpooledBlob {
+                        sha256,
+                        byte_len: checked_u64(byte_len, "candidate event byte length")?,
+                    }),
+                    (None, None) => None,
+                    _ => {
+                        return Err(JobError::Integrity(
+                            "candidate event has an incomplete blob reference".to_owned(),
+                        ));
+                    }
+                };
+                Ok(SpooledEvent {
+                    sequence: checked_u64(sequence, "candidate event sequence")?,
+                    kind,
+                    metadata: serde_json::from_str(&metadata)?,
+                    blob,
+                })
+            })
+            .collect()
+    }
+
+    fn start_candidate(&mut self, start: CandidateStart) -> Result<(), JobError> {
+        let CandidateStart {
+            metadata,
+            id,
+            provenance,
+            recovery_index,
+            parent_message_id,
+            parent_attachment_index,
+            embedded_path,
+            supported,
+        } = start;
         if self
             .property
             .as_ref()
@@ -530,12 +1018,53 @@ impl DurableCatalogSink {
             source_node_id.map_or_else(|| "-".to_owned(), |value| value.to_string()),
             recovery_index.map_or_else(|| "-".to_owned(), |value| value.to_string())
         );
+        let parent_item_key = parent_message_id
+            .map(|_| {
+                let mut parent_path = embedded_path.clone();
+                let attachment_index = parent_path.pop().ok_or_else(|| {
+                    JobError::EventSequence("embedded message path is empty".to_owned())
+                })?;
+                if Some(attachment_index) != parent_attachment_index {
+                    return Err(JobError::EventSequence(
+                        "embedded message path disagrees with its attachment".to_owned(),
+                    ));
+                }
+                if let Some(key) = self.recent_candidates.get(&parent_path) {
+                    return Ok(key.clone());
+                }
+                self.connection
+                    .query_row(
+                        "SELECT item_key FROM candidates \
+                         WHERE provenance = ?1 AND recovery_index IS ?2 \
+                           AND embedded_path_json = ?3 AND status != 'pending' \
+                         ORDER BY rowid DESC LIMIT 1",
+                        params![
+                            provenance,
+                            recovery_index,
+                            serde_json::to_string(&parent_path)?
+                        ],
+                        |row| row.get::<_, String>(0),
+                    )
+                    .map_err(|error| match error {
+                        rusqlite::Error::QueryReturnedNoRows => JobError::EventSequence(
+                            "embedded message parent is not durably committed".to_owned(),
+                        ),
+                        other => other.into(),
+                    })
+            })
+            .transpose()?;
+        if parent_item_key.is_some() != parent_attachment_index.is_some() {
+            return Err(JobError::EventSequence(
+                "embedded message parent attachment is incomplete".to_owned(),
+            ));
+        }
         self.connection.execute_batch("BEGIN IMMEDIATE")?;
         let result = self.connection.execute(
             "INSERT INTO candidates(\
                 item_key, provenance, source_node_id, recovery_index, occurrence,\
-                completeness, status, metadata_json, recovery_unit_json\
-             ) VALUES (?1, ?2, ?3, ?4, ?5, 'damaged', 'pending', ?6, ?7)",
+                completeness, status, metadata_json, recovery_unit_json,\
+                parent_item_key, parent_attachment_index, embedded_path_json\
+             ) VALUES (?1, ?2, ?3, ?4, ?5, 'damaged', 'pending', ?6, ?7, ?8, ?9, ?10)",
             params![
                 key,
                 provenance,
@@ -545,7 +1074,10 @@ impl DurableCatalogSink {
                 serde_json::to_string(&metadata)?,
                 self.unit
                     .map(|unit| serde_json::to_string(&unit))
-                    .transpose()?
+                    .transpose()?,
+                parent_item_key,
+                parent_attachment_index,
+                serde_json::to_string(&embedded_path)?,
             ],
         );
         if let Err(error) = result {
@@ -558,6 +1090,7 @@ impl DurableCatalogSink {
             sequence: 0,
             recipients: HashSet::new(),
             supported,
+            embedded_path,
         });
         Ok(())
     }
@@ -630,7 +1163,22 @@ impl DurableCatalogSink {
                 }),
                 Some(blob),
             )?;
-        } else if complete && active.expected.is_some_and(|size| size != 0) {
+        } else if complete && active.attachment_type == Some(i32::from(b'i')) {
+            return Ok(());
+        } else if complete && active.expected == Some(0) {
+            let blob = BlobWriter::new(&self.spool)?;
+            let blob = self.finish_blob(blob, Some(0))?;
+            self.record_event(
+                "attachment_data",
+                json!({
+                    "message_id": active.message_id,
+                    "index": active.index,
+                    "declared_size": active.expected,
+                    "actual_size": 0,
+                }),
+                Some(blob),
+            )?;
+        } else if complete {
             return Err(JobError::EventSequence(
                 "attachment declared data but emitted no bytes".to_owned(),
             ));
@@ -695,6 +1243,7 @@ impl DurableCatalogSink {
         self.property = None;
         self.attachment = None;
         self.unit = None;
+        self.recent_candidates.clear();
         if self.active.take().is_some() {
             let _ = self.connection.execute_batch("ROLLBACK");
         }
@@ -721,6 +1270,7 @@ impl DurableCatalogSink {
                         "recovery units cannot be nested".to_owned(),
                     ));
                 }
+                self.recent_candidates.clear();
             }
             CatalogEvent::UnitEnd(unit) => {
                 if self.active.is_some() || self.unit.take() != Some(unit) {
@@ -739,9 +1289,27 @@ impl DurableCatalogSink {
                         "folder event occurred during a message".to_owned(),
                     ));
                 }
+                let address = match self.unit {
+                    Some(RecoveryUnit::Folder { address }) => Some(address),
+                    _ => None,
+                };
+                let address_json = address
+                    .map(|value| serde_json::to_string(&value))
+                    .transpose()?;
+                let folder_key = address_json
+                    .clone()
+                    .unwrap_or_else(|| format!("legacy:{id}"));
                 self.connection.execute(
-                    "INSERT OR REPLACE INTO folders(source_id, parent_source_id, name) VALUES (?1, ?2, ?3)",
-                    params![i64::from(id), parent_id.map(i64::from), name],
+                    "INSERT OR REPLACE INTO folders(\
+                        folder_key, source_id, parent_source_id, name, address_json\
+                     ) VALUES (?1, ?2, ?3, ?4, ?5)",
+                    params![
+                        folder_key,
+                        i64::from(id),
+                        parent_id.map(i64::from),
+                        name,
+                        address_json
+                    ],
                 )?;
             }
             CatalogEvent::MessageStart {
@@ -751,6 +1319,7 @@ impl DurableCatalogSink {
                 folder_id,
                 parent_message_id,
                 parent_attachment_index,
+                embedded_path,
                 item_type,
                 message_class,
                 subject,
@@ -759,11 +1328,12 @@ impl DurableCatalogSink {
                 submit_filetime,
                 delivery_filetime,
                 supported,
-            } => self.start_candidate(
-                json!({
+            } => self.start_candidate(CandidateStart {
+                metadata: json!({
                     "folder_id": folder_id,
                     "parent_message_id": parent_message_id,
                     "parent_attachment_index": parent_attachment_index,
+                    "embedded_path": embedded_path,
                     "item_type": item_type,
                     "message_class": message_class,
                     "subject": subject,
@@ -776,8 +1346,11 @@ impl DurableCatalogSink {
                 id,
                 provenance,
                 recovery_index,
+                parent_message_id,
+                parent_attachment_index,
+                embedded_path,
                 supported,
-            )?,
+            })?,
             CatalogEvent::Recipient {
                 message_id,
                 index,
@@ -841,6 +1414,7 @@ impl DurableCatalogSink {
                 self.attachment = Some(ActiveAttachment {
                     message_id,
                     index,
+                    attachment_type,
                     expected: data_size,
                     blob: None,
                 });
@@ -879,6 +1453,18 @@ impl DurableCatalogSink {
                     ));
                 }
                 self.finish_attachment(true)?;
+            }
+            CatalogEvent::AttachmentAbort { message_id, index } => {
+                require_message(self.active.as_ref(), message_id)?;
+                let attachment = self.attachment.as_ref().ok_or_else(|| {
+                    JobError::EventSequence("attachment abort without metadata".to_owned())
+                })?;
+                if attachment.message_id != message_id || attachment.index != index {
+                    return Err(JobError::EventSequence(
+                        "attachment abort does not match active attachment".to_owned(),
+                    ));
+                }
+                self.finish_attachment(false)?;
             }
             CatalogEvent::PropertyStart(descriptor) => {
                 if self.property.is_some() {
@@ -975,6 +1561,8 @@ impl DurableCatalogSink {
                     let _ = self.connection.execute_batch("ROLLBACK");
                     return Err(error.into());
                 }
+                self.recent_candidates
+                    .insert(active.embedded_path, active.key.clone());
             }
         }
         Ok(())
@@ -1048,9 +1636,11 @@ fn create_schema(connection: &Connection) -> Result<(), JobError> {
             key TEXT PRIMARY KEY, value TEXT NOT NULL\
          ) STRICT;\
          CREATE TABLE folders(\
-            source_id INTEGER PRIMARY KEY,\
+            folder_key TEXT PRIMARY KEY,\
+            source_id INTEGER NOT NULL,\
             parent_source_id INTEGER,\
-            name TEXT\
+            name TEXT,\
+            address_json TEXT\
          ) STRICT;\
          CREATE TABLE candidates(\
             item_key TEXT PRIMARY KEY,\
@@ -1061,7 +1651,11 @@ fn create_schema(connection: &Connection) -> Result<(), JobError> {
             completeness TEXT NOT NULL CHECK(completeness IN ('complete','partial','damaged')),\
             status TEXT NOT NULL CHECK(status IN ('pending','spooled','written','unsupported','failed')),\
             metadata_json TEXT NOT NULL,\
-            recovery_unit_json TEXT\
+            recovery_unit_json TEXT,\
+            parent_item_key TEXT REFERENCES candidates(item_key),\
+            parent_attachment_index INTEGER CHECK(parent_attachment_index >= 0),\
+            embedded_path_json TEXT NOT NULL DEFAULT '[]',\
+            CHECK((parent_item_key IS NULL) = (parent_attachment_index IS NULL))\
          ) STRICT;\
          CREATE TABLE blobs(\
             sha256 TEXT PRIMARY KEY CHECK(\
@@ -1088,6 +1682,27 @@ fn create_schema(connection: &Connection) -> Result<(), JobError> {
          CREATE TABLE isolated_units(\
             unit_json TEXT PRIMARY KEY,\
             failures INTEGER NOT NULL CHECK(failures > 0)\
+         ) STRICT;\
+         CREATE TABLE parts(\
+            part_index INTEGER PRIMARY KEY CHECK(part_index > 0),\
+            filename TEXT NOT NULL UNIQUE,\
+            byte_len INTEGER NOT NULL CHECK(byte_len > 0),\
+            sha256 TEXT NOT NULL CHECK(\
+                length(sha256) = 64 AND sha256 NOT GLOB '*[^0-9a-f]*'\
+            ),\
+            oversize INTEGER NOT NULL CHECK(oversize IN (0, 1)),\
+            sidecar_json TEXT NOT NULL\
+         ) STRICT;\
+         CREATE TABLE part_items(\
+            part_index INTEGER NOT NULL REFERENCES parts(part_index),\
+            item_key TEXT NOT NULL UNIQUE REFERENCES candidates(item_key),\
+            PRIMARY KEY(part_index, item_key)\
+         ) STRICT;\
+         CREATE TABLE publication_intents(\
+            part_index INTEGER PRIMARY KEY CHECK(part_index > 0),\
+            part_json TEXT NOT NULL,\
+            sidecar_json TEXT NOT NULL,\
+            item_keys_json TEXT NOT NULL\
          ) STRICT;",
     )?;
     Ok(())
@@ -1110,6 +1725,319 @@ fn property_json(descriptor: PropertyDescriptor) -> serde_json::Value {
         "value_type": descriptor.value_type,
         "data_size": descriptor.data_size,
     })
+}
+
+fn parse_provenance(value: &str) -> Result<CatalogProvenance, JobError> {
+    match value {
+        "normal" => Ok(CatalogProvenance::Normal),
+        "recovered" => Ok(CatalogProvenance::Recovered),
+        "orphan" => Ok(CatalogProvenance::Orphan),
+        "fragment" => Ok(CatalogProvenance::Fragment),
+        other => Err(JobError::Integrity(format!(
+            "invalid candidate provenance {other:?}"
+        ))),
+    }
+}
+
+fn checked_u32(value: i64, name: &str) -> Result<u32, JobError> {
+    u32::try_from(value).map_err(|_| JobError::Integrity(format!("invalid {name}")))
+}
+
+fn checked_u64(value: i64, name: &str) -> Result<u64, JobError> {
+    u64::try_from(value).map_err(|_| JobError::Integrity(format!("invalid {name}")))
+}
+
+fn commit_published_part_transaction(
+    connection: &mut Connection,
+    part: &PublishedPart,
+    sidecar: &PartSidecar,
+    item_keys: &[String],
+    clear_intent: bool,
+) -> Result<(), JobError> {
+    let transaction = connection.transaction()?;
+    transaction.execute(
+        "INSERT INTO parts(part_index, filename, byte_len, sha256, oversize, sidecar_json) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        params![
+            part.index,
+            part.filename,
+            part.byte_len,
+            part.sha256,
+            part.oversize,
+            serde_json::to_string(sidecar)?
+        ],
+    )?;
+    for item_key in item_keys {
+        let changed = transaction.execute(
+            "UPDATE candidates SET status = 'written' \
+             WHERE item_key = ?1 AND status = 'spooled'",
+            [item_key],
+        )?;
+        if changed != 1 {
+            return Err(JobError::Integrity(format!(
+                "candidate {item_key} is not available for part assignment"
+            )));
+        }
+        transaction.execute(
+            "INSERT INTO part_items(part_index, item_key) VALUES (?1, ?2)",
+            params![part.index, item_key],
+        )?;
+    }
+    if clear_intent {
+        let changed = transaction.execute(
+            "DELETE FROM publication_intents WHERE part_index = ?1",
+            [part.index],
+        )?;
+        if changed != 1 {
+            return Err(JobError::Integrity(format!(
+                "publication intent for part {} is absent",
+                part.index
+            )));
+        }
+    }
+    transaction.commit()?;
+    Ok(())
+}
+
+fn reconcile_publications(
+    connection: &mut Connection,
+    partial_directory: &File,
+    parts_directory: &File,
+    partial: &Path,
+    parts: &Path,
+) -> Result<(), JobError> {
+    let intents = {
+        let mut statement = connection.prepare(
+            "SELECT part_json, sidecar_json, item_keys_json \
+             FROM publication_intents ORDER BY part_index",
+        )?;
+        statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()?
+    };
+    for (part_json, sidecar_json, item_keys_json) in intents {
+        let part: PublishedPart = serde_json::from_str(&part_json)?;
+        let sidecar: PartSidecar = serde_json::from_str(&sidecar_json)?;
+        let item_keys: Vec<String> = serde_json::from_str(&item_keys_json)?;
+        validate_part_record(&part)?;
+        validate_sidecar(&part, &sidecar)?;
+        if item_keys.is_empty() {
+            return Err(JobError::Integrity(format!(
+                "publication intent for part {} has no candidates",
+                part.index
+            )));
+        }
+        let final_path = parts.join(&part.filename);
+        let sidecar_filename = part.filename.trim_end_matches(".pst").to_owned() + ".json";
+        let sidecar_path = parts.join(&sidecar_filename);
+        let staged_sidecar_filename = sidecar_filename.clone() + ".partial";
+        let staged_sidecar_path = partial.join(&staged_sidecar_filename);
+        let final_exists = final_path
+            .try_exists()
+            .map_err(|source| io_error(&final_path, source))?;
+        let sidecar_exists = sidecar_path
+            .try_exists()
+            .map_err(|source| io_error(&sidecar_path, source))?;
+        if !final_exists {
+            if sidecar_exists {
+                return Err(JobError::Integrity(format!(
+                    "part {} has a sidecar without its PST",
+                    part.index
+                )));
+            }
+            connection.execute(
+                "DELETE FROM publication_intents WHERE part_index = ?1",
+                [part.index],
+            )?;
+            continue;
+        }
+        verify_part_artifact(&final_path, &part)?;
+        if sidecar_exists {
+            verify_sidecar_artifact(&sidecar_path, &sidecar)?;
+        } else {
+            if staged_sidecar_path
+                .try_exists()
+                .map_err(|source| io_error(&staged_sidecar_path, source))?
+            {
+                verify_sidecar_artifact(&staged_sidecar_path, &sidecar)?;
+            } else {
+                write_sidecar_partial(&staged_sidecar_path, &sidecar)?;
+            }
+            rename_noclobber(
+                partial_directory,
+                Path::new(&staged_sidecar_filename),
+                parts_directory,
+                Path::new(&sidecar_filename),
+                &sidecar_path,
+            )?;
+            sync_file(parts_directory, parts)?;
+            verify_sidecar_artifact(&sidecar_path, &sidecar)?;
+        }
+        commit_published_part_transaction(connection, &part, &sidecar, &item_keys, true)?;
+    }
+    Ok(())
+}
+
+fn validate_part_record(part: &PublishedPart) -> Result<(), JobError> {
+    if part.index == 0
+        || part.byte_len == 0
+        || part.filename.is_empty()
+        || Path::new(&part.filename)
+            .file_name()
+            .and_then(|name| name.to_str())
+            != Some(part.filename.as_str())
+        || !part.filename.ends_with(".pst")
+        || part.sha256.len() != 64
+        || !part
+            .sha256
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err(JobError::Integrity(
+            "invalid published part accounting record".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_sidecar(part: &PublishedPart, sidecar: &PartSidecar) -> Result<(), JobError> {
+    if sidecar.schema_version != "1.0.0"
+        || sidecar.producer_version.is_empty()
+        || sidecar.index != part.index
+        || sidecar.filename != part.filename
+        || sidecar.byte_len != part.byte_len
+        || sidecar.sha256 != part.sha256
+        || sidecar.oversize != part.oversize
+        || sidecar.store_record_key.len() != 32
+        || !sidecar
+            .store_record_key
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        || sidecar.folder_count == 0
+        || sidecar.message_count == 0
+    {
+        return Err(JobError::Integrity(
+            "part sidecar disagrees with the publication record".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn write_sidecar_partial(path: &Path, sidecar: &PartSidecar) -> Result<(), JobError> {
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
+        .open(path)
+        .map_err(|source| io_error(path, source))?;
+    serde_json::to_writer_pretty(&mut file, sidecar)?;
+    file.write_all(b"\n")
+        .map_err(|source| io_error(path, source))?;
+    file.sync_all().map_err(|source| io_error(path, source))?;
+    verify_sidecar_artifact(path, sidecar)
+}
+
+fn verify_sidecar_artifact(path: &Path, expected: &PartSidecar) -> Result<(), JobError> {
+    let actual = read_sidecar_artifact(path)?;
+    if &actual != expected {
+        return Err(JobError::Integrity(
+            "published part sidecar content mismatch".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn read_sidecar_artifact(path: &Path) -> Result<PartSidecar, JobError> {
+    let metadata = path
+        .symlink_metadata()
+        .map_err(|source| io_error(path, source))?;
+    if metadata.file_type().is_symlink()
+        || !private_state_attributes_valid(
+            metadata.is_file(),
+            metadata.uid(),
+            metadata.mode(),
+            Some(metadata.nlink()),
+        )
+    {
+        return Err(JobError::Integrity(
+            "published part sidecar has unsafe attributes".to_owned(),
+        ));
+    }
+    let file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
+        .open(path)
+        .map_err(|source| io_error(path, source))?;
+    let opened = file.metadata().map_err(|source| io_error(path, source))?;
+    if metadata.dev() != opened.dev()
+        || metadata.ino() != opened.ino()
+        || !private_state_attributes_valid(
+            opened.is_file(),
+            opened.uid(),
+            opened.mode(),
+            Some(opened.nlink()),
+        )
+    {
+        return Err(JobError::Integrity(
+            "published part sidecar changed while opening".to_owned(),
+        ));
+    }
+    serde_json::from_reader(file).map_err(JobError::from)
+}
+
+fn valid_leaf_name(value: &str) -> bool {
+    !value.is_empty() && Path::new(value).file_name().and_then(|name| name.to_str()) == Some(value)
+}
+
+fn refuse_existing(path: &Path) -> Result<(), JobError> {
+    match path.symlink_metadata() {
+        Err(error) if error.kind() == ErrorKind::NotFound => Ok(()),
+        Ok(_) => Err(JobError::Integrity(format!(
+            "publication destination already exists: {}",
+            path.display()
+        ))),
+        Err(source) => Err(io_error(path, source)),
+    }
+}
+
+fn rename_noclobber(
+    source_directory: &File,
+    source_name: &Path,
+    destination_directory: &File,
+    destination_name: &Path,
+    destination: &Path,
+) -> Result<(), JobError> {
+    use rustix::fs::{RenameFlags, renameat_with};
+    use rustix::io::Errno;
+
+    match renameat_with(
+        source_directory,
+        source_name,
+        destination_directory,
+        destination_name,
+        RenameFlags::NOREPLACE,
+    ) {
+        Ok(()) => Ok(()),
+        Err(Errno::EXIST) => Err(JobError::Integrity(format!(
+            "publication destination already exists: {}",
+            destination.display()
+        ))),
+        Err(Errno::NOSYS | Errno::INVAL | Errno::NOTSUP) => Err(io_error(
+            destination,
+            std::io::Error::new(
+                ErrorKind::Unsupported,
+                "atomic no-replace rename is unsupported by this kernel or filesystem",
+            ),
+        )),
+        Err(source) => Err(io_error(destination, source.into())),
+    }
 }
 
 fn require_message(active: Option<&ActiveCandidate>, message_id: u32) -> Result<(), JobError> {
@@ -1285,6 +2213,26 @@ fn validate_foreign_keys(connection: &Connection) -> Result<(), JobError> {
             SELECT 1 FROM blobs b WHERE NOT EXISTS(
                 SELECT 1 FROM candidate_events e WHERE e.blob_sha256 = b.sha256
             )
+            UNION ALL
+            SELECT 1 FROM candidates c
+            WHERE c.status = 'written' AND NOT EXISTS(
+                SELECT 1 FROM part_items i WHERE i.item_key = c.item_key
+            )
+            UNION ALL
+            SELECT 1 FROM part_items i
+            JOIN candidates c ON c.item_key = i.item_key
+            WHERE c.status != 'written'
+            UNION ALL
+            SELECT 1 FROM parts p WHERE NOT EXISTS(
+                SELECT 1 FROM part_items i WHERE i.part_index = p.part_index
+            )
+            UNION ALL
+            SELECT 1 FROM parts p
+            WHERE p.oversize = 1 AND (
+                SELECT COUNT(*) FROM part_items i
+                JOIN candidates c ON c.item_key = i.item_key
+                WHERE i.part_index = p.part_index AND c.parent_item_key IS NULL
+            ) != 1
          )"#,
         [],
         |row| row.get::<_, bool>(0),
@@ -1313,6 +2261,113 @@ fn validate_blob_store(connection: &Connection, spool: &Path) -> Result<(), JobE
     Ok(())
 }
 
+fn validate_part_store(connection: &Connection, parts: &Path) -> Result<(), JobError> {
+    let mut statement = connection.prepare(
+        "SELECT part_index, filename, byte_len, sha256, oversize, sidecar_json \
+         FROM parts ORDER BY part_index",
+    )?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok((
+                PublishedPart {
+                    index: row.get(0)?,
+                    filename: row.get(1)?,
+                    byte_len: row.get(2)?,
+                    sha256: row.get(3)?,
+                    oversize: row.get(4)?,
+                },
+                row.get::<_, String>(5)?,
+            ))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut accounted = HashSet::new();
+    let mut accounted_sidecars = HashSet::new();
+    for (part, sidecar_json) in rows {
+        validate_part_record(&part)?;
+        verify_part_artifact(&parts.join(&part.filename), &part)?;
+        let sidecar_filename = part.filename.trim_end_matches(".pst").to_owned() + ".json";
+        let expected_sidecar: PartSidecar = serde_json::from_str(&sidecar_json)?;
+        validate_sidecar(&part, &expected_sidecar)?;
+        verify_sidecar_artifact(&parts.join(&sidecar_filename), &expected_sidecar)?;
+        accounted_sidecars.insert(sidecar_filename);
+        accounted.insert(part.filename);
+    }
+    for entry in fs::read_dir(parts).map_err(|source| io_error(parts, source))? {
+        let entry = entry.map_err(|source| io_error(parts, source))?;
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if name.ends_with(".pst") && !accounted.contains(name.as_ref()) {
+            return Err(JobError::Integrity(format!(
+                "finalized PST {name:?} has no ledger record"
+            )));
+        } else if name.ends_with(".json") && !accounted_sidecars.contains(name.as_ref()) {
+            return Err(JobError::Integrity(format!(
+                "finalized sidecar {name:?} has no ledger record"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn verify_part_artifact(path: &Path, part: &PublishedPart) -> Result<(), JobError> {
+    let metadata = path
+        .symlink_metadata()
+        .map_err(|source| io_error(path, source))?;
+    if metadata.file_type().is_symlink()
+        || !private_state_attributes_valid(
+            metadata.is_file(),
+            metadata.uid(),
+            metadata.mode(),
+            Some(metadata.nlink()),
+        )
+        || metadata.len() != part.byte_len
+    {
+        return Err(JobError::Integrity(format!(
+            "published part {} has an invalid type or size",
+            part.filename
+        )));
+    }
+    let mut file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
+        .open(path)
+        .map_err(|source| io_error(path, source))?;
+    let opened = file.metadata().map_err(|source| io_error(path, source))?;
+    if metadata.dev() != opened.dev()
+        || metadata.ino() != opened.ino()
+        || !private_state_attributes_valid(
+            opened.is_file(),
+            opened.uid(),
+            opened.mode(),
+            Some(opened.nlink()),
+        )
+        || opened.len() != part.byte_len
+    {
+        return Err(JobError::Integrity(format!(
+            "published part {} changed while opening",
+            part.filename
+        )));
+    }
+    let mut hasher = Sha256::new();
+    let mut buffer = vec![0_u8; 1024 * 1024];
+    loop {
+        let read = file
+            .read(&mut buffer)
+            .map_err(|source| io_error(path, source))?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    if digest_hex(hasher.finalize().as_slice()) != part.sha256 {
+        return Err(JobError::Integrity(format!(
+            "published part {} failed SHA-256 validation",
+            part.filename
+        )));
+    }
+    Ok(())
+}
+
 fn valid_blob_hash(value: &str) -> bool {
     value.len() == 64
         && value
@@ -1321,6 +2376,14 @@ fn valid_blob_hash(value: &str) -> bool {
 }
 
 fn verify_blob(path: &Path, expected_hash: &str, expected_len: u64) -> Result<(), JobError> {
+    open_verified_blob(path, expected_hash, expected_len).map(|_| ())
+}
+
+fn open_verified_blob(
+    path: &Path,
+    expected_hash: &str,
+    expected_len: u64,
+) -> Result<File, JobError> {
     let metadata = path
         .symlink_metadata()
         .map_err(|source| io_error(path, source))?;
@@ -1372,7 +2435,9 @@ fn verify_blob(path: &Path, expected_hash: &str, expected_len: u64) -> Result<()
             "blob {expected_hash} failed SHA-256 validation"
         )));
     }
-    Ok(())
+    file.seek(std::io::SeekFrom::Start(0))
+        .map_err(|source| io_error(path, source))?;
+    Ok(file)
 }
 
 fn remove_temporary_blobs(spool: &Path) -> Result<(), JobError> {
@@ -1426,7 +2491,7 @@ fn io_error(path: &Path, source: std::io::Error) -> JobError {
 #[cfg(test)]
 mod tests {
     use std::io::Write as _;
-    use std::io::{BufRead, BufReader};
+    use std::io::{BufRead, BufReader, Read as _};
     use std::os::unix::fs::{PermissionsExt, symlink};
     use std::process::{Command, Stdio};
     use std::time::Duration;
@@ -1440,8 +2505,8 @@ mod tests {
     use sha2::{Digest, Sha256};
 
     use super::{
-        DurableCatalogSink, JobError, WorkerEvent, digest_hex, private_state_attributes_valid,
-        write_hashed,
+        DurableCatalogSink, JobError, PartSidecar, PublishedPart, WorkerEvent, digest_hex,
+        private_state_attributes_valid, write_hashed, write_sidecar_partial,
     };
 
     struct PrefixThenError {
@@ -1492,6 +2557,7 @@ mod tests {
             folder_id,
             parent_message_id: None,
             parent_attachment_index: None,
+            embedded_path: Vec::new(),
             item_type: Some(11),
             message_class: Some("IPM.Note".to_owned()),
             subject: Some("private subject".to_owned()),
@@ -1695,6 +2761,208 @@ mod tests {
     }
 
     #[test]
+    fn spool_read_model_and_part_assignment_are_transactional()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempdir()?;
+        let job = directory.path().join("job");
+        let mut sink = DurableCatalogSink::create(&job)?;
+        sink.event(CatalogEvent::Folder {
+            id: 1,
+            parent_id: None,
+            name: Some("private folder".to_owned()),
+        })?;
+        message_start(&mut sink, 10)?;
+        let descriptor = body_descriptor(10, 4);
+        sink.event(CatalogEvent::PropertyStart(descriptor))?;
+        sink.event(CatalogEvent::PropertyData {
+            descriptor,
+            bytes: b"body",
+        })?;
+        sink.event(CatalogEvent::PropertyEnd(descriptor))?;
+        sink.event(CatalogEvent::MessageEnd {
+            id: 10,
+            complete: true,
+        })?;
+
+        let folders = sink.spooled_folders()?;
+        assert_eq!(
+            folders
+                .iter()
+                .find(|folder| folder.source_id == 1)
+                .and_then(|folder| folder.name.as_deref()),
+            Some("private folder")
+        );
+        let candidates = sink.spooled_candidates()?;
+        assert_eq!(candidates.len(), 1);
+        let blob = candidates[0].events[0]
+            .blob
+            .as_ref()
+            .ok_or("missing blob")?;
+        let mut payload = Vec::new();
+        sink.open_blob(blob)?.read_to_end(&mut payload)?;
+        assert_eq!(payload, b"body");
+
+        let blob_path = job.join(".pstforge/spool").join(&blob.sha256);
+        std::fs::write(&blob_path, b"evil")?;
+        assert!(matches!(sink.open_blob(blob), Err(JobError::Integrity(_))));
+        std::fs::write(&blob_path, b"body")?;
+
+        let part_bytes = vec![0_u8; 1024];
+        let part_path = job.join("parts/part-0001.pst");
+        std::fs::write(&part_path, &part_bytes)?;
+        std::fs::set_permissions(&part_path, std::fs::Permissions::from_mode(0o600))?;
+        let part = PublishedPart {
+            index: 1,
+            filename: "part-0001.pst".to_owned(),
+            byte_len: 1024,
+            sha256: digest_hex(Sha256::digest(&part_bytes).as_slice()),
+            oversize: false,
+        };
+        let sidecar = PartSidecar {
+            schema_version: "1.0.0".to_owned(),
+            producer_version: "0.4.0".to_owned(),
+            index: part.index,
+            filename: part.filename.clone(),
+            byte_len: part.byte_len,
+            sha256: part.sha256.clone(),
+            store_record_key: "0".repeat(32),
+            folder_count: 1,
+            message_count: 1,
+            oversize: part.oversize,
+            partial: false,
+            omitted_properties: 0,
+            omitted_attachments: 0,
+        };
+        let item_key = candidates[0].item_key.clone();
+        let oversize = PublishedPart {
+            oversize: true,
+            ..part.clone()
+        };
+        let oversize_sidecar = PartSidecar {
+            oversize: true,
+            ..sidecar.clone()
+        };
+        assert!(
+            sink.commit_published_part(
+                &oversize,
+                &oversize_sidecar,
+                &[item_key.clone(), "missing".to_owned()],
+            )
+            .is_err()
+        );
+        assert!(
+            sink.commit_published_part(&part, &sidecar, &[item_key.clone(), "missing".to_owned()],)
+                .is_err()
+        );
+        assert_eq!(sink.spooled_candidates()?.len(), 1);
+        sink.commit_published_part(&part, &sidecar, &[item_key])?;
+        let sidecar_path = job.join("parts/part-0001.json");
+        std::fs::write(&sidecar_path, serde_json::to_vec(&sidecar)?)?;
+        std::fs::set_permissions(&sidecar_path, std::fs::Permissions::from_mode(0o600))?;
+        assert!(sink.spooled_candidates()?.is_empty());
+        assert_eq!(sink.summary()?.committed_candidates, 1);
+        assert!(
+            sink.commit_published_part(&part, &sidecar, &["normal:10:-:0".to_owned()],)
+                .is_err()
+        );
+        sink.checkpoint()?;
+        drop(sink);
+        let reopened = DurableCatalogSink::open(&job)?;
+        drop(reopened);
+        let mut wrong_sidecar = sidecar.clone();
+        wrong_sidecar.omitted_properties = 1;
+        std::fs::write(&sidecar_path, serde_json::to_vec(&wrong_sidecar)?)?;
+        assert!(matches!(
+            DurableCatalogSink::open(&job),
+            Err(JobError::Integrity(_))
+        ));
+        std::fs::write(&sidecar_path, serde_json::to_vec(&sidecar)?)?;
+        std::fs::write(&part_path, vec![1_u8; 1024])?;
+        assert!(matches!(
+            DurableCatalogSink::open(&job),
+            Err(JobError::Integrity(_))
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn publication_intent_recovers_every_cross_resource_crash_state()
+    -> Result<(), Box<dyn std::error::Error>> {
+        for publication_step in 0..=2 {
+            let directory = tempdir()?;
+            let job = directory.path().join("job");
+            let mut sink = DurableCatalogSink::create(&job)?;
+            message_start(&mut sink, 10)?;
+            sink.event(CatalogEvent::MessageEnd {
+                id: 10,
+                complete: true,
+            })?;
+            let item_key = sink.spooled_candidates()?[0].item_key.clone();
+            let bytes = b"validated part checkpoint";
+            let part = PublishedPart {
+                index: 1,
+                filename: "part-0001.pst".to_owned(),
+                byte_len: bytes.len() as u64,
+                sha256: digest_hex(Sha256::digest(bytes).as_slice()),
+                oversize: false,
+            };
+            let sidecar = PartSidecar {
+                schema_version: "1.0.0".to_owned(),
+                producer_version: "0.4.0".to_owned(),
+                index: 1,
+                filename: part.filename.clone(),
+                byte_len: part.byte_len,
+                sha256: part.sha256.clone(),
+                store_record_key: "0".repeat(32),
+                folder_count: 1,
+                message_count: 1,
+                oversize: false,
+                partial: false,
+                omitted_properties: 0,
+                omitted_attachments: 0,
+            };
+            write_sidecar_partial(
+                &job.join(".pstforge/partial/part-0001.json.partial"),
+                &sidecar,
+            )?;
+            sink.record_publication_intent(&part, &sidecar, std::slice::from_ref(&item_key))?;
+            if publication_step >= 1 {
+                let path = job.join("parts/part-0001.pst");
+                std::fs::write(&path, bytes)?;
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
+            }
+            if publication_step >= 2 {
+                std::fs::rename(
+                    job.join(".pstforge/partial/part-0001.json.partial"),
+                    job.join("parts/part-0001.json"),
+                )?;
+            }
+            drop(sink);
+
+            let reopened = DurableCatalogSink::open(&job)?;
+            let intent_count = reopened.connection.query_row(
+                "SELECT COUNT(*) FROM publication_intents",
+                [],
+                |row| row.get::<_, u64>(0),
+            )?;
+            assert_eq!(intent_count, 0);
+            if publication_step == 0 {
+                assert_eq!(reopened.spooled_candidates()?.len(), 1);
+                assert!(!job.join("parts/part-0001.pst").exists());
+                assert!(
+                    job.join(".pstforge/partial/part-0001.json.partial")
+                        .is_file()
+                );
+            } else {
+                assert!(reopened.spooled_candidates()?.is_empty());
+                assert!(job.join("parts/part-0001.pst").is_file());
+                assert!(job.join("parts/part-0001.json").is_file());
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
     fn incomplete_candidates_roll_back_on_drop() -> Result<(), Box<dyn std::error::Error>> {
         let directory = tempdir()?;
         let job = directory.path().join("job");
@@ -1891,6 +3159,68 @@ mod tests {
     }
 
     #[test]
+    fn aborted_attachment_does_not_block_later_attachment() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let directory = tempdir()?;
+        let job = directory.path().join("job");
+        let mut sink = DurableCatalogSink::create(&job)?;
+        message_start(&mut sink, 10)?;
+        sink.event(CatalogEvent::AttachmentStart {
+            message_id: 10,
+            index: 0,
+            attachment_type: Some(i32::from(b'd')),
+            data_size: Some(4),
+            filename: Some("damaged.bin".to_owned()),
+        })?;
+        sink.event(CatalogEvent::AttachmentData {
+            message_id: 10,
+            index: 0,
+            bytes: b"ab",
+        })?;
+        sink.event(CatalogEvent::AttachmentAbort {
+            message_id: 10,
+            index: 0,
+        })?;
+        sink.event(CatalogEvent::AttachmentStart {
+            message_id: 10,
+            index: 1,
+            attachment_type: Some(i32::from(b'd')),
+            data_size: Some(3),
+            filename: Some("valid.bin".to_owned()),
+        })?;
+        sink.event(CatalogEvent::AttachmentData {
+            message_id: 10,
+            index: 1,
+            bytes: b"xyz",
+        })?;
+        sink.event(CatalogEvent::AttachmentEnd {
+            message_id: 10,
+            index: 1,
+        })?;
+        sink.event(CatalogEvent::MessageEnd {
+            id: 10,
+            complete: false,
+        })?;
+
+        let candidate = sink.spooled_candidates()?.remove(0);
+        assert_eq!(
+            candidate
+                .events
+                .iter()
+                .filter(|event| event.kind == "attachment")
+                .count(),
+            2
+        );
+        assert!(candidate.events.iter().any(|event| {
+            event.kind == "attachment_partial" && event.metadata["index"].as_u64() == Some(0)
+        }));
+        assert!(candidate.events.iter().any(|event| {
+            event.kind == "attachment_data" && event.metadata["index"].as_u64() == Some(1)
+        }));
+        Ok(())
+    }
+
+    #[test]
     fn complete_attachment_requires_its_explicit_end_event()
     -> Result<(), Box<dyn std::error::Error>> {
         for end_with_message in [false, true] {
@@ -1941,10 +3271,15 @@ mod tests {
                     filename: None,
                 })?;
                 if explicitly_ended {
-                    sink.event(CatalogEvent::AttachmentEnd {
+                    let ended = sink.event(CatalogEvent::AttachmentEnd {
                         message_id: 10,
                         index: 0,
-                    })?;
+                    });
+                    if expected.is_none() {
+                        assert!(ended.is_err());
+                        continue;
+                    }
+                    ended?;
                 }
                 sink.event(CatalogEvent::MessageEnd {
                     id: 10,
@@ -1959,6 +3294,12 @@ mod tests {
                     |row| row.get::<_, u64>(0),
                 )?;
                 assert_eq!(missing, u64::from(!explicitly_ended));
+                let data = connection.query_row(
+                    "SELECT COUNT(*) FROM candidate_events WHERE kind = 'attachment_data'",
+                    [],
+                    |row| row.get::<_, u64>(0),
+                )?;
+                assert_eq!(data, u64::from(explicitly_ended));
             }
         }
         Ok(())
@@ -2079,6 +3420,32 @@ mod tests {
             "INSERT INTO candidate_events(\
                 item_key, sequence, kind, metadata_json, blob_sha256, byte_len\
              ) VALUES ('missing', 1, 'test', '{}', NULL, NULL)",
+            [],
+        )?;
+        drop(connection);
+        assert!(matches!(
+            DurableCatalogSink::open(&job),
+            Err(JobError::Integrity(_))
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn inconsistent_written_part_state_is_refused_on_reopen()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempdir()?;
+        let job = directory.path().join("job");
+        let mut sink = DurableCatalogSink::create(&job)?;
+        message_start(&mut sink, 10)?;
+        sink.event(CatalogEvent::MessageEnd {
+            id: 10,
+            complete: true,
+        })?;
+        sink.checkpoint()?;
+        drop(sink);
+        let connection = Connection::open(job.join(".pstforge/job.sqlite3"))?;
+        connection.execute(
+            "UPDATE candidates SET status = 'written' WHERE item_key = 'normal:10:-:0'",
             [],
         )?;
         drop(connection);

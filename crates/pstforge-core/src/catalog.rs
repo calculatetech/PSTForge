@@ -1,7 +1,7 @@
 use libpff_sys::CatalogSink;
 use serde::Serialize;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RecoveryProvenance {
     Normal,
@@ -28,7 +28,7 @@ pub enum ProcessingStatus {
     Failed,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
 pub struct ItemKey {
     pub provenance: RecoveryProvenance,
     pub source_node_id: Option<u32>,

@@ -44,6 +44,13 @@ where
         prop_ids: Option<&[u16]>,
         budget: Rc<std::cell::RefCell<crate::ltp::prop_context::PropertyMaterializationBudget>>,
     ) -> io::Result<Rc<Self>>;
+    fn read_embedded_with_streamed_properties(
+        store: Rc<Pst::Store>,
+        node: Pst::NodeBTreeEntry,
+        prop_ids: Option<&[u16]>,
+        streamed_ids: &[u16],
+        budget: Rc<std::cell::RefCell<crate::ltp::prop_context::PropertyMaterializationBudget>>,
+    ) -> io::Result<Rc<Self>>;
     fn pst_store(&self) -> &Rc<Pst::Store>;
     fn sub_nodes(&self) -> &MessageSubNodes<Pst>;
     fn materialization_budget(

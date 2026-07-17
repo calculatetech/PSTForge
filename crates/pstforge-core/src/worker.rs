@@ -65,6 +65,7 @@ enum ControlFrame {
         folder_id: Option<u32>,
         parent_message_id: Option<u32>,
         parent_attachment_index: Option<u32>,
+        embedded_path: Vec<u32>,
         item_type: Option<u8>,
         message_class: Option<String>,
         subject: Option<String>,
@@ -95,6 +96,10 @@ enum ControlFrame {
         byte_len: u32,
     },
     AttachmentEnd {
+        message_id: u32,
+        index: u32,
+    },
+    AttachmentAbort {
         message_id: u32,
         index: u32,
     },
@@ -321,6 +326,7 @@ impl CatalogSink for ProtocolSink<'_> {
                 folder_id,
                 parent_message_id,
                 parent_attachment_index,
+                embedded_path,
                 item_type,
                 message_class,
                 subject,
@@ -336,6 +342,7 @@ impl CatalogSink for ProtocolSink<'_> {
                 folder_id,
                 parent_message_id,
                 parent_attachment_index,
+                embedded_path,
                 item_type,
                 message_class,
                 subject,
@@ -391,6 +398,9 @@ impl CatalogSink for ProtocolSink<'_> {
             }
             CatalogEvent::AttachmentEnd { message_id, index } => {
                 self.send(&ControlFrame::AttachmentEnd { message_id, index })
+            }
+            CatalogEvent::AttachmentAbort { message_id, index } => {
+                self.send(&ControlFrame::AttachmentAbort { message_id, index })
             }
             CatalogEvent::PropertyStart(descriptor) => {
                 self.send(&ControlFrame::PropertyStart { descriptor })
@@ -626,6 +636,7 @@ pub(crate) fn receive_worker_catalog_body_with_progress(
             folder_id,
             parent_message_id,
             parent_attachment_index,
+            embedded_path,
             item_type,
             message_class,
             subject,
@@ -645,6 +656,7 @@ pub(crate) fn receive_worker_catalog_body_with_progress(
                 "folder_id": folder_id,
                 "parent_message_id": parent_message_id,
                 "parent_attachment_index": parent_attachment_index,
+                "embedded_path": embedded_path,
                 "item_type": item_type,
                 "message_class": message_class,
                 "subject": subject,
@@ -751,6 +763,7 @@ fn send_control_to_sink(
             folder_id,
             parent_message_id,
             parent_attachment_index,
+            embedded_path,
             item_type,
             message_class,
             subject,
@@ -766,6 +779,7 @@ fn send_control_to_sink(
             folder_id,
             parent_message_id,
             parent_attachment_index,
+            embedded_path,
             item_type,
             message_class,
             subject,
@@ -805,6 +819,9 @@ fn send_control_to_sink(
         },
         ControlFrame::AttachmentEnd { message_id, index } => {
             CatalogEvent::AttachmentEnd { message_id, index }
+        }
+        ControlFrame::AttachmentAbort { message_id, index } => {
+            CatalogEvent::AttachmentAbort { message_id, index }
         }
         ControlFrame::PropertyStart { descriptor } => CatalogEvent::PropertyStart(descriptor),
         ControlFrame::PropertyEnd { descriptor } => CatalogEvent::PropertyEnd(descriptor),
@@ -939,6 +956,7 @@ mod tests {
                 folder_id: None,
                 parent_message_id: None,
                 parent_attachment_index: None,
+                embedded_path: Vec::new(),
                 item_type: Some(11),
                 message_class: Some("IPM.Note".to_owned()),
                 subject: None,
@@ -1037,6 +1055,7 @@ mod tests {
                         folder_id: Some(1),
                         parent_message_id: None,
                         parent_attachment_index: None,
+                        embedded_path: Vec::new(),
                         item_type: Some(11),
                         message_class: None,
                         subject: None,
@@ -1073,6 +1092,7 @@ mod tests {
                     "folder_id": 1,
                     "parent_message_id": null,
                     "parent_attachment_index": null,
+                    "embedded_path": [],
                     "item_type": 11,
                     "message_class": null,
                     "subject": null,
@@ -1101,6 +1121,7 @@ mod tests {
                 folder_id: Some(1),
                 parent_message_id: None,
                 parent_attachment_index: None,
+                embedded_path: Vec::new(),
                 item_type: Some(11),
                 message_class: None,
                 subject: Some("second".to_owned()),
@@ -1135,6 +1156,7 @@ mod tests {
                 "folder_id": 1,
                 "parent_message_id": null,
                 "parent_attachment_index": null,
+                "embedded_path": [],
                 "item_type": 11,
                 "message_class": null,
                 "subject": "first",

@@ -172,6 +172,7 @@ where
     message: Rc<Pst::Message>,
     properties: AttachmentProperties,
     data: Option<AttachmentData>,
+    streamed_data_identity: Option<(u64, [u8; 32])>,
 }
 
 impl<Pst> AttachmentInner<Pst>
@@ -222,6 +223,8 @@ where
         message: Rc<<Pst as PstFile>::Message>,
         sub_node: NodeId,
         prop_ids: Option<&[u16]>,
+        materialize_data: bool,
+        embedded_streamed_ids: &[u16],
     ) -> io::Result<Self> {
         let node_id_type = sub_node.id_type()?;
         match node_id_type {
@@ -237,7 +240,7 @@ where
         let header = pst.header();
         let root = header.root();
 
-        let (properties, data, embedded_node) = {
+        let (properties, data, embedded_node, streamed_data_identity) = {
             let mut file = pst
                 .reader()
                 .lock()
@@ -260,7 +263,6 @@ where
                 node.sub_node(),
                 None,
             );
-
             let mut page_cache = pst.block_cache();
             let data = node.data();
             let heap = <<Pst as PstFile>::HeapNode as HeapNodeReadWrite<Pst>>::read(
@@ -277,7 +279,24 @@ where
                 Pst,
             >>::new(node, tree);
             let mut properties = BTreeMap::new();
+            let mut streamed_data_identity = None;
             for (prop_id, record) in prop_context.properties()? {
+                if !materialize_data && prop_id == 0x3701 {
+                    if record.prop_type() != PropertyType::Binary {
+                        return Err(
+                            MessagingError::InvalidMessageObjectData(record.prop_type()).into()
+                        );
+                    }
+                    let (_, byte_len, sha256) = prop_context.stream_property_identity(
+                        file,
+                        encoding,
+                        &block_btree,
+                        &mut page_cache,
+                        record,
+                    )?;
+                    streamed_data_identity = Some((byte_len, sha256));
+                    continue;
+                }
                 let value = prop_context.read_property(
                     file,
                     encoding,
@@ -291,112 +310,129 @@ where
             let properties = AttachmentProperties { properties };
             let attachment_size = declared_attachment_size(&properties)?;
             let attachment_method = AttachmentMethod::try_from(properties.attachment_method()?)?;
-            let data = match attachment_method {
-                AttachmentMethod::ByValue => {
-                    let binary_data = match properties
-                        .get(0x3701)
-                        .ok_or(MessagingError::AttachmentMessageObjectDataNotFound)?
-                    {
-                        PropertyValue::Binary(value) => value.clone(),
-                        PropertyValue::Null => BinaryValue::new(Vec::new()),
-                        invalid => {
-                            return Err(MessagingError::InvalidMessageObjectData(
-                                PropertyType::from(invalid),
-                            )
-                            .into());
-                        }
-                    };
-                    validate_attachment_content_size(attachment_size, binary_data.buffer().len())?;
-                    (Some(AttachmentData::Binary(binary_data)), None)
-                }
-                AttachmentMethod::EmbeddedMessage => {
-                    let object_data = match properties
-                        .get(0x3701)
-                        .ok_or(MessagingError::AttachmentMessageObjectDataNotFound)?
-                    {
-                        PropertyValue::Object(value) => value,
-                        invalid => {
-                            return Err(MessagingError::InvalidMessageObjectData(
-                                PropertyType::from(invalid),
-                            )
-                            .into());
-                        }
-                    };
-                    let sub_node = object_data.node();
-                    let root = node
-                        .sub_node()
-                        .ok_or(MessagingError::AttachmentSubNodeNotFound(sub_node))?;
-                    let block = block_btree.find_entry(file, root.search_key(), &mut page_cache)?;
-                    let tree = SubNodeTree::<Pst>::read(file, &block)?;
-                    let node = tree.find_leaf_entry_bounded(
-                        file,
-                        &block_btree,
-                        sub_node,
-                        &mut page_cache,
-                    )?;
-                    let node = <<Pst as PstFile>::NodeBTreeEntry as NodeBTreeEntryReadWrite>::new(
-                        node.node(),
-                        node.block(),
-                        node.sub_node(),
-                        None,
-                    );
-                    (None, Some((node, attachment_size, object_data.size())))
-                }
-                AttachmentMethod::Storage => {
-                    let object_data = match properties
-                        .get(0x3701)
-                        .ok_or(MessagingError::AttachmentMessageObjectDataNotFound)?
-                    {
-                        PropertyValue::Object(value) => value,
-                        invalid => {
-                            return Err(MessagingError::InvalidMessageObjectData(
-                                PropertyType::from(invalid),
-                            )
-                            .into());
-                        }
-                    };
-                    let object_size = object_data.size();
-                    let sub_node = object_data.node();
-                    let root = node
-                        .sub_node()
-                        .ok_or(MessagingError::AttachmentSubNodeNotFound(sub_node))?;
-                    let block = block_btree.find_entry(file, root.search_key(), &mut page_cache)?;
-                    let tree = SubNodeTree::<Pst>::read(file, &block)?;
-                    let node = tree.find_leaf_entry_bounded(
-                        file,
-                        &block_btree,
-                        sub_node,
-                        &mut page_cache,
-                    )?;
-                    let block =
-                        block_btree.find_entry(file, node.block().search_key(), &mut page_cache)?;
-                    let block = DataTree::read(file, encoding, &block)?;
-                    property_budget.borrow_mut().charge(block.declared_size())?;
-                    let mut data = vec![];
-                    let _ = block
-                        .reader(
+            let data = if !materialize_data {
+                (None, None)
+            } else {
+                match attachment_method {
+                    AttachmentMethod::ByValue => {
+                        let binary_data = match properties
+                            .get(0x3701)
+                            .ok_or(MessagingError::AttachmentMessageObjectDataNotFound)?
+                        {
+                            PropertyValue::Binary(value) => value.clone(),
+                            PropertyValue::Null => BinaryValue::new(Vec::new()),
+                            invalid => {
+                                return Err(MessagingError::InvalidMessageObjectData(
+                                    PropertyType::from(invalid),
+                                )
+                                .into());
+                            }
+                        };
+                        validate_attachment_content_size(
+                            attachment_size,
+                            binary_data.buffer().len(),
+                        )?;
+                        (Some(AttachmentData::Binary(binary_data)), None)
+                    }
+                    AttachmentMethod::EmbeddedMessage => {
+                        let object_data = match properties
+                            .get(0x3701)
+                            .ok_or(MessagingError::AttachmentMessageObjectDataNotFound)?
+                        {
+                            PropertyValue::Object(value) => value,
+                            invalid => {
+                                return Err(MessagingError::InvalidMessageObjectData(
+                                    PropertyType::from(invalid),
+                                )
+                                .into());
+                            }
+                        };
+                        let sub_node = object_data.node();
+                        let root = node
+                            .sub_node()
+                            .ok_or(MessagingError::AttachmentSubNodeNotFound(sub_node))?;
+                        let block =
+                            block_btree.find_entry(file, root.search_key(), &mut page_cache)?;
+                        let tree = SubNodeTree::<Pst>::read(file, &block)?;
+                        let node = tree.find_leaf_entry_bounded(
                             file,
-                            encoding,
                             &block_btree,
+                            sub_node,
                             &mut page_cache,
-                            &mut Default::default(),
-                        )?
-                        .read_to_end(&mut data)?;
-                    validate_object_content_size(object_size, data.len())?;
-                    validate_attachment_content_size(attachment_size, data.len())?;
-                    (Some(AttachmentData::Binary(BinaryValue::new(data))), None)
+                        )?;
+                        let node =
+                            <<Pst as PstFile>::NodeBTreeEntry as NodeBTreeEntryReadWrite>::new(
+                                node.node(),
+                                node.block(),
+                                node.sub_node(),
+                                None,
+                            );
+                        (None, Some((node, attachment_size, object_data.size())))
+                    }
+                    AttachmentMethod::Storage => {
+                        let object_data = match properties
+                            .get(0x3701)
+                            .ok_or(MessagingError::AttachmentMessageObjectDataNotFound)?
+                        {
+                            PropertyValue::Object(value) => value,
+                            invalid => {
+                                return Err(MessagingError::InvalidMessageObjectData(
+                                    PropertyType::from(invalid),
+                                )
+                                .into());
+                            }
+                        };
+                        let object_size = object_data.size();
+                        let sub_node = object_data.node();
+                        let root = node
+                            .sub_node()
+                            .ok_or(MessagingError::AttachmentSubNodeNotFound(sub_node))?;
+                        let block =
+                            block_btree.find_entry(file, root.search_key(), &mut page_cache)?;
+                        let tree = SubNodeTree::<Pst>::read(file, &block)?;
+                        let node = tree.find_leaf_entry_bounded(
+                            file,
+                            &block_btree,
+                            sub_node,
+                            &mut page_cache,
+                        )?;
+                        let block = block_btree.find_entry(
+                            file,
+                            node.block().search_key(),
+                            &mut page_cache,
+                        )?;
+                        let block = DataTree::read(file, encoding, &block)?;
+                        property_budget.borrow_mut().charge(block.declared_size())?;
+                        let mut data = vec![];
+                        let _ = block
+                            .reader(
+                                file,
+                                encoding,
+                                &block_btree,
+                                &mut page_cache,
+                                &mut Default::default(),
+                            )?
+                            .read_to_end(&mut data)?;
+                        validate_object_content_size(object_size, data.len())?;
+                        validate_attachment_content_size(attachment_size, data.len())?;
+                        (Some(AttachmentData::Binary(BinaryValue::new(data))), None)
+                    }
+                    _ => (None, None),
                 }
-                _ => (None, None),
             };
 
-            (properties, data.0, data.1)
+            (properties, data.0, data.1, streamed_data_identity)
         };
         let data = match embedded_node {
             Some((node, attachment_size, object_size)) => {
                 let message = <<Pst as PstFile>::Message as MessageReadWrite<
                     Pst,
-                >>::read_embedded_with_budget(
-                    store.clone(), node, prop_ids, property_budget.clone()
+                >>::read_embedded_with_streamed_properties(
+                    store.clone(),
+                    node,
+                    prop_ids,
+                    embedded_streamed_ids,
+                    property_budget.clone(),
                 )?;
                 let message_size =
                     usize::try_from(message.properties().message_size()?).map_err(|_| {
@@ -416,6 +452,7 @@ where
             message,
             properties,
             data,
+            streamed_data_identity,
         })
     }
 }
@@ -431,6 +468,26 @@ impl UnicodeAttachment {
         prop_ids: Option<&[u16]>,
     ) -> io::Result<Rc<Self>> {
         <Self as AttachmentReadWrite<UnicodePstFile>>::read(message, sub_node, prop_ids)
+    }
+
+    /// Read attachment metadata without materializing its by-value payload.
+    pub fn read_metadata(message: Rc<UnicodeMessage>, sub_node: NodeId) -> io::Result<Rc<Self>> {
+        let inner = AttachmentInner::read(message, sub_node, None, false, &[])?;
+        Ok(Rc::new(Self { inner }))
+    }
+
+    pub fn read_with_streamed_embedded_properties(
+        message: Rc<UnicodeMessage>,
+        sub_node: NodeId,
+        prop_ids: Option<&[u16]>,
+        streamed_ids: &[u16],
+    ) -> io::Result<Rc<Self>> {
+        let inner = AttachmentInner::read(message, sub_node, prop_ids, true, streamed_ids)?;
+        Ok(Rc::new(Self { inner }))
+    }
+
+    pub fn streamed_data_identity(&self) -> Option<(u64, [u8; 32])> {
+        self.inner.streamed_data_identity
     }
 }
 
@@ -454,7 +511,7 @@ impl AttachmentReadWrite<UnicodePstFile> for UnicodeAttachment {
         sub_node: NodeId,
         prop_ids: Option<&[u16]>,
     ) -> io::Result<Rc<Self>> {
-        let inner = AttachmentInner::read(message, sub_node, prop_ids)?;
+        let inner = AttachmentInner::read(message, sub_node, prop_ids, true, &[])?;
         Ok(Rc::new(Self { inner }))
     }
 }
@@ -470,6 +527,16 @@ impl AnsiAttachment {
         prop_ids: Option<&[u16]>,
     ) -> io::Result<Rc<Self>> {
         <Self as AttachmentReadWrite<AnsiPstFile>>::read(message, sub_node, prop_ids)
+    }
+
+    /// Read attachment metadata without materializing its by-value payload.
+    pub fn read_metadata(message: Rc<AnsiMessage>, sub_node: NodeId) -> io::Result<Rc<Self>> {
+        let inner = AttachmentInner::read(message, sub_node, None, false, &[])?;
+        Ok(Rc::new(Self { inner }))
+    }
+
+    pub fn streamed_data_identity(&self) -> Option<(u64, [u8; 32])> {
+        self.inner.streamed_data_identity
     }
 }
 
@@ -493,7 +560,7 @@ impl AttachmentReadWrite<AnsiPstFile> for AnsiAttachment {
         sub_node: NodeId,
         prop_ids: Option<&[u16]>,
     ) -> io::Result<Rc<Self>> {
-        let inner = AttachmentInner::read(message, sub_node, prop_ids)?;
+        let inner = AttachmentInner::read(message, sub_node, prop_ids, true, &[])?;
         Ok(Rc::new(Self { inner }))
     }
 }

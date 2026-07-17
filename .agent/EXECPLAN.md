@@ -425,7 +425,87 @@ work. Hash and identity evidence show that the source was not modified.
   - [x] Passed `cargo xtask gate full`, including licenses, advisories, writer
     interoperability, and the external corpus. Evidence:
     `.agent/test-results/1784216979-full`.
-- [ ] Milestone 0.4.0: Size-Limited PST Splitting.
+- [x] Milestone 0.4.0: Size-Limited PST Splitting.
+  - [x] (2026-07-16) Added deterministic canonical translation, ordering, and
+    packing from the durable recovery spool. The packer estimates store,
+    folder, message, property, and attachment cost, then enforces the requested
+    maximum against the completed PST and rebuilds an over-target normal part
+    before publication. A single indivisible over-target message is retained
+    in a marked oversize part with partial-success accounting.
+  - [x] (2026-07-16) Extended the writer to arbitrary multi-folder and
+    multi-message stores, recursive NBT/BBT and descriptor trees, streamed
+    property/attachment blocks, source creation/modification timestamps, and
+    deterministic per-part store identity derived from source SHA-256,
+    recovery mode, maximum size, writer format, and part index.
+  - [x] (2026-07-16) Added publication intents, private sibling scratch state,
+    validation, `fsync`, atomic PST and sidecar publication, exact typed
+    sidecar-to-ledger binding, transactional item assignment, and crash
+    reconciliation. Reopen rejects missing, extra, symlinked, replaced,
+    malformed, or unledgered part artifacts.
+  - [x] (2026-07-16) Added boundary, table-growth, hard-limit, oversize,
+    deterministic packing, property fallback, invalid FILETIME, message-class,
+    publication-crash, artifact-tamper, and source-immutability tests. The real
+    public GroupDocs Unicode PST splits at 2 MiB into two byte-identical runs,
+    with five messages per part and no source identity change.
+  - [x] (2026-07-16) Strengthened the external gate to independently stream
+    libpff fingerprints for every source/output message and compare exact
+    multiplicity, source folder placement, sender, subject, all four
+    timestamps, body properties, recipients, attachment payloads, and
+    MIME/inline rendering metadata. It independently derives leaf and hierarchy
+    folder counts, reads the actual store record key, and compares deterministic
+    sidecar bytes across runs.
+  - [x] (2026-07-16) Completed clean-context adversarial remediation for hard
+    size enforcement, publication ordering, stale-path cleanup, validator-log
+    privacy, exact sidecar binding, folder/message fidelity, and false-pass
+    risks. The final property-containment remediation bounds and validates
+    streamed UTF-16 and compressed RTF before writing, preserves valid report
+    classes, and makes every unsupported source property an explicit partial
+    omission. It also preserves source message flags and Internet codepages,
+    bounds attachment streaming to declared size, retains empty attachments,
+    and makes unavailable/oversize attachment content candidate-local partial
+    damage. Final focused reviews also added a side-effect-free writer input
+    preflight, candidate-local bisection for unrepresentable mail, explicit
+    unsupported accounting for deeper embedded descendants, and kept writer
+    construction/self-validation failures fatal. Attachment recovery now
+    continues after a damaged index, incomplete payload prefixes remain private,
+    and canonical replay binds attachment type, terminal state, declaration,
+    payload, embedded ownership, and property owners before publication. A
+    supported parent remains writable when its embedded child has an unsupported
+    message class, with that attachment explicitly omitted. Resume numbering and
+    stale partial cleanup findings were confirmed as version 0.4.1 scope.
+  - [x] (2026-07-16) Passed the final accepted-source full gate, including formatting,
+    warning-denied compilation and Clippy, workspace tests, documentation,
+    artifacts, licenses, RustSec advisories, writer `pffinfo`/`readpst`, writer
+    acceptance, all external corpus cases, and the deterministic real-PST split
+    gate. Evidence: `.agent/test-results/1784248198-full`.
+  - [x] (2026-07-16) Remediated the independent Microsoft ScanPST findings from
+    split candidates r1 through r4: data-tree totals and full intermediate HN
+    pages, BBT reference counts, bounded HN allocations and fill maps, copied
+    contents-table properties, and folder/hierarchy unread counts. Malformed or
+    oversized copied properties are now candidate-local explicit omissions,
+    not reasons to discard an otherwise recoverable message. Candidate r5
+    retains five messages in each part. The owner reports that ScanPST found no
+    errors and both parts open successfully in Outlook; no r5 ScanPST log was
+    copied into the external acceptance directory, so this conclusion relies
+    on the reported human run.
+  - [x] (2026-07-16) Imported both r5 parts into MailPlus. Part 0001 contains one
+    message in Deleted Items and four Inbox messages, two unread; part 0002
+    contains five read Inbox messages. MailPlus imported the nine Inbox
+    messages into one Inbox but did not import the Deleted Items message. The
+    generated PST still contains and exposes that deleted-folder message, so
+    the missing MailPlus item is recorded as target importer behavior rather
+    than PSTForge loss.
+  - [x] (2026-07-16) Opened both r5 split parts in Outlook after ScanPST found
+    no errors. Part 0001 exposes one Deleted Items message and four Inbox
+    messages, two unread; part 0002 exposes five read Inbox messages. Outlook
+    opened both independently without the prior crash or resource failure.
+  - [x] (2026-07-16) The final whole-milestone review found that native message
+    identifiers were incorrectly deduplicated globally even though embedded
+    message NIDs are scoped to their attachment subnode tree. Deduplication now
+    applies only to nonzero top-level identifiers; embedded ownership remains
+    keyed by its durable parent candidate and attachment path. A focused
+    regression forces the same identifier through top-level and embedded
+    scopes. A fresh clean-context remediation review returned `CLEAN`.
 - [ ] Milestone 0.4.1: Resume and 50 GB Qualification.
 - [ ] Milestone 0.5.0: Operational UX and Debian Packaging.
 - [ ] Milestone 0.5.1: GitHub CI and Private-Corpus Automation; the remote is
@@ -478,6 +558,50 @@ work. Hash and identity evidence show that the source was not modified.
   Evidence: the final validator now independently parses each completed entry
   and string/GUID identity and byte-compares all regenerated NAMEID streams and
   buckets; the fixture spans two custom GUID sets plus PS_MAPI.
+
+- Observation: `libpff` reports a named property's store-local `0x8000+`
+  identifier but does not expose the NAMEID GUID/name identity required to
+  preserve it in a new store. Reusing that numeric identifier in another PST
+  can silently change the property's meaning.
+  Evidence: the recovery catalog supplies `entry_type` and value type only;
+  the adapted writer's independent NAMEID validator requires GUID set plus
+  numeric/string name before assigning a new per-store ID. Version 0.4.0
+  therefore records these properties as omitted and marks the message/part
+  partial instead of guessing.
+
+- Observation: Deleting a publication scratch directory by a pathname derived
+  from a held descriptor creates a same-UID stale-path race after another
+  process renames and replaces that pathname.
+  Evidence: clean-context review demonstrated the replacement window. Version
+  0.4.0 leaves only empty private `.pstforge-*` directories after successful
+  publication; bounded stale-directory cleanup belongs to 0.4.1 resume/cleanup
+  semantics.
+
+- Observation: A sidecar leaf-folder count cannot validate total generated
+  folder inventory because a part may replicate additional source hierarchy
+  prefixes. The GroupDocs first part has two leaf folders, three replicated
+  source hierarchy nodes, and six mandatory writer folders.
+  Evidence: independent libpff traversal reports nine folders. The external
+  gate now derives leaf and prefix sets separately rather than relying on the
+  coincidentally correct `leaf count + 7` formula.
+
+- Observation: `compressed-rtf` 1.0.1 verifies the container CRC but treats EOF
+  or a truncated token run as successful decompression, so decoded length alone
+  does not prove the required LZFu end reference was present.
+  Evidence: a correctly rechecksummed fixture with its final end reference
+  removed was accepted by the dependency and rejected by PSTForge's bounded
+  structural token walk. Uncompressed containers also require the specified
+  zero CRC before preservation.
+
+- Observation: `libpff_message_get_number_of_attachments` can return a native
+  error for a message with no readable attachment table; the same error family
+  can also represent a damaged or unreadable table and therefore cannot be
+  safely reclassified as zero attachments from its backtrace or message flags.
+  Evidence: public and generated healthy fixtures produced descriptor-1649
+  count errors, while upstream semantics show those strings wrap descriptor
+  lookup/read failures. Version 0.4.0 records count uncertainty as candidate
+  partial, and the external gate compares recoverable content while requiring
+  that incomplete source messages remain visibly partial.
 
 - Observation: `docs/outline.md` made PST splitting a non-goal, but the actual
   urgent requirement is to produce smaller PSTs for MailPlus import. EML,
@@ -745,6 +869,35 @@ work. Hash and identity evidence show that the source was not modified.
   Evidence: the ignored external-corpus recovery gate using the private
   manifest outside the repository on 2026-07-16.
 
+- Observation: The first four 0.4.0 split candidates passed PSTForge's
+  independent readers but exposed progressively narrower defects in Microsoft
+  ScanPST: invalid data-tree totals and references, oversized or incompletely
+  described heap allocations, missing copied contents-table properties, and
+  incorrect unread aggregates. Candidate r5 resolves those findings. The owner
+  reports a clean ScanPST run and successful Outlook opening of both parts with
+  the expected folder and unread counts. The ScanPST log itself was not copied
+  into the external acceptance directory, so the human report is the retained
+  acceptance evidence.
+  Evidence: focused writer/core regressions, r1-r4 external ScanPST logs and
+  repaired comparisons, and owner acceptance of r5 on 2026-07-16.
+
+- Observation: MailPlus imports the nine Inbox messages from the two accepted
+  parts into one Inbox but does not import the message stored under Deleted
+  Items. Outlook and the PST itself expose that tenth message in Deleted Items,
+  so the difference is an importer policy rather than loss during recovery,
+  packing, or PST serialization.
+  Evidence: owner comparison of the same r5 artifacts in Outlook and MailPlus
+  on 2026-07-16.
+
+- Observation: A message NID is a stable global deduplication key only for a
+  top-level NBT message. Embedded-message NIDs belong to separate attachment
+  subnode trees and can repeat without identifying the same message. The
+  writer's repeated local embedded NID values were exposed by libpff as distinct
+  identifiers in a generated experiment, so that experiment was removed rather
+  than retained as a false regression; the scope rule is tested directly.
+  Evidence: MS-PST subnode ownership, the durable parent/path model, focused
+  libpff-sys tests, and final clean-context review on 2026-07-16.
+
 ## Decision Log
 
 - Decision: PSTForge 1.0 writes smaller PSTs; general export formats move
@@ -980,6 +1133,161 @@ work. Hash and identity evidence show that the source was not modified.
   the owner's private job state and requires OS isolation beyond this tool.
   Date/Author: 2026-07-16 / Codex.
 
+- Decision: Version 0.4.0 treats the requested part size as a hard limit on the
+  finalized PST, not an estimator promise. Candidate estimates determine the
+  first packing attempt; completed normal parts that exceed the limit are
+  deterministically reduced and rebuilt until compliant. Only a singleton
+  message that itself cannot fit may publish as an explicitly marked oversize
+  part.
+  Rationale: real PST table and tree growth is discontinuous, so an estimate
+  alone cannot provide import checkpoints with a dependable maximum size.
+  Date/Author: 2026-07-16 / Codex.
+
+- Decision: A published part consists of an immutable PST plus a schema-1.0.0
+  JSON sidecar whose exact typed value is stored in the ledger transaction.
+  Publication intent is durable before rename; reconciliation accepts only the
+  exact expected PST/sidecar identities and then commits all item assignments
+  atomically. Validator failure evidence contains status and byte counts, never
+  validator text that may disclose mailbox data.
+  Rationale: a crash at any publication boundary must leave either independently
+  valid immutable artifacts that can be reconciled or discardable private
+  scratch state, without internally trusting producer reports.
+  Date/Author: 2026-07-16 / Codex.
+
+- Decision: Version 0.4.0 does not reinterpret source properties at or above
+  `0x8000` when libpff cannot provide their GUID/name identity. It omits them,
+  increments structured omission counts, and marks the containing output
+  partial. The writer continues to rebuild valid deterministic NAMEID maps for
+  typed identities supplied at its boundary.
+  Rationale: named-property numeric IDs are local to one store. Guessing an
+  identity would produce apparently valid PSTs with silently corrupted custom
+  semantics; reopening a damaged source through an unsupervised second parser
+  path also conflicts with the established recovery boundary.
+  Date/Author: 2026-07-16 / Codex.
+
+- Decision: Message-class admission is ASCII-case-insensitive and respects
+  MAPI dot boundaries. Version 0.4.0 accepts `IPM.Note` and its nonempty
+  descendants, plus nonempty `REPORT.IPM.Note.<receipt-type>` descendants;
+  lookalikes without the separating dot are contained as unsupported.
+  Rationale: inconsistent prefix matching could discard legitimate delivery
+  reports or admit a malformed class that later poisons an otherwise valid
+  part. Cataloging, canonical translation, and writer validation now apply the
+  same predicate.
+  Date/Author: 2026-07-16 / Codex.
+
+- Decision: A source compressed-RTF property is preserved only after bounded
+  header, CRC, token-growth, declared-length, and normative end-reference
+  validation. An uncompressed RTF container additionally requires a zero CRC.
+  Rationale: candidate-local containment cannot delegate to a decoder that
+  considers truncated token EOF successful; malformed body bytes must become
+  an explicit property omission instead of risking rejection of the whole PST
+  part by an independent importer.
+  Date/Author: 2026-07-16 / Codex.
+
+- Decision: Version 0.4.0 preserves source `PidTagMessageFlags` and
+  `PidTagInternetCodepage` as typed message inputs. The writer changes only the
+  attachment-presence flag to match attachments actually written and uses the
+  same value in the message PC and folder contents row. Positive non-UTF-8
+  source codepages retain byte-exact HTML; codepage 65001/default HTML must pass
+  bounded streaming UTF-8 validation.
+  Rationale: replacing read/unread and other state or relabeling source HTML as
+  UTF-8 is silent semantic corruption even when the PST remains structurally
+  valid.
+  Date/Author: 2026-07-16 / Codex.
+
+- Decision: Attachment counts, sizes, payloads, and embedded-item availability
+  are untrusted. Count uncertainty and every lookup/stream/size/embedded/limit
+  failure are candidate-local partial damage. Non-embedded streaming emits no
+  more than the declared byte count, explicit zero-byte payloads receive a real
+  durable empty blob, and embedded attachments require an embedded item rather
+  than a binary payload.
+  Rationale: neither source flags nor native error text proves that an
+  attachment table is absent. PSTForge must not convert parser uncertainty,
+  oversized streams, or unavailable content into full-success attachment loss.
+  Date/Author: 2026-07-16 / Codex.
+
+- Decision: Attachment recovery is isolated per source index. A failed lookup
+  emits a placeholder partial attachment; metadata failures default only that
+  field; property failures abort only the active property; and data, embedded
+  item, or depth failures explicitly abort that attachment before enumeration
+  continues. Sink and durable-state failures remain fatal.
+  Rationale: one corrupt attachment must not suppress valid later attachments
+  or disappear from omission accounting, while a failed ledger write cannot be
+  treated as recoverable source damage.
+  Date/Author: 2026-07-16 / Codex after clean-context adversarial review.
+
+- Decision: Canonical replay treats attachment metadata, terminal events,
+  payload blobs, and embedded-child ownership as one typed state machine. It
+  rejects duplicate or contradictory terminals, declaration/length mismatches,
+  foreign message IDs, binary payloads on embedded attachments, children on
+  non-embedded attachments, and child-plus-terminal states. Partial payload
+  prefixes remain private spool evidence and are never serialized.
+  Rationale: a durable partial stream or inconsistent ledger event must not be
+  upgraded into a complete attachment or move bytes between messages during PST
+  publication.
+  Date/Author: 2026-07-16 / Codex after clean-context adversarial review.
+
+- Decision: Durable embedded ownership is validated globally across writable
+  and unsupported candidates before reachability is constructed. Parent keys,
+  attachment indexes, message IDs, and embedded paths must agree with their
+  redundant metadata, and one attachment slot may have only one child claim. An
+  unsupported embedded message becomes an explicit omitted attachment on its
+  writable parent; a writable child of an unsupported parent remains promoted
+  as recoverable top-level mail.
+  Rationale: unsupported classes are source-local omissions, not grounds to lose
+  their parent or every later message, while corrupt ownership must not silently
+  reparent recovered mail.
+  Date/Author: 2026-07-16 / Codex after clean-context adversarial review.
+
+- Decision: Complete and incomplete property events validate owner kind,
+  current message ID, index nullability, and referenced recipient/attachment
+  existence. Attachment terminal events independently validate their redundant
+  message ID. The private ledger is integrity-checked for contradictory durable
+  structure but is not represented as cryptographically authenticated against a
+  coherent rewrite of every authoritative and redundant field.
+  Rationale: detectable corruption and cross-object reassignment must fail
+  closed without overstating what duplicate mutable SQLite fields can prove.
+  Date/Author: 2026-07-16 / Codex after clean-context adversarial review.
+
+- Decision: Version 0.4.0 contains only errors produced by the writer's
+  side-effect-free input preflight. It bisects a multi-candidate part to isolate
+  the source item and durably marks an irreducible singleton unsupported;
+  generic construction, completed-output self-validation, independent-reader,
+  I/O, and publication failures remain fatal. The preflight uses the writer's
+  actual hierarchy/table/property shape checks and bounds aggregate message and
+  attachment sizes before output begins.
+  Rationale: one damaged message must not block later recoverable mail, but a
+  writer defect must never be mislabeled as unsupported source content.
+  Date/Author: 2026-07-16 / Codex after clean-context adversarial review.
+
+- Decision: When the writer intentionally omits attachments nested below one
+  embedded-message level, every omitted descendant candidate key is marked
+  unsupported after the staged part survives actual-size bisection and before
+  the accepted part is published. Written item assignments include only mail
+  actually serialized.
+  Rationale: nested descendants must not remain `spooled`, be reported written,
+  or be mutated during a failed packing attempt; final written plus unsupported
+  accounting must equal every committed candidate.
+  Date/Author: 2026-07-16 / Codex after clean-context adversarial review.
+
+- Decision: Preserve source folder placement for Deleted Items and do not move
+  deleted mail into Inbox to compensate for MailPlus omitting that folder on
+  import. Acceptance compares the generated PST's complete contents separately
+  from the target importer's visible result.
+  Rationale: flattening or reclassifying recovered mail would change source
+  semantics and conceal importer behavior. Outlook confirms the accepted PST
+  still contains the message in the correct folder.
+  Date/Author: 2026-07-16 / Codex with human acceptance evidence.
+
+- Decision: Use the visited native-identifier set only for nonzero top-level
+  messages. Never suppress an embedded candidate because its local NID matches
+  a top-level message or an embedded message in another subnode tree. Durable
+  embedded identity uses parent candidate ownership plus attachment path, and
+  the existing maximum embedded depth contains malformed cycles.
+  Rationale: NIDs are scoped within subnode trees; global deduplication can turn
+  a valid embedded attachment into an unresolved child and abort publication.
+  Date/Author: 2026-07-16 / Codex after clean-context adversarial review.
+
 ## Outcomes & Retrospective
 
 Version 0.1.0 now lets an operator inspect a healthy PST in human or JSON form
@@ -1040,6 +1348,28 @@ containment and low memory use: 2,178 candidates committed, five partial, no
 source identity change, 8.71 seconds elapsed, and 20,672 KiB maximum RSS. The
 next milestone adds native crash isolation and bounded retries before 0.4.0
 packs the accepted spool into importable parts.
+
+Version 0.4.0 is implemented and has passed the final accepted-source full
+automated gate at `.agent/test-results/1784248198-full`. Candidate r5 also passed the human
+acceptance gate: ScanPST reported no errors, both parts opened independently in
+Outlook with the expected folder and unread state, and MailPlus imported all
+nine Inbox messages. MailPlus omitted the one Deleted Items message that remains
+present and readable in the PST, which is recorded as importer behavior rather
+than source loss. One high finding from the final whole-milestone review was
+resolved by scoping native-ID deduplication to top-level messages, and the
+fresh remediation review returned `CLEAN`. The approved milestone is ready for
+commit and integration. The current candidate deterministically
+converts the durable spool into independently valid size-limited Unicode PSTs,
+publishes immutable
+part/sidecar pairs through crash-reconcilable intents, and binds every written
+candidate to exactly one ledger part. A real healthy Unicode PST produces two
+sub-2-MiB parts with exact source-to-output fingerprints for all content libpff
+can recover and identical bytes across runs. Libpff attachment-count
+uncertainty, unsupported source named properties, malformed values, nested
+attachment losses, and attachments beyond the PST signed-size boundary are
+explicit partial omissions rather than silent success. The 50 GB damaged
+source, interruption/resume, disk preflight, and stale-scratch cleanup remain
+0.4.1 qualification work.
 
 ## Context and Orientation
 

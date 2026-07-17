@@ -16,6 +16,7 @@ const MAX_SUBNODE_TREE_DEPTH: usize = 32;
 const MAX_SUBNODE_TREE_ENTRIES: usize = 4096;
 const MAX_DATA_TREE_DEPTH: usize = 32;
 const MAX_DATA_TREE_ENTRIES: usize = 16_384;
+const MAX_STREAMING_DATA_TREE_ENTRIES: usize = 300_000;
 const MAX_MATERIALIZED_DATA_TREE_BYTES: usize = 64 * 1024 * 1024;
 
 fn observe_materialized_data_tree_bytes(
@@ -94,13 +95,27 @@ impl SubNodeTraversalBudget {
     }
 }
 
-#[derive(Default)]
 struct DataTreeTraversalBudget {
     visited_blocks: BTreeSet<u64>,
     visited_entries: usize,
+    max_entries: usize,
+}
+
+impl Default for DataTreeTraversalBudget {
+    fn default() -> Self {
+        Self::new(MAX_DATA_TREE_ENTRIES)
+    }
 }
 
 impl DataTreeTraversalBudget {
+    fn new(max_entries: usize) -> Self {
+        Self {
+            visited_blocks: BTreeSet::new(),
+            visited_entries: 0,
+            max_entries,
+        }
+    }
+
     fn observe_tree(&mut self, depth: usize, entries: usize) -> io::Result<()> {
         if depth > MAX_DATA_TREE_DEPTH {
             return Err(NdbError::DataTreeDepthExceeded(MAX_DATA_TREE_DEPTH).into());
@@ -108,9 +123,9 @@ impl DataTreeTraversalBudget {
         self.visited_entries = self
             .visited_entries
             .checked_add(entries)
-            .ok_or(NdbError::DataTreeEntryLimitExceeded(MAX_DATA_TREE_ENTRIES))?;
-        if self.visited_entries > MAX_DATA_TREE_ENTRIES {
-            return Err(NdbError::DataTreeEntryLimitExceeded(MAX_DATA_TREE_ENTRIES).into());
+            .ok_or(NdbError::DataTreeEntryLimitExceeded(self.max_entries))?;
+        if self.visited_entries > self.max_entries {
+            return Err(NdbError::DataTreeEntryLimitExceeded(self.max_entries).into());
         }
         Ok(())
     }
@@ -835,7 +850,14 @@ where
                     .into());
                 }
                 let entries = self
-                    .sub_entries(f, encoding, block_btree, page_cache, block_cache)?
+                    .sub_entries(
+                        f,
+                        encoding,
+                        block_btree,
+                        page_cache,
+                        block_cache,
+                        MAX_DATA_TREE_ENTRIES,
+                    )?
                     .collect::<Vec<_>>();
                 let mut blocks = Vec::with_capacity(entries.len());
                 let mut materialized = 0_usize;
@@ -898,7 +920,14 @@ where
         Ok(Some(match self {
             Self::Intermediate(_) => {
                 let Some(data_block) = self
-                    .sub_entries(f, encoding, block_btree, page_cache, block_cache)?
+                    .sub_entries(
+                        f,
+                        encoding,
+                        block_btree,
+                        page_cache,
+                        block_cache,
+                        MAX_DATA_TREE_ENTRIES,
+                    )?
                     .nth(n)
                 else {
                     return Ok(None);
@@ -962,8 +991,52 @@ where
             )
             .into());
         }
-        let reader: DataTreeReader<'a, Pst, R> =
-            DataTreeReader::new(self, f, encoding, block_btree, page_cache, block_cache)?;
+        let reader: DataTreeReader<'a, Pst, R> = DataTreeReader::new(
+            self,
+            f,
+            encoding,
+            block_btree,
+            page_cache,
+            block_cache,
+            MAX_DATA_TREE_ENTRIES,
+        )?;
+        let reader: Box<dyn 'a + Read> = Box::new(reader);
+        Ok(reader)
+    }
+
+    pub fn streaming_reader<'a, R>(
+        &self,
+        f: &'a mut R,
+        encoding: NdbCryptMethod,
+        block_btree: &'a PstFileReadWriteBlockBTree<Pst>,
+        page_cache: &mut RootBTreePageCache<<Pst as PstFile>::BlockBTree>,
+        block_cache: &'a mut DataBlockCache<Pst>,
+    ) -> io::Result<Box<dyn 'a + Read>>
+    where
+        Pst: 'a,
+        R: PstReader,
+        <Pst as PstFile>::DataBlock: 'a + Clone,
+        <Pst as PstFile>::BTreeKey: BTreePageKeyReadWrite,
+        <Pst as PstFile>::BlockBTree: RootBTreeReadWrite,
+        <<Pst as PstFile>::BlockBTree as RootBTree>::Entry: BTreeEntryReadWrite,
+        <<Pst as PstFile>::BlockBTree as RootBTree>::IntermediatePage:
+            RootBTreeIntermediatePageReadWrite<
+                    Pst,
+                    <<Pst as PstFile>::BlockBTree as RootBTree>::Entry,
+                    <<Pst as PstFile>::BlockBTree as RootBTree>::LeafPage,
+                >,
+        <<Pst as PstFile>::BlockBTree as RootBTree>::LeafPage:
+            RootBTreeLeafPageReadWrite<Pst> + BTreePageReadWrite,
+    {
+        let reader: DataTreeReader<'a, Pst, R> = DataTreeReader::new(
+            self,
+            f,
+            encoding,
+            block_btree,
+            page_cache,
+            block_cache,
+            MAX_STREAMING_DATA_TREE_ENTRIES,
+        )?;
         let reader: Box<dyn 'a + Read> = Box::new(reader);
         Ok(reader)
     }
@@ -975,6 +1048,7 @@ where
         block_btree: &PstFileReadWriteBlockBTree<Pst>,
         page_cache: &mut RootBTreePageCache<<Pst as PstFile>::BlockBTree>,
         block_cache: &'a mut DataBlockCache<Pst>,
+        max_entries: usize,
     ) -> io::Result<Box<dyn 'a + Iterator<Item = <Pst as PstFile>::BlockBTreeEntry>>>
     where
         R: PstReader,
@@ -997,7 +1071,7 @@ where
     {
         match self {
             Self::Intermediate(block, ..) => {
-                let mut budget = DataTreeTraversalBudget::default();
+                let mut budget = DataTreeTraversalBudget::new(max_entries);
                 budget.observe_tree(0, block.entries().len())?;
                 let root_level = block.header().level();
                 let mut pending = block
@@ -1089,6 +1163,7 @@ where
         block_btree: &'a PstFileReadWriteBlockBTree<Pst>,
         page_cache: &mut RootBTreePageCache<<Pst as PstFile>::BlockBTree>,
         block_cache: &'a mut DataBlockCache<Pst>,
+        max_entries: usize,
     ) -> io::Result<Self>
     where
         <Pst as PstFile>::BlockId: BlockId<Index = <Pst as PstFile>::BTreeKey> + BlockIdReadWrite,
@@ -1115,7 +1190,14 @@ where
         let cursor = match data_tree {
             DataTree::Intermediate(_) => {
                 let next = data_tree
-                    .sub_entries(file, encoding, block_btree, page_cache, block_cache)?
+                    .sub_entries(
+                        file,
+                        encoding,
+                        block_btree,
+                        page_cache,
+                        block_cache,
+                        max_entries,
+                    )?
                     .collect();
 
                 DataTreeCursor {

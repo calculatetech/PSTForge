@@ -1,6 +1,7 @@
 //! Creation of compact Unicode version 23 PST stores.
 
 use byteorder::{LittleEndian, WriteBytesExt};
+use sha2::{Digest, Sha256};
 use std::{
     collections::{BTreeMap, BTreeSet},
     io::{self, Read, Seek, SeekFrom, Write},
@@ -15,9 +16,13 @@ use std::{
 use thiserror::Error;
 
 use crate::{
+    PstFile, UnicodePstFile,
     block_sig::compute_sig,
     ltp::{
-        heap::{HeapFillLevel, HeapId, HeapNodeHeader, HeapNodeType},
+        heap::{
+            HeapFillLevel, HeapId, HeapNodeBitmapHeader, HeapNodeHeader, HeapNodePageHeader,
+            HeapNodeType,
+        },
         prop_type::PropertyType,
         read_write::{HeapNodePageReadWrite, TableContextInfoReadWrite},
         table_context::{
@@ -28,8 +33,9 @@ use crate::{
     ndb::{
         block::{
             DataTreeBlockHeader, UnicodeBlockTrailer, UnicodeDataBlock, UnicodeDataTreeBlock,
-            UnicodeDataTreeEntry, UnicodeLeafSubNodeTreeBlock, UnicodeLeafSubNodeTreeEntry,
-            UnicodeSubNodeTreeBlockHeader, block_size,
+            UnicodeDataTreeEntry, UnicodeIntermediateSubNodeTreeBlock,
+            UnicodeIntermediateSubNodeTreeEntry, UnicodeLeafSubNodeTreeBlock,
+            UnicodeLeafSubNodeTreeEntry, UnicodeSubNodeTreeBlockHeader, block_size,
         },
         block_id::{UnicodeBlockId, UnicodePageId},
         block_ref::{UnicodeBlockRef, UnicodePageRef},
@@ -54,13 +60,18 @@ use crate::{
     },
 };
 
-const FILE_EOF: u64 = 0x42400;
 const FIRST_AMAP: u64 = 0x4400;
+const INITIAL_FILE_EOF: u64 = FIRST_AMAP + AMAP_DATA_SIZE;
 const FIRST_PMAP: u64 = 0x4600;
 const FIRST_DATA: u64 = 0x4800;
 const SLOTS_PER_AMAP: u64 = 496 * 8;
 const SLOT_SIZE: u64 = 64;
 const PAGE_SIZE: u64 = 512;
+const AMAP_DATA_SIZE: u64 = SLOTS_PER_AMAP * SLOT_SIZE;
+const FMAP_FIRST_AMAP: u64 = 128;
+const FMAP_AMAP_COUNT: u64 = 496;
+const FPMAP_FIRST_AMAP: u64 = 128 * 64;
+const FPMAP_AMAP_COUNT: u64 = 496 * 64;
 const IPM_FOLDER_INDEX: u32 = 0x401;
 const SEARCH_ROOT_INDEX: u32 = 0x402;
 const DELETED_FOLDER_INDEX: u32 = 0x403;
@@ -129,7 +140,24 @@ pub enum NativeBody {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum AttachmentContent {
     Binary(Vec<u8>),
+    Spooled(FileBlobSpec),
     Embedded(Box<MessageSpec>),
+}
+
+/// Immutable private-spool payload streamed into a PST data tree.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FileBlobSpec {
+    pub path: PathBuf,
+    pub byte_len: u64,
+    pub sha256: [u8; 32],
+}
+
+/// A raw encoded MAPI property streamed from an immutable private spool.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SpooledPropertySpec {
+    pub id: u16,
+    pub property_type: u16,
+    pub blob: FileBlobSpec,
 }
 
 /// A by-value file or embedded-message attachment.
@@ -222,12 +250,16 @@ pub struct NamedProperty {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MessageSpec {
     pub message_class: String,
+    pub message_flags: i32,
+    pub internet_codepage: i32,
     pub subject: String,
     pub sender_name: String,
     pub sender_email: String,
     pub recipients: Vec<RecipientSpec>,
     pub sent_filetime: i64,
     pub received_filetime: i64,
+    pub creation_filetime: i64,
+    pub modification_filetime: i64,
     pub body_text: Option<String>,
     pub body_html: Option<Vec<u8>>,
     pub body_rtf: Option<Vec<u8>>,
@@ -237,6 +269,7 @@ pub struct MessageSpec {
     pub attachments: Vec<AttachmentSpec>,
     pub named_properties: Vec<NamedProperty>,
     pub raw_properties: Vec<RawProperty>,
+    pub spooled_properties: Vec<SpooledPropertySpec>,
     pub unsupported_properties: Vec<UnsupportedProperty>,
 }
 
@@ -249,6 +282,29 @@ pub struct FidelityStore {
     pub message: MessageSpec,
 }
 
+/// One source folder and its top-level mail in a split output part.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MailFolderSpec {
+    /// Non-empty path below the PST's mandatory IPM root.
+    pub path: Vec<String>,
+    pub messages: Vec<MessageSpec>,
+}
+
+/// Deterministic multi-folder input for size-limited output parts.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MailStoreSpec {
+    pub store_name: String,
+    pub record_key: [u8; 16],
+    pub folders: Vec<MailFolderSpec>,
+}
+
+struct StoreInput<'a> {
+    store_name: &'a str,
+    folder_name: &'a str,
+    record_key: [u8; 16],
+    message: &'a MessageSpec,
+}
+
 impl From<&MinimalStore> for FidelityStore {
     fn from(spec: &MinimalStore) -> Self {
         const FIXED_FILETIME: i64 = 133_801_632_000_000_000;
@@ -258,6 +314,8 @@ impl From<&MinimalStore> for FidelityStore {
             record_key: spec.record_key,
             message: MessageSpec {
                 message_class: "IPM.Note".to_owned(),
+                message_flags: 1,
+                internet_codepage: 65001,
                 subject: spec.subject.clone(),
                 sender_name: spec.sender_name.clone(),
                 sender_email: spec.sender_email.clone(),
@@ -268,6 +326,8 @@ impl From<&MinimalStore> for FidelityStore {
                 }],
                 sent_filetime: FIXED_FILETIME,
                 received_filetime: FIXED_FILETIME,
+                creation_filetime: FIXED_FILETIME,
+                modification_filetime: FIXED_FILETIME,
                 body_text: Some(spec.body.clone()),
                 body_html: None,
                 body_rtf: None,
@@ -277,6 +337,7 @@ impl From<&MinimalStore> for FidelityStore {
                 attachments: Vec::new(),
                 named_properties: Vec::new(),
                 raw_properties: Vec::new(),
+                spooled_properties: Vec::new(),
                 unsupported_properties: Vec::new(),
             },
         }
@@ -292,6 +353,8 @@ impl Default for FidelityStore {
         };
         let embedded = MessageSpec {
             message_class: "IPM.Note".to_owned(),
+            message_flags: 1,
+            internet_codepage: 65001,
             subject: "Embedded message checkpoint".to_owned(),
             sender_name: "Embedded Sender".to_owned(),
             sender_email: "embedded-sender@example.com".to_owned(),
@@ -302,6 +365,8 @@ impl Default for FidelityStore {
             )],
             sent_filetime: 133_801_632_100_000_000,
             received_filetime: 133_801_632_200_000_000,
+            creation_filetime: 133_801_632_100_000_000,
+            modification_filetime: 133_801_632_200_000_000,
             body_text: Some("Embedded plain-text body.".to_owned()),
             body_html: None,
             body_rtf: None,
@@ -318,6 +383,7 @@ impl Default for FidelityStore {
                 id: 0x10F7,
                 value: RawPropertyValue::MultipleInteger32(vec![7, 11]),
             }],
+            spooled_properties: Vec::new(),
             unsupported_properties: Vec::new(),
         };
         Self {
@@ -326,6 +392,8 @@ impl Default for FidelityStore {
             record_key: *b"PSTFORGE-0.2.1!!",
             message: MessageSpec {
                 message_class: "IPM.Note".to_owned(),
+                message_flags: 1,
+                internet_codepage: 65001,
                 subject: "Unicode fidelity: \u{20ac} \u{4e16}\u{754c}".to_owned(),
                 sender_name: "PSTForge Sender".to_owned(),
                 sender_email: "sender@example.com".to_owned(),
@@ -336,6 +404,8 @@ impl Default for FidelityStore {
                 ],
                 sent_filetime: 133_801_632_300_000_000,
                 received_filetime: 133_801_632_400_000_000,
+                creation_filetime: 133_801_632_300_000_000,
+                modification_filetime: 133_801_632_400_000_000,
                 body_text: Some("Plain-text body checkpoint.".to_owned()),
                 body_html: Some(
                     "<html><body><p><strong>HTML body checkpoint: € 世界.</strong></p></body></html>"
@@ -402,6 +472,7 @@ impl Default for FidelityStore {
                         ]),
                     },
                 ],
+                spooled_properties: Vec::new(),
                 unsupported_properties: Vec::new(),
             },
         }
@@ -455,6 +526,10 @@ pub enum WriterError {
     ValueTooLarge(&'static str),
     #[error("invalid PST structure: {0}")]
     InvalidStructure(String),
+    #[error("PST input cannot be represented: {0}")]
+    InputRejected(String),
+    #[error("completed PST validation failed: {0}")]
+    CompletedValidation(String),
     #[error("I/O error: {0}")]
     Io(#[from] io::Error),
 }
@@ -573,6 +648,10 @@ struct BlockSpec {
 enum BlockPayload {
     Data(Vec<u8>),
     Subnode(Vec<UnicodeLeafSubNodeTreeEntry>),
+    IntermediateSubnode {
+        level: u8,
+        entries: Vec<UnicodeIntermediateSubNodeTreeEntry>,
+    },
     DataTree {
         level: u8,
         total_size: u32,
@@ -585,6 +664,9 @@ impl BlockPayload {
         match self {
             Self::Data(data) => data.len(),
             Self::Subnode(entries) => 8_usize.saturating_add(entries.len().saturating_mul(24)),
+            Self::IntermediateSubnode { entries, .. } => {
+                8_usize.saturating_add(entries.len().saturating_mul(16))
+            }
             Self::DataTree { entries, .. } => {
                 8_usize.saturating_add(entries.len().saturating_mul(8))
             }
@@ -596,8 +678,21 @@ struct WrittenBlock {
     id: UnicodeBlockId,
     offset: u64,
     size: u16,
-    physical_size: u64,
     ref_count: u16,
+}
+
+struct BlockStream<'a> {
+    file: &'a mut std::fs::File,
+    cursor: &'a mut u64,
+    written: &'a mut Vec<WrittenBlock>,
+}
+
+impl BlockStream<'_> {
+    fn emit(&mut self, block: BlockSpec) -> Result<(), WriterError> {
+        self.written
+            .extend(write_blocks(self.file, &[block], self.cursor)?);
+        Ok(())
+    }
 }
 
 struct TableRowSpec {
@@ -605,7 +700,14 @@ struct TableRowSpec {
     values: Vec<(u16, PropertyValue)>,
 }
 
+struct ExternalTableBuild {
+    data_block: UnicodeBlockId,
+    subnode_block: UnicodeBlockId,
+    blocks: Vec<BlockSpec>,
+}
+
 const MAX_DATA_BLOCK_PAYLOAD: usize = 8176;
+const MAX_HEAP_ALLOCATION: usize = 3580;
 const MAX_DATA_TREE_ENTRIES: usize = 1021;
 const MAX_FIDELITY_PROPERTY_BYTES: usize = 16 * 1024;
 const MAX_FIDELITY_COLLECTION_ITEMS: usize = MAX_FIDELITY_PROPERTY_BYTES / 8;
@@ -647,8 +749,30 @@ fn append_data_tree(
     next_block_index: &mut u64,
     blocks: &mut Vec<BlockSpec>,
 ) -> Result<UnicodeBlockId, WriterError> {
-    let mut leaves = Vec::with_capacity(bytes.len().div_ceil(MAX_DATA_BLOCK_PAYLOAD));
-    for chunk in bytes.chunks(MAX_DATA_BLOCK_PAYLOAD) {
+    append_data_tree_sized(bytes, MAX_DATA_BLOCK_PAYLOAD, next_block_index, blocks)
+}
+
+fn append_data_tree_aligned(
+    bytes: &[u8],
+    alignment: usize,
+    next_block_index: &mut u64,
+    blocks: &mut Vec<BlockSpec>,
+) -> Result<UnicodeBlockId, WriterError> {
+    if alignment == 0 || alignment > MAX_DATA_BLOCK_PAYLOAD {
+        return Err(WriterError::ValueTooLarge("data-tree alignment"));
+    }
+    let chunk_size = (MAX_DATA_BLOCK_PAYLOAD / alignment) * alignment;
+    append_data_tree_sized(bytes, chunk_size, next_block_index, blocks)
+}
+
+fn append_data_tree_sized(
+    bytes: &[u8],
+    chunk_size: usize,
+    next_block_index: &mut u64,
+    blocks: &mut Vec<BlockSpec>,
+) -> Result<UnicodeBlockId, WriterError> {
+    let mut leaves = Vec::with_capacity(bytes.len().div_ceil(chunk_size));
+    for chunk in bytes.chunks(chunk_size) {
         let id = take_block_id(next_block_index, false)?;
         blocks.push(BlockSpec {
             id,
@@ -708,6 +832,287 @@ fn append_data_tree(
     Ok(id)
 }
 
+fn append_data_tree_pages(
+    pages: &[Vec<u8>],
+    next_block_index: &mut u64,
+    blocks: &mut Vec<BlockSpec>,
+) -> Result<UnicodeBlockId, WriterError> {
+    if pages.is_empty() {
+        return Err(WriterError::InvalidStructure(
+            "data tree must contain pages".to_owned(),
+        ));
+    }
+    let mut leaves = Vec::with_capacity(pages.len());
+    for page in pages {
+        if page.len() > MAX_DATA_BLOCK_PAYLOAD {
+            return Err(WriterError::ValueTooLarge("heap data page"));
+        }
+        let id = take_block_id(next_block_index, false)?;
+        blocks.push(BlockSpec {
+            id,
+            payload: BlockPayload::Data(page.clone()),
+            ref_count: 2,
+        });
+        leaves.push((id, page.len()));
+    }
+    if leaves.len() == 1 {
+        return Ok(leaves[0].0);
+    }
+    if leaves.len() > MAX_DATA_TREE_ENTRIES {
+        return Err(WriterError::ValueTooLarge("heap data-tree page count"));
+    }
+    let total_size = leaves.iter().try_fold(0_u32, |total, (_, size)| {
+        total.checked_add(u32::try_from(*size).ok()?)
+    });
+    let total_size = total_size.ok_or(WriterError::ValueTooLarge("heap data-tree size"))?;
+    let id = take_block_id(next_block_index, true)?;
+    blocks.push(BlockSpec {
+        id,
+        payload: BlockPayload::DataTree {
+            level: 1,
+            total_size,
+            entries: leaves
+                .iter()
+                .map(|(block, _)| UnicodeDataTreeEntry::from(*block))
+                .collect(),
+        },
+        ref_count: 2,
+    });
+    Ok(id)
+}
+
+fn append_spooled_data_tree(
+    blob: &FileBlobSpec,
+    next_block_index: &mut u64,
+    stream: &mut BlockStream<'_>,
+) -> Result<(UnicodeBlockId, usize), WriterError> {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let nofollow = i32::try_from(rustix::fs::OFlags::NOFOLLOW.bits())
+        .map_err(|_| WriterError::ValueTooLarge("open flags"))?;
+    let mut file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(nofollow)
+        .open(&blob.path)?;
+    let metadata = file.metadata()?;
+    if !metadata.file_type().is_file() || metadata.len() != blob.byte_len {
+        return Err(WriterError::InvalidStructure(
+            "spooled attachment identity mismatch".to_owned(),
+        ));
+    }
+
+    let mut remaining = blob.byte_len;
+    let mut leaves = Vec::with_capacity(MAX_DATA_TREE_ENTRIES);
+    let mut xblocks = Vec::new();
+    let mut logical_size = 0_usize;
+    let mut hasher = Sha256::new();
+    while remaining > 0 {
+        let length = usize::try_from(remaining.min(MAX_DATA_BLOCK_PAYLOAD as u64))
+            .map_err(|_| WriterError::ValueTooLarge("spooled attachment chunk"))?;
+        let mut chunk = vec![0_u8; length];
+        file.read_exact(&mut chunk)?;
+        hasher.update(&chunk);
+        let id = take_block_id(next_block_index, false)?;
+        let block = BlockSpec {
+            id,
+            payload: BlockPayload::Data(chunk),
+            ref_count: 2,
+        };
+        logical_size = logical_size
+            .checked_add(block.payload.logical_size())
+            .ok_or(WriterError::ValueTooLarge("spooled attachment size"))?;
+        stream.emit(block)?;
+        leaves.push((id, length));
+        remaining -= u64::try_from(length)
+            .map_err(|_| WriterError::ValueTooLarge("spooled attachment chunk"))?;
+        if leaves.len() == MAX_DATA_TREE_ENTRIES && remaining > 0 {
+            let total_size = leaves.iter().try_fold(0_u32, |total, (_, size)| {
+                total.checked_add(u32::try_from(*size).ok()?)
+            });
+            let total_size = total_size.ok_or(WriterError::ValueTooLarge("spooled data tree"))?;
+            let id = take_block_id(next_block_index, true)?;
+            let block = BlockSpec {
+                id,
+                payload: BlockPayload::DataTree {
+                    level: 1,
+                    total_size,
+                    entries: leaves
+                        .iter()
+                        .map(|(block, _)| UnicodeDataTreeEntry::from(*block))
+                        .collect(),
+                },
+                ref_count: 2,
+            };
+            logical_size = logical_size
+                .checked_add(block.payload.logical_size())
+                .ok_or(WriterError::ValueTooLarge("spooled attachment size"))?;
+            stream.emit(block)?;
+            xblocks.push((id, total_size));
+            leaves.clear();
+        }
+    }
+    let mut trailing = [0_u8; 1];
+    let actual_hash: [u8; 32] = hasher.finalize().into();
+    if file.read(&mut trailing)? != 0 || actual_hash != blob.sha256 {
+        return Err(WriterError::InvalidStructure(
+            "spooled attachment hash mismatch".to_owned(),
+        ));
+    }
+    if leaves.is_empty() {
+        let id = take_block_id(next_block_index, false)?;
+        let block = BlockSpec {
+            id,
+            payload: BlockPayload::Data(Vec::new()),
+            ref_count: 2,
+        };
+        logical_size = logical_size
+            .checked_add(block.payload.logical_size())
+            .ok_or(WriterError::ValueTooLarge("spooled attachment size"))?;
+        stream.emit(block)?;
+        return Ok((id, logical_size));
+    }
+    if xblocks.is_empty() && leaves.len() == 1 {
+        return Ok((leaves[0].0, logical_size));
+    }
+
+    if !leaves.is_empty() {
+        let total_size = leaves.iter().try_fold(0_u32, |total, (_, size)| {
+            total.checked_add(u32::try_from(*size).ok()?)
+        });
+        let total_size = total_size.ok_or(WriterError::ValueTooLarge("spooled data tree"))?;
+        let id = take_block_id(next_block_index, true)?;
+        let block = BlockSpec {
+            id,
+            payload: BlockPayload::DataTree {
+                level: 1,
+                total_size,
+                entries: leaves
+                    .iter()
+                    .map(|(block, _)| UnicodeDataTreeEntry::from(*block))
+                    .collect(),
+            },
+            ref_count: 2,
+        };
+        logical_size = logical_size
+            .checked_add(block.payload.logical_size())
+            .ok_or(WriterError::ValueTooLarge("spooled attachment size"))?;
+        stream.emit(block)?;
+        xblocks.push((id, total_size));
+    }
+    if xblocks.len() == 1 {
+        return Ok((xblocks[0].0, logical_size));
+    }
+    if xblocks.len() > MAX_DATA_TREE_ENTRIES {
+        return Err(WriterError::ValueTooLarge("spooled XXBLOCK entry count"));
+    }
+    let total_size = xblocks
+        .iter()
+        .try_fold(0_u32, |total, (_, size)| total.checked_add(*size))
+        .ok_or(WriterError::ValueTooLarge("spooled XXBLOCK size"))?;
+    let id = take_block_id(next_block_index, true)?;
+    let block = BlockSpec {
+        id,
+        payload: BlockPayload::DataTree {
+            level: 2,
+            total_size,
+            entries: xblocks
+                .iter()
+                .map(|(block, _)| UnicodeDataTreeEntry::from(*block))
+                .collect(),
+        },
+        ref_count: 2,
+    };
+    logical_size = logical_size
+        .checked_add(block.payload.logical_size())
+        .ok_or(WriterError::ValueTooLarge("spooled attachment size"))?;
+    stream.emit(block)?;
+    Ok((id, logical_size))
+}
+
+fn append_spooled_properties(
+    specs: &[SpooledPropertySpec],
+    properties: &mut Vec<(u16, PropertyValue)>,
+    subnodes: &mut Vec<UnicodeLeafSubNodeTreeEntry>,
+    next_block_index: &mut u64,
+    next_value_node: &mut u32,
+    stream: &mut BlockStream<'_>,
+) -> Result<usize, WriterError> {
+    let mut logical_size = 0_usize;
+    for spec in specs {
+        let property_type = PropertyType::try_from(spec.property_type).map_err(|_| {
+            WriterError::InvalidStructure(format!(
+                "unsupported streamed property type: 0x{:04X}",
+                spec.property_type
+            ))
+        })?;
+        let value_node = node(NodeIdType::ListsTablesProperties, *next_value_node)?;
+        *next_value_node = next_value_node
+            .checked_add(1)
+            .ok_or(WriterError::ValueTooLarge("streamed property value node"))?;
+        let (root, size) = append_spooled_data_tree(&spec.blob, next_block_index, stream)?;
+        logical_size = logical_size
+            .checked_add(size)
+            .ok_or(WriterError::ValueTooLarge("message size"))?;
+        subnodes.push(UnicodeLeafSubNodeTreeEntry::new(value_node, root, None));
+        properties.push((spec.id, PropertyValue::External(property_type, value_node)));
+    }
+    Ok(logical_size)
+}
+
+fn append_subnode_tree(
+    mut entries: Vec<UnicodeLeafSubNodeTreeEntry>,
+    next_block_index: &mut u64,
+    blocks: &mut Vec<BlockSpec>,
+) -> Result<UnicodeBlockId, WriterError> {
+    const LEAF_CAPACITY: usize = (MAX_DATA_BLOCK_PAYLOAD - 8) / 24;
+    const INTERMEDIATE_CAPACITY: usize = (MAX_DATA_BLOCK_PAYLOAD - 8) / 16;
+
+    if entries.is_empty() {
+        return Err(WriterError::InvalidStructure(
+            "subnode tree must contain entries".to_owned(),
+        ));
+    }
+    entries.sort_by_key(|entry| u32::from(entry.node()));
+    let mut roots = Vec::with_capacity(entries.len().div_ceil(LEAF_CAPACITY));
+    for group in entries.chunks(LEAF_CAPACITY) {
+        let id = take_block_id(next_block_index, true)?;
+        blocks.push(BlockSpec {
+            id,
+            payload: BlockPayload::Subnode(group.to_vec()),
+            ref_count: 2,
+        });
+        roots.push(UnicodeIntermediateSubNodeTreeEntry::new(
+            group[0].node(),
+            id,
+        ));
+    }
+
+    let mut level = 1_u8;
+    while roots.len() > 1 {
+        let mut parents = Vec::with_capacity(roots.len().div_ceil(INTERMEDIATE_CAPACITY));
+        for group in roots.chunks(INTERMEDIATE_CAPACITY) {
+            let id = take_block_id(next_block_index, true)?;
+            blocks.push(BlockSpec {
+                id,
+                payload: BlockPayload::IntermediateSubnode {
+                    level,
+                    entries: group.to_vec(),
+                },
+                ref_count: 2,
+            });
+            parents.push(UnicodeIntermediateSubNodeTreeEntry::new(
+                group[0].node(),
+                id,
+            ));
+        }
+        roots = parents;
+        level = level
+            .checked_add(1)
+            .ok_or(WriterError::ValueTooLarge("subnode tree depth"))?;
+    }
+    Ok(roots[0].block())
+}
+
 fn take_block_id(next: &mut u64, internal: bool) -> Result<UnicodeBlockId, WriterError> {
     let index = *next;
     *next = next
@@ -728,52 +1133,168 @@ pub fn create_minimal_store(
     create_fidelity_store(path, &FidelityStore::from(spec)).map(|_| ())
 }
 
-/// Create a deterministic Unicode PST containing one canonical mail message.
-pub fn create_fidelity_store(
-    path: impl AsRef<Path>,
-    spec: &FidelityStore,
-) -> Result<FidelityWriteReport, WriterError> {
-    validate_spec(spec)?;
-    let report = FidelityWriteReport {
-        unsupported_properties: collect_unsupported_properties(&spec.message, &[])?,
-    };
-    let path = path.as_ref();
-    match path.symlink_metadata() {
-        Ok(_) => return Err(WriterError::OutputExists(path.to_path_buf())),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-        Err(error) => return Err(WriterError::Io(error)),
+struct MessageBlocks {
+    property_context: Vec<u8>,
+    recipient_table: Vec<u8>,
+    attachment_table: Vec<u8>,
+    subnodes: Vec<UnicodeLeafSubNodeTreeEntry>,
+    dynamic_blocks: Vec<BlockSpec>,
+    record_key: [u8; 16],
+    message_size: i32,
+}
+
+struct BuiltTopMessage {
+    property_block: UnicodeBlockId,
+    recipient_block: UnicodeBlockId,
+    attachment_block: UnicodeBlockId,
+    subnode_block: UnicodeBlockId,
+    shared_table_blocks: bool,
+    message: MessageBlocks,
+}
+
+fn built_message_block_specs(built: BuiltTopMessage) -> Vec<BlockSpec> {
+    let mut blocks = vec![
+        BlockSpec {
+            id: built.property_block,
+            payload: BlockPayload::Data(built.message.property_context),
+            ref_count: 2,
+        },
+        BlockSpec {
+            id: built.recipient_block,
+            payload: BlockPayload::Data(built.message.recipient_table),
+            ref_count: if built.shared_table_blocks { 3 } else { 2 },
+        },
+        BlockSpec {
+            id: built.attachment_block,
+            payload: BlockPayload::Data(built.message.attachment_table),
+            ref_count: if built.shared_table_blocks { 3 } else { 2 },
+        },
+        BlockSpec {
+            id: built.subnode_block,
+            payload: BlockPayload::Subnode(built.message.subnodes),
+            ref_count: 2,
+        },
+    ];
+    blocks.extend(built.message.dynamic_blocks);
+    blocks.sort_by_key(|block| u64::from(block.id));
+    blocks
+}
+
+fn collect_subnode_ids(blocks: &[BlockSpec], output: &mut Vec<NodeId>) {
+    for block in blocks {
+        if let BlockPayload::Subnode(entries) = &block.payload {
+            output.extend(entries.iter().map(|entry| entry.node()));
+        }
     }
-    let parent = path
-        .parent()
-        .filter(|parent| !parent.as_os_str().is_empty())
-        .unwrap_or_else(|| Path::new("."));
-    let parent_directory = std::fs::File::open(parent)?;
-    let mut temporary = PublicationTemporary::new(parent)?;
-    let file = &mut temporary.file;
-    file.set_len(FILE_EOF)?;
+}
 
-    let root_folder = NID_ROOT_FOLDER;
-    let ipm_folder = node(NodeIdType::NormalFolder, IPM_FOLDER_INDEX)?;
-    let search_root = node(NodeIdType::NormalFolder, SEARCH_ROOT_INDEX)?;
-    let deleted_folder = node(NodeIdType::NormalFolder, DELETED_FOLDER_INDEX)?;
-    let mail_folder = node(NodeIdType::NormalFolder, MAIL_FOLDER_INDEX)?;
-    let spam_search = node(NodeIdType::SearchFolder, SPAM_SEARCH_INDEX)?;
-    let message = node(NodeIdType::NormalMessage, MESSAGE_INDEX)?;
+fn message_requires_streaming(message: &MessageSpec) -> bool {
+    !message.spooled_properties.is_empty()
+        || message
+            .attachments
+            .iter()
+            .any(|attachment| match &attachment.content {
+                AttachmentContent::Spooled(_) => true,
+                AttachmentContent::Embedded(message) => message_requires_streaming(message),
+                AttachmentContent::Binary(_) => false,
+            })
+}
 
-    let hierarchy_columns = hierarchy_columns()?;
-    let contents_columns = contents_columns()?;
-    let associated_columns = associated_columns()?;
-    let search_contents_columns = search_contents_columns()?;
-    let receive_folder_columns = receive_folder_columns()?;
-    let outgoing_queue_columns = outgoing_queue_columns()?;
-    let contents_index_columns = contents_index_columns()?;
-    let search_index_columns = search_index_columns()?;
-    let attachment_index_columns = attachment_index_columns()?;
+struct FolderPlan<'a> {
+    path: Vec<String>,
+    messages: Vec<&'a MessageSpec>,
+    node: NodeId,
+    parent: Option<usize>,
+    children: Vec<usize>,
+}
+
+fn plan_folders<'a>(
+    fallback_name: &'a str,
+    fallback_messages: &[&'a MessageSpec],
+    folders: Option<&'a [MailFolderSpec]>,
+) -> Result<Vec<FolderPlan<'a>>, WriterError> {
+    let mut paths = BTreeMap::<Vec<String>, Vec<&MessageSpec>>::new();
+    if let Some(folders) = folders {
+        let mut explicit_paths = BTreeSet::new();
+        for folder in folders {
+            if folder.path.is_empty() || folder.path.iter().any(String::is_empty) {
+                return Err(WriterError::InvalidStructure(
+                    "mail folder paths and components must be non-empty".to_owned(),
+                ));
+            }
+            if !explicit_paths.insert(folder.path.clone()) {
+                return Err(WriterError::InvalidStructure(
+                    "duplicate mail folder path".to_owned(),
+                ));
+            }
+            for depth in 1..=folder.path.len() {
+                paths.entry(folder.path[..depth].to_vec()).or_default();
+            }
+            let messages = paths.get_mut(&folder.path).ok_or_else(|| {
+                WriterError::InvalidStructure("mail folder path was not planned".to_owned())
+            })?;
+            messages.extend(folder.messages.iter());
+        }
+    } else {
+        paths.insert(vec![fallback_name.to_owned()], fallback_messages.to_vec());
+    }
+    if paths.values().all(Vec::is_empty) {
+        return Err(WriterError::InvalidStructure(
+            "mail store must contain at least one message".to_owned(),
+        ));
+    }
+
+    let path_indexes = paths
+        .keys()
+        .enumerate()
+        .map(|(index, path)| (path.clone(), index))
+        .collect::<BTreeMap<_, _>>();
+    let mut plans = paths
+        .into_iter()
+        .enumerate()
+        .map(|(index, (path, messages))| {
+            let index =
+                u32::try_from(index).map_err(|_| WriterError::ValueTooLarge("folder count"))?;
+            let parent = (path.len() > 1)
+                .then(|| path_indexes.get(&path[..path.len() - 1]).copied())
+                .flatten();
+            Ok(FolderPlan {
+                path,
+                messages,
+                node: node(
+                    NodeIdType::NormalFolder,
+                    MAIL_FOLDER_INDEX
+                        .checked_add(index)
+                        .ok_or(WriterError::ValueTooLarge("folder node"))?,
+                )?,
+                parent,
+                children: Vec::new(),
+            })
+        })
+        .collect::<Result<Vec<_>, WriterError>>()?;
+    for child in 0..plans.len() {
+        if let Some(parent) = plans[child].parent {
+            plans[parent].children.push(child);
+        }
+    }
+    Ok(plans)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_message_blocks(
+    message_spec: &MessageSpec,
+    store_key: [u8; 16],
+    message: NodeId,
+    named_identities: &[NamedIdentity],
+    recipient_block: UnicodeBlockId,
+    attachment_table_block: UnicodeBlockId,
+    next_block_index: &mut u64,
+    next_value_node: &mut u32,
+    mut block_stream: Option<&mut BlockStream<'_>>,
+) -> Result<MessageBlocks, WriterError> {
     let recipient_columns = recipient_columns()?;
     let attachment_columns = attachment_columns()?;
-    let named_identities = collect_named_identities(&spec.message);
-    let recipient_rows = spec
-        .message
+    let recipient_rows = message_spec
         .recipients
         .iter()
         .enumerate()
@@ -781,22 +1302,21 @@ pub fn create_fidelity_store(
         .collect::<Result<Vec<_>, _>>()?;
     let recipient_table = table_context(&recipient_columns, &recipient_rows)?;
     let mut attachment_rows = Vec::new();
-    let mut attachment_blocks = Vec::new();
+    let mut dynamic_blocks = Vec::new();
+    let mut streamed_logical_size = 0_usize;
     let mut message_subnodes = vec![
         UnicodeLeafSubNodeTreeEntry::new(
             NodeId::from(NID_RECIPIENT_TABLE_TEMPLATE),
-            leaf_bid(17)?,
+            recipient_block,
             None,
         ),
         UnicodeLeafSubNodeTreeEntry::new(
             NodeId::from(NID_ATTACHMENT_TABLE_TEMPLATE),
-            leaf_bid(18)?,
+            attachment_table_block,
             None,
         ),
     ];
-    let mut next_block_index = 28_u64;
-    let mut next_value_node = 0x4_0000_u32;
-    for (index, attachment) in spec.message.attachments.iter().enumerate() {
+    for (index, attachment) in message_spec.attachments.iter().enumerate() {
         let attachment_index =
             u32::try_from(index).map_err(|_| WriterError::ValueTooLarge("attachment count"))?;
         let attachment_node = node(
@@ -805,10 +1325,31 @@ pub fn create_fidelity_store(
                 .checked_add(attachment_index)
                 .ok_or(WriterError::ValueTooLarge("attachment node"))?,
         )?;
-        let attachment_block = take_block_id(&mut next_block_index, false)?;
+        let attachment_block = take_block_id(next_block_index, false)?;
         let mut attachment_local_subnodes = Vec::new();
+        let mut streamed_size = None;
         let (method, data_property) = match &attachment.content {
             AttachmentContent::Binary(data) => (1, PropertyValue::Binary(data.clone())),
+            AttachmentContent::Spooled(blob) => {
+                let value_node = node(NodeIdType::ListsTablesProperties, *next_value_node)?;
+                *next_value_node = next_value_node
+                    .checked_add(1)
+                    .ok_or(WriterError::ValueTooLarge("attachment value node"))?;
+                let stream = block_stream.as_deref_mut().ok_or_else(|| {
+                    WriterError::InvalidStructure(
+                        "spooled attachment requires streaming output".to_owned(),
+                    )
+                })?;
+                let (root, logical_size) =
+                    append_spooled_data_tree(blob, next_block_index, stream)?;
+                streamed_logical_size = streamed_logical_size
+                    .checked_add(logical_size)
+                    .ok_or(WriterError::ValueTooLarge("message size"))?;
+                attachment_local_subnodes
+                    .push(UnicodeLeafSubNodeTreeEntry::new(value_node, root, None));
+                streamed_size = Some(blob.byte_len);
+                (1, PropertyValue::External(PropertyType::Binary, value_node))
+            }
             AttachmentContent::Embedded(embedded) => {
                 let embedded_node = node(
                     NodeIdType::NormalMessage,
@@ -825,13 +1366,10 @@ pub fn create_fidelity_store(
                 let embedded_recipients =
                     table_context(&recipient_columns, &embedded_recipient_rows)?;
                 let embedded_attachments = table_context(&attachment_columns, &[])?;
-                let embedded_blocks_start = attachment_blocks.len();
-                // Keep the embedded message PC before its table BIDs. Outlook and
-                // libpff both assume this canonical allocation order while walking
-                // attachment-local descriptors.
-                let embedded_pc_block = take_block_id(&mut next_block_index, false)?;
-                let embedded_recipient_block = take_block_id(&mut next_block_index, false)?;
-                let embedded_attachment_block = take_block_id(&mut next_block_index, false)?;
+                let embedded_blocks_start = dynamic_blocks.len();
+                let embedded_pc_block = take_block_id(next_block_index, false)?;
+                let embedded_recipient_block = take_block_id(next_block_index, false)?;
+                let embedded_attachment_block = take_block_id(next_block_index, false)?;
                 let mut embedded_subnodes = vec![
                     UnicodeLeafSubNodeTreeEntry::new(
                         NodeId::from(NID_RECIPIENT_TABLE_TEMPLATE),
@@ -844,14 +1382,34 @@ pub fn create_fidelity_store(
                         None,
                     ),
                 ];
-                let embedded_key = message_record_key(spec.record_key, embedded_node);
+                let embedded_key = message_record_key(store_key, embedded_node);
                 let mut embedded_properties =
-                    message_properties(embedded, &named_identities, embedded_key, 0)?;
+                    message_properties(embedded, named_identities, embedded_key, 0)?;
+                let embedded_streamed_size = if embedded.spooled_properties.is_empty() {
+                    0
+                } else {
+                    let stream = block_stream.as_deref_mut().ok_or_else(|| {
+                        WriterError::InvalidStructure(
+                            "embedded spooled property requires streaming output".to_owned(),
+                        )
+                    })?;
+                    append_spooled_properties(
+                        &embedded.spooled_properties,
+                        &mut embedded_properties,
+                        &mut embedded_subnodes,
+                        next_block_index,
+                        next_value_node,
+                        stream,
+                    )?
+                };
+                streamed_logical_size = streamed_logical_size
+                    .checked_add(embedded_streamed_size)
+                    .ok_or(WriterError::ValueTooLarge("message size"))?;
                 externalize_large_properties(
                     &mut embedded_properties,
-                    &mut next_block_index,
-                    &mut next_value_node,
-                    &mut attachment_blocks,
+                    next_block_index,
+                    next_value_node,
+                    &mut dynamic_blocks,
                     &mut embedded_subnodes,
                 )?;
                 let embedded_pc_zero = property_context(&embedded_properties)?;
@@ -859,8 +1417,9 @@ pub fn create_fidelity_store(
                     .len()
                     .checked_add(embedded_recipients.len())
                     .and_then(|total| total.checked_add(embedded_attachments.len()))
+                    .and_then(|total| total.checked_add(embedded_streamed_size))
                     .and_then(|total| {
-                        attachment_blocks[embedded_blocks_start..]
+                        dynamic_blocks[embedded_blocks_start..]
                             .iter()
                             .try_fold(total, |sum, block| {
                                 sum.checked_add(block.payload.logical_size())
@@ -870,15 +1429,14 @@ pub fn create_fidelity_store(
                 let embedded_size = i32::try_from(embedded_bytes)
                     .map_err(|_| WriterError::ValueTooLarge("embedded message size"))?;
                 set_message_size(&mut embedded_properties, embedded_size)?;
-                let embedded_pc = property_context(&embedded_properties)?;
                 let embedded_object_size = u32::try_from(embedded_size)
                     .map_err(|_| WriterError::ValueTooLarge("embedded message"))?;
-                let embedded_subnode_block = take_block_id(&mut next_block_index, true)?;
+                let embedded_subnode_block = take_block_id(next_block_index, true)?;
                 embedded_subnodes.sort_by_key(|entry| u32::from(entry.node()));
-                attachment_blocks.extend([
+                dynamic_blocks.extend([
                     BlockSpec {
                         id: embedded_pc_block,
-                        payload: BlockPayload::Data(embedded_pc),
+                        payload: BlockPayload::Data(property_context(&embedded_properties)?),
                         ref_count: 2,
                     },
                     BlockSpec {
@@ -912,7 +1470,7 @@ pub fn create_fidelity_store(
             i32::try_from(index).map_err(|_| WriterError::ValueTooLarge("attachment number"))?;
         let mut properties =
             attachment_properties(attachment, attachment_number, method, 0, data_property);
-        let size = attachment_property_size(&properties)?;
+        let size = attachment_property_size_with_stream(&properties, streamed_size)?;
         set_attachment_size(&mut properties, size)?;
         attachment_rows.push(attachment_table_row(
             attachment_node,
@@ -923,12 +1481,12 @@ pub fn create_fidelity_store(
         ));
         externalize_large_properties(
             &mut properties,
-            &mut next_block_index,
-            &mut next_value_node,
-            &mut attachment_blocks,
+            next_block_index,
+            next_value_node,
+            &mut dynamic_blocks,
             &mut attachment_local_subnodes,
         )?;
-        attachment_blocks.push(BlockSpec {
+        dynamic_blocks.push(BlockSpec {
             id: attachment_block,
             payload: BlockPayload::Data(property_context(&properties)?),
             ref_count: 2,
@@ -937,8 +1495,8 @@ pub fn create_fidelity_store(
         let attachment_subnode = if attachment_local_subnodes.is_empty() {
             None
         } else {
-            let block = take_block_id(&mut next_block_index, true)?;
-            attachment_blocks.push(BlockSpec {
+            let block = take_block_id(next_block_index, true)?;
+            dynamic_blocks.push(BlockSpec {
                 id: block,
                 payload: BlockPayload::Subnode(attachment_local_subnodes),
                 ref_count: 2,
@@ -953,31 +1511,541 @@ pub fn create_fidelity_store(
     }
     message_subnodes.sort_by_key(|entry| u32::from(entry.node()));
     let attachment_table = table_context(&attachment_columns, &attachment_rows)?;
-    let top_key = message_record_key(spec.record_key, message);
-    let mut top_properties = message_properties(&spec.message, &named_identities, top_key, 0)?;
+    let record_key = message_record_key(store_key, message);
+    let mut top_properties = message_properties(message_spec, named_identities, record_key, 0)?;
+    if !message_spec.spooled_properties.is_empty() {
+        let stream = block_stream.ok_or_else(|| {
+            WriterError::InvalidStructure("spooled property requires streaming output".to_owned())
+        })?;
+        streamed_logical_size = streamed_logical_size
+            .checked_add(append_spooled_properties(
+                &message_spec.spooled_properties,
+                &mut top_properties,
+                &mut message_subnodes,
+                next_block_index,
+                next_value_node,
+                stream,
+            )?)
+            .ok_or(WriterError::ValueTooLarge("message size"))?;
+    }
     externalize_large_properties(
         &mut top_properties,
-        &mut next_block_index,
-        &mut next_value_node,
-        &mut attachment_blocks,
+        next_block_index,
+        next_value_node,
+        &mut dynamic_blocks,
         &mut message_subnodes,
     )?;
     message_subnodes.sort_by_key(|entry| u32::from(entry.node()));
-    let top_pc_zero = property_context(&top_properties)?;
-    let message_bytes = top_pc_zero
+    let message_bytes = property_context(&top_properties)?
         .len()
         .checked_add(recipient_table.len())
         .and_then(|total| total.checked_add(attachment_table.len()))
         .and_then(|total| {
-            attachment_blocks.iter().try_fold(total, |sum, block| {
+            dynamic_blocks.iter().try_fold(total, |sum, block| {
                 sum.checked_add(block.payload.logical_size())
             })
         })
+        .and_then(|total| total.checked_add(streamed_logical_size))
         .ok_or(WriterError::ValueTooLarge("message size"))?;
     let message_size =
         i32::try_from(message_bytes).map_err(|_| WriterError::ValueTooLarge("message size"))?;
     set_message_size(&mut top_properties, message_size)?;
-    let top_property_context = property_context(&top_properties)?;
+    Ok(MessageBlocks {
+        property_context: property_context(&top_properties)?,
+        recipient_table,
+        attachment_table,
+        subnodes: message_subnodes,
+        dynamic_blocks,
+        record_key,
+        message_size,
+    })
+}
+
+/// Create a deterministic Unicode PST containing one canonical mail message.
+pub fn create_fidelity_store(
+    path: impl AsRef<Path>,
+    spec: &FidelityStore,
+) -> Result<FidelityWriteReport, WriterError> {
+    validate_spec(spec)?;
+    create_flat_store(
+        path.as_ref(),
+        &StoreInput {
+            store_name: &spec.store_name,
+            folder_name: &spec.folder_name,
+            record_key: spec.record_key,
+            message: &spec.message,
+        },
+        &[&spec.message],
+        None,
+    )
+}
+
+/// Create a deterministic PST part containing multiple messages in one source folder.
+///
+/// Nested and multiple folder paths are rejected until the hierarchy allocator is
+/// selected by `create_mail_store`; no path component is silently flattened.
+pub fn create_mail_store(
+    path: impl AsRef<Path>,
+    spec: &MailStoreSpec,
+) -> Result<FidelityWriteReport, WriterError> {
+    validate_mail_store_input(spec)?;
+    let first_folder = spec
+        .folders
+        .iter()
+        .filter(|folder| !folder.messages.is_empty())
+        .min_by(|left, right| left.path.cmp(&right.path))
+        .ok_or_else(|| {
+            WriterError::InvalidStructure("mail store must contain at least one message".to_owned())
+        })?;
+    let first = &first_folder.messages[0];
+    let input = StoreInput {
+        store_name: &spec.store_name,
+        folder_name: first_folder
+            .path
+            .first()
+            .map(String::as_str)
+            .unwrap_or("Recovered Mail"),
+        record_key: spec.record_key,
+        message: first,
+    };
+    let messages = spec
+        .folders
+        .iter()
+        .flat_map(|folder| folder.messages.iter())
+        .collect::<Vec<_>>();
+    create_flat_store(path.as_ref(), &input, &messages, Some(&spec.folders))
+}
+
+/// Validate every source-controlled mail-store shape without creating output.
+pub fn validate_mail_store_input(spec: &MailStoreSpec) -> Result<(), WriterError> {
+    let validate = || -> Result<(), WriterError> {
+        if spec.store_name.is_empty() {
+            return Err(WriterError::InvalidStructure(
+                "store name must be non-empty".to_owned(),
+            ));
+        }
+        validate_unicode("store name", &spec.store_name)?;
+        for component in spec.folders.iter().flat_map(|folder| &folder.path) {
+            validate_unicode("folder name", component)?;
+        }
+        let messages = spec
+            .folders
+            .iter()
+            .flat_map(|folder| folder.messages.iter())
+            .collect::<Vec<_>>();
+        let fallback = spec
+            .folders
+            .iter()
+            .flat_map(|folder| folder.path.first())
+            .next()
+            .map(String::as_str)
+            .unwrap_or("Recovered Mail");
+        let folder_plans = plan_folders(fallback, &messages, Some(&spec.folders))?;
+        validate_folder_hierarchy_shapes(&folder_plans)?;
+        let named_identities = collect_named_identities_many_refs(&messages);
+        property_context(&named_property_map(&named_identities)?)?;
+        for message in messages {
+            validate_aggregate_properties(message)?;
+            validate_message(message, false)?;
+            validate_message_size_bound(message)?;
+        }
+        Ok(())
+    };
+    validate().map_err(input_rejection_error)
+}
+
+fn validate_folder_hierarchy_shapes(folders: &[FolderPlan<'_>]) -> Result<(), WriterError> {
+    let columns = hierarchy_columns()?;
+    for folder in folders {
+        let rows = folder
+            .children
+            .iter()
+            .map(|child| {
+                let child = &folders[*child];
+                Ok(folder_table_row_with_unread(
+                    child.node,
+                    child.path.last().ok_or_else(|| {
+                        WriterError::InvalidStructure("folder path is empty".to_owned())
+                    })?,
+                    i32::try_from(child.messages.len())
+                        .map_err(|_| WriterError::ValueTooLarge("folder message count"))?,
+                    folder_unread_count(&child.messages)?,
+                    !child.children.is_empty(),
+                ))
+            })
+            .collect::<Result<Vec<_>, WriterError>>()?;
+        table_context(&columns, &rows)?;
+    }
+    let deleted = node(NodeIdType::NormalFolder, DELETED_FOLDER_INDEX)?;
+    let mut rows = vec![folder_table_row(deleted, "Deleted Items", 0, false)];
+    for folder in folders.iter().filter(|folder| folder.parent.is_none()) {
+        rows.push(folder_table_row_with_unread(
+            folder.node,
+            folder
+                .path
+                .last()
+                .ok_or_else(|| WriterError::InvalidStructure("folder path is empty".to_owned()))?,
+            i32::try_from(folder.messages.len())
+                .map_err(|_| WriterError::ValueTooLarge("folder message count"))?,
+            folder_unread_count(&folder.messages)?,
+            !folder.children.is_empty(),
+        ));
+    }
+    table_context(&columns, &rows)?;
+    Ok(())
+}
+
+fn validate_message_size_bound(message: &MessageSpec) -> Result<(), WriterError> {
+    const BASE_OVERHEAD: u64 = 128 * 1024;
+    const RECIPIENT_OVERHEAD: u64 = 16 * 1024;
+    const ATTACHMENT_OVERHEAD: u64 = 64 * 1024;
+    let mut bytes = BASE_OVERHEAD
+        .checked_add(
+            u64::try_from(message.recipients.len())
+                .map_err(|_| WriterError::ValueTooLarge("message size"))?
+                .checked_mul(RECIPIENT_OVERHEAD)
+                .ok_or(WriterError::ValueTooLarge("message size"))?,
+        )
+        .ok_or(WriterError::ValueTooLarge("message size"))?;
+    for property in &message.spooled_properties {
+        bytes = bytes
+            .checked_add(property.blob.byte_len)
+            .ok_or(WriterError::ValueTooLarge("message size"))?;
+    }
+    for attachment in &message.attachments {
+        bytes = bytes
+            .checked_add(ATTACHMENT_OVERHEAD)
+            .ok_or(WriterError::ValueTooLarge("message size"))?;
+        let content_bytes = match &attachment.content {
+            AttachmentContent::Binary(data) => u64::try_from(data.len())
+                .map_err(|_| WriterError::ValueTooLarge("attachment properties"))?,
+            AttachmentContent::Spooled(blob) => blob.byte_len,
+            AttachmentContent::Embedded(embedded) => {
+                validate_message_size_bound(embedded)?;
+                estimated_message_payload(embedded)?
+            }
+        };
+        let metadata_bytes = attachment_metadata_bytes(attachment)?;
+        if content_bytes
+            .checked_add(metadata_bytes)
+            .is_none_or(|size| size > i32::MAX as u64)
+        {
+            return Err(WriterError::ValueTooLarge("attachment properties"));
+        }
+        bytes = bytes
+            .checked_add(content_bytes)
+            .and_then(|value| value.checked_add(metadata_bytes))
+            .ok_or(WriterError::ValueTooLarge("message size"))?;
+    }
+    if bytes > i32::MAX as u64 {
+        return Err(WriterError::ValueTooLarge("message size"));
+    }
+    Ok(())
+}
+
+fn estimated_message_payload(message: &MessageSpec) -> Result<u64, WriterError> {
+    let mut bytes = 128_u64 * 1024;
+    for property in &message.spooled_properties {
+        bytes = bytes
+            .checked_add(property.blob.byte_len)
+            .ok_or(WriterError::ValueTooLarge("embedded message size"))?;
+    }
+    Ok(bytes)
+}
+
+fn attachment_metadata_bytes(attachment: &AttachmentSpec) -> Result<u64, WriterError> {
+    let mut bytes = 20_u64;
+    for value in [
+        Some(&attachment.filename),
+        Some(&attachment.filename),
+        attachment.mime_type.as_ref(),
+        attachment.content_id.as_ref(),
+        attachment.content_location.as_ref(),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        bytes = bytes
+            .checked_add(
+                u64::try_from(unicode_payload_len(value)?)
+                    .map_err(|_| WriterError::ValueTooLarge("attachment properties"))?,
+            )
+            .ok_or(WriterError::ValueTooLarge("attachment properties"))?;
+    }
+    Ok(bytes)
+}
+
+fn input_rejection_error(error: WriterError) -> WriterError {
+    match error {
+        WriterError::InvalidStructure(detail) => WriterError::InputRejected(detail),
+        WriterError::ValueTooLarge(name) => WriterError::InputRejected(name.to_owned()),
+        other => other,
+    }
+}
+
+fn create_flat_store(
+    path: &Path,
+    spec: &StoreInput<'_>,
+    messages: &[&MessageSpec],
+    folders: Option<&[MailFolderSpec]>,
+) -> Result<FidelityWriteReport, WriterError> {
+    let folder_plans = plan_folders(spec.folder_name, messages, folders)?;
+    let messages = folder_plans
+        .iter()
+        .flat_map(|folder| folder.messages.iter().copied())
+        .collect::<Vec<_>>();
+    let mut unsupported_properties = Vec::new();
+    for (index, message) in messages.iter().enumerate() {
+        let index =
+            u32::try_from(index).map_err(|_| WriterError::ValueTooLarge("message count"))?;
+        let path = (messages.len() != 1)
+            .then_some(index)
+            .into_iter()
+            .collect::<Vec<_>>();
+        unsupported_properties.extend(collect_unsupported_properties(message, &path)?);
+    }
+    let report = FidelityWriteReport {
+        unsupported_properties,
+    };
+    match path.symlink_metadata() {
+        Ok(_) => return Err(WriterError::OutputExists(path.to_path_buf())),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(WriterError::Io(error)),
+    }
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let parent_directory = std::fs::File::open(parent)?;
+    let mut temporary = PublicationTemporary::new(parent)?;
+    let file = &mut temporary.file;
+    file.set_len(INITIAL_FILE_EOF)?;
+    let mut allocation_cursor = FIRST_DATA;
+    let mut written = Vec::new();
+    let mut streamed_subnodes = Vec::new();
+
+    let root_folder = NID_ROOT_FOLDER;
+    let ipm_folder = node(NodeIdType::NormalFolder, IPM_FOLDER_INDEX)?;
+    let search_root = node(NodeIdType::NormalFolder, SEARCH_ROOT_INDEX)?;
+    let deleted_folder = node(NodeIdType::NormalFolder, DELETED_FOLDER_INDEX)?;
+    let spam_search = node(NodeIdType::SearchFolder, SPAM_SEARCH_INDEX)?;
+    let hierarchy_columns = hierarchy_columns()?;
+    let contents_columns = contents_columns()?;
+    let associated_columns = associated_columns()?;
+    let search_contents_columns = search_contents_columns()?;
+    let receive_folder_columns = receive_folder_columns()?;
+    let outgoing_queue_columns = outgoing_queue_columns()?;
+    let contents_index_columns = contents_index_columns()?;
+    let search_index_columns = search_index_columns()?;
+    let attachment_index_columns = attachment_index_columns()?;
+    if messages.is_empty() {
+        return Err(WriterError::InvalidStructure(
+            "mail store must contain at least one message".to_owned(),
+        ));
+    }
+    let named_identities = collect_named_identities_many_refs(&messages);
+    let mut next_block_index = 28_u64;
+    let mut next_value_node = 0x4_0000_u32;
+    let mut contents_rows = Vec::with_capacity(messages.len());
+    let mut top_nodes = Vec::with_capacity(messages.len());
+    let mut single_message = None;
+    let message_parents = folder_plans
+        .iter()
+        .flat_map(|folder| std::iter::repeat_n(folder.node, folder.messages.len()))
+        .collect::<Vec<_>>();
+    for (message_position, message_spec) in messages.iter().enumerate() {
+        let index = u32::try_from(message_position)
+            .map_err(|_| WriterError::ValueTooLarge("message count"))?;
+        let message_node = node(
+            NodeIdType::NormalMessage,
+            MESSAGE_INDEX
+                .checked_add(index)
+                .ok_or(WriterError::ValueTooLarge("message node"))?,
+        )?;
+        let (property_block, recipient_block, attachment_block, subnode_block) = if index == 0 {
+            (
+                leaf_bid(12)?,
+                leaf_bid(17)?,
+                leaf_bid(18)?,
+                internal_bid(27)?,
+            )
+        } else {
+            (
+                take_block_id(&mut next_block_index, false)?,
+                take_block_id(&mut next_block_index, false)?,
+                take_block_id(&mut next_block_index, false)?,
+                take_block_id(&mut next_block_index, true)?,
+            )
+        };
+        let stream_message = messages.len() > 1 || message_requires_streaming(message_spec);
+        let mut block_stream = stream_message.then_some(BlockStream {
+            file: &mut *file,
+            cursor: &mut allocation_cursor,
+            written: &mut written,
+        });
+        let message = build_message_blocks(
+            message_spec,
+            spec.record_key,
+            message_node,
+            &named_identities,
+            recipient_block,
+            attachment_block,
+            &mut next_block_index,
+            &mut next_value_node,
+            block_stream.as_mut(),
+        )?;
+        contents_rows.push(message_table_row(
+            message_node,
+            message_spec,
+            spec.record_key,
+            message.record_key,
+            message.message_size,
+            &contents_columns,
+        )?);
+        top_nodes.push(TopMessageNode {
+            node: message_node,
+            property_block,
+            subnode_block,
+            parent: message_parents[message_position],
+        });
+        let built = BuiltTopMessage {
+            property_block,
+            recipient_block,
+            attachment_block,
+            subnode_block,
+            shared_table_blocks: index == 0,
+            message,
+        };
+        if !stream_message {
+            single_message = Some(built);
+        } else {
+            let message_blocks = built_message_block_specs(built);
+            collect_subnode_ids(&message_blocks, &mut streamed_subnodes);
+            let stream = block_stream.as_mut().ok_or_else(|| {
+                WriterError::InvalidStructure("message block stream is missing".to_owned())
+            })?;
+            for block in message_blocks {
+                stream.emit(block)?;
+            }
+        }
+    }
+    let mut folder_blocks = Vec::new();
+    let mut top_folders = Vec::with_capacity(folder_plans.len());
+    let mut row_start = 0_usize;
+    for (index, folder) in folder_plans.iter().enumerate() {
+        let unread_count = folder_unread_count(&folder.messages)?;
+        let property_block = if index == 0 {
+            leaf_bid(10)?
+        } else {
+            take_block_id(&mut next_block_index, false)?
+        };
+        folder_blocks.push(BlockSpec {
+            id: property_block,
+            payload: BlockPayload::Data(property_context(&folder_properties_with_unread(
+                folder.path.last().ok_or_else(|| {
+                    WriterError::InvalidStructure("folder path is empty".to_owned())
+                })?,
+                i32::try_from(folder.messages.len())
+                    .map_err(|_| WriterError::ValueTooLarge("folder message count"))?,
+                unread_count,
+                !folder.children.is_empty(),
+            ))?),
+            ref_count: 2,
+        });
+
+        let hierarchy_block = if folder.children.is_empty() {
+            leaf_bid(9)?
+        } else {
+            let block = take_block_id(&mut next_block_index, false)?;
+            let rows = folder
+                .children
+                .iter()
+                .map(|child| {
+                    let child = &folder_plans[*child];
+                    Ok(folder_table_row_with_unread(
+                        child.node,
+                        child.path.last().ok_or_else(|| {
+                            WriterError::InvalidStructure("folder path is empty".to_owned())
+                        })?,
+                        i32::try_from(child.messages.len())
+                            .map_err(|_| WriterError::ValueTooLarge("folder message count"))?,
+                        folder_unread_count(&child.messages)?,
+                        !child.children.is_empty(),
+                    ))
+                })
+                .collect::<Result<Vec<_>, WriterError>>()?;
+            folder_blocks.push(BlockSpec {
+                id: block,
+                payload: BlockPayload::Data(table_context(&hierarchy_columns, &rows)?),
+                ref_count: 2,
+            });
+            block
+        };
+
+        let row_end = row_start
+            .checked_add(folder.messages.len())
+            .ok_or(WriterError::ValueTooLarge("folder row range"))?;
+        let rows = &contents_rows[row_start..row_end];
+        row_start = row_end;
+        let (contents_block, contents_subnode) = if rows.is_empty() {
+            (leaf_bid(5)?, None)
+        } else if rows.len() == 1 {
+            let block = if index == 0 {
+                leaf_bid(11)?
+            } else {
+                take_block_id(&mut next_block_index, false)?
+            };
+            folder_blocks.push(BlockSpec {
+                id: block,
+                payload: BlockPayload::Data(table_context(&contents_columns, rows)?),
+                ref_count: 2,
+            });
+            (block, None)
+        } else {
+            let contents = table_context_external(&contents_columns, rows, &mut next_block_index)?;
+            let data = contents.data_block;
+            let subnode = contents.subnode_block;
+            folder_blocks.extend(contents.blocks);
+            (data, Some(subnode))
+        };
+        let parent = folder
+            .parent
+            .map_or(ipm_folder, |parent| folder_plans[parent].node);
+        top_folders.push(TopFolderNode {
+            node: folder.node,
+            parent,
+            property_block,
+            hierarchy_block,
+            contents_block,
+            contents_subnode,
+        });
+    }
+    let mut ipm_rows = vec![folder_table_row(deleted_folder, "Deleted Items", 0, false)];
+    for folder in folder_plans.iter().filter(|folder| folder.parent.is_none()) {
+        ipm_rows.push(folder_table_row_with_unread(
+            folder.node,
+            folder
+                .path
+                .last()
+                .ok_or_else(|| WriterError::InvalidStructure("folder path is empty".to_owned()))?,
+            i32::try_from(folder.messages.len())
+                .map_err(|_| WriterError::ValueTooLarge("folder message count"))?,
+            folder_unread_count(&folder.messages)?,
+            !folder.children.is_empty(),
+        ));
+    }
+    let empty_contents = folder_plans
+        .iter()
+        .filter(|folder| folder.messages.is_empty())
+        .count();
+    let empty_hierarchies = folder_plans
+        .iter()
+        .filter(|folder| folder.children.is_empty())
+        .count();
+    let shared_ref_count = |base: usize, extra: usize| {
+        u16::try_from(base.saturating_add(extra))
+            .map_err(|_| WriterError::ValueTooLarge("shared block reference count"))
+    };
     let mut blocks = vec![
         BlockSpec {
             id: leaf_bid(1)?,
@@ -1014,7 +2082,7 @@ pub fn create_fidelity_store(
         BlockSpec {
             id: leaf_bid(5)?,
             payload: BlockPayload::Data(table_context(&contents_columns, &[])?),
-            ref_count: 6,
+            ref_count: shared_ref_count(6, empty_contents)?,
         },
         BlockSpec {
             id: leaf_bid(6)?,
@@ -1027,13 +2095,7 @@ pub fn create_fidelity_store(
         },
         BlockSpec {
             id: leaf_bid(7)?,
-            payload: BlockPayload::Data(table_context(
-                &hierarchy_columns,
-                &[
-                    folder_table_row(deleted_folder, "Deleted Items", 0, false),
-                    folder_table_row(mail_folder, &spec.folder_name, 1, false),
-                ],
-            )?),
+            payload: BlockPayload::Data(table_context(&hierarchy_columns, &ipm_rows)?),
             ref_count: 2,
         },
         BlockSpec {
@@ -1048,34 +2110,12 @@ pub fn create_fidelity_store(
         BlockSpec {
             id: leaf_bid(9)?,
             payload: BlockPayload::Data(table_context(&hierarchy_columns, &[])?),
-            ref_count: 5,
-        },
-        BlockSpec {
-            id: leaf_bid(10)?,
-            payload: BlockPayload::Data(property_context(&folder_properties(
-                &spec.folder_name,
-                1,
-                false,
-            ))?),
-            ref_count: 2,
-        },
-        BlockSpec {
-            id: leaf_bid(11)?,
-            payload: BlockPayload::Data(table_context(
-                &contents_columns,
-                &[message_table_row(message, spec, top_key, message_size)],
-            )?),
-            ref_count: 2,
-        },
-        BlockSpec {
-            id: leaf_bid(12)?,
-            payload: BlockPayload::Data(top_property_context),
-            ref_count: 2,
+            ref_count: shared_ref_count(4, empty_hierarchies)?,
         },
         BlockSpec {
             id: leaf_bid(13)?,
             payload: BlockPayload::Data(table_context(&associated_columns, &[])?),
-            ref_count: 7,
+            ref_count: shared_ref_count(6, folder_plans.len())?,
         },
         BlockSpec {
             id: leaf_bid(14)?,
@@ -1098,16 +2138,6 @@ pub fn create_fidelity_store(
         BlockSpec {
             id: leaf_bid(16)?,
             payload: BlockPayload::Data(table_context(&search_contents_columns, &[])?),
-            ref_count: 3,
-        },
-        BlockSpec {
-            id: leaf_bid(17)?,
-            payload: BlockPayload::Data(recipient_table),
-            ref_count: 3,
-        },
-        BlockSpec {
-            id: leaf_bid(18)?,
-            payload: BlockPayload::Data(attachment_table),
             ref_count: 3,
         },
         BlockSpec {
@@ -1168,37 +2198,35 @@ pub fn create_fidelity_store(
             payload: BlockPayload::Data(hierarchy_map()),
             ref_count: 2,
         },
-        BlockSpec {
-            id: internal_bid(27)?,
-            payload: BlockPayload::Subnode(message_subnodes),
-            ref_count: 2,
-        },
     ];
-    blocks.extend(attachment_blocks);
+    blocks.extend(folder_blocks);
+    if let Some(message) = single_message {
+        blocks.extend(built_message_block_specs(message));
+    }
     blocks.sort_by_key(|block| u64::from(block.id));
 
-    let written = write_blocks(&mut *file, &blocks)?;
-    let page_offset = align_up(
-        written
-            .last()
-            .map(|block| block.offset + block.physical_size)
-            .unwrap_or(FIRST_DATA),
-        PAGE_SIZE,
-    );
+    written.extend(write_blocks(&mut *file, &blocks, &mut allocation_cursor)?);
+    written.sort_by_key(|block| u64::from(block.id));
+    let page_offset = align_up(allocation_cursor, PAGE_SIZE);
     let (bbt, nbt_offset, next_page_id) = write_bbt(&mut *file, page_offset, 0x100, &written)?;
     let nodes = node_entries(
         root_folder,
         ipm_folder,
         search_root,
         deleted_folder,
-        mail_folder,
         spam_search,
-        message,
+        &top_folders,
+        &top_nodes,
     )?;
     let (nbt, allocated_end, next_page_id) =
         write_nbt(&mut *file, nbt_offset, next_page_id, &nodes)?;
 
-    write_fixed_pages(&mut *file, allocated_end, UnicodePageId::from(next_page_id))?;
+    let dynamic_allocation = allocated_end > INITIAL_FILE_EOF;
+    let file_eof = allocation_file_eof(allocated_end)?;
+    file.set_len(file_eof)?;
+    if !dynamic_allocation {
+        write_fixed_pages(&mut *file, allocated_end, UnicodePageId::from(next_page_id))?;
+    }
     write_header(
         &mut *file,
         nbt,
@@ -1206,7 +2234,8 @@ pub fn create_fidelity_store(
         allocated_end,
         UnicodePageId::from(next_page_id),
         leaf_bid(next_block_index)?,
-        nid_counters(&nodes, &blocks)?,
+        nid_counters(&nodes, &blocks, &streamed_subnodes)?,
+        dynamic_allocation,
     )?;
     file.sync_all()?;
     let validated_path = PathBuf::from(format!(
@@ -1214,7 +2243,22 @@ pub fn create_fidelity_store(
         std::process::id(),
         temporary.file.as_raw_fd()
     ));
-    validate_completed_store(&validated_path, spec)?;
+    if dynamic_allocation {
+        (|| -> Result<(), WriterError> {
+            let mut pst = UnicodePstFile::open(&validated_path)?;
+            let mut transaction = pst.lock()?;
+            transaction.flush()?;
+            drop(transaction);
+            drop(pst);
+            temporary.file.sync_all()?;
+            Ok(())
+        })()
+        .map_err(completed_validation_error)?;
+    }
+    validate_completed_store(&validated_path, spec, message_parents[0])
+        .map_err(completed_validation_error)?;
+    validate_completed_folder_store(&validated_path, spec.record_key, &folder_plans)
+        .map_err(completed_validation_error)?;
     validate_with_independent_readers(&validated_path, &mut temporary)?;
     publish_noclobber(
         temporary.source_name(),
@@ -1225,6 +2269,10 @@ pub fn create_fidelity_store(
     sync_published_directory(path, &parent_directory)?;
     verify_published_destination(path, &temporary.file)?;
     Ok(report)
+}
+
+fn completed_validation_error(error: WriterError) -> WriterError {
+    WriterError::CompletedValidation(error.to_string())
 }
 
 fn collect_unsupported_properties(
@@ -1466,7 +2514,6 @@ impl PublicationTemporary {
         tool: &'static str,
         outcome: &ValidatorOutput,
     ) -> Result<PathBuf, WriterError> {
-        self.retain = true;
         let evidence = self.directory_path()?;
         let diagnostic_path = format!(
             "/proc/self/fd/{}/validator-failure.log",
@@ -1479,15 +2526,18 @@ impl PublicationTemporary {
             format!("stdout truncated: {}\n", outcome.stdout_truncated).as_bytes(),
         );
         diagnostic.extend_from_slice(
-            format!("stderr truncated: {}\nstdout:\n", outcome.stderr_truncated).as_bytes(),
+            format!("stderr truncated: {}\n", outcome.stderr_truncated).as_bytes(),
         );
-        diagnostic.extend_from_slice(&outcome.stdout);
-        diagnostic.extend_from_slice(b"\nstderr:\n");
-        diagnostic.extend_from_slice(&outcome.stderr);
+        diagnostic
+            .extend_from_slice(format!("stdout bytes: {}\n", outcome.stdout.len()).as_bytes());
+        diagnostic
+            .extend_from_slice(format!("stderr bytes: {}\n", outcome.stderr.len()).as_bytes());
+        diagnostic.extend_from_slice(b"validator output redacted to protect recovered mail data\n");
         let diagnostic_file = std::fs::File::create(diagnostic_path)?;
         (&diagnostic_file).write_all(&diagnostic)?;
         diagnostic_file.sync_all()?;
         self.directory.sync_all()?;
+        self.retain = true;
         Ok(evidence)
     }
 }
@@ -1910,7 +2960,7 @@ fn validate_attachment_property_context_shape(
     match &attachment.content {
         AttachmentContent::Binary(data) if data.len() <= 2048 => lengths.push(data.len()),
         AttachmentContent::Embedded(_) => lengths.push(8),
-        AttachmentContent::Binary(_) => {}
+        AttachmentContent::Binary(_) | AttachmentContent::Spooled(_) => {}
     }
     validate_property_context_shape("attachment property context", property_count, &lengths)
 }
@@ -1995,6 +3045,12 @@ fn validate_message_property_context_shape(message: &MessageSpec) -> Result<(), 
     if let Some(body) = &message.body_rtf {
         property_count += 2;
         lengths.push(rtf_container_len(body.len())?);
+    } else if message
+        .spooled_properties
+        .iter()
+        .any(|property| property.id == 0x1009)
+    {
+        property_count += 1;
     }
     if message.native_body.is_some() {
         property_count += 1;
@@ -2029,6 +3085,7 @@ fn validate_message_property_context_shape(message: &MessageSpec) -> Result<(), 
     property_count = property_count
         .checked_add(message.named_properties.len())
         .and_then(|count| count.checked_add(message.raw_properties.len()))
+        .and_then(|count| count.checked_add(message.spooled_properties.len()))
         .ok_or(WriterError::ValueTooLarge("message property count"))?;
     for value in message
         .named_properties
@@ -2047,11 +3104,16 @@ fn validate_message_property_context_shape(message: &MessageSpec) -> Result<(), 
 }
 
 fn validate_message(message: &MessageSpec, embedded: bool) -> Result<(), WriterError> {
-    if message.message_class != "IPM.Note" && !message.message_class.starts_with("IPM.Note.") {
+    if !supported_message_class(&message.message_class) {
         return Err(WriterError::InvalidStructure(format!(
             "unsupported message class: {}",
             message.message_class
         )));
+    }
+    if message.internet_codepage <= 0 {
+        return Err(WriterError::InvalidStructure(
+            "Internet codepage must be positive".to_owned(),
+        ));
     }
     for (name, value) in [
         ("message class", &message.message_class),
@@ -2075,23 +3137,29 @@ fn validate_message(message: &MessageSpec, embedded: bool) -> Result<(), WriterE
         validate_unicode("recipient display name", &recipient.display_name)?;
         validate_unicode("recipient email address", &recipient.email_address)?;
     }
-    if message.body_rtf.is_none() && message.rtf_in_sync {
+    let has_streamed = |id| {
+        message
+            .spooled_properties
+            .iter()
+            .any(|property| property.id == id)
+    };
+    if message.body_rtf.is_none() && !has_streamed(0x1009) && message.rtf_in_sync {
         return Err(WriterError::InvalidStructure(
             "RTF cannot be marked synchronized when no RTF body is present".to_owned(),
         ));
     }
     match message.native_body {
-        Some(NativeBody::PlainText) if message.body_text.is_none() => {
+        Some(NativeBody::PlainText) if message.body_text.is_none() && !has_streamed(0x1000) => {
             return Err(WriterError::InvalidStructure(
                 "native plain-text body is not present".to_owned(),
             ));
         }
-        Some(NativeBody::Rtf) if message.body_rtf.is_none() => {
+        Some(NativeBody::Rtf) if message.body_rtf.is_none() && !has_streamed(0x1009) => {
             return Err(WriterError::InvalidStructure(
                 "native RTF body is not present".to_owned(),
             ));
         }
-        Some(NativeBody::Html) if message.body_html.is_none() => {
+        Some(NativeBody::Html) if message.body_html.is_none() && !has_streamed(0x1013) => {
             return Err(WriterError::InvalidStructure(
                 "native HTML body is not present".to_owned(),
             ));
@@ -2130,6 +3198,63 @@ fn validate_message(message: &MessageSpec, embedded: bool) -> Result<(), WriterE
         }
         validate_payload_len("Internet headers", unicode_payload_len(headers)?)?;
     }
+    let mut streamed_ids = BTreeSet::new();
+    for property in &message.spooled_properties {
+        let property_type = PropertyType::try_from(property.property_type).map_err(|_| {
+            WriterError::InvalidStructure(format!(
+                "unsupported streamed property type: 0x{:04X}",
+                property.property_type
+            ))
+        })?;
+        if matches!(
+            property_type,
+            PropertyType::Null
+                | PropertyType::Integer16
+                | PropertyType::Integer32
+                | PropertyType::Floating32
+                | PropertyType::ErrorCode
+                | PropertyType::Boolean
+                | PropertyType::Object
+        ) {
+            return Err(WriterError::InvalidStructure(
+                "streamed property type must use external storage".to_owned(),
+            ));
+        }
+        if property.id >= 0x8000
+            || !streamed_ids.insert(property.id)
+            || message
+                .raw_properties
+                .iter()
+                .any(|raw| raw.id == property.id)
+        {
+            return Err(WriterError::InvalidStructure(
+                "streamed property identifier is duplicated or reserved".to_owned(),
+            ));
+        }
+        let allowed_managed = match property.id {
+            0x007D => {
+                message.internet_headers.is_none()
+                    && matches!(property_type, PropertyType::String8 | PropertyType::Unicode)
+            }
+            0x1000 => {
+                message.body_text.is_none()
+                    && matches!(property_type, PropertyType::String8 | PropertyType::Unicode)
+            }
+            0x1009 => message.body_rtf.is_none() && property_type == PropertyType::Binary,
+            0x1013 => message.body_html.is_none() && property_type == PropertyType::Binary,
+            _ => false,
+        };
+        if explicit_message_property(property.id) && !allowed_managed {
+            return Err(WriterError::InvalidStructure(
+                "streamed property collides with a writer-managed property".to_owned(),
+            ));
+        }
+        if property.blob.path.as_os_str().is_empty() || property.blob.byte_len > i32::MAX as u64 {
+            return Err(WriterError::InvalidStructure(
+                "streamed property blob is invalid or too large".to_owned(),
+            ));
+        }
+    }
     for attachment in &message.attachments {
         if attachment.filename.is_empty() {
             return Err(WriterError::InvalidStructure(
@@ -2163,6 +3288,11 @@ fn validate_message(message: &MessageSpec, embedded: bool) -> Result<(), WriterE
         }
         if let AttachmentContent::Binary(data) = &attachment.content {
             validate_payload_len("attachment payload", data.len())?;
+        }
+        if let AttachmentContent::Spooled(blob) = &attachment.content {
+            if blob.path.as_os_str().is_empty() || blob.byte_len > i32::MAX as u64 {
+                return Err(WriterError::ValueTooLarge("spooled attachment payload"));
+            }
         }
         if let AttachmentContent::Embedded(child) = &attachment.content {
             if embedded || !child.attachments.is_empty() {
@@ -2238,8 +3368,45 @@ fn validate_message(message: &MessageSpec, embedded: bool) -> Result<(), WriterE
         }
         validate_raw_value(&property.value)?;
     }
+    if !embedded {
+        validate_contents_raw_property_types(message)?;
+    }
     validate_message_property_context_shape(message)?;
     Ok(())
+}
+
+fn validate_contents_raw_property_types(message: &MessageSpec) -> Result<(), WriterError> {
+    let columns = contents_columns()?;
+    for raw in &message.raw_properties {
+        let Some(column) = columns.iter().find(|column| column.prop_id() == raw.id) else {
+            continue;
+        };
+        let actual = raw_property_value(&raw.value).property_type();
+        if actual != column.prop_type() {
+            return Err(WriterError::InvalidStructure(format!(
+                "raw property 0x{:04X} has type {actual:?}, expected {:?} for the contents table",
+                raw.id,
+                column.prop_type()
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn supported_message_class(value: &str) -> bool {
+    class_is_or_descends_from(value, "IPM.Note") || class_descends_from(value, "REPORT.IPM.Note")
+}
+
+fn class_is_or_descends_from(value: &str, root: &str) -> bool {
+    value.eq_ignore_ascii_case(root) || class_descends_from(value, root)
+}
+
+fn class_descends_from(value: &str, root: &str) -> bool {
+    value
+        .get(..root.len())
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case(root))
+        && value.as_bytes().get(root.len()) == Some(&b'.')
+        && value.len() > root.len() + 1
 }
 
 fn validate_unicode(name: &'static str, value: &str) -> Result<(), WriterError> {
@@ -2348,7 +3515,47 @@ fn explicit_message_property(id: u16) -> bool {
     )
 }
 
-fn validate_completed_store(path: &Path, spec: &FidelityStore) -> Result<(), WriterError> {
+fn validation_property_ids(
+    message: &MessageSpec,
+    named_identities: &[NamedIdentity],
+) -> Result<Vec<u16>, WriterError> {
+    let mut ids = vec![
+        0x001A, 0x0037, 0x0039, 0x0042, 0x0064, 0x0065, 0x007D, 0x0C1A, 0x0C1E, 0x0C1F, 0x0E02,
+        0x0E03, 0x0E04, 0x0E06, 0x0E07, 0x0E08, 0x0E17, 0x0E1B, 0x0E1F, 0x1000, 0x1009, 0x1013,
+        0x1016, 0x3007, 0x3008, 0x300B, 0x3FDE,
+    ];
+    ids.extend(message.raw_properties.iter().map(|property| property.id));
+    for property in &message.named_properties {
+        let index = named_identities
+            .binary_search(&(property.set, property.name.clone()))
+            .map_err(|_| {
+                WriterError::InvalidStructure("named property is not mapped".to_owned())
+            })?;
+        ids.push(
+            0x8000_u16
+                .checked_add(
+                    u16::try_from(index)
+                        .map_err(|_| WriterError::ValueTooLarge("named-property count"))?,
+                )
+                .ok_or(WriterError::ValueTooLarge("named-property identifier"))?,
+        );
+    }
+    let streamed = message
+        .spooled_properties
+        .iter()
+        .map(|property| property.id)
+        .collect::<BTreeSet<_>>();
+    ids.retain(|id| !streamed.contains(id));
+    ids.sort_unstable();
+    ids.dedup();
+    Ok(ids)
+}
+
+fn validate_completed_store(
+    path: &Path,
+    spec: &StoreInput<'_>,
+    mail: NodeId,
+) -> Result<(), WriterError> {
     use crate::{ltp::prop_context::PropertyValue as ReadValue, messaging::store::EntryId};
 
     let invalid = |message: &str| WriterError::InvalidStructure(message.to_owned());
@@ -2357,17 +3564,7 @@ fn validate_completed_store(path: &Path, spec: &FidelityStore) -> Result<(), Wri
         return Err(invalid("completed store display name mismatch"));
     }
 
-    let ipm = node(NodeIdType::NormalFolder, IPM_FOLDER_INDEX)?;
-    let mail = node(NodeIdType::NormalFolder, MAIL_FOLDER_INDEX)?;
     let message = node(NodeIdType::NormalMessage, MESSAGE_INDEX)?;
-    let ipm_entry = store.properties().make_entry_id(ipm)?;
-    let ipm_folder = store.open_folder(&ipm_entry)?;
-    let hierarchy = ipm_folder
-        .hierarchy_table()
-        .ok_or_else(|| invalid("completed store IPM hierarchy table is missing"))?;
-    hierarchy
-        .find_row(crate::ltp::table_context::TableRowId::new(u32::from(mail)))
-        .map_err(|_| invalid("completed store mail folder is not indexed"))?;
     let mail_entry = store.properties().make_entry_id(mail)?;
     let folder = store.open_folder(&mail_entry)?;
     let contents = folder
@@ -2441,11 +3638,13 @@ fn validate_completed_store(path: &Path, spec: &FidelityStore) -> Result<(), Wri
         }
     }
 
+    let named_identities = collect_named_identities(spec.message);
+    let validation_ids = validation_property_ids(spec.message, &named_identities)?;
     let message_entry = EntryId::new(
         crate::messaging::store::StoreRecordKey::new(spec.record_key),
         message,
     );
-    let message = store.open_message(&message_entry, None)?;
+    let message = store.open_message(&message_entry, Some(&validation_ids))?;
     if message.properties().message_class()? != spec.message.message_class {
         return Err(invalid("completed store message class mismatch"));
     }
@@ -2475,16 +3674,12 @@ fn validate_completed_store(path: &Path, spec: &FidelityStore) -> Result<(), Wri
             return Err(invalid("completed store sender address type mismatch"));
         }
     }
-    let expected_flags = if spec.message.attachments.is_empty() {
-        1
-    } else {
-        0x11
-    };
+    let expected_flags = output_message_flags(spec.message);
     if !matches!(message.properties().get(0x0E07), Some(ReadValue::Integer32(value)) if *value == expected_flags)
         || !matches!(message.properties().get(0x0E1B), Some(ReadValue::Boolean(value)) if *value != spec.message.attachments.is_empty())
         || !matches!(
             message.properties().get(0x3FDE),
-            Some(ReadValue::Integer32(65001))
+            Some(ReadValue::Integer32(value)) if *value == spec.message.internet_codepage
         )
     {
         return Err(invalid("completed store attachment flags mismatch"));
@@ -2505,9 +3700,17 @@ fn validate_completed_store(path: &Path, spec: &FidelityStore) -> Result<(), Wri
         (None, None) => {}
         _ => return Err(invalid("completed store RTF body mismatch")),
     }
-    match (&spec.message.body_rtf, message.properties().get(0x0E1F)) {
-        (Some(_), Some(ReadValue::Boolean(actual))) if *actual == spec.message.rtf_in_sync => {}
-        (None, None) => {}
+    let has_streamed_rtf = spec
+        .message
+        .spooled_properties
+        .iter()
+        .any(|property| property.id == 0x1009);
+    match (
+        spec.message.body_rtf.is_some() || has_streamed_rtf,
+        message.properties().get(0x0E1F),
+    ) {
+        (true, Some(ReadValue::Boolean(actual))) if *actual == spec.message.rtf_in_sync => {}
+        (false, None) => {}
         _ => return Err(invalid("completed store RTF synchronization flag mismatch")),
     }
     match (spec.message.native_body, message.properties().get(0x1016)) {
@@ -2530,8 +3733,11 @@ fn validate_completed_store(path: &Path, spec: &FidelityStore) -> Result<(), Wri
         message.properties().get(0x0E06),
         Some(ReadValue::Time(value)) if *value == spec.message.received_filetime
     ) || !matches!(
+        message.properties().get(0x3007),
+        Some(ReadValue::Time(value)) if *value == spec.message.creation_filetime
+    ) || !matches!(
         message.properties().get(0x3008),
-        Some(ReadValue::Time(value)) if *value == spec.message.received_filetime
+        Some(ReadValue::Time(value)) if *value == spec.message.modification_filetime
     ) {
         return Err(invalid("completed store timestamps mismatch"));
     }
@@ -2554,7 +3760,6 @@ fn validate_completed_store(path: &Path, spec: &FidelityStore) -> Result<(), Wri
             _ => return Err(invalid("completed store display-recipient mismatch")),
         }
     }
-    let named_identities = collect_named_identities(&spec.message);
     for property in &spec.message.named_properties {
         let index = named_identities
             .binary_search(&(property.set, property.name.clone()))
@@ -2667,6 +3872,239 @@ fn validate_completed_store(path: &Path, spec: &FidelityStore) -> Result<(), Wri
     Ok(())
 }
 
+fn validate_completed_folder_store(
+    path: &Path,
+    record_key: [u8; 16],
+    folders: &[FolderPlan<'_>],
+) -> Result<(), WriterError> {
+    let invalid = |message: &str| WriterError::InvalidStructure(message.to_owned());
+    let store = crate::open_store(path)?;
+    let ipm_node = node(NodeIdType::NormalFolder, IPM_FOLDER_INDEX)?;
+    let ipm = store.open_folder(&store.properties().make_entry_id(ipm_node)?)?;
+    let mut message_index = 0_u32;
+    for folder_plan in folders {
+        let actual_parent = if let Some(parent) = folder_plan.parent {
+            store.open_folder(&store.properties().make_entry_id(folders[parent].node)?)?
+        } else {
+            ipm.clone()
+        };
+        actual_parent
+            .hierarchy_table()
+            .ok_or_else(|| invalid("completed parent hierarchy table is missing"))?
+            .find_row(crate::ltp::table_context::TableRowId::new(u32::from(
+                folder_plan.node,
+            )))
+            .map_err(|_| invalid("completed child folder is not indexed"))?;
+
+        let folder = store.open_folder(&store.properties().make_entry_id(folder_plan.node)?)?;
+        if folder.properties().display_name()?
+            != *folder_plan
+                .path
+                .last()
+                .ok_or_else(|| invalid("planned folder path is empty"))?
+            || folder.properties().content_count()?
+                != i32::try_from(folder_plan.messages.len())
+                    .map_err(|_| WriterError::ValueTooLarge("folder message count"))?
+            || folder.properties().unread_count()? != folder_unread_count(&folder_plan.messages)?
+            || folder.properties().has_sub_folders()? == folder_plan.children.is_empty()
+        {
+            return Err(invalid("completed folder properties mismatch"));
+        }
+        let hierarchy = folder
+            .hierarchy_table()
+            .ok_or_else(|| invalid("completed folder hierarchy table is missing"))?;
+        if hierarchy.rows_matrix().count() != folder_plan.children.len() {
+            return Err(invalid("completed child folder count mismatch"));
+        }
+        for child in &folder_plan.children {
+            hierarchy
+                .find_row(crate::ltp::table_context::TableRowId::new(u32::from(
+                    folders[*child].node,
+                )))
+                .map_err(|_| invalid("completed child hierarchy row is missing"))?;
+        }
+        let contents = folder
+            .contents_table()
+            .ok_or_else(|| invalid("completed folder contents table is missing"))?;
+        if contents.rows_matrix().count() != folder_plan.messages.len() {
+            return Err(invalid("completed folder message count mismatch"));
+        }
+        for expected in &folder_plan.messages {
+            let message = node(
+                NodeIdType::NormalMessage,
+                MESSAGE_INDEX
+                    .checked_add(message_index)
+                    .ok_or(WriterError::ValueTooLarge("message node"))?,
+            )?;
+            message_index = message_index
+                .checked_add(1)
+                .ok_or(WriterError::ValueTooLarge("message count"))?;
+            let row = contents
+                .find_row(crate::ltp::table_context::TableRowId::new(u32::from(
+                    message,
+                )))
+                .map_err(|_| invalid("completed store message is not indexed"))?;
+            let values = row.columns(contents.context())?;
+            let subject = contents
+                .context()
+                .columns()
+                .iter()
+                .position(|column| column.prop_id() == 0x0037)
+                .ok_or_else(|| invalid("completed store subject column is missing"))?;
+            let value = values[subject]
+                .as_ref()
+                .ok_or_else(|| invalid("completed store subject is missing"))?;
+            let actual =
+                contents.read_column(value, contents.context().columns()[subject].prop_type())?;
+            if !matches!(actual, crate::ltp::prop_context::PropertyValue::Unicode(value) if value.to_string() == expected.subject)
+            {
+                return Err(invalid("completed store subject mismatch"));
+            }
+            let flags = contents
+                .context()
+                .columns()
+                .iter()
+                .position(|column| column.prop_id() == 0x0E07)
+                .ok_or_else(|| invalid("completed store message-flags column is missing"))?;
+            let value = values[flags]
+                .as_ref()
+                .ok_or_else(|| invalid("completed store message flags are missing"))?;
+            let actual =
+                contents.read_column(value, contents.context().columns()[flags].prop_type())?;
+            if !matches!(actual, crate::ltp::prop_context::PropertyValue::Integer32(value) if value == output_message_flags(expected))
+            {
+                return Err(invalid("completed store message flags mismatch"));
+            }
+            store.open_message(&store.properties().make_entry_id(message)?, Some(&[]))?;
+        }
+    }
+    validate_spooled_attachment_identities(path, record_key, folders)
+}
+
+fn validate_spooled_attachment_identities(
+    path: &Path,
+    record_key: [u8; 16],
+    folders: &[FolderPlan<'_>],
+) -> Result<(), WriterError> {
+    use crate::{
+        UnicodePstFile,
+        messaging::{
+            attachment::{Attachment, AttachmentData, UnicodeAttachment},
+            message::{Message, UnicodeMessage},
+            store::{EntryId, UnicodeStore},
+        },
+    };
+    use std::rc::Rc;
+
+    let invalid = |message: &str| WriterError::InvalidStructure(message.to_owned());
+    let pst = Rc::new(UnicodePstFile::open(path)?);
+    let store = UnicodeStore::read(pst)?;
+    let mut message_index = 0_u32;
+    for message_spec in folders.iter().flat_map(|folder| &folder.messages) {
+        let validate_streamed_attachments = message_index != 0;
+        let streamed_ids = message_spec
+            .spooled_properties
+            .iter()
+            .map(|property| property.id)
+            .collect::<Vec<_>>();
+        let message_node = node(
+            NodeIdType::NormalMessage,
+            MESSAGE_INDEX
+                .checked_add(message_index)
+                .ok_or(WriterError::ValueTooLarge("message node"))?,
+        )?;
+        message_index = message_index
+            .checked_add(1)
+            .ok_or(WriterError::ValueTooLarge("message count"))?;
+        let message = UnicodeMessage::read_with_streamed_properties(
+            store.clone(),
+            &EntryId::new(
+                crate::messaging::store::StoreRecordKey::new(record_key),
+                message_node,
+            ),
+            Some(&[]),
+            &streamed_ids,
+        )?;
+        for property in &message_spec.spooled_properties {
+            if message.streamed_property_identity(property.id)
+                != Some((
+                    property.property_type,
+                    property.blob.byte_len,
+                    property.blob.sha256,
+                ))
+            {
+                return Err(invalid(
+                    "completed store streamed message property identity mismatch",
+                ));
+            }
+        }
+        if !validate_streamed_attachments {
+            continue;
+        }
+        for (attachment_index, attachment_spec) in message_spec.attachments.iter().enumerate() {
+            let attachment_index = u32::try_from(attachment_index)
+                .map_err(|_| WriterError::ValueTooLarge("attachment count"))?;
+            let attachment_node = node(
+                NodeIdType::Attachment,
+                0x2_0000_u32
+                    .checked_add(attachment_index)
+                    .ok_or(WriterError::ValueTooLarge("attachment node"))?,
+            )?;
+            match &attachment_spec.content {
+                AttachmentContent::Spooled(expected) => {
+                    let attachment =
+                        UnicodeAttachment::read_metadata(message.clone(), attachment_node)
+                            .map_err(|error| {
+                                invalid(&format!(
+                                    "completed store streamed attachment cannot be read: {error}"
+                                ))
+                            })?;
+                    if attachment.streamed_data_identity()
+                        != Some((expected.byte_len, expected.sha256))
+                    {
+                        return Err(invalid(
+                            "completed store streamed attachment identity mismatch",
+                        ));
+                    }
+                }
+                AttachmentContent::Embedded(expected)
+                    if !expected.spooled_properties.is_empty() =>
+                {
+                    let embedded_streamed_ids = expected
+                        .spooled_properties
+                        .iter()
+                        .map(|property| property.id)
+                        .collect::<Vec<_>>();
+                    let attachment = UnicodeAttachment::read_with_streamed_embedded_properties(
+                        message.clone(),
+                        attachment_node,
+                        Some(&[0x0E08]),
+                        &embedded_streamed_ids,
+                    )?;
+                    let Some(AttachmentData::Message(actual)) = attachment.data() else {
+                        return Err(invalid("completed store embedded message is missing"));
+                    };
+                    for property in &expected.spooled_properties {
+                        if actual.streamed_property_identity(property.id)
+                            != Some((
+                                property.property_type,
+                                property.blob.byte_len,
+                                property.blob.sha256,
+                            ))
+                        {
+                            return Err(invalid(
+                                "completed store embedded streamed property identity mismatch",
+                            ));
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    Ok(())
+}
+
 fn raw_value_matches(
     expected: &RawPropertyValue,
     actual: &crate::ltp::prop_context::PropertyValue,
@@ -2722,7 +4160,7 @@ fn raw_value_matches(
 
 fn validate_attachment_fidelity(
     path: &Path,
-    spec: &FidelityStore,
+    spec: &StoreInput<'_>,
     named_identities: &[NamedIdentity],
 ) -> Result<(), WriterError> {
     use crate::{
@@ -2747,7 +4185,7 @@ fn validate_attachment_fidelity(
             crate::messaging::store::StoreRecordKey::new(spec.record_key),
             top_node,
         ),
-        None,
+        Some(&[]),
     )?;
     let attachment_table = top
         .attachment_table()
@@ -2761,12 +4199,33 @@ fn validate_attachment_fidelity(
                 .checked_add(index_u32)
                 .ok_or(WriterError::ValueTooLarge("attachment node"))?,
         )?;
-        let attachment =
-            UnicodeAttachment::read(top.clone(), attachment_node, None).map_err(|error| {
-                invalid(&format!(
-                    "completed store attachment {index} cannot be read: {error}"
-                ))
-            })?;
+        let attachment = match &expected.content {
+            AttachmentContent::Spooled(_) => {
+                UnicodeAttachment::read_metadata(top.clone(), attachment_node)
+            }
+            AttachmentContent::Embedded(message) => {
+                let validation_ids = validation_property_ids(message, named_identities)?;
+                let streamed_ids = message
+                    .spooled_properties
+                    .iter()
+                    .map(|property| property.id)
+                    .collect::<Vec<_>>();
+                UnicodeAttachment::read_with_streamed_embedded_properties(
+                    top.clone(),
+                    attachment_node,
+                    Some(&validation_ids),
+                    &streamed_ids,
+                )
+            }
+            AttachmentContent::Binary(_) => {
+                UnicodeAttachment::read(top.clone(), attachment_node, None)
+            }
+        }
+        .map_err(|error| {
+            invalid(&format!(
+                "completed store attachment {index} cannot be read: {error}"
+            ))
+        })?;
         let properties = attachment.properties();
         let row = attachment_table
             .find_row(crate::ltp::table_context::TableRowId::new(u32::from(
@@ -2843,6 +4302,27 @@ fn validate_attachment_fidelity(
                 ))?;
                 if actual.buffer() != expected_data || pc_method != 1 || pc_size != expected_size {
                     return Err(invalid("completed store binary attachment size mismatch"));
+                }
+            }
+            (AttachmentContent::Spooled(blob), None) => {
+                let expected_size = attachment_property_size_with_stream(
+                    &attachment_properties(
+                        expected,
+                        expected_number,
+                        1,
+                        0,
+                        PropertyValue::External(
+                            PropertyType::Binary,
+                            node(NodeIdType::ListsTablesProperties, 1)?,
+                        ),
+                    ),
+                    Some(blob.byte_len),
+                )?;
+                if pc_method != 1
+                    || pc_size != expected_size
+                    || attachment.streamed_data_identity() != Some((blob.byte_len, blob.sha256))
+                {
+                    return Err(invalid("completed store spooled attachment size mismatch"));
                 }
             }
             (
@@ -2967,11 +4447,12 @@ fn validate_embedded_message(
         || !unicode_matches(0x0C1E, "SMTP")
         || !matches!(properties.get(0x0039), Some(ReadValue::Time(value)) if *value == expected.sent_filetime)
         || !matches!(properties.get(0x0E06), Some(ReadValue::Time(value)) if *value == expected.received_filetime)
-        || !matches!(properties.get(0x3008), Some(ReadValue::Time(value)) if *value == expected.received_filetime)
+        || !matches!(properties.get(0x3007), Some(ReadValue::Time(value)) if *value == expected.creation_filetime)
+        || !matches!(properties.get(0x3008), Some(ReadValue::Time(value)) if *value == expected.modification_filetime)
         || !matches!(properties.get(0x300B), Some(ReadValue::Binary(value)) if value.buffer() == record_key)
-        || !matches!(properties.get(0x0E07), Some(ReadValue::Integer32(value)) if *value == if expected.attachments.is_empty() { 1 } else { 0x11 })
+        || !matches!(properties.get(0x0E07), Some(ReadValue::Integer32(value)) if *value == output_message_flags(expected))
         || !matches!(properties.get(0x0E1B), Some(ReadValue::Boolean(value)) if *value != expected.attachments.is_empty())
-        || !matches!(properties.get(0x3FDE), Some(ReadValue::Integer32(65001)))
+        || !matches!(properties.get(0x3FDE), Some(ReadValue::Integer32(value)) if *value == expected.internet_codepage)
     {
         return Err(invalid("completed store embedded metadata mismatch"));
     }
@@ -2991,9 +4472,16 @@ fn validate_embedded_message(
         (None, None) => {}
         _ => return Err(invalid("completed store embedded RTF mismatch")),
     }
-    match (&expected.body_rtf, properties.get(0x0E1F)) {
-        (Some(_), Some(ReadValue::Boolean(actual))) if *actual == expected.rtf_in_sync => {}
-        (None, None) => {}
+    let has_streamed_rtf = expected
+        .spooled_properties
+        .iter()
+        .any(|property| property.id == 0x1009);
+    match (
+        expected.body_rtf.is_some() || has_streamed_rtf,
+        properties.get(0x0E1F),
+    ) {
+        (true, Some(ReadValue::Boolean(actual))) if *actual == expected.rtf_in_sync => {}
+        (false, None) => {}
         _ => return Err(invalid("completed store embedded RTF sync mismatch")),
     }
     match (expected.native_body, properties.get(0x1016)) {
@@ -3042,6 +4530,19 @@ fn validate_embedded_message(
             .is_some_and(|actual| raw_value_matches(&property.value, actual))
         {
             return Err(invalid("completed store embedded raw property mismatch"));
+        }
+    }
+    for property in &expected.spooled_properties {
+        if actual.streamed_property_identity(property.id)
+            != Some((
+                property.property_type,
+                property.blob.byte_len,
+                property.blob.sha256,
+            ))
+        {
+            return Err(invalid(
+                "completed store embedded streamed property mismatch",
+            ));
         }
     }
     let recipients = actual
@@ -3116,7 +4617,7 @@ fn validate_embedded_message(
 }
 
 fn store_properties(
-    spec: &FidelityStore,
+    spec: &StoreInput<'_>,
     ipm_folder: NodeId,
     deleted_folder: NodeId,
     search_root: NodeId,
@@ -3124,7 +4625,7 @@ fn store_properties(
     Ok(vec![
         (0x0E34, PropertyValue::Binary(spec.record_key.to_vec())),
         (0x0FF9, PropertyValue::Binary(spec.record_key.to_vec())),
-        (0x3001, PropertyValue::Unicode(spec.store_name.clone())),
+        (0x3001, PropertyValue::Unicode(spec.store_name.to_owned())),
         (
             0x35E0,
             PropertyValue::Binary(entry_id(spec.record_key, ipm_folder)?),
@@ -3147,11 +4648,20 @@ fn folder_properties(
     content_count: i32,
     has_children: bool,
 ) -> Vec<(u16, PropertyValue)> {
+    folder_properties_with_unread(name, content_count, 0, has_children)
+}
+
+fn folder_properties_with_unread(
+    name: &str,
+    content_count: i32,
+    unread_count: i32,
+    has_children: bool,
+) -> Vec<(u16, PropertyValue)> {
     vec![
         (0x3001, PropertyValue::Unicode(name.to_owned())),
         (0x3601, PropertyValue::Integer32(1)),
         (0x3602, PropertyValue::Integer32(content_count)),
-        (0x3603, PropertyValue::Integer32(0)),
+        (0x3603, PropertyValue::Integer32(unread_count)),
         (0x360A, PropertyValue::Boolean(has_children)),
         (0x3613, PropertyValue::Unicode("IPF.Note".to_owned())),
     ]
@@ -3181,6 +4691,15 @@ fn collect_named_identities(message: &MessageSpec) -> Vec<NamedIdentity> {
     identities
         .into_iter()
         .map(|(set, name)| (set, name.clone()))
+        .collect()
+}
+
+fn collect_named_identities_many_refs(messages: &[&MessageSpec]) -> Vec<NamedIdentity> {
+    messages
+        .iter()
+        .flat_map(|message| collect_named_identities(message))
+        .collect::<BTreeSet<_>>()
+        .into_iter()
         .collect()
 }
 
@@ -3309,11 +4828,7 @@ fn message_properties(
         (0x0E06, PropertyValue::Time(message.received_filetime)),
         (
             0x0E07,
-            PropertyValue::Integer32(if message.attachments.is_empty() {
-                1
-            } else {
-                0x11
-            }),
+            PropertyValue::Integer32(output_message_flags(message)),
         ),
         (0x0E08, PropertyValue::Integer32(message_size)),
         (0x0E17, PropertyValue::Integer32(0)),
@@ -3321,10 +4836,10 @@ fn message_properties(
             0x0E1B,
             PropertyValue::Boolean(!message.attachments.is_empty()),
         ),
-        (0x3007, PropertyValue::Time(message.received_filetime)),
-        (0x3008, PropertyValue::Time(message.received_filetime)),
+        (0x3007, PropertyValue::Time(message.creation_filetime)),
+        (0x3008, PropertyValue::Time(message.modification_filetime)),
         (0x300B, PropertyValue::Binary(record_key.to_vec())),
-        (0x3FDE, PropertyValue::Integer32(65001)),
+        (0x3FDE, PropertyValue::Integer32(message.internet_codepage)),
     ];
     if let Some(body) = &message.body_text {
         properties.push((0x1000, PropertyValue::Unicode(body.clone())));
@@ -3334,6 +4849,12 @@ fn message_properties(
     }
     if let Some(rtf) = &message.body_rtf {
         properties.push((0x1009, PropertyValue::Binary(rtf_container(rtf)?)));
+        properties.push((0x0E1F, PropertyValue::Boolean(message.rtf_in_sync)));
+    } else if message
+        .spooled_properties
+        .iter()
+        .any(|property| property.id == 0x1009)
+    {
         properties.push((0x0E1F, PropertyValue::Boolean(message.rtf_in_sync)));
     }
     if let Some(native_body) = message.native_body {
@@ -3362,6 +4883,16 @@ fn message_properties(
         properties.push((raw.id, raw_property_value(&raw.value)));
     }
     Ok(properties)
+}
+
+fn output_message_flags(message: &MessageSpec) -> i32 {
+    const HAS_ATTACHMENTS: i32 = 0x10;
+    let flags = message.message_flags & !HAS_ATTACHMENTS;
+    if message.attachments.is_empty() {
+        flags
+    } else {
+        flags | HAS_ATTACHMENTS
+    }
 }
 
 fn display_recipient_properties(recipients: &[RecipientSpec]) -> Vec<(u16, PropertyValue)> {
@@ -3779,6 +5310,13 @@ fn attachment_properties(
 }
 
 fn attachment_property_size(properties: &[(u16, PropertyValue)]) -> Result<i32, WriterError> {
+    attachment_property_size_with_stream(properties, None)
+}
+
+fn attachment_property_size_with_stream(
+    properties: &[(u16, PropertyValue)],
+    streamed_size: Option<u64>,
+) -> Result<i32, WriterError> {
     let size = properties.iter().try_fold(0_usize, |total, (_, value)| {
         let value_size = match value {
             PropertyValue::Integer32(_) => 4,
@@ -3786,6 +5324,12 @@ fn attachment_property_size(properties: &[(u16, PropertyValue)]) -> Result<i32, 
             PropertyValue::Binary(value) => value.len(),
             PropertyValue::Object(_, size) => usize::try_from(*size)
                 .map_err(|_| WriterError::ValueTooLarge("attachment object"))?,
+            PropertyValue::External(PropertyType::Binary, _) => {
+                usize::try_from(streamed_size.ok_or_else(|| {
+                    WriterError::InvalidStructure("streamed attachment size is missing".to_owned())
+                })?)
+                .map_err(|_| WriterError::ValueTooLarge("streamed attachment"))?
+            }
             _ => {
                 return Err(WriterError::InvalidStructure(
                     "unsupported attachment property type for size calculation".to_owned(),
@@ -3932,12 +5476,22 @@ fn column(
 }
 
 fn folder_table_row(id: NodeId, name: &str, count: i32, children: bool) -> TableRowSpec {
+    folder_table_row_with_unread(id, name, count, 0, children)
+}
+
+fn folder_table_row_with_unread(
+    id: NodeId,
+    name: &str,
+    count: i32,
+    unread_count: i32,
+    children: bool,
+) -> TableRowSpec {
     TableRowSpec {
         id,
         values: vec![
             (0x3001, PropertyValue::Unicode(name.to_owned())),
             (0x3602, PropertyValue::Integer32(count)),
-            (0x3603, PropertyValue::Integer32(0)),
+            (0x3603, PropertyValue::Integer32(unread_count)),
             (0x360A, PropertyValue::Boolean(children)),
             (0x3613, PropertyValue::Unicode("IPF.Note".to_owned())),
         ],
@@ -3946,11 +5500,12 @@ fn folder_table_row(id: NodeId, name: &str, count: i32, children: bool) -> Table
 
 fn message_table_row(
     id: NodeId,
-    spec: &FidelityStore,
+    message: &MessageSpec,
+    store_key: [u8; 16],
     record_key: [u8; 16],
     message_size: i32,
-) -> TableRowSpec {
-    let message = &spec.message;
+    columns: &[TableColumnDescriptor],
+) -> Result<TableRowSpec, WriterError> {
     let mut values = vec![
         (
             0x001A,
@@ -3962,11 +5517,7 @@ fn message_table_row(
         (0x0E06, PropertyValue::Time(message.received_filetime)),
         (
             0x0E07,
-            PropertyValue::Integer32(if message.attachments.is_empty() {
-                1
-            } else {
-                0x11
-            }),
+            PropertyValue::Integer32(output_message_flags(message)),
         ),
         (0x0E08, PropertyValue::Integer32(message_size)),
         (0x0E17, PropertyValue::Integer32(0)),
@@ -3974,16 +5525,43 @@ fn message_table_row(
         (0x0E33, PropertyValue::Integer64(0x90)),
         (
             0x0E34,
-            PropertyValue::Binary(message_instance_entry_id(spec.record_key)),
+            PropertyValue::Binary(message_instance_entry_id(store_key)),
         ),
-        (0x3008, PropertyValue::Time(message.received_filetime)),
+        (0x3008, PropertyValue::Time(message.modification_filetime)),
     ];
     values.extend(
         display_recipient_properties(&message.recipients)
             .into_iter()
             .filter(|(id, _)| matches!(*id, 0x0E03 | 0x0E04)),
     );
-    TableRowSpec { id, values }
+    for raw in &message.raw_properties {
+        if values.iter().any(|(id, _)| *id == raw.id) {
+            continue;
+        }
+        let Some(column) = columns.iter().find(|column| column.prop_id() == raw.id) else {
+            continue;
+        };
+        let value = raw_property_value(&raw.value);
+        if value.property_type() != column.prop_type() {
+            return Err(WriterError::InvalidStructure(format!(
+                "raw property 0x{:04X} is incompatible with the contents table",
+                raw.id
+            )));
+        }
+        values.push((raw.id, value));
+    }
+    Ok(TableRowSpec { id, values })
+}
+
+fn folder_unread_count(messages: &[&MessageSpec]) -> Result<i32, WriterError> {
+    const MSGFLAG_READ: i32 = 0x0000_0001;
+    i32::try_from(
+        messages
+            .iter()
+            .filter(|message| output_message_flags(message) & MSGFLAG_READ == 0)
+            .count(),
+    )
+    .map_err(|_| WriterError::ValueTooLarge("folder unread count"))
 }
 
 fn set_message_size(
@@ -4116,6 +5694,405 @@ fn table_context(
     allocations.push(matrix);
     allocations.extend(variable_values);
     heap_page(HeapNodeType::Table, &allocations)
+}
+
+fn table_context_external(
+    columns: &[TableColumnDescriptor],
+    rows: &[TableRowSpec],
+    next_block_index: &mut u64,
+) -> Result<ExternalTableBuild, WriterError> {
+    let mut rows = rows.iter().collect::<Vec<_>>();
+    rows.sort_by_key(|row| u32::from(row.id));
+    if rows.is_empty() {
+        return Err(WriterError::InvalidStructure(
+            "external table must contain rows".to_owned(),
+        ));
+    }
+
+    let end_4byte = columns
+        .iter()
+        .filter(|column| {
+            !matches!(
+                column.prop_type(),
+                PropertyType::Integer16 | PropertyType::Boolean
+            )
+        })
+        .map(|column| column.offset().saturating_add(u16::from(column.size())))
+        .max()
+        .unwrap_or(0);
+    let end_4byte = u16::try_from(align_up(u64::from(end_4byte), 4))
+        .map_err(|_| WriterError::ValueTooLarge("table row"))?;
+    let end_2byte = columns
+        .iter()
+        .filter(|column| column.prop_type() == PropertyType::Integer16)
+        .map(|column| column.offset().saturating_add(2))
+        .max()
+        .unwrap_or(end_4byte)
+        .max(end_4byte);
+    let end_1byte = columns
+        .iter()
+        .filter(|column| column.prop_type() == PropertyType::Boolean)
+        .map(|column| column.offset().saturating_add(1))
+        .max()
+        .unwrap_or(end_2byte)
+        .max(end_2byte);
+    let end_bitmap = end_1byte
+        .checked_add(
+            u16::try_from(columns.len().div_ceil(8))
+                .map_err(|_| WriterError::ValueTooLarge("table bitmap"))?,
+        )
+        .ok_or(WriterError::ValueTooLarge("table row"))?;
+
+    let row_index =
+        HeapId::new(2, 0).map_err(|error| WriterError::InvalidStructure(error.to_string()))?;
+    let mut next_value_node = 0x5_0000_u32;
+    let row_matrix_node = node(NodeIdType::ListsTablesProperties, next_value_node)?;
+    next_value_node = next_value_node
+        .checked_add(1)
+        .ok_or(WriterError::ValueTooLarge("table value node"))?;
+
+    let mut leaf = Vec::with_capacity(rows.len().saturating_mul(8));
+    let mut matrix = Vec::with_capacity(rows.len().saturating_mul(usize::from(end_bitmap)));
+    let mut blocks = Vec::new();
+    let mut subnodes = Vec::new();
+    for (index, row) in rows.iter().enumerate() {
+        leaf.write_u32::<LittleEndian>(u32::from(row.id))?;
+        leaf.write_u32::<LittleEndian>(
+            u32::try_from(index).map_err(|_| WriterError::ValueTooLarge("table row index"))?,
+        )?;
+
+        let mut bytes = vec![0_u8; usize::from(end_bitmap)];
+        bytes[0..4].copy_from_slice(&u32::from(row.id).to_le_bytes());
+        bytes[4..8].copy_from_slice(&1_u32.to_le_bytes());
+        mark_column(&mut bytes, columns, LTP_ROW_ID_PROP_ID)?;
+        mark_column(&mut bytes, columns, LTP_ROW_VERSION_PROP_ID)?;
+        for (property_id, value) in &row.values {
+            write_external_table_value(
+                &mut bytes,
+                columns,
+                *property_id,
+                value,
+                &mut next_value_node,
+                next_block_index,
+                &mut blocks,
+                &mut subnodes,
+            )?;
+        }
+        matrix.extend_from_slice(&bytes);
+    }
+
+    let matrix_root = append_data_tree_aligned(
+        &matrix,
+        usize::from(end_bitmap),
+        next_block_index,
+        &mut blocks,
+    )?;
+    subnodes.push(UnicodeLeafSubNodeTreeEntry::new(
+        row_matrix_node,
+        matrix_root,
+        None,
+    ));
+    let subnode_block = append_subnode_tree(subnodes, next_block_index, &mut blocks)?;
+
+    const BTH_RECORDS_PER_PAGE: usize = MAX_HEAP_ALLOCATION / 8;
+    let mut heap_pages = Vec::new();
+    let mut roots = Vec::with_capacity(rows.len().div_ceil(BTH_RECORDS_PER_PAGE));
+    for chunk in leaf.chunks(BTH_RECORDS_PER_PAGE * 8) {
+        let page_index = u16::try_from(heap_pages.len() + 1)
+            .map_err(|_| WriterError::ValueTooLarge("heap page index"))?;
+        let heap_id = HeapId::new(1, page_index)
+            .map_err(|error| WriterError::InvalidStructure(error.to_string()))?;
+        let key = u32::from_le_bytes(
+            chunk[0..4]
+                .try_into()
+                .map_err(|_| WriterError::InvalidStructure("empty BTH leaf".to_owned()))?,
+        );
+        heap_pages.push(heap_continuation_page(page_index, chunk)?);
+        roots.push((key, heap_id));
+    }
+    let mut levels = 0_u8;
+    while roots.len() > 1 {
+        levels = levels
+            .checked_add(1)
+            .ok_or(WriterError::ValueTooLarge("BTH depth"))?;
+        let mut parents = Vec::with_capacity(roots.len().div_ceil(BTH_RECORDS_PER_PAGE));
+        for group in roots.chunks(BTH_RECORDS_PER_PAGE) {
+            let mut entries = Vec::with_capacity(group.len() * 8);
+            for (key, next_level) in group {
+                entries.write_u32::<LittleEndian>(*key)?;
+                entries.write_u32::<LittleEndian>(u32::from(*next_level))?;
+            }
+            let page_index = u16::try_from(heap_pages.len() + 1)
+                .map_err(|_| WriterError::ValueTooLarge("heap page index"))?;
+            let heap_id = HeapId::new(1, page_index)
+                .map_err(|error| WriterError::InvalidStructure(error.to_string()))?;
+            heap_pages.push(heap_continuation_page(page_index, &entries)?);
+            parents.push((group[0].0, heap_id));
+        }
+        roots = parents;
+    }
+    let row_tree_root = roots[0].1;
+    let mut table = Vec::new();
+    TableContextInfo::new(
+        end_4byte,
+        end_2byte,
+        end_1byte,
+        end_bitmap,
+        row_index,
+        Some(row_matrix_node),
+        columns.to_vec(),
+    )
+    .map_err(|error| WriterError::InvalidStructure(error.to_string()))?
+    .write(&mut table)?;
+    let mut index = Vec::new();
+    HeapTreeHeader::new(4, 4, levels, row_tree_root)
+        .map_err(|error| WriterError::InvalidStructure(error.to_string()))?
+        .write(&mut index)?;
+    heap_pages.insert(0, heap_page(HeapNodeType::Table, &[table, index])?);
+    let non_final = heap_pages.len().saturating_sub(1);
+    for page in heap_pages.iter_mut().take(non_final) {
+        fill_heap_page(page)?;
+    }
+    update_heap_fill_levels(&mut heap_pages)?;
+    let data_block = append_data_tree_pages(&heap_pages, next_block_index, &mut blocks)?;
+
+    Ok(ExternalTableBuild {
+        data_block,
+        subnode_block,
+        blocks,
+    })
+}
+
+fn fill_heap_page(page: &mut Vec<u8>) -> Result<(), WriterError> {
+    if page.len() >= MAX_DATA_BLOCK_PAYLOAD {
+        if page.len() == MAX_DATA_BLOCK_PAYLOAD {
+            return Ok(());
+        }
+        return Err(WriterError::ValueTooLarge("heap page"));
+    }
+    let offset_bytes = page
+        .get(..2)
+        .ok_or_else(|| WriterError::InvalidStructure("heap page has no map offset".to_owned()))?;
+    let page_map_offset =
+        usize::from(u16::from_le_bytes(offset_bytes.try_into().map_err(
+            |_| WriterError::InvalidStructure("invalid heap map offset".to_owned()),
+        )?));
+    let mut page_map = page
+        .get(page_map_offset..)
+        .ok_or_else(|| WriterError::InvalidStructure("heap map exceeds its page".to_owned()))?
+        .to_vec();
+    let allocation_count = page_map
+        .get(..2)
+        .ok_or_else(|| WriterError::InvalidStructure("heap page map has no count".to_owned()))?;
+    let allocation_count =
+        u16::from_le_bytes(allocation_count.try_into().map_err(|_| {
+            WriterError::InvalidStructure("invalid heap allocation count".to_owned())
+        })?);
+    let expected_map_size = usize::from(allocation_count)
+        .checked_add(1)
+        .and_then(|offset_count| offset_count.checked_mul(size_of::<u16>()))
+        .and_then(|offsets_size| offsets_size.checked_add(2 * size_of::<u16>()))
+        .ok_or(WriterError::ValueTooLarge("heap page map"))?;
+    if page_map.len() != expected_map_size {
+        return Err(WriterError::InvalidStructure(
+            "heap page map size does not match its allocation count".to_owned(),
+        ));
+    }
+    let allocation_end = usize::from(u16::from_le_bytes(
+        page_map[page_map.len() - size_of::<u16>()..]
+            .try_into()
+            .map_err(|_| {
+                WriterError::InvalidStructure("invalid heap allocation endpoint".to_owned())
+            })?,
+    ));
+    let mut padding_allocations = 1_usize;
+    let (filled_map_offset, padding_size) = loop {
+        let expanded_map_size = padding_allocations
+            .checked_mul(size_of::<u16>())
+            .and_then(|padding_map_size| page_map.len().checked_add(padding_map_size))
+            .ok_or(WriterError::ValueTooLarge("heap page map"))?;
+        let filled_map_offset = MAX_DATA_BLOCK_PAYLOAD
+            .checked_sub(expanded_map_size)
+            .ok_or(WriterError::ValueTooLarge("heap page map"))?;
+        let padding_size = filled_map_offset
+            .checked_sub(allocation_end)
+            .ok_or_else(|| {
+                WriterError::InvalidStructure(
+                    "heap page allocations overlap the filled map".to_owned(),
+                )
+            })?;
+        let padding_capacity = padding_allocations
+            .checked_mul(MAX_HEAP_ALLOCATION)
+            .ok_or(WriterError::ValueTooLarge("heap padding allocations"))?;
+        if padding_size < padding_allocations {
+            return Err(WriterError::InvalidStructure(
+                "heap page has no room for non-empty padding allocations".to_owned(),
+            ));
+        }
+        if padding_size <= padding_capacity {
+            break (filled_map_offset, padding_size);
+        }
+        padding_allocations = padding_allocations
+            .checked_add(1)
+            .ok_or(WriterError::ValueTooLarge("heap padding allocations"))?;
+    };
+    let allocation_count = allocation_count
+        .checked_add(
+            u16::try_from(padding_allocations)
+                .map_err(|_| WriterError::ValueTooLarge("heap allocation count"))?,
+        )
+        .ok_or(WriterError::ValueTooLarge("heap allocation count"))?;
+    page_map[0..2].copy_from_slice(&allocation_count.to_le_bytes());
+    let mut padding_end = allocation_end;
+    let mut padding_remaining = padding_size;
+    for allocation_index in 0..padding_allocations {
+        let allocations_remaining = padding_allocations - allocation_index;
+        let allocation_size = padding_remaining
+            .saturating_sub(allocations_remaining - 1)
+            .min(MAX_HEAP_ALLOCATION);
+        padding_end = padding_end
+            .checked_add(allocation_size)
+            .ok_or(WriterError::ValueTooLarge("heap padding allocation"))?;
+        page_map.extend_from_slice(
+            &u16::try_from(padding_end)
+                .map_err(|_| WriterError::ValueTooLarge("heap padding endpoint"))?
+                .to_le_bytes(),
+        );
+        padding_remaining -= allocation_size;
+    }
+    if padding_remaining != 0 || padding_end != filled_map_offset {
+        return Err(WriterError::InvalidStructure(
+            "heap padding does not reach the page map".to_owned(),
+        ));
+    }
+    let filled_map_offset = u16::try_from(filled_map_offset)
+        .map_err(|_| WriterError::ValueTooLarge("heap page map offset"))?;
+    page.truncate(page_map_offset);
+    page.resize(usize::from(filled_map_offset), 0);
+    page.extend_from_slice(&page_map);
+    page[0..2].copy_from_slice(&filled_map_offset.to_le_bytes());
+    Ok(())
+}
+
+fn update_heap_fill_levels(pages: &mut [Vec<u8>]) -> Result<(), WriterError> {
+    let levels = pages
+        .iter()
+        .map(|page| heap_fill_level(page.len()))
+        .collect::<Result<Vec<_>, _>>()?;
+    let root_page = pages
+        .first_mut()
+        .ok_or_else(|| WriterError::InvalidStructure("heap has no root page".to_owned()))?;
+    let root_header = HeapNodeHeader::read(&mut io::Cursor::new(root_page.as_slice()))?;
+    let mut root_levels = [HeapFillLevel::Empty; 8];
+    let root_count = levels.len().min(root_levels.len());
+    root_levels[..root_count].copy_from_slice(&levels[..root_count]);
+    HeapNodeHeader::new(
+        root_header.page_map_offset(),
+        root_header.client_signature(),
+        root_header.user_root(),
+        root_levels,
+    )
+    .write(&mut io::Cursor::new(root_page.as_mut_slice()))?;
+
+    for bitmap_index in (8..pages.len()).step_by(128) {
+        let bitmap_page = pages.get_mut(bitmap_index).ok_or_else(|| {
+            WriterError::InvalidStructure("heap bitmap page is missing".to_owned())
+        })?;
+        let bitmap_header =
+            HeapNodeBitmapHeader::read(&mut io::Cursor::new(bitmap_page.as_slice()))?;
+        let mut bitmap_levels = [HeapFillLevel::Empty; 128];
+        let represented_count = levels.len().saturating_sub(bitmap_index).min(128);
+        bitmap_levels[..represented_count]
+            .copy_from_slice(&levels[bitmap_index..bitmap_index + represented_count]);
+        HeapNodeBitmapHeader::new(bitmap_header.page_map_offset(), bitmap_levels)
+            .write(&mut io::Cursor::new(bitmap_page.as_mut_slice()))?;
+    }
+    Ok(())
+}
+
+fn heap_fill_level(page_size: usize) -> Result<HeapFillLevel, WriterError> {
+    let free = MAX_DATA_BLOCK_PAYLOAD
+        .checked_sub(page_size)
+        .ok_or(WriterError::ValueTooLarge("heap page"))?;
+    Ok(match free {
+        3584.. => HeapFillLevel::Empty,
+        2560..=3583 => HeapFillLevel::Level1,
+        2048..=2559 => HeapFillLevel::Level2,
+        1792..=2047 => HeapFillLevel::Level3,
+        1536..=1791 => HeapFillLevel::Level4,
+        1280..=1535 => HeapFillLevel::Level5,
+        1024..=1279 => HeapFillLevel::Level6,
+        768..=1023 => HeapFillLevel::Level7,
+        512..=767 => HeapFillLevel::Level8,
+        256..=511 => HeapFillLevel::Level9,
+        128..=255 => HeapFillLevel::Level10,
+        64..=127 => HeapFillLevel::Level11,
+        32..=63 => HeapFillLevel::Level12,
+        16..=31 => HeapFillLevel::Level13,
+        8..=15 => HeapFillLevel::Level14,
+        0..=7 => HeapFillLevel::Level15,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn write_external_table_value(
+    row: &mut [u8],
+    columns: &[TableColumnDescriptor],
+    property_id: u16,
+    value: &PropertyValue,
+    next_value_node: &mut u32,
+    next_block_index: &mut u64,
+    blocks: &mut Vec<BlockSpec>,
+    subnodes: &mut Vec<UnicodeLeafSubNodeTreeEntry>,
+) -> Result<(), WriterError> {
+    let column = columns
+        .iter()
+        .find(|column| column.prop_id() == property_id)
+        .ok_or_else(|| WriterError::InvalidStructure("table value has no column".to_owned()))?;
+    let offset = usize::from(column.offset());
+    match value {
+        PropertyValue::Integer16(value) => write_row_bytes(row, offset, &value.to_le_bytes())?,
+        PropertyValue::Integer32(value) => write_row_bytes(row, offset, &value.to_le_bytes())?,
+        PropertyValue::Floating32(value) | PropertyValue::ErrorCode(value) => {
+            write_row_bytes(row, offset, &value.to_le_bytes())?
+        }
+        PropertyValue::Boolean(value) => write_row_bytes(row, offset, &[u8::from(*value)])?,
+        PropertyValue::Integer64(value)
+        | PropertyValue::Currency(value)
+        | PropertyValue::Time(value) => write_row_bytes(row, offset, &value.to_le_bytes())?,
+        PropertyValue::Floating64(value) | PropertyValue::FloatingTime(value) => {
+            write_row_bytes(row, offset, &value.to_le_bytes())?
+        }
+        PropertyValue::Guid(_)
+        | PropertyValue::Unicode(_)
+        | PropertyValue::Binary(_)
+        | PropertyValue::MultipleInteger16(_)
+        | PropertyValue::MultipleInteger32(_)
+        | PropertyValue::MultipleInteger64(_)
+        | PropertyValue::MultipleGuid(_)
+        | PropertyValue::Object(_, _) => {
+            let data = table_variable_bytes(value)?.ok_or_else(|| {
+                WriterError::InvalidStructure("table variable value is missing".to_owned())
+            })?;
+            if data.is_empty() {
+                write_row_bytes(row, offset, &0_u32.to_le_bytes())?;
+                return mark_column(row, columns, property_id);
+            }
+            let value_node = node(NodeIdType::ListsTablesProperties, *next_value_node)?;
+            *next_value_node = next_value_node
+                .checked_add(1)
+                .ok_or(WriterError::ValueTooLarge("table value node"))?;
+            let root = append_data_tree(&data, next_block_index, blocks)?;
+            subnodes.push(UnicodeLeafSubNodeTreeEntry::new(value_node, root, None));
+            write_row_bytes(row, offset, &u32::from(value_node).to_le_bytes())?;
+        }
+        PropertyValue::External(_, _) => {
+            return Err(WriterError::InvalidStructure(
+                "table values cannot reference property subnodes".to_owned(),
+            ));
+        }
+    }
+    mark_column(row, columns, property_id)
 }
 
 fn write_table_value(
@@ -4295,16 +6272,59 @@ fn heap_page(kind: HeapNodeType, allocations: &[Vec<u8>]) -> Result<Vec<u8>, Wri
     Ok(data)
 }
 
+fn heap_continuation_page(page_index: u16, allocation: &[u8]) -> Result<Vec<u8>, WriterError> {
+    let bitmap = page_index % 128 == 8;
+    let header_size = if bitmap { 66_usize } else { 2_usize };
+    let allocation_end = header_size
+        .checked_add(allocation.len())
+        .ok_or(WriterError::ValueTooLarge("heap continuation page"))?;
+    let payload_size = usize::try_from(align_up(
+        u64::try_from(allocation_end)
+            .map_err(|_| WriterError::ValueTooLarge("heap continuation page"))?,
+        2,
+    ))
+    .map_err(|_| WriterError::ValueTooLarge("heap continuation page"))?;
+    let total = payload_size
+        .checked_add(8)
+        .ok_or(WriterError::ValueTooLarge("heap continuation page"))?;
+    if total > MAX_DATA_BLOCK_PAYLOAD {
+        return Err(WriterError::ValueTooLarge("heap continuation page"));
+    }
+    let page_map_offset = u16::try_from(payload_size)
+        .map_err(|_| WriterError::ValueTooLarge("heap continuation page"))?;
+    let mut data = Vec::with_capacity(total);
+    if bitmap {
+        HeapNodeBitmapHeader::new(page_map_offset, [HeapFillLevel::Empty; 128]).write(&mut data)?;
+    } else {
+        HeapNodePageHeader::new(page_map_offset).write(&mut data)?;
+    }
+    data.extend_from_slice(allocation);
+    data.resize(payload_size, 0);
+    data.write_u16::<LittleEndian>(1)?;
+    data.write_u16::<LittleEndian>(0)?;
+    data.write_u16::<LittleEndian>(
+        u16::try_from(header_size)
+            .map_err(|_| WriterError::ValueTooLarge("heap continuation offset"))?,
+    )?;
+    data.write_u16::<LittleEndian>(
+        u16::try_from(allocation_end)
+            .map_err(|_| WriterError::ValueTooLarge("heap continuation offset"))?,
+    )?;
+    Ok(data)
+}
+
 fn write_blocks(
     file: &mut std::fs::File,
     blocks: &[BlockSpec],
+    cursor: &mut u64,
 ) -> Result<Vec<WrittenBlock>, WriterError> {
-    let mut offset = FIRST_DATA;
     let mut written = Vec::with_capacity(blocks.len());
     for block in blocks {
-        file.seek(SeekFrom::Start(offset))?;
         let size = u16::try_from(block.payload.logical_size())
             .map_err(|_| WriterError::ValueTooLarge("data block"))?;
+        let physical_size = u64::from(block_size(size.saturating_add(16))?);
+        let offset = allocate_extent(cursor, physical_size, SLOT_SIZE)?;
+        file.seek(SeekFrom::Start(offset))?;
         let signature = compute_sig(offset as u32, u64::from(block.id) as u32);
         let trailer = UnicodeBlockTrailer::new(size, signature, 0, block.id)
             .map_err(|error| WriterError::InvalidStructure(error.to_string()))?;
@@ -4345,18 +6365,26 @@ fn write_blocks(
                     .map_err(|error| WriterError::InvalidStructure(error.to_string()))?
                     .write(file)?;
             }
+            BlockPayload::IntermediateSubnode { level, entries } => {
+                UnicodeIntermediateSubNodeTreeBlock::new(
+                    UnicodeSubNodeTreeBlockHeader::new(
+                        *level,
+                        u16::try_from(entries.len())
+                            .map_err(|_| WriterError::ValueTooLarge("subnode entry count"))?,
+                    ),
+                    entries.clone(),
+                    trailer,
+                )
+                .map_err(|error| WriterError::InvalidStructure(error.to_string()))?
+                .write(file)?;
+            }
         }
-        let physical_size = u64::from(block_size(size.saturating_add(16))?);
         written.push(WrittenBlock {
             id: block.id,
             offset,
             size,
-            physical_size,
             ref_count: block.ref_count,
         });
-        offset = offset
-            .checked_add(physical_size)
-            .ok_or(WriterError::ValueTooLarge("file offset"))?;
     }
     Ok(written)
 }
@@ -4382,12 +6410,11 @@ fn write_bbt(
         })
         .collect::<Vec<_>>();
     let mut roots = Vec::with_capacity(pages.len());
-    for (index, range) in pages.iter().enumerate() {
-        let index = u64::try_from(index).map_err(|_| WriterError::ValueTooLarge("BBT page"))?;
-        let offset = first_offset
-            .checked_add(index.saturating_mul(PAGE_SIZE))
-            .ok_or(WriterError::ValueTooLarge("BBT offset"))?;
-        let page_id = UnicodePageId::from(first_page_id.saturating_add(index));
+    let mut next_offset = first_offset;
+    let mut next_page = first_page_id;
+    for range in &pages {
+        let offset = allocate_extent(&mut next_offset, PAGE_SIZE, PAGE_SIZE)?;
+        let page_id = UnicodePageId::from(next_page);
         let page = UnicodeBlockBTreePage::new(
             0,
             20,
@@ -4402,36 +6429,41 @@ fn write_bbt(
             entries[range.start].key(),
             UnicodePageRef::new(page_id, UnicodeByteIndex::new(offset)),
         ));
+        next_page = next_page
+            .checked_add(1)
+            .ok_or(WriterError::ValueTooLarge("BBT page id"))?;
     }
-
-    let page_count =
-        u64::try_from(pages.len()).map_err(|_| WriterError::ValueTooLarge("BBT page count"))?;
-    if roots.len() == 1 {
-        return Ok((
-            roots[0].block(),
-            first_offset + PAGE_SIZE,
-            first_page_id + 1,
-        ));
+    let mut level = 1_u8;
+    while roots.len() > 1 {
+        let ranges = plan_leaf_pages(roots.len(), 20)?;
+        let mut parents = Vec::with_capacity(ranges.len());
+        for range in ranges {
+            let offset = allocate_extent(&mut next_offset, PAGE_SIZE, PAGE_SIZE)?;
+            let page_id = UnicodePageId::from(next_page);
+            let page = UnicodeBTreeEntryPage::new(
+                level,
+                20,
+                24,
+                &roots[range.clone()],
+                page_trailer(PageType::BlockBTree, offset, page_id),
+            )
+            .map_err(|error| WriterError::InvalidStructure(error.to_string()))?;
+            file.seek(SeekFrom::Start(offset))?;
+            page.write(file)?;
+            parents.push(<UnicodeBTreePageEntry as BTreePageEntryReadWrite>::new(
+                roots[range.start].key(),
+                UnicodePageRef::new(page_id, UnicodeByteIndex::new(offset)),
+            ));
+            next_page = next_page
+                .checked_add(1)
+                .ok_or(WriterError::ValueTooLarge("BBT page id"))?;
+        }
+        roots = parents;
+        level = level
+            .checked_add(1)
+            .ok_or(WriterError::ValueTooLarge("BBT depth"))?;
     }
-    let root_offset = first_offset
-        .checked_add(page_count.saturating_mul(PAGE_SIZE))
-        .ok_or(WriterError::ValueTooLarge("BBT root offset"))?;
-    let root_page_id = UnicodePageId::from(first_page_id.saturating_add(page_count));
-    let root = UnicodeBTreeEntryPage::new(
-        1,
-        20,
-        24,
-        &roots,
-        page_trailer(PageType::BlockBTree, root_offset, root_page_id),
-    )
-    .map_err(|error| WriterError::InvalidStructure(error.to_string()))?;
-    file.seek(SeekFrom::Start(root_offset))?;
-    root.write(file)?;
-    Ok((
-        UnicodePageRef::new(root_page_id, UnicodeByteIndex::new(root_offset)),
-        root_offset + PAGE_SIZE,
-        first_page_id + page_count + 1,
-    ))
+    Ok((roots[0].block(), next_offset, next_page))
 }
 
 fn write_nbt(
@@ -4445,12 +6477,11 @@ fn write_nbt(
         return Err(WriterError::InvalidStructure("NBT is empty".to_owned()));
     }
     let mut roots = Vec::with_capacity(pages.len());
-    for (index, range) in pages.iter().enumerate() {
-        let index = u64::try_from(index).map_err(|_| WriterError::ValueTooLarge("NBT page"))?;
-        let offset = first_offset
-            .checked_add(index.saturating_mul(PAGE_SIZE))
-            .ok_or(WriterError::ValueTooLarge("NBT offset"))?;
-        let page_id = UnicodePageId::from(first_page_id.saturating_add(index));
+    let mut next_offset = first_offset;
+    let mut next_page = first_page_id;
+    for range in &pages {
+        let offset = allocate_extent(&mut next_offset, PAGE_SIZE, PAGE_SIZE)?;
+        let page_id = UnicodePageId::from(next_page);
         let trailer = page_trailer(PageType::NodeBTree, offset, page_id);
         let page = UnicodeNodeBTreePage::new(0, 15, 32, &entries[range.clone()], trailer)
             .map_err(|error| WriterError::InvalidStructure(error.to_string()))?;
@@ -4460,33 +6491,57 @@ fn write_nbt(
             entries[range.start].key(),
             UnicodePageRef::new(page_id, UnicodeByteIndex::new(offset)),
         ));
+        next_page = next_page
+            .checked_add(1)
+            .ok_or(WriterError::ValueTooLarge("NBT page id"))?;
     }
+    let mut level = 1_u8;
+    while roots.len() > 1 {
+        let ranges = plan_leaf_pages(roots.len(), 20)?;
+        let mut parents = Vec::with_capacity(ranges.len());
+        for range in ranges {
+            let offset = allocate_extent(&mut next_offset, PAGE_SIZE, PAGE_SIZE)?;
+            let page_id = UnicodePageId::from(next_page);
+            let page = UnicodeBTreeEntryPage::new(
+                level,
+                20,
+                24,
+                &roots[range.clone()],
+                page_trailer(PageType::NodeBTree, offset, page_id),
+            )
+            .map_err(|error| WriterError::InvalidStructure(error.to_string()))?;
+            file.seek(SeekFrom::Start(offset))?;
+            page.write(file)?;
+            parents.push(<UnicodeBTreePageEntry as BTreePageEntryReadWrite>::new(
+                roots[range.start].key(),
+                UnicodePageRef::new(page_id, UnicodeByteIndex::new(offset)),
+            ));
+            next_page = next_page
+                .checked_add(1)
+                .ok_or(WriterError::ValueTooLarge("NBT page id"))?;
+        }
+        roots = parents;
+        level = level
+            .checked_add(1)
+            .ok_or(WriterError::ValueTooLarge("NBT depth"))?;
+    }
+    Ok((roots[0].block(), next_offset, next_page))
+}
 
-    let page_count =
-        u64::try_from(pages.len()).map_err(|_| WriterError::ValueTooLarge("NBT page count"))?;
-    if roots.len() == 1 {
-        let root = roots[0].block();
-        return Ok((root, first_offset + PAGE_SIZE, first_page_id + 1));
-    }
-    let root_offset = first_offset
-        .checked_add(page_count.saturating_mul(PAGE_SIZE))
-        .ok_or(WriterError::ValueTooLarge("NBT root offset"))?;
-    let root_page_id = UnicodePageId::from(first_page_id.saturating_add(page_count));
-    let root = UnicodeBTreeEntryPage::new(
-        1,
-        20,
-        24,
-        &roots,
-        page_trailer(PageType::NodeBTree, root_offset, root_page_id),
-    )
-    .map_err(|error| WriterError::InvalidStructure(error.to_string()))?;
-    file.seek(SeekFrom::Start(root_offset))?;
-    root.write(file)?;
-    Ok((
-        UnicodePageRef::new(root_page_id, UnicodeByteIndex::new(root_offset)),
-        root_offset + PAGE_SIZE,
-        first_page_id + page_count + 1,
-    ))
+struct TopMessageNode {
+    node: NodeId,
+    property_block: UnicodeBlockId,
+    subnode_block: UnicodeBlockId,
+    parent: NodeId,
+}
+
+struct TopFolderNode {
+    node: NodeId,
+    parent: NodeId,
+    property_block: UnicodeBlockId,
+    hierarchy_block: UnicodeBlockId,
+    contents_block: UnicodeBlockId,
+    contents_subnode: Option<UnicodeBlockId>,
 }
 
 fn node_entries(
@@ -4494,9 +6549,9 @@ fn node_entries(
     ipm: NodeId,
     search_root: NodeId,
     deleted: NodeId,
-    mail: NodeId,
     spam_search: NodeId,
-    message: NodeId,
+    folders: &[TopFolderNode],
+    messages: &[TopMessageNode],
 ) -> Result<Vec<UnicodeNodeBTreeEntry>, WriterError> {
     let mut entries = vec![
         UnicodeNodeBTreeEntry::new(NID_MESSAGE_STORE, leaf_bid(1)?, None, None),
@@ -4601,10 +6656,6 @@ fn node_entries(
         table_node(deleted, NodeIdType::HierarchyTable, leaf_bid(9)?)?,
         table_node(deleted, NodeIdType::ContentsTable, leaf_bid(5)?)?,
         table_node(deleted, NodeIdType::AssociatedContentsTable, leaf_bid(13)?)?,
-        UnicodeNodeBTreeEntry::new(mail, leaf_bid(10)?, None, Some(ipm)),
-        table_node(mail, NodeIdType::HierarchyTable, leaf_bid(9)?)?,
-        table_node(mail, NodeIdType::ContentsTable, leaf_bid(11)?)?,
-        table_node(mail, NodeIdType::AssociatedContentsTable, leaf_bid(13)?)?,
         UnicodeNodeBTreeEntry::new(spam_search, leaf_bid(15)?, None, Some(root)),
         UnicodeNodeBTreeEntry::new(
             node(NodeIdType::SearchUpdateQueue, SPAM_SEARCH_INDEX)?,
@@ -4624,8 +6675,42 @@ fn node_entries(
             None,
             None,
         ),
-        UnicodeNodeBTreeEntry::new(message, leaf_bid(12)?, Some(internal_bid(27)?), Some(mail)),
     ];
+    for folder in folders {
+        entries.extend([
+            UnicodeNodeBTreeEntry::new(
+                folder.node,
+                folder.property_block,
+                None,
+                Some(folder.parent),
+            ),
+            table_node_with_subnode(
+                folder.node,
+                NodeIdType::HierarchyTable,
+                folder.hierarchy_block,
+                None,
+            )?,
+            table_node_with_subnode(
+                folder.node,
+                NodeIdType::ContentsTable,
+                folder.contents_block,
+                folder.contents_subnode,
+            )?,
+            table_node(
+                folder.node,
+                NodeIdType::AssociatedContentsTable,
+                leaf_bid(13)?,
+            )?,
+        ]);
+    }
+    entries.extend(messages.iter().map(|message| {
+        UnicodeNodeBTreeEntry::new(
+            message.node,
+            message.property_block,
+            Some(message.subnode_block),
+            Some(message.parent),
+        )
+    }));
     entries.sort_by_key(|entry| entry.key());
     Ok(entries)
 }
@@ -4635,10 +6720,19 @@ fn table_node(
     kind: NodeIdType,
     data: UnicodeBlockId,
 ) -> Result<UnicodeNodeBTreeEntry, WriterError> {
+    table_node_with_subnode(folder, kind, data, None)
+}
+
+fn table_node_with_subnode(
+    folder: NodeId,
+    kind: NodeIdType,
+    data: UnicodeBlockId,
+    subnode: Option<UnicodeBlockId>,
+) -> Result<UnicodeNodeBTreeEntry, WriterError> {
     Ok(UnicodeNodeBTreeEntry::new(
         node(kind, folder.index())?,
         data,
-        None,
+        subnode,
         None,
     ))
 }
@@ -4648,7 +6742,7 @@ fn write_fixed_pages(
     allocated_end: u64,
     next_page_id: UnicodePageId,
 ) -> Result<(), WriterError> {
-    if allocated_end > FILE_EOF {
+    if allocated_end > INITIAL_FILE_EOF {
         return Err(WriterError::ValueTooLarge("initial allocation region"));
     }
     let allocated_slots = allocated_end
@@ -4710,6 +6804,7 @@ fn write_fixed_pages(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn write_header(
     file: &mut std::fs::File,
     nbt: UnicodePageRef,
@@ -4718,25 +6813,33 @@ fn write_header(
     next_page_id: UnicodePageId,
     next_block_id: UnicodeBlockId,
     nids: [u32; 32],
+    dynamic_allocation: bool,
 ) -> Result<(), WriterError> {
-    let allocated_slots = allocated_end
-        .checked_sub(FIRST_AMAP)
-        .ok_or_else(|| WriterError::InvalidStructure("allocation start underflow".to_owned()))?
-        .div_ceil(SLOT_SIZE);
-    let free_slots = SLOTS_PER_AMAP
-        .checked_sub(allocated_slots)
-        .ok_or(WriterError::ValueTooLarge("allocation map"))?;
-    let free_bytes = free_slots
-        .checked_mul(SLOT_SIZE)
-        .ok_or(WriterError::ValueTooLarge("free byte count"))?;
+    let file_eof = allocation_file_eof(allocated_end)?;
+    let free_bytes = if dynamic_allocation {
+        0
+    } else {
+        let allocated_slots = allocated_end
+            .checked_sub(FIRST_AMAP)
+            .ok_or_else(|| WriterError::InvalidStructure("allocation start underflow".to_owned()))?
+            .div_ceil(SLOT_SIZE);
+        SLOTS_PER_AMAP
+            .checked_sub(allocated_slots)
+            .and_then(|slots| slots.checked_mul(SLOT_SIZE))
+            .ok_or(WriterError::ValueTooLarge("free byte count"))?
+    };
     let root = UnicodeRoot::new(
-        UnicodeByteIndex::new(FILE_EOF),
-        UnicodeByteIndex::new(FIRST_AMAP),
+        UnicodeByteIndex::new(file_eof),
+        UnicodeByteIndex::new(file_eof - AMAP_DATA_SIZE),
         UnicodeByteIndex::new(free_bytes),
         UnicodeByteIndex::new(0),
         nbt,
         bbt,
-        AmapStatus::Valid2,
+        if dynamic_allocation {
+            AmapStatus::Invalid
+        } else {
+            AmapStatus::Valid2
+        },
     );
     let header = UnicodeHeader::new_store(
         root,
@@ -4754,6 +6857,7 @@ fn write_header(
 fn nid_counters(
     entries: &[UnicodeNodeBTreeEntry],
     blocks: &[BlockSpec],
+    streamed_subnodes: &[NodeId],
 ) -> Result<[u32; 32], WriterError> {
     let mut counters = INITIAL_NID_COUNTERS;
     for entry in entries {
@@ -4766,6 +6870,9 @@ fn nid_counters(
         for entry in entries {
             update_nid_counter(&mut counters, entry.node(), false)?;
         }
+    }
+    for node in streamed_subnodes {
+        update_nid_counter(&mut counters, *node, false)?;
     }
     Ok(counters)
 }
@@ -4843,6 +6950,63 @@ fn align_up(value: u64, alignment: u64) -> u64 {
     value.div_ceil(alignment) * alignment
 }
 
+fn reserved_map_page_count(amap_index: u64) -> u64 {
+    let mut pages = 1;
+    if amap_index % 8 == 0 {
+        pages += 1;
+        if amap_index >= FMAP_FIRST_AMAP && (amap_index - FMAP_FIRST_AMAP) % FMAP_AMAP_COUNT == 0 {
+            pages += 1;
+        }
+        if amap_index >= FPMAP_FIRST_AMAP && (amap_index - FPMAP_FIRST_AMAP) % FPMAP_AMAP_COUNT == 0
+        {
+            pages += 1;
+        }
+    }
+    pages
+}
+
+fn allocate_extent(cursor: &mut u64, size: u64, alignment: u64) -> Result<u64, WriterError> {
+    let mut offset = align_up(*cursor, alignment);
+    loop {
+        let amap_index = offset.checked_sub(FIRST_AMAP).ok_or_else(|| {
+            WriterError::InvalidStructure("allocation before first AMap".to_owned())
+        })? / AMAP_DATA_SIZE;
+        let region_start = FIRST_AMAP
+            .checked_add(amap_index.saturating_mul(AMAP_DATA_SIZE))
+            .ok_or(WriterError::ValueTooLarge("allocation region"))?;
+        let reserved_end = region_start
+            .checked_add(reserved_map_page_count(amap_index).saturating_mul(PAGE_SIZE))
+            .ok_or(WriterError::ValueTooLarge("allocation map pages"))?;
+        if offset < reserved_end {
+            offset = align_up(reserved_end, alignment);
+        }
+        let end = offset
+            .checked_add(size)
+            .ok_or(WriterError::ValueTooLarge("allocation extent"))?;
+        let region_end = region_start
+            .checked_add(AMAP_DATA_SIZE)
+            .ok_or(WriterError::ValueTooLarge("allocation region"))?;
+        if end <= region_end {
+            *cursor = end;
+            return Ok(offset);
+        }
+        offset = region_end;
+    }
+}
+
+fn allocation_file_eof(allocated_end: u64) -> Result<u64, WriterError> {
+    let used = allocated_end
+        .checked_sub(FIRST_AMAP)
+        .ok_or_else(|| WriterError::InvalidStructure("allocation end underflow".to_owned()))?;
+    FIRST_AMAP
+        .checked_add(
+            used.div_ceil(AMAP_DATA_SIZE)
+                .max(1)
+                .saturating_mul(AMAP_DATA_SIZE),
+        )
+        .ok_or(WriterError::ValueTooLarge("file EOF"))
+}
+
 fn plan_leaf_pages(entry_count: usize, capacity: usize) -> Result<Vec<Range<usize>>, WriterError> {
     if capacity == 0 {
         return Err(WriterError::InvalidStructure(
@@ -4873,6 +7037,7 @@ mod tests {
         messaging::store::EntryId,
         ndb::{
             block_id::BlockId,
+            byte_index::ByteIndex,
             header::Header,
             page::{
                 AllocationMapPage, BTreePage, BlockBTreeEntry, DensityListPage, PageTrailer,
@@ -5044,7 +7209,21 @@ mod tests {
         assert!(variables.is_empty());
 
         let minimal = MinimalStore::default();
-        let spec = FidelityStore::from(&minimal);
+        let mut spec = FidelityStore::from(&minimal);
+        spec.message.raw_properties.extend([
+            RawProperty {
+                id: 0x0017,
+                value: RawPropertyValue::Integer32(1),
+            },
+            RawProperty {
+                id: 0x0070,
+                value: RawPropertyValue::Unicode("conversation topic".to_owned()),
+            },
+            RawProperty {
+                id: 0x0071,
+                value: RawPropertyValue::Binary(vec![1, 2, 3]),
+            },
+        ]);
         let message = node(NodeIdType::NormalMessage, MESSAGE_INDEX)?;
         let recipients = table_context(&recipient_columns()?, &[])?;
         let attachments = table_context(&attachment_columns()?, &[])?;
@@ -5054,9 +7233,17 @@ mod tests {
             property_context(&properties)?.len() + recipients.len() + attachments.len(),
         )?;
         set_message_size(&mut properties, message_size)?;
-        let row = message_table_row(message, &spec, record_key, message_size);
-        let contents_ids = contents_columns()?
-            .into_iter()
+        let contents = contents_columns()?;
+        let row = message_table_row(
+            message,
+            &spec.message,
+            spec.record_key,
+            record_key,
+            message_size,
+            &contents,
+        )?;
+        let contents_ids = contents
+            .iter()
             .map(|column| column.prop_id())
             .collect::<BTreeSet<_>>();
         for (id, value) in properties
@@ -5081,7 +7268,14 @@ mod tests {
 
         let mut no_recipients = spec.clone();
         no_recipients.message.recipients.clear();
-        let no_recipient_row = message_table_row(message, &no_recipients, record_key, message_size);
+        let no_recipient_row = message_table_row(
+            message,
+            &no_recipients.message,
+            no_recipients.record_key,
+            record_key,
+            message_size,
+            &contents,
+        )?;
         assert!(
             no_recipient_row
                 .values
@@ -5296,10 +7490,607 @@ mod tests {
     }
 
     #[test]
+    fn multi_message_store_indexes_each_top_level_message() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("multiple.pst");
+        let base = FidelityStore::from(&MinimalStore {
+            store_name: "PSTForge multi-message".to_owned(),
+            folder_name: "Inbox".to_owned(),
+            subject: "first".to_owned(),
+            body: "first body".to_owned(),
+            sender_name: "Sender".to_owned(),
+            sender_email: "sender@example.com".to_owned(),
+            recipient: "recipient@example.com".to_owned(),
+            record_key: *b"PSTForgeMultiMsg",
+        });
+        let mut second = base.message.clone();
+        second.subject = "second".to_owned();
+        second.body_text = Some("second body".to_owned());
+        let spec = MailStoreSpec {
+            store_name: base.store_name.clone(),
+            record_key: base.record_key,
+            folders: vec![MailFolderSpec {
+                path: vec![base.folder_name.clone()],
+                messages: vec![base.message.clone(), second],
+            }],
+        };
+        create_mail_store(&path, &spec)?;
+
+        let store = open_store(&path)?;
+        let folder = store.open_folder(
+            &store
+                .properties()
+                .make_entry_id(node(NodeIdType::NormalFolder, MAIL_FOLDER_INDEX)?)?,
+        )?;
+        assert_eq!(
+            folder
+                .contents_table()
+                .ok_or("missing contents table")?
+                .rows_matrix()
+                .count(),
+            2
+        );
+        let second = store.open_message(
+            &EntryId::new(
+                crate::messaging::store::StoreRecordKey::new(spec.record_key),
+                node(NodeIdType::NormalMessage, MESSAGE_INDEX + 1)?,
+            ),
+            None,
+        )?;
+        assert!(matches!(
+            second.properties().get(0x0037),
+            Some(crate::ltp::prop_context::PropertyValue::Unicode(value))
+                if value.to_string() == "second"
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn private_message_tables_do_not_retain_template_refcounts()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let blocks = built_message_block_specs(BuiltTopMessage {
+            property_block: leaf_bid(100)?,
+            recipient_block: leaf_bid(101)?,
+            attachment_block: leaf_bid(102)?,
+            subnode_block: internal_bid(103)?,
+            shared_table_blocks: false,
+            message: MessageBlocks {
+                property_context: Vec::new(),
+                recipient_table: Vec::new(),
+                attachment_table: Vec::new(),
+                subnodes: Vec::new(),
+                dynamic_blocks: Vec::new(),
+                record_key: [0; 16],
+                message_size: 0,
+            },
+        });
+        assert_eq!(blocks[1].ref_count, 2);
+        assert_eq!(blocks[2].ref_count, 2);
+        Ok(())
+    }
+
+    #[test]
+    fn mail_store_preflight_contains_hierarchy_and_huge_attachment_shapes() {
+        let base = FidelityStore::default();
+        let many_folders = MailStoreSpec {
+            store_name: "PSTForge hierarchy limit".to_owned(),
+            record_key: base.record_key,
+            folders: (0..1_000)
+                .map(|index| MailFolderSpec {
+                    path: vec![format!("Folder {index:04}")],
+                    messages: vec![base.message.clone()],
+                })
+                .collect(),
+        };
+        assert!(matches!(
+            validate_mail_store_input(&many_folders),
+            Err(WriterError::InputRejected(_))
+        ));
+
+        let mut huge_message = base.message;
+        huge_message.attachments = vec![AttachmentSpec {
+            filename: "huge.bin".to_owned(),
+            mime_type: Some("application/octet-stream".to_owned()),
+            content_id: None,
+            content_location: None,
+            rendering_position: None,
+            flags: 0,
+            content: AttachmentContent::Spooled(FileBlobSpec {
+                path: PathBuf::from("/dev/null"),
+                byte_len: i32::MAX as u64,
+                sha256: [0; 32],
+            }),
+        }];
+        let huge_attachment = MailStoreSpec {
+            store_name: "PSTForge attachment limit".to_owned(),
+            record_key: *b"PSTForgeHugeBlob",
+            folders: vec![MailFolderSpec {
+                path: vec!["Inbox".to_owned()],
+                messages: vec![huge_message],
+            }],
+        };
+        assert!(matches!(
+            validate_mail_store_input(&huge_attachment),
+            Err(WriterError::InputRejected(_))
+        ));
+    }
+
+    #[test]
+    fn spooled_attachment_streams_across_data_tree_groups() -> Result<(), Box<dyn std::error::Error>>
+    {
+        use crate::messaging::{
+            attachment::{Attachment, AttachmentData, UnicodeAttachment},
+            message::UnicodeMessage,
+            store::UnicodeStore,
+        };
+        use std::rc::Rc;
+
+        let directory = tempfile::tempdir()?;
+        let source = directory.path().join("payload.bin");
+        let payload_len = MAX_DATA_BLOCK_PAYLOAD
+            .checked_mul(MAX_DATA_TREE_ENTRIES)
+            .and_then(|length| length.checked_add(137))
+            .ok_or("test payload length overflow")?;
+        let payload = (0..payload_len)
+            .map(|index| u8::try_from(index % 251).expect("bounded byte"))
+            .collect::<Vec<_>>();
+        std::fs::write(&source, &payload)?;
+        let sha256: [u8; 32] = Sha256::digest(&payload).into();
+
+        let mut spec = FidelityStore::default();
+        spec.message.attachments.truncate(1);
+        spec.message.attachments[0].content = AttachmentContent::Spooled(FileBlobSpec {
+            path: source,
+            byte_len: u64::try_from(payload.len())?,
+            sha256,
+        });
+        let destination = directory.path().join("spooled.pst");
+        create_fidelity_store(&destination, &spec)?;
+
+        let pst = Rc::new(UnicodePstFile::open(&destination)?);
+        let store = UnicodeStore::read(pst)?;
+        let message = UnicodeMessage::read(
+            store,
+            &EntryId::new(
+                crate::messaging::store::StoreRecordKey::new(spec.record_key),
+                node(NodeIdType::NormalMessage, MESSAGE_INDEX)?,
+            ),
+            None,
+        )?;
+        let attachment =
+            UnicodeAttachment::read(message, node(NodeIdType::Attachment, 0x2_0000)?, None)?;
+        assert!(matches!(
+            attachment.data(),
+            Some(AttachmentData::Binary(actual)) if actual.buffer() == payload
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn spooled_attachment_rejects_stale_identity_without_publication()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let source = directory.path().join("payload.bin");
+        let payload = vec![0xA5; MAX_DATA_BLOCK_PAYLOAD + 1];
+        std::fs::write(&source, &payload)?;
+        let mut spec = FidelityStore::default();
+        spec.message.attachments.truncate(1);
+        spec.message.attachments[0].content = AttachmentContent::Spooled(FileBlobSpec {
+            path: source,
+            byte_len: u64::try_from(payload.len())?,
+            sha256: [0_u8; 32],
+        });
+
+        let bad_hash = directory.path().join("bad-hash.pst");
+        assert!(matches!(
+            create_fidelity_store(&bad_hash, &spec),
+            Err(WriterError::InvalidStructure(message)) if message.contains("hash mismatch")
+        ));
+        assert!(!bad_hash.exists());
+
+        let AttachmentContent::Spooled(blob) = &mut spec.message.attachments[0].content else {
+            return Err("expected spooled attachment".into());
+        };
+        blob.sha256 = Sha256::digest(&payload).into();
+        blob.byte_len = blob
+            .byte_len
+            .checked_sub(1)
+            .ok_or("test payload length underflow")?;
+        let bad_length = directory.path().join("bad-length.pst");
+        assert!(matches!(
+            create_fidelity_store(&bad_length, &spec),
+            Err(WriterError::InvalidStructure(message)) if message.contains("identity mismatch")
+        ));
+        assert!(!bad_length.exists());
+        Ok(())
+    }
+
+    #[test]
+    fn spooled_message_properties_round_trip_top_level_and_embedded()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let write_utf16_blob = |name: &str,
+                                text: &str,
+                                repeats: usize|
+         -> Result<FileBlobSpec, Box<dyn std::error::Error>> {
+            let path = directory.path().join(name);
+            let mut file = std::fs::File::create(&path)?;
+            let encoded = text
+                .encode_utf16()
+                .flat_map(u16::to_le_bytes)
+                .collect::<Vec<_>>();
+            let mut hasher = Sha256::new();
+            let mut byte_len = 0_u64;
+            for _ in 0..repeats {
+                file.write_all(&encoded)?;
+                hasher.update(&encoded);
+                byte_len = byte_len
+                    .checked_add(u64::try_from(encoded.len())?)
+                    .ok_or("streamed property test size overflow")?;
+            }
+            file.sync_all()?;
+            Ok(FileBlobSpec {
+                path,
+                byte_len,
+                sha256: hasher.finalize().into(),
+            })
+        };
+
+        let mut spec = FidelityStore::default();
+        spec.message.body_text = None;
+        spec.message.native_body = Some(NativeBody::PlainText);
+        spec.message.spooled_properties.push(SpooledPropertySpec {
+            id: 0x1000,
+            property_type: u16::from(PropertyType::Unicode),
+            blob: write_utf16_blob("top-body.bin", "Top streamed body. ", 120_000)?,
+        });
+        let AttachmentContent::Embedded(embedded) = &mut spec.message.attachments[1].content else {
+            return Err("expected embedded message".into());
+        };
+        embedded.body_text = None;
+        embedded.native_body = Some(NativeBody::PlainText);
+        embedded.spooled_properties.push(SpooledPropertySpec {
+            id: 0x1000,
+            property_type: u16::from(PropertyType::Unicode),
+            blob: write_utf16_blob("embedded-body.bin", "Embedded streamed body. ", 2_000)?,
+        });
+
+        create_fidelity_store(directory.path().join("streamed-properties.pst"), &spec)?;
+        Ok(())
+    }
+
+    #[test]
+    fn completed_store_hashes_spooled_attachments_after_first_message()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let source = directory.path().join("later.bin");
+        let payload = vec![0x3C; MAX_DATA_BLOCK_PAYLOAD + 17];
+        std::fs::write(&source, &payload)?;
+
+        let base = FidelityStore::default();
+        let mut first = base.message.clone();
+        first.attachments.clear();
+        let mut second = first.clone();
+        second.subject = "second with spool".to_owned();
+        second.attachments.push(AttachmentSpec {
+            filename: "later.bin".to_owned(),
+            mime_type: Some("application/octet-stream".to_owned()),
+            content_id: None,
+            content_location: None,
+            rendering_position: None,
+            flags: 0,
+            content: AttachmentContent::Spooled(FileBlobSpec {
+                path: source,
+                byte_len: u64::try_from(payload.len())?,
+                sha256: Sha256::digest(&payload).into(),
+            }),
+        });
+        let mut spec = MailStoreSpec {
+            store_name: base.store_name,
+            record_key: base.record_key,
+            folders: vec![MailFolderSpec {
+                path: vec![base.folder_name],
+                messages: vec![first, second],
+            }],
+        };
+        let destination = directory.path().join("later.pst");
+        create_mail_store(&destination, &spec)?;
+
+        let AttachmentContent::Spooled(blob) =
+            &mut spec.folders[0].messages[1].attachments[0].content
+        else {
+            return Err("expected spooled attachment".into());
+        };
+        blob.sha256 = [0_u8; 32];
+        let plans = plan_folders("unused", &[], Some(&spec.folders))?;
+        assert!(matches!(
+            validate_spooled_attachment_identities(&destination, spec.record_key, &plans),
+            Err(WriterError::InvalidStructure(message)) if message.contains("identity mismatch")
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn spooled_attachment_validates_above_reader_safety_thresholds()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let source = directory.path().join("large.bin");
+        let mut source_file = std::fs::File::create(&source)?;
+        let chunk = vec![0x6D; 1024 * 1024];
+        let mut hasher = Sha256::new();
+        for _ in 0..129 {
+            source_file.write_all(&chunk)?;
+            hasher.update(&chunk);
+        }
+        source_file.sync_all()?;
+        drop(source_file);
+
+        let mut spec = FidelityStore::default();
+        spec.message.attachments.truncate(1);
+        spec.message.attachments[0].content = AttachmentContent::Spooled(FileBlobSpec {
+            path: source,
+            byte_len: 129 * 1024 * 1024,
+            sha256: hasher.finalize().into(),
+        });
+        create_fidelity_store(directory.path().join("large.pst"), &spec)?;
+        Ok(())
+    }
+
+    #[test]
+    fn contents_table_scales_past_one_heap_page() -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("many-messages.pst");
+        let base = FidelityStore::from(&MinimalStore {
+            store_name: "PSTForge scalable contents".to_owned(),
+            folder_name: "Inbox".to_owned(),
+            subject: "message 00".to_owned(),
+            body: "body".to_owned(),
+            sender_name: "Sender".to_owned(),
+            sender_email: "sender@example.com".to_owned(),
+            recipient: "recipient@example.com".to_owned(),
+            record_key: *b"PSTForgeScale001",
+        });
+        let messages = (0..1100)
+            .map(|index| MessageSpec {
+                subject: format!("message {index:02}"),
+                ..base.message.clone()
+            })
+            .collect::<Vec<_>>();
+        let spec = MailStoreSpec {
+            store_name: base.store_name.clone(),
+            record_key: base.record_key,
+            folders: vec![MailFolderSpec {
+                path: vec![base.folder_name.clone()],
+                messages,
+            }],
+        };
+        create_mail_store(&path, &spec)?;
+
+        let pst = UnicodePstFile::open(&path)?;
+        assert!(pst.header().root().file_eof_index().index() > INITIAL_FILE_EOF);
+        let mut raw = std::fs::File::open(&path)?;
+        raw.seek(SeekFrom::Start(FIRST_AMAP + AMAP_DATA_SIZE))?;
+        <UnicodeMapPage<{ PageType::AllocationMap as u8 }> as MapPageReadWrite<
+            UnicodePstFile,
+            { PageType::AllocationMap as u8 },
+        >>::read(&mut raw)?;
+
+        let store = open_store(&path)?;
+        let folder = store.open_folder(
+            &store
+                .properties()
+                .make_entry_id(node(NodeIdType::NormalFolder, MAIL_FOLDER_INDEX)?)?,
+        )?;
+        assert_eq!(
+            folder
+                .contents_table()
+                .ok_or("missing contents table")?
+                .rows_matrix()
+                .count(),
+            1100
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn external_table_fills_every_non_final_heap_page() -> Result<(), Box<dyn std::error::Error>> {
+        let columns = contents_columns()?;
+        let rows = (0..8000)
+            .map(|index| {
+                Ok(TableRowSpec {
+                    id: node(NodeIdType::NormalMessage, MESSAGE_INDEX + index)?,
+                    values: Vec::new(),
+                })
+            })
+            .collect::<Result<Vec<_>, WriterError>>()?;
+        let mut next_block = 100;
+        let external = table_context_external(&columns, &rows, &mut next_block)?;
+        let root = external
+            .blocks
+            .iter()
+            .find(|block| block.id == external.data_block)
+            .ok_or("missing external table root")?;
+        let BlockPayload::DataTree {
+            total_size,
+            entries,
+            ..
+        } = &root.payload
+        else {
+            return Err("external table root is not an XBLOCK".into());
+        };
+        assert!(entries.len() > 1);
+        let child_sizes = entries
+            .iter()
+            .map(|entry| {
+                let id = UnicodeBlockId::from(*entry);
+                let block = external
+                    .blocks
+                    .iter()
+                    .find(|block| block.id == id)
+                    .ok_or("missing XBLOCK child")?;
+                let BlockPayload::Data(data) = &block.payload else {
+                    return Err("XBLOCK child is not a data block");
+                };
+                Ok(data.len())
+            })
+            .collect::<Result<Vec<_>, &str>>()?;
+        assert!(
+            child_sizes[..child_sizes.len() - 1]
+                .iter()
+                .all(|size| *size == MAX_DATA_BLOCK_PAYLOAD)
+        );
+        assert_eq!(
+            usize::try_from(*total_size)?,
+            child_sizes.iter().sum::<usize>()
+        );
+        for (page_index, entry) in entries[..entries.len() - 1].iter().enumerate() {
+            let id = UnicodeBlockId::from(*entry);
+            let block = external
+                .blocks
+                .iter()
+                .find(|block| block.id == id)
+                .ok_or("missing XBLOCK child")?;
+            let BlockPayload::Data(data) = &block.payload else {
+                return Err("XBLOCK child is not a data block".into());
+            };
+            let map_offset = usize::from(u16::from_le_bytes(data[..2].try_into()?));
+            let page_map = data.get(map_offset..).ok_or("heap map exceeds page")?;
+            let allocation_count = usize::from(u16::from_le_bytes(page_map[..2].try_into()?));
+            assert_eq!(page_map.len(), 4 + (allocation_count + 1) * 2);
+            let offsets = page_map[4..]
+                .chunks_exact(2)
+                .map(|bytes| u16::from_le_bytes(bytes.try_into().expect("two-byte chunk")))
+                .collect::<Vec<_>>();
+            assert_eq!(
+                usize::from(*offsets.last().ok_or("missing endpoint")?),
+                map_offset
+            );
+            assert!(
+                offsets
+                    .windows(2)
+                    .all(|range| usize::from(range[1] - range[0]) <= 3580)
+            );
+            if page_index == 1 {
+                assert!(allocation_count > 1);
+                assert_eq!(offsets[..2], [2, 3578]);
+            }
+        }
+        let root_data = external
+            .blocks
+            .iter()
+            .find(|block| block.id == UnicodeBlockId::from(entries[0]))
+            .and_then(|block| match &block.payload {
+                BlockPayload::Data(data) => Some(data),
+                _ => None,
+            })
+            .ok_or("missing root heap page")?;
+        let root_header = HeapNodeHeader::read(&mut io::Cursor::new(root_data))?;
+        assert!(
+            root_header
+                .fill_levels()
+                .iter()
+                .all(|level| *level == HeapFillLevel::Level15)
+        );
+        let bitmap_data = external
+            .blocks
+            .iter()
+            .find(|block| block.id == UnicodeBlockId::from(entries[8]))
+            .and_then(|block| match &block.payload {
+                BlockPayload::Data(data) => Some(data),
+                _ => None,
+            })
+            .ok_or("missing bitmap heap page")?;
+        let bitmap_header = HeapNodeBitmapHeader::read(&mut io::Cursor::new(bitmap_data))?;
+        let full_bitmap_pages = entries.len() - 1 - 8;
+        assert!(
+            bitmap_header.fill_levels()[..full_bitmap_pages]
+                .iter()
+                .all(|level| *level == HeapFillLevel::Level15)
+        );
+        assert!(
+            bitmap_header.fill_levels()[full_bitmap_pages..]
+                .iter()
+                .all(|level| *level == HeapFillLevel::Empty)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn mail_store_reproduces_required_nested_folder_paths() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("folders.pst");
+        let base = FidelityStore::from(&MinimalStore {
+            store_name: "PSTForge hierarchy".to_owned(),
+            folder_name: "unused".to_owned(),
+            subject: "base".to_owned(),
+            body: "body".to_owned(),
+            sender_name: "Sender".to_owned(),
+            sender_email: "sender@example.com".to_owned(),
+            recipient: "recipient@example.com".to_owned(),
+            record_key: *b"PSTForgeFolders1",
+        });
+        let message = |subject: &str| MessageSpec {
+            subject: subject.to_owned(),
+            ..base.message.clone()
+        };
+        let spec = MailStoreSpec {
+            store_name: base.store_name,
+            record_key: base.record_key,
+            folders: vec![
+                MailFolderSpec {
+                    path: vec!["Inbox".to_owned(), "Projects".to_owned()],
+                    messages: vec![message("projects")],
+                },
+                MailFolderSpec {
+                    path: vec!["Archive".to_owned()],
+                    messages: vec![message("archive")],
+                },
+                MailFolderSpec {
+                    path: vec!["Inbox".to_owned(), "Personal".to_owned()],
+                    messages: vec![message("personal")],
+                },
+            ],
+        };
+        create_mail_store(&path, &spec)?;
+
+        let store = open_store(&path)?;
+        let ipm = store.open_folder(
+            &store
+                .properties()
+                .make_entry_id(node(NodeIdType::NormalFolder, IPM_FOLDER_INDEX)?)?,
+        )?;
+        let ipm_hierarchy = ipm.hierarchy_table().ok_or("missing IPM hierarchy")?;
+        assert_eq!(ipm_hierarchy.rows_matrix().count(), 3);
+        let inbox_node = node(NodeIdType::NormalFolder, MAIL_FOLDER_INDEX + 1)?;
+        let inbox = store.open_folder(&store.properties().make_entry_id(inbox_node)?)?;
+        assert_eq!(inbox.properties().display_name()?, "Inbox");
+        assert_eq!(
+            inbox
+                .contents_table()
+                .ok_or("missing Inbox contents")?
+                .rows_matrix()
+                .count(),
+            0
+        );
+        let children = inbox.hierarchy_table().ok_or("missing Inbox hierarchy")?;
+        assert_eq!(children.rows_matrix().count(), 2);
+        for index in [MAIL_FOLDER_INDEX + 2, MAIL_FOLDER_INDEX + 3] {
+            children.find_row(crate::ltp::table_context::TableRowId::new(u32::from(node(
+                NodeIdType::NormalFolder,
+                index,
+            )?)))?;
+        }
+        Ok(())
+    }
+
+    #[test]
     fn fidelity_store_round_trips_rich_mail() -> Result<(), Box<dyn std::error::Error>> {
         let directory = tempfile::tempdir()?;
         let path = directory.path().join("fidelity.pst");
-        let spec = FidelityStore::default();
+        let mut spec = FidelityStore::default();
+        spec.message.message_flags = 0x02;
         create_fidelity_store(&path, &spec)?;
 
         let mut header = std::fs::File::open(&path)?;
@@ -5329,6 +8120,10 @@ mod tests {
             message.properties().get(0x0037),
             Some(crate::ltp::prop_context::PropertyValue::Unicode(value))
                 if value.to_string() == spec.message.subject
+        ));
+        assert!(matches!(
+            message.properties().get(0x0E07),
+            Some(crate::ltp::prop_context::PropertyValue::Integer32(0x12))
         ));
         assert!(matches!(
             message.properties().get(0x1013),
@@ -5389,7 +8184,9 @@ mod tests {
             .map_err(|error| format!("binary attachment read failed: {error}"))?;
         let expected_binary = match &spec.message.attachments[0].content {
             AttachmentContent::Binary(value) => value,
-            AttachmentContent::Embedded(_) => return Err("expected binary attachment".into()),
+            AttachmentContent::Embedded(_) | AttachmentContent::Spooled(_) => {
+                return Err("expected binary attachment".into());
+            }
         };
         assert!(matches!(
             binary.data(),
@@ -5611,7 +8408,9 @@ mod tests {
         let diagnostics = std::fs::read_to_string(evidence.join("validator-failure.log"))?;
         assert!(diagnostics.contains("tool: fixture"));
         assert!(diagnostics.contains("timed out: true"));
-        assert!(diagnostics.contains("bounded stderr"));
+        assert!(diagnostics.contains("validator output redacted"));
+        assert!(!diagnostics.contains("bounded stdout"));
+        assert!(!diagnostics.contains("bounded stderr"));
         Ok(())
     }
 
@@ -5749,6 +8548,20 @@ mod tests {
         assert!(matches!(
             validate_spec(&invalid_html),
             Err(WriterError::InvalidStructure(_))
+        ));
+
+        let mut wrong_contents_type = FidelityStore::default();
+        wrong_contents_type
+            .message
+            .raw_properties
+            .push(RawProperty {
+                id: 0x0017,
+                value: RawPropertyValue::Unicode("not an integer".to_owned()),
+            });
+        assert!(matches!(
+            validate_spec(&wrong_contents_type),
+            Err(WriterError::InvalidStructure(detail))
+                if detail.contains("expected Integer32")
         ));
 
         let mut invalid_embedded_html = FidelityStore::default();
@@ -6113,12 +8926,16 @@ mod tests {
                     value: RawPropertyValue::Boolean(true),
                 });
             }
-            AttachmentContent::Binary(_) => return Err("expected embedded fixture".into()),
+            AttachmentContent::Binary(_) | AttachmentContent::Spooled(_) => {
+                return Err("expected embedded fixture".into());
+            }
         }
         let identities = collect_named_identities(&spec.message);
         let embedded = match &spec.message.attachments[1].content {
             AttachmentContent::Embedded(message) => message,
-            AttachmentContent::Binary(_) => return Err("expected embedded fixture".into()),
+            AttachmentContent::Binary(_) | AttachmentContent::Spooled(_) => {
+                return Err("expected embedded fixture".into());
+            }
         };
         assert_eq!(identities.len(), 4);
         let properties = message_properties(

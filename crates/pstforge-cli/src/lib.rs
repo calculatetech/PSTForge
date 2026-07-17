@@ -6,7 +6,8 @@ use std::path::PathBuf;
 use clap::{ArgAction, Parser, Subcommand, ValueEnum};
 use pstforge_core::{
     EncryptionMode, FileFormat, InfoReport, InspectionError, RecoveryError, RecoveryMode,
-    RecoveryReport, SourceError, VerifyReport, WorkerProtocolError,
+    RecoveryReport, SourceError, SplitError, SplitFailureKind, SplitReport, VerifyReport,
+    WorkerProtocolError,
 };
 use thiserror::Error;
 
@@ -54,6 +55,18 @@ pub enum Command {
         source: PathBuf,
         #[arg(long, short = 'o')]
         output: PathBuf,
+        #[arg(long, value_enum, default_value_t = RecoveryModeArg::Balanced)]
+        recovery: RecoveryModeArg,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Recover mail and write independently importable size-limited PST parts.
+    Split {
+        source: PathBuf,
+        #[arg(long, short = 'o')]
+        output: PathBuf,
+        #[arg(long, value_parser = parse_byte_size, default_value = "4GiB")]
+        max_pst_size: u64,
         #[arg(long, value_enum, default_value_t = RecoveryModeArg::Balanced)]
         recovery: RecoveryModeArg,
         #[arg(long)]
@@ -109,6 +122,8 @@ pub enum CliError {
     #[error(transparent)]
     Recovery(#[from] RecoveryError),
     #[error(transparent)]
+    Split(#[from] SplitError),
+    #[error(transparent)]
     Worker(#[from] WorkerProtocolError),
     #[error("cannot write command result: {0}")]
     Output(#[from] std::io::Error),
@@ -128,6 +143,13 @@ pub enum CommandStatus {
 impl CliError {
     pub fn exit_code(&self) -> u8 {
         match self {
+            Self::Split(error) => match error.failure_kind() {
+                SplitFailureKind::Source => 3,
+                SplitFailureKind::Output => 4,
+                SplitFailureKind::Conformance => 5,
+                SplitFailureKind::Interrupted => 130,
+                SplitFailureKind::Internal => 6,
+            },
             Self::Inspection(
                 InspectionError::Source(_)
                 | InspectionError::Pff(_)
@@ -207,6 +229,34 @@ pub fn execute(cli: &Cli, output: &mut dyn Write) -> Result<CommandStatus, CliEr
                 Ok(CommandStatus::Complete)
             } else {
                 Ok(CommandStatus::Partial)
+            }
+        }
+        Command::Split {
+            source,
+            output: job_directory,
+            max_pst_size,
+            recovery,
+            json,
+        } => {
+            let executable = std::env::current_exe().map_err(CliError::Executable)?;
+            let report = pstforge_core::split(
+                source,
+                job_directory,
+                &executable,
+                (*recovery).into(),
+                *max_pst_size,
+            )?;
+            if *json {
+                write_json(output, &report)?;
+            } else {
+                write_split(output, &report)?;
+            }
+            if report.recovery.interrupted {
+                Ok(CommandStatus::Interrupted)
+            } else if report.partial {
+                Ok(CommandStatus::Partial)
+            } else {
+                Ok(CommandStatus::Complete)
             }
         }
         Command::Worker {
@@ -356,6 +406,71 @@ fn write_recovery(output: &mut dyn Write, report: &RecoveryReport) -> Result<(),
     Ok(())
 }
 
+fn write_split(output: &mut dyn Write, report: &SplitReport) -> Result<(), std::io::Error> {
+    writeln!(output, "PSTForge split")?;
+    writeln!(output, "Source: {}", report.recovery.source.canonical_path)?;
+    writeln!(output, "SHA-256: {}", report.recovery.source.sha256)?;
+    writeln!(output, "Job: {}", report.recovery.job_directory)?;
+    writeln!(
+        output,
+        "Maximum part size: {} bytes",
+        report.maximum_pst_bytes
+    )?;
+    writeln!(output, "Written candidates: {}", report.written_candidates)?;
+    writeln!(output, "Parts: {}", report.parts.len())?;
+    for part in &report.parts {
+        writeln!(
+            output,
+            "  {}: {} bytes, SHA-256 {}, messages {}, folders {}, oversize {}, partial {}",
+            part.filename,
+            part.byte_len,
+            part.sha256,
+            part.message_count,
+            part.folder_count,
+            yes_no(part.oversize),
+            yes_no(part.partial)
+        )?;
+    }
+    writeln!(
+        output,
+        "Source unchanged: {}",
+        yes_no(report.recovery.source_unchanged)
+    )?;
+    Ok(())
+}
+
+fn parse_byte_size(value: &str) -> Result<u64, String> {
+    let split = value
+        .find(|character: char| !character.is_ascii_digit())
+        .unwrap_or(value.len());
+    let (number, suffix) = value.split_at(split);
+    if number.is_empty() {
+        return Err("size must start with a decimal integer".to_owned());
+    }
+    let number = number
+        .parse::<u64>()
+        .map_err(|_| "size integer is out of range".to_owned())?;
+    let multiplier = match suffix.to_ascii_lowercase().as_str() {
+        "" | "b" => 1,
+        "kb" => 1_000,
+        "mb" => 1_000_000,
+        "gb" => 1_000_000_000,
+        "tb" => 1_000_000_000_000,
+        "kib" => 1 << 10,
+        "mib" => 1 << 20,
+        "gib" => 1 << 30,
+        "tib" => 1_u64 << 40,
+        _ => return Err("size suffix must be B, KB, MB, GB, TB, KiB, MiB, GiB, or TiB".to_owned()),
+    };
+    let bytes = number
+        .checked_mul(multiplier)
+        .ok_or_else(|| "size is out of range".to_owned())?;
+    if bytes == 0 {
+        return Err("size must be greater than zero".to_owned());
+    }
+    Ok(bytes)
+}
+
 fn write_common(output: &mut dyn Write, report: &InfoReport) -> Result<(), std::io::Error> {
     writeln!(output, "Source: {}", report.source.canonical_path)?;
     writeln!(output, "SHA-256: {}", report.source.sha256)?;
@@ -427,7 +542,7 @@ mod tests {
     use pstforge_core::{RecoveryError, SourceError};
     use pstforge_job::JobError;
 
-    use super::{Cli, CliError, Command, RecoveryModeArg, VerifyMode};
+    use super::{Cli, CliError, Command, RecoveryModeArg, VerifyMode, parse_byte_size};
 
     #[test]
     fn parses_info_json_with_global_options_after_command() {
@@ -495,6 +610,24 @@ mod tests {
                 ..
             }
         ));
+        Ok(())
+    }
+
+    #[test]
+    fn split_defaults_to_four_gib_and_accepts_si_sizes() -> Result<(), clap::Error> {
+        let default = Cli::try_parse_from(["pstforge", "split", "mail.pst", "--output", "job"])?;
+        assert!(matches!(
+            default.command,
+            Command::Split {
+                max_pst_size: 4_294_967_296,
+                recovery: RecoveryModeArg::Balanced,
+                ..
+            }
+        ));
+        assert_eq!(parse_byte_size("4GB"), Ok(4_000_000_000));
+        assert_eq!(parse_byte_size("4GiB"), Ok(4_294_967_296));
+        assert!(parse_byte_size("0").is_err());
+        assert!(parse_byte_size("1.5GiB").is_err());
         Ok(())
     }
 

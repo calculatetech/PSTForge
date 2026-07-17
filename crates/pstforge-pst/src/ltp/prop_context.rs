@@ -2,6 +2,7 @@
 
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use core::mem;
+use sha2::{Digest, Sha256};
 use std::{
     cell::RefCell,
     collections::BTreeMap,
@@ -1278,6 +1279,64 @@ where
         }
         Ok(decoded)
     }
+
+    fn stream_property_identity<R: PstReader>(
+        &self,
+        f: &mut R,
+        encoding: NdbCryptMethod,
+        block_btree: &PstFileReadWriteBlockBTree<Pst>,
+        page_cache: &mut RootBTreePageCache<<Pst as PstFile>::BlockBTree>,
+        value: PropertyTreeRecordValue,
+    ) -> io::Result<(u16, u64, [u8; 32])> {
+        let PropertyValueRecord::Node(sub_node_id) = value.value() else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "streamed property is not stored in a subnode",
+            ));
+        };
+        let sub_node = self
+            .node
+            .sub_node()
+            .ok_or(LtpError::PropertySubNodeValueNotFound(u32::from(
+                sub_node_id,
+            )))?;
+        let block = block_btree.find_entry(f, sub_node.search_key(), page_cache)?;
+        let sub_node_tree = SubNodeTree::<Pst>::read(f, &block)?;
+        let block = sub_node_tree.find_entry(f, block_btree, sub_node_id, page_cache)?;
+        let block = block_btree.find_entry(f, block.search_key(), page_cache)?;
+        let data_tree = DataTree::read(f, encoding, &block)?;
+        let mut block_cache = self.block_cache.borrow_mut();
+        let mut reader =
+            data_tree.streaming_reader(f, encoding, block_btree, page_cache, &mut block_cache)?;
+        let mut hasher = Sha256::new();
+        let mut byte_len = 0_u64;
+        let mut buffer = [0_u8; 8192];
+        loop {
+            let read = reader.read(&mut buffer)?;
+            if read == 0 {
+                break;
+            }
+            hasher.update(&buffer[..read]);
+            byte_len = byte_len
+                .checked_add(u64::try_from(read).map_err(|_| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "streamed property length overflow",
+                    )
+                })?)
+                .ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "streamed property length overflow",
+                    )
+                })?;
+        }
+        Ok((
+            u16::from(value.prop_type()),
+            byte_len,
+            hasher.finalize().into(),
+        ))
+    }
 }
 
 pub struct UnicodePropertyContext {
@@ -1340,6 +1399,18 @@ impl PropertyContextReadWrite<UnicodePstFile> for UnicodePropertyContext {
         self.inner
             .read_property(f, encoding, block_btree, page_cache, value, budget)
     }
+
+    fn stream_property_identity<R: PstReader>(
+        &self,
+        f: &mut R,
+        encoding: NdbCryptMethod,
+        block_btree: &UnicodeBlockBTree,
+        page_cache: &mut RootBTreePageCache<UnicodeBlockBTree>,
+        value: PropertyTreeRecordValue,
+    ) -> io::Result<(u16, u64, [u8; 32])> {
+        self.inner
+            .stream_property_identity(f, encoding, block_btree, page_cache, value)
+    }
 }
 
 pub struct AnsiPropertyContext {
@@ -1398,6 +1469,18 @@ impl PropertyContextReadWrite<AnsiPstFile> for AnsiPropertyContext {
     ) -> io::Result<PropertyValue> {
         self.inner
             .read_property(f, encoding, block_btree, page_cache, value, budget)
+    }
+
+    fn stream_property_identity<R: PstReader>(
+        &self,
+        f: &mut R,
+        encoding: NdbCryptMethod,
+        block_btree: &AnsiBlockBTree,
+        page_cache: &mut RootBTreePageCache<AnsiBlockBTree>,
+        value: PropertyTreeRecordValue,
+    ) -> io::Result<(u16, u64, [u8; 32])> {
+        self.inner
+            .stream_property_identity(f, encoding, block_btree, page_cache, value)
     }
 }
 

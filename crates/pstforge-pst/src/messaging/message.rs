@@ -137,6 +137,7 @@ pub trait Message {
     fn properties(&self) -> &MessageProperties;
     fn recipient_table(&self) -> Option<&Rc<dyn TableContext>>;
     fn attachment_table(&self) -> Option<&Rc<dyn TableContext>>;
+    fn streamed_property_identity(&self, id: u16) -> Option<(u16, u64, [u8; 32])>;
 }
 
 struct MessageInner<Pst>
@@ -148,6 +149,7 @@ where
     sub_nodes: MessageSubNodes<Pst>,
     recipient_table: Option<Rc<dyn TableContext>>,
     attachment_table: Option<Rc<dyn TableContext>>,
+    streamed_property_identities: BTreeMap<u16, (u16, u64, [u8; 32])>,
     property_budget: Rc<RefCell<PropertyMaterializationBudget>>,
 }
 
@@ -196,6 +198,15 @@ where
         entry_id: &EntryId,
         prop_ids: Option<&[u16]>,
     ) -> io::Result<Self> {
+        Self::read_with_streamed_properties(store, entry_id, prop_ids, &[])
+    }
+
+    fn read_with_streamed_properties(
+        store: Rc<<Pst as PstFile>::Store>,
+        entry_id: &EntryId,
+        prop_ids: Option<&[u16]>,
+        streamed_ids: &[u16],
+    ) -> io::Result<Self> {
         let node_id = entry_id.node_id();
         let node_id_type = node_id.id_type()?;
         match node_id_type {
@@ -229,29 +240,22 @@ where
             node_btree.find_entry(file, node_key, &mut page_cache)?
         };
 
-        Self::read_embedded(store, node, prop_ids)
-    }
-
-    fn read_embedded(
-        store: Rc<<Pst as PstFile>::Store>,
-        node: <Pst as PstFile>::NodeBTreeEntry,
-        prop_ids: Option<&[u16]>,
-    ) -> io::Result<Self> {
         let budget = Rc::new(RefCell::new(PropertyMaterializationBudget::new()));
-        Self::read_embedded_with_budget(store, node, prop_ids, budget)
+        Self::read_embedded_with_streamed_properties(store, node, prop_ids, streamed_ids, budget)
     }
 
-    fn read_embedded_with_budget(
+    fn read_embedded_with_streamed_properties(
         store: Rc<<Pst as PstFile>::Store>,
         node: <Pst as PstFile>::NodeBTreeEntry,
         prop_ids: Option<&[u16]>,
+        streamed_ids: &[u16],
         budget: Rc<RefCell<PropertyMaterializationBudget>>,
     ) -> io::Result<Self> {
         let pst = store.pst();
         let header = pst.header();
         let root = header.root();
 
-        let (properties, sub_nodes) = {
+        let (properties, sub_nodes, streamed_property_identities) = {
             let mut file = pst
                 .reader()
                 .lock()
@@ -282,7 +286,19 @@ where
             let tree = <Pst as PstFile>::PropertyTree::new(heap, header.user_root());
             let prop_context = <Pst as PstFile>::PropertyContext::new(node, tree);
             let mut properties = BTreeMap::new();
+            let mut streamed_property_identities = BTreeMap::new();
             for (prop_id, record) in prop_context.properties()? {
+                if streamed_ids.contains(&prop_id) {
+                    let identity = prop_context.stream_property_identity(
+                        file,
+                        encoding,
+                        &block_btree,
+                        &mut page_cache,
+                        record,
+                    )?;
+                    streamed_property_identities.insert(prop_id, identity);
+                    continue;
+                }
                 if prop_ids.is_some_and(|ids| !ids.contains(&prop_id)) {
                     continue;
                 }
@@ -305,7 +321,7 @@ where
                 .map(|entry| (entry.node(), entry))
                 .collect();
 
-            (properties, sub_nodes)
+            (properties, sub_nodes, streamed_property_identities)
         };
 
         let mut recipient_table_nodes = sub_nodes.iter().filter_map(|(node_id, entry)| {
@@ -367,6 +383,7 @@ where
             sub_nodes,
             recipient_table,
             attachment_table,
+            streamed_property_identities,
             property_budget: budget,
         })
     }
@@ -388,6 +405,17 @@ impl UnicodeMessage {
     ) -> io::Result<Rc<Self>> {
         <Self as MessageReadWrite<UnicodePstFile>>::read(store, entry_id, prop_ids)
     }
+
+    pub fn read_with_streamed_properties(
+        store: Rc<UnicodeStore>,
+        entry_id: &EntryId,
+        prop_ids: Option<&[u16]>,
+        streamed_ids: &[u16],
+    ) -> io::Result<Rc<Self>> {
+        let inner =
+            MessageInner::read_with_streamed_properties(store, entry_id, prop_ids, streamed_ids)?;
+        Ok(Rc::new(Self { inner }))
+    }
 }
 
 impl Message for UnicodeMessage {
@@ -406,6 +434,10 @@ impl Message for UnicodeMessage {
     fn attachment_table(&self) -> Option<&Rc<dyn TableContext>> {
         self.inner.attachment_table.as_ref()
     }
+
+    fn streamed_property_identity(&self, id: u16) -> Option<(u16, u64, [u8; 32])> {
+        self.inner.streamed_property_identities.get(&id).copied()
+    }
 }
 
 impl MessageReadWrite<UnicodePstFile> for UnicodeMessage {
@@ -423,7 +455,14 @@ impl MessageReadWrite<UnicodePstFile> for UnicodeMessage {
         node: UnicodeNodeBTreeEntry,
         prop_ids: Option<&[u16]>,
     ) -> io::Result<Rc<Self>> {
-        let inner = MessageInner::read_embedded(store, node, prop_ids)?;
+        let budget = Rc::new(RefCell::new(PropertyMaterializationBudget::new()));
+        let inner = MessageInner::read_embedded_with_streamed_properties(
+            store,
+            node,
+            prop_ids,
+            &[],
+            budget,
+        )?;
         Ok(Rc::new(Self { inner }))
     }
 
@@ -433,7 +472,30 @@ impl MessageReadWrite<UnicodePstFile> for UnicodeMessage {
         prop_ids: Option<&[u16]>,
         budget: Rc<RefCell<PropertyMaterializationBudget>>,
     ) -> io::Result<Rc<Self>> {
-        let inner = MessageInner::read_embedded_with_budget(store, node, prop_ids, budget)?;
+        let inner = MessageInner::read_embedded_with_streamed_properties(
+            store,
+            node,
+            prop_ids,
+            &[],
+            budget,
+        )?;
+        Ok(Rc::new(Self { inner }))
+    }
+
+    fn read_embedded_with_streamed_properties(
+        store: Rc<UnicodeStore>,
+        node: UnicodeNodeBTreeEntry,
+        prop_ids: Option<&[u16]>,
+        streamed_ids: &[u16],
+        budget: Rc<RefCell<PropertyMaterializationBudget>>,
+    ) -> io::Result<Rc<Self>> {
+        let inner = MessageInner::read_embedded_with_streamed_properties(
+            store,
+            node,
+            prop_ids,
+            streamed_ids,
+            budget,
+        )?;
         Ok(Rc::new(Self { inner }))
     }
 
@@ -480,6 +542,10 @@ impl Message for AnsiMessage {
     fn attachment_table(&self) -> Option<&Rc<dyn TableContext>> {
         self.inner.attachment_table.as_ref()
     }
+
+    fn streamed_property_identity(&self, id: u16) -> Option<(u16, u64, [u8; 32])> {
+        self.inner.streamed_property_identities.get(&id).copied()
+    }
 }
 
 impl MessageReadWrite<AnsiPstFile> for AnsiMessage {
@@ -497,7 +563,14 @@ impl MessageReadWrite<AnsiPstFile> for AnsiMessage {
         node: AnsiNodeBTreeEntry,
         prop_ids: Option<&[u16]>,
     ) -> io::Result<Rc<Self>> {
-        let inner = MessageInner::read_embedded(store, node, prop_ids)?;
+        let budget = Rc::new(RefCell::new(PropertyMaterializationBudget::new()));
+        let inner = MessageInner::read_embedded_with_streamed_properties(
+            store,
+            node,
+            prop_ids,
+            &[],
+            budget,
+        )?;
         Ok(Rc::new(Self { inner }))
     }
 
@@ -507,7 +580,30 @@ impl MessageReadWrite<AnsiPstFile> for AnsiMessage {
         prop_ids: Option<&[u16]>,
         budget: Rc<RefCell<PropertyMaterializationBudget>>,
     ) -> io::Result<Rc<Self>> {
-        let inner = MessageInner::read_embedded_with_budget(store, node, prop_ids, budget)?;
+        let inner = MessageInner::read_embedded_with_streamed_properties(
+            store,
+            node,
+            prop_ids,
+            &[],
+            budget,
+        )?;
+        Ok(Rc::new(Self { inner }))
+    }
+
+    fn read_embedded_with_streamed_properties(
+        store: Rc<AnsiStore>,
+        node: AnsiNodeBTreeEntry,
+        prop_ids: Option<&[u16]>,
+        streamed_ids: &[u16],
+        budget: Rc<RefCell<PropertyMaterializationBudget>>,
+    ) -> io::Result<Rc<Self>> {
+        let inner = MessageInner::read_embedded_with_streamed_properties(
+            store,
+            node,
+            prop_ids,
+            streamed_ids,
+            budget,
+        )?;
         Ok(Rc::new(Self { inner }))
     }
 

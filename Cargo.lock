@@ -422,7 +422,7 @@ checksum = "68ab91017fe16c622486840e4c83c9a37afeff978bd239b5293d61ece587de66"
 
 [[package]]
 name = "libpff-sys"
-version = "0.3.1"
+version = "0.4.0"
 dependencies = [
  "pkg-config",
  "serde",
@@ -520,14 +520,17 @@ dependencies = [
 
 [[package]]
 name = "pstforge-cli"
-version = "0.3.1"
+version = "0.4.0"
 dependencies = [
  "clap",
+ "libpff-sys",
  "pstforge-core",
  "pstforge-job",
+ "pstforge-pst",
  "rustix",
  "serde",
  "serde_json",
+ "sha2",
  "tempfile",
  "thiserror",
  "toml",
@@ -537,12 +540,15 @@ dependencies = [
 
 [[package]]
 name = "pstforge-core"
-version = "0.3.1"
+version = "0.4.0"
 dependencies = [
  "chrono",
+ "compressed-rtf",
  "libc",
  "libpff-sys",
  "pstforge-job",
+ "pstforge-pst",
+ "rusqlite",
  "rustix",
  "serde",
  "serde_json",
@@ -555,7 +561,7 @@ dependencies = [
 
 [[package]]
 name = "pstforge-job"
-version = "0.3.1"
+version = "0.4.0"
 dependencies = [
  "libc",
  "libpff-sys",
@@ -570,11 +576,12 @@ dependencies = [
 
 [[package]]
 name = "pstforge-pst"
-version = "0.3.1"
+version = "0.4.0"
 dependencies = [
  "byteorder",
  "compressed-rtf",
  "rustix",
+ "sha2",
  "tempfile",
  "thiserror",
  "tracing",
@@ -1089,7 +1096,7 @@ dependencies = [
 
 [[package]]
 name = "xtask"
-version = "0.3.1"
+version = "0.4.0"
 dependencies = [
  "base64",
  "libpff-sys",

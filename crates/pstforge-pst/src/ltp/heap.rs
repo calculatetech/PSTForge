@@ -222,7 +222,10 @@ impl HeapFillLevel {
     fn pack_fill_levels(fill_levels: &[HeapFillLevel; 8]) -> u32 {
         fill_levels
             .iter()
-            .fold(0, |acc, &x| (acc << 4) | (x as u32))
+            .enumerate()
+            .fold(0, |acc, (index, &level)| {
+                acc | (u32::from(level as u8) << (index * 4))
+            })
     }
 }
 

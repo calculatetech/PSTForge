@@ -175,7 +175,11 @@ Each output store receives a deterministic identity derived from the source
 SHA-256, immutable job configuration, and part index. Node and block allocation
 is deterministic. Source creation and modification timestamps are preserved
 where valid; tool run time is stored in manifests, not substituted for source
-mail time. Named property identifiers are rebuilt consistently per part.
+mail time. Named property identifiers are rebuilt consistently per part when
+the source GUID/name identity is available. The current `libpff` catalog
+boundary exposes only the store-local `0x8000+` identifier, not that identity;
+such source properties are omitted with explicit partial accounting rather
+than guessed or assigned a semantically unrelated identity.
 
 Known mail properties are translated to conforming PST structures. Unknown
 properties are preserved when their MAPI type and value can be serialized
@@ -191,11 +195,13 @@ content ID, content location, and flags are explicit. RTF synchronization is
 an input fact and is never inferred from the presence of RTF bytes. The native
 body selector is also explicit and optional: it selects plain text, RTF, or
 HTML only when that representation is present, and absence remains absence
-rather than a derived preference. Version 0.2.1 accepts HTML bodies only as
-valid UTF-8 bytes and emits
-`PidTagInternetCodepage` 65001 on every top-level and embedded message; it does
-not synthesize the redundant `PidTagMessageCodepage` fallback, while a source
-value supplied through the typed raw-property boundary remains preservable. A raw property that
+rather than a derived preference. The version 0.2.1 typed writer boundary
+accepts HTML bodies only as valid UTF-8 bytes and defaults
+`PidTagInternetCodepage` to 65001. Version 0.4.0 preserves a positive source
+Internet codepage and its byte-exact HTML; HTML declared as 65001, or lacking a
+source codepage and therefore defaulted to 65001, must pass bounded streaming
+UTF-8 validation or be omitted with partial accounting. The writer does not
+synthesize the redundant `PidTagMessageCodepage` fallback. A raw property that
 duplicates a writer-managed property is rejected at the writer boundary rather
 than silently replacing the conforming value. Every intentionally omitted
 property is returned in a structured write report with an empty top-level path
