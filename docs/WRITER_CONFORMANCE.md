@@ -27,6 +27,9 @@ interoperability evidence, preservation impact, and concrete options.
   produced demonstrably corrupt user-visible output, while the retained
   behavior passed independent integrity and product checks. The exception is
   frozen by a focused regression and human decision.
+- `Accepted mixed conformance`: the normative portion of a grouped invariant
+  is verified, while an explicitly identified empirical or conflicting portion
+  uses human-approved real-world behavior.
 - `Accepted recovery policy`: Microsoft defines the required structure but not
   the recovery value. The human owner has accepted the documented behavior and
   its accounting contract.
@@ -374,7 +377,7 @@ overview reference is replaced by a section-specific reference.
 - **Evidence:** `scanpst_required_metadata_is_serialized`, upstream-reader roundtrip; ScanPST r2
 
 ### MSG-02
-- **Status:** Partial: ordinary source folders match the required PC/three-TC structure; fixed-root count discrepancy is EMP-07
+- **Status:** Accepted mixed conformance: normative folder relationships and ordinary counts are verified; fixed-root counts use EMP-07
 - **Requirement:** Folder PCs and hierarchy/contents/associated table nodes agree on parentage, counts, unread state, and child rows
 - **Sources:** PST-FOLDER-PC; MS-PST 2.4.4; MAPI-FOLDERS; MAPI-CONTENTS
 - **Implementation:** `plan_folders`, `folder_properties_with_unread`, `folder_table_row_with_unread`, `node_entries`
@@ -388,7 +391,7 @@ overview reference is replaced by a section-specific reference.
 - **Evidence:** rich-mail and embedded roundtrips; ScanPST fidelity candidates
 
 ### MSG-04
-- **Status:** Partial: complete required ID set and row/PC equality verified; MS-PST type contradiction is EMP-06
+- **Status:** Accepted mixed conformance: required columns and row/PC equality are verified; conflicting table types use EMP-06
 - **Requirement:** Contents-table rows use the mandatory template columns and match message PCs
 - **Sources:** PST-CONTENTS; MS-PST 2.4.4.3
 - **Implementation:** `contents_columns`, `message_table_row`, `set_message_size`
@@ -423,7 +426,7 @@ overview reference is replaced by a section-specific reference.
 - **Evidence:** `root_folders_and_associated_messages_keep_their_source_placement`; ScanPST/Outlook r2
 
 ### MSG-09
-- **Status:** Verified for populated mappings: store-wide identity collection, deterministic property indices, reserved/custom GUID selectors, numeric/string entry forms, UTF-16 byte lengths and padding, LID/CRC hashing, 251 buckets, and bucket contents match. The reserved-only/empty GUID and entry sentinel remains isolated in EMP-03.
+- **Status:** Accepted mixed conformance: populated mappings are verified; reserved-only/empty GUID and entry sentinels use EMP-03
 - **Requirement:** Named-property streams map numeric/string names and reserved/custom GUID selectors deterministically across top-level and embedded messages
 - **Sources:** PST-NAMEID 2.4.7, including [entry stream](https://learn.microsoft.com/en-us/openspecs/office_file_formats/ms-pst/e17e195d-0454-4b9b-b398-c9127a26a678), [string stream](https://learn.microsoft.com/en-us/openspecs/office_file_formats/ms-pst/bbf3cbf6-74f4-48f0-899d-7d79650c021f), [GUID stream](https://learn.microsoft.com/en-us/openspecs/office_file_formats/ms-pst/0f67b30c-0891-44ef-9a80-24d43ba1b28c), and [hash buckets](https://learn.microsoft.com/en-us/openspecs/office_file_formats/ms-pst/6d390cac-0a02-4a34-9a93-e04e26f149ee)
 - **Implementation:** `collect_named_identities*`, `named_property_map`, `validate_named_map`
@@ -444,14 +447,14 @@ overview reference is replaced by a section-specific reference.
 - **Evidence:** all-raw-value and class checkpoint tests; ScanPST/Outlook checkpoints
 
 ### MSG-12
-- **Status:** Partial: exact embedded class, method 5 object, start `0x7FFB`, end `0x7FFC`, flags `0x7FFD`, hidden `0x7FFE`, display name, encoding, rendering data, and embedded content agree. The accepted source-derived `0x7FFA`/`0x7FFF` values and the absence of documented replacement-time `0x7FF9` are isolated in EMP-13 and remain unchanged.
+- **Status:** Accepted mixed conformance: documented linkage is verified; conflicting source properties use EMP-13
 - **Requirement:** Calendar exception attachment properties retain documented linkage and embedded exception content
 - **Sources:** [MS-OXOCAL 2.2.10 Exceptions](https://learn.microsoft.com/en-us/openspecs/exchange_server_protocols/ms-oxocal/ad438f25-c933-44af-afbb-bb20bc876a0b); [2.2.10.1.1 PidTagAttachmentHidden](https://learn.microsoft.com/en-us/openspecs/exchange_server_protocols/ms-oxocal/4968bd1c-eeed-4f32-8d0f-e732cee09b5d); [2.2.10.1.6 PidTagExceptionReplaceTime](https://learn.microsoft.com/en-us/openspecs/exchange_server_protocols/ms-oxocal/22956d67-d5cb-4db2-aa49-a6f15d24de7a); [MS-OXOCAL creation example](https://learn.microsoft.com/en-us/openspecs/exchange_server_protocols/ms-oxocal/7d95cc80-48b7-4ad2-93fb-767b6962ff8c); [MS-OXCICAL RECURRENCE-ID](https://learn.microsoft.com/en-us/openspecs/exchange_server_protocols/ms-oxcical/6911f0f9-a26b-44bd-be7e-0fe38059fae0)
 - **Implementation:** `calendar_exception_attachment_*`, `validate_attachment_fidelity`
 - **Evidence:** `calendar_exception_attachment_properties_round_trip`; exact libpff source/output fingerprint; ScanPST/Outlook accepted checkpoint
 
 ### MSG-13
-- **Status:** Verified for the presence, emptiness, and specified NIDs of all six required table-template objects. Associated-contents, search-contents, recipient, and attachment schemas agree exactly; the hierarchy/contents type conflicts remain isolated in EMP-06. Outlook-maintained index nodes remain separately isolated in EMP-02.
+- **Status:** Accepted mixed conformance: the six required objects and four unconflicted schemas are verified; hierarchy/contents types use EMP-06 and Outlook-maintained index nodes use EMP-02
 - **Requirement:** Every PST contains empty hierarchy, contents, associated-contents, search-contents, recipient, and attachment table templates at their specified NIDs; each template's schema is tracked by its section-specific entry or explicit exception
 - **Sources:** MS-PST 2.7.3.3; PST-HIERARCHY; PST-CONTENTS; PST-FAI; PST-SEARCH-TC; PST-RECIP-TC; PST-ATTACH-TC
 - **Implementation:** `NID_*_TABLE_TEMPLATE`, `hierarchy_columns`, `contents_columns`, `associated_columns`, `search_contents_columns`, `recipient_columns`, `attachment_columns`, fixed template blocks and `node_entries`
@@ -517,70 +520,70 @@ These entries are deliberately separate because reader acceptance cannot
 establish their format. No entry authorizes removing the existing output.
 
 ### EMP-01
-- **Status:** Empirical. Retain unchanged. After the audit, present retain/rebuild/omit options and preservation impact to the owner.
+- **Status:** Accepted required interoperability output. Retain unchanged.
 - **Requirement:** The hierarchy map node `0xC01` contains a fixed 124-byte HMP payload copied from deterministic ScanPST output
 - **Sources:** MS-PST does not define the HMP payload; ScanPST identifies HMP as an Outlook-maintained structure
 - **Implementation:** `hierarchy_map`, `NID_HIERARCHY_MAP`, `node_entries`
 - **Evidence:** ScanPST accepts current candidates; historical omission caused HMP repair findings
 
 ### EMP-02
-- **Status:** Empirical Outlook-maintained output. Retain unchanged pending control comparison and human disposition.
+- **Status:** Accepted required Outlook-maintained interoperability output. Retain unchanged.
 - **Requirement:** Contents, search, and attachment index nodes use fixed NIDs `0x6B6`, `0x6D7`, and `0x6F8`, ScanPST-derived empty schemas, and reserved NID type bits that do not advance a creation counter
 - **Sources:** MS-PST mandates the six table templates in MSG-13 but does not define these three additional index nodes, their schemas, or their reserved NID type
 - **Implementation:** `NID_*_INDEX_TEMPLATE`, `contents_index_columns`, `search_index_columns`, `attachment_index_columns`, `update_nid_counter`
 - **Evidence:** `scanpst_required_metadata_is_serialized`; ScanPST accepts current candidates
 
 ### EMP-03
-- **Status:** Empirical. Retain both sentinels unchanged pending Outlook-created empty/reserved-only controls and human disposition.
+- **Status:** Accepted required interoperability output. Retain both sentinels unchanged.
 - **Requirement:** An empty NAMEID map includes a fixed reserved MAPI mapping and hash bucket, and a populated map with only reserved GUID sets still includes a physical 16-byte MAPI GUID stream
 - **Sources:** PST-NAMEID documents the five map properties and reserved GUID selectors, but custom GUID stream entries are indexed starting at selector 3; it does not require either sentinel
 - **Implementation:** `named_property_map` empty and no-custom-GUID branches
 - **Evidence:** `empty_named_property_map_preserves_required_interoperability_streams`; zero-length GUID streams were treated as missing by libpff; ScanPST and Outlook accept current candidates
 
 ### EMP-04
-- **Status:** Empirical. Retain unchanged. Do not substitute `0xC1` or remove it without human disposition and a ScanPST-first candidate.
+- **Status:** Accepted required interoperability output. Retain unchanged; do not substitute `0xC1` or remove it.
 - **Requirement:** Fixed internal node `0xEC1` is emitted as an empty search-folder template
 - **Sources:** MS-PST 2.4.1 documents `NID_SEARCH_FOLDER_TEMPLATE` as `0xC1`; no Microsoft source for `0xEC1` has been located
 - **Implementation:** `NID_SEARCH_FOLDER_TEMPLATE`, `node_entries`
 - **Evidence:** ScanPST repaired-r6 graph introduced/retained it; later candidates are clean
 
 ### EMP-05
-- **Status:** Empirical. Retain unchanged pending comparison with Outlook-created controls and human disposition.
+- **Status:** Accepted required interoperability output. Retain unchanged.
 - **Requirement:** The store PC emits Boolean property `0x6633 = true`
 - **Sources:** No Microsoft property definition was located; it is absent from the MS-PST minimum and sample store property lists
 - **Implementation:** `store_properties`
 - **Evidence:** Present in ScanPST-clean PSTForge candidates
 
 ### EMP-06
-- **Status:** Specification conflict. Retain unchanged while Outlook-created table schemas are compared. Any change requires human disposition and ScanPST-first acceptance.
+- **Status:** Accepted interoperability exception. Retain the proven ScanPST- and Outlook-compatible encoding unchanged where the published requirements conflict.
 - **Requirement:** Hierarchy and contents templates encode `0x0E30` as binary; hierarchy encodes `0x3613` as Unicode
 - **Sources:** PST-HIERARCHY and PST-CONTENTS say `0x0E30` is `PtypInteger32`, and PST-HIERARCHY says `0x3613` is `PtypBinary`; OXPROPS-CONTAINER independently requires `0x3613` to be `PtypString`
 - **Implementation:** `hierarchy_columns`, `contents_columns`, `message_table_row`
 - **Evidence:** ScanPST-clean candidates and repaired-r6-derived metadata accept the current Binary/Unicode encoding
 
 ### EMP-07
-- **Status:** Microsoft-source contradiction. Retain current item-count semantics pending control comparison and human disposition.
+- **Status:** Accepted interoperability exception. Retain the proven item-count semantics where Microsoft sources contradict each other.
 - **Requirement:** Fixed Root and IPM subtree PCs use message counts, while MS-PST 2.7.3.4.1/.2 examples put hierarchy-row counts in `PidTagContentCount` despite defining it as item count
 - **Sources:** PST-FOLDER-PC defines `0x3602` as total items; MS-PST fixed-folder examples use 3 and 1 when their contents tables have zero rows
 - **Implementation:** `folder_properties`, fixed Root/IPM blocks in `create_flat_store`
 - **Evidence:** Current values agree with source-folder message semantics and pass ScanPST/Outlook
 
 ### EMP-08
-- **Status:** Empirical interoperability output. Retain unchanged; no schema reduction or replacement without human disposition.
+- **Status:** Accepted required interoperability output. Retain unchanged; do not reduce or replace these schemas.
 - **Requirement:** Receive, outgoing, contents-index, search-index, and attachment-index tables use ScanPST-derived PST schemas and fixed NIDs
 - **Sources:** MS-PST does not define these PST node schemas; MAPI-RECEIVE and MAPI-OUTGOING describe provider-facing tables with different required column sets
 - **Implementation:** `receive_folder_columns`, `outgoing_queue_columns`, `*_index_columns`, fixed blocks 20-24
 - **Evidence:** r6-r8 ScanPST repaired references supplied the current descriptors; later candidates are clean
 
 ### EMP-09
-- **Status:** Empirical values. Retain unchanged until the structures are normatively established or the owner approves the demonstrated deterministic convention.
+- **Status:** Accepted deterministic interoperability convention. Retain unchanged.
 - **Requirement:** Contents rows emit ScanPST-derived replication instance values (`0x0E30`, `0x0E33`, `0x0E34`) and the store emits a 16-byte `0x0E34`
 - **Sources:** MS-PST documents the column tags but not PSTForge's deterministic values; the MS-PST sample store has a structurally different 24-byte version-history value
 - **Implementation:** `message_table_row`, `message_instance_entry_id`, `store_properties`
 - **Evidence:** r6-r8 repaired-reference comparison and clean later ScanPST runs
 
 ### EMP-10
-- **Status:** Empirical creation-state seed. Retain unchanged. Any normalization, randomization, or alternative initialization requires human disposition and a ScanPST-first candidate.
+- **Status:** Accepted deterministic interoperability convention. Retain unchanged; do not normalize, randomize, or substitute alternative initial values.
 - **Requirement:** A newly created header starts `bidUnused` at `0x0000000100000004` and `dwUnique` at `2`
 - **Sources:** MS-PST 2.2.2.6 identifies `bidUnused` as unused padding and requires `dwUnique` to increase when the header changes, but does not prescribe these initial values
 - **Implementation:** `UnicodeHeader::new_store`
@@ -603,7 +606,7 @@ establish their format. No entry authorizes removing the existing output.
 - **Evidence:** raw-property recovery tests and ScanPST-accepted associated/PIM candidates
 
 ### EMP-13
-- **Status:** Source/specification conflict. Retain the exact source values and current gate unchanged. Do not remap, discard, synthesize `0x7FF9`, or reinterpret either property until the owner chooses a disposition after source-library and Outlook-created-control comparison.
+- **Status:** Accepted source-preservation exception. Retain the exact source values and current gate unchanged; do not remap, discard, synthesize `0x7FF9`, or reinterpret either property.
 - **Requirement:** The accepted calendar-exception source and output retain `0x7FFA/PtypInteger32` and `0x7FFF/PtypBoolean`, require `0x7FFA..=0x7FFE` as linkage, and do not require `0x7FF9/PtypTime`
 - **Sources:** MS-OXOCAL defines replacement time as `0x7FF9/PtypTime`, start/end as `0x7FFB`/`0x7FFC`, flags as `0x7FFD`, and hidden as `0x7FFE`; MS-OXPROPS defines `0x7FFF` as `PidTagAttachmentContactPhoto`; no Microsoft definition for the observed `0x7FFA/PtypInteger32` was located
 - **Implementation:** `calendar_exception_attachment_property`, `calendar_exception_attachment_property_type_is_valid`, `calendar_exception_attachment_has_linkage`; equivalent core translation gates
@@ -640,3 +643,10 @@ Checkpoint 9 is complete only when:
    empirical output before such a code change is made.
 5. Remaining 0.4.2 writer work adds or updates its entries before
    implementation.
+
+EMP-01 through EMP-10 have completed this gate. The owner accepted their
+current output as required interoperability behavior after comparing clean
+ScanPST/Outlook results with historical repair findings and the absence of a
+demonstrably better authoritative representation. EMP-13 is likewise resolved
+in favor of exact, accepted source preservation where the source and published
+calendar property descriptions conflict.

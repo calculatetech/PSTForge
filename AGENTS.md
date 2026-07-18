@@ -222,6 +222,23 @@ a milestone commit, and `cargo xtask gate release` for release candidates.
 Exact contents and expected evidence for these tiers are specified in the
 ExecPlan.
 
+On the current development host, the canonical combined external manifest is
+`$HOME/.local/share/pstforge-test-corpus/full-manifest.toml`. It contains the
+legacy ANSI, Unicode, damaged, and split cases plus every focused 0.4.2 case.
+Before a full or release gate, verify that exact file is readable and invoke
+the gate with the variable set explicitly:
+
+```sh
+test -r "$HOME/.local/share/pstforge-test-corpus/full-manifest.toml"
+PSTFORGE_CORPUS_MANIFEST="$HOME/.local/share/pstforge-test-corpus/full-manifest.toml" \
+  cargo xtask gate full
+```
+
+Do not substitute `$HOME/.local/share/pstforge-test-corpus/manifest.toml` or
+`$HOME/.local/share/pstforge/corpus/manifest.toml` for a full gate. They are
+focused manifests and intentionally omit required cases. Do not rediscover or
+scan for another manifest while the canonical combined manifest is readable.
+
 ## Documentation Maintenance
 
 The ExecPlan is a living document. Update its Progress, Surprises &

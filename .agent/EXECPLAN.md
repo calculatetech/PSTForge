@@ -1675,6 +1675,19 @@ work. Hash and identity evidence show that the source was not modified.
       passed at `.agent/test-results/1784394282-full`. A fresh final-state
       review returned `CLEAN`. No production code, PST bytes, or human
       acceptance behavior changed.
+    - [x] (2026-07-18) Resolved the structural empirical-output checkpoint
+      without changing writer bytes. The owner accepted EMP-01 through EMP-10
+      as required interoperability behavior: current output passes ScanPST and
+      Outlook, historical omissions produced repair findings, and no
+      authoritative alternative has demonstrated better real-world behavior.
+      The same evidence rule resolves EMP-13 in favor of exact source
+      preservation because its source/output properties match and the result
+      passes ScanPST and Outlook. The final combined-manifest full gate passed
+      at `.agent/test-results/1784395034-full`; this checkpoint changes only
+      conformance and decision documentation. The first clean-context review
+      rejected `Verified` on grouped rows that also use accepted exceptions;
+      define `Accepted mixed conformance` so their verified normative portions
+      and approved empirical/conflicting portions remain distinguishable.
     - [x] Create `docs/WRITER_CONFORMANCE.md` with one traceable row for every
       existing store, NDB, LTP, folder, message, recipient, attachment,
       embedded-message, associated-content, named-property, and publication
@@ -2956,6 +2969,19 @@ work. Hash and identity evidence show that the source was not modified.
   clean recovery points but do not benefit from an idle approval round trip
   when all acceptance evidence is machine-verifiable.
   Date/Author: 2026-07-18 / human owner direction.
+
+- Decision: Retain EMP-01 through EMP-10 as required interoperability output,
+  and retain EMP-13 as an exact source-preservation exception. Where a
+  published description conflicts with demonstrated real-world behavior,
+  proven ScanPST and Outlook behavior controls.
+  Rationale: Current candidates pass both independent validators; earlier
+  omissions produced concrete HMP, search-folder, hierarchy, and contents-table
+  repair findings; several structures have no published replacement; and
+  EMP-13 preserves readable source properties exactly. Rebuilding, omitting,
+  or normalizing these values would introduce known or unbounded
+  interoperability and preservation risk without improving recovered data.
+  Date/Author: 2026-07-18 / human owner approval of the structural empirical
+  checkpoint and reality-over-conflicting-specification rule.
 
 ## Outcomes & Retrospective
 
