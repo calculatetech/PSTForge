@@ -2196,6 +2196,8 @@ mod tests {
         )?;
         let attachment = &input.store.folders[0].messages[0].attachments[0];
         assert_eq!(attachment.mime_type.as_deref(), Some("application/pdf"));
+        assert_eq!(attachment.rendering_position, None);
+        assert_eq!(attachment.flags, 0);
         assert_eq!(
             input.store.folders[0].messages[0].attachments[1].mime_type,
             None
@@ -2211,7 +2213,24 @@ mod tests {
                 .get(&ReconstructedField::AttachmentMimeType),
             Some(&1)
         );
+        assert_eq!(
+            input
+                .reconstructions
+                .generated
+                .get(&ReconstructedField::AttachmentRenderingPosition),
+            Some(&2)
+        );
+        assert_eq!(
+            input
+                .reconstructions
+                .generated
+                .get(&ReconstructedField::AttachmentFlags),
+            Some(&2)
+        );
         assert!(!input.partial);
+        let neutral_defaults_pst = directory.path().join("neutral-attachment-defaults.pst");
+        pstforge_pst::writer::create_mail_store(&neutral_defaults_pst, &input.store)?;
+        assert!(neutral_defaults_pst.is_file());
 
         let mut source_wins = mail;
         source_wins.attachments[0]

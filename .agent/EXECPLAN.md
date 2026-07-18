@@ -1728,7 +1728,7 @@ work. Hash and identity evidence show that the source was not modified.
       `.agent/test-results/1784398030-full`. The owner reports ScanPST and
       Outlook acceptance clean, approving this output-changing checkpoint for
       commit and push.
-    - [ ] (2026-07-18) Extended missing attachment-type recovery to common
+    - [x] (2026-07-18) Extended missing attachment-type recovery to common
       emailed containers without changing payload bytes. Exact ZIP signatures
       produce the generic `application/zip` label; bounded OPC parsing upgrades
       only an exact `[Content_Types].xml` override plus matching required main
@@ -1756,6 +1756,21 @@ work. Hash and identity evidence show that the source was not modified.
       `qualification-v042-attachment-types-r2` passed independent `pffinfo` and
       `readpst` validation; the owner reports ScanPST and Outlook acceptance
       clean.
+    - [x] (2026-07-18) Resolved the neutral attachment metadata portion of
+      EMP-15 without changing PST bytes. When the source omits rendering
+      position, `-1` documents that the plain-text body-position property does
+      not render the attachment; RTF retains its separate placeholder
+      mechanism. When the source omits attachment flags, zero is the documented
+      process-in-all-applications value. The packed-blob recovery regression
+      freezes both translated inputs, their bounded generated-value accounting,
+      and completed PST serialization. Generated display filenames other than
+      the accepted unknown `.bin` case remain a separate owner decision. The
+      combined-manifest full gate passed at
+      `.agent/test-results/1784401533-full`; its writer-acceptance evidence is
+      byte-identical to the preceding output-changing checkpoint. The first
+      focused review corrected overbroad rendering terminology, required
+      completed-PST validation, and corrected the source page date. A fresh
+      final-state review returned `CLEAN`.
     - [x] Create `docs/WRITER_CONFORMANCE.md` with one traceable row for every
       existing store, NDB, LTP, folder, message, recipient, attachment,
       embedded-message, associated-content, named-property, and publication
