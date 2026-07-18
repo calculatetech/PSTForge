@@ -1791,6 +1791,30 @@ work. Hash and identity evidence show that the source was not modified.
       `544b37b9e862aa92442298c874f3afab05a99a4a9e6bd0b9d8f3117fabcab0f5`;
       `pffinfo` and `readpst` accept it with `.pdf`, `.bin`, and `.docx`
       generated names. The owner reports ScanPST and Outlook acceptance clean.
+    - [x] (2026-07-18) Compared current fabricated visible metadata with an
+      integrity-first omission before deciding EMP-14 subject/sender policy.
+      One PST contains otherwise equivalent messages: comparison A writes
+      `(no subject)` and `Unknown Sender`; comparison B omits an unknown subject
+      and all sender identity properties. The writer continues to reject a
+      one-sided sender pair. Empty Unicode table values are not emitted because
+      they encode as invalid HID zero; the contents-table column remains and
+      its existence bit is clear. The focused writer test proves completed
+      readback. Candidate
+      `qualification-v042-missing-metadata-comparison-r2/parts/part-0001.pst`
+      is 271,360 bytes with SHA-256
+      `d3381fcad5f7a31b9113112d77a32246e7b4ce6919364de63df91c65a88bb85a`;
+      `pffinfo`, `readpst`, and ScanPST accept both messages. Outlook leaves
+      omitted fields blank in the list and supplies `(no subject)` only in the
+      opened view. MailPlus supplies `(No subject)` for the omitted subject and
+      leaves the omitted sender blank, while the fabricated sender renders as
+      `<Unknown@SYNTAX_ERROR>`. The owner therefore selected omission and
+      client-controlled presentation. Production translation now leaves wholly
+      missing subject and sender identity absent across readable message
+      classes while retaining typed bounded missing-metadata counts in
+      `recovery.log`. Associated messages may omit subject but retain their
+      separately validated nonempty display-name rule; when both source display
+      name and subject are absent, the prior neutral `(no subject)` fallback is
+      retained only as the associated-table display name and counted there.
     - [x] Create `docs/WRITER_CONFORMANCE.md` with one traceable row for every
       existing store, NDB, LTP, folder, message, recipient, attachment,
       embedded-message, associated-content, named-property, and publication
@@ -3098,6 +3122,24 @@ work. Hash and identity evidence show that the source was not modified.
   keep every derivation visible without exposing source values.
   Date/Author: 2026-07-18 / human owner approval of the derived-value
   checkpoint.
+
+- Decision: Leave a wholly missing subject and sender identity absent across
+  readable message classes instead of writing `(no subject)` or
+  `Unknown Sender`. Continue copying one readable sender half to its missing
+  counterpart across message classes, require a separate nonempty display name
+  for associated items, and count every applicable absent subject, sender name,
+  and sender address in the bounded typed `recovery.log`. When an associated
+  item has neither display name nor subject, retain the existing neutral
+  `(no subject)` value only for its required associated display name and count
+  that generated field separately.
+  Rationale: ScanPST accepted both comparison messages. Outlook leaves the
+  omitted list fields blank and supplies its own `(no subject)` view label;
+  MailPlus supplies `(No subject)` while leaving the sender blank. In contrast,
+  MailPlus renders the fabricated sender as `<Unknown@SYNTAX_ERROR>`. Omission
+  preserves the source truth and lets each client apply its native display
+  policy without turning invented metadata into a malformed identity.
+  Date/Author: 2026-07-18 / human owner approval after Outlook and MailPlus
+  comparison.
 
 - Decision: Treat code page 65001 as derived only when missing-source HTML is
   nonempty and passes full-stream strict UTF-8 validation, and treat

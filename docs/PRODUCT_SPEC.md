@@ -286,7 +286,15 @@ The stable output structure is:
 
 `recovery.log` is the bounded human recovery record. It states what was
 preserved, what was restored outside its original location, and what could not
-be preserved, grouped by source-visible folder and plain-language reason.
+be preserved, grouped by source-visible folder and plain-language reason. It
+also reports bounded typed counts for source metadata that was derived from
+other readable values, defaulted, or deliberately left absent. Across readable
+message classes, a wholly missing subject or sender identity remains absent so
+the importing client controls its presentation; associated items still require
+a separate nonempty display name. If an associated item has neither a display
+name nor subject, `(no subject)` is generated only for that structural display
+name. These omissions and generated structural values are counted without
+logging message values or item identifiers.
 Part manifests contain size, SHA-256, store identity, counts, oversize status,
 and bounded error totals under private job state rather than beside the PST
 files. CLI `--json` output remains the machine-readable summary. The JSON

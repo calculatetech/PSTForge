@@ -519,9 +519,9 @@ fn render_recovery_log(report: &SplitReport) -> String {
             report.recovery.issues_dropped
         ));
     }
-    output.push_str("\nData reconstructed\n");
+    output.push_str("\nMetadata recovery\n");
     if reconstructions.is_empty() {
-        output.push_str("No source metadata required reconstruction.\n");
+        output.push_str("No source metadata required recovery handling.\n");
     } else {
         append_reconstruction_group(
             &mut output,
@@ -530,7 +530,7 @@ fn render_recovery_log(report: &SplitReport) -> String {
         );
         append_reconstruction_group(
             &mut output,
-            "Generated because source metadata was absent or unusable",
+            "Source metadata absent or unusable; defaults generated or fields left absent",
             &reconstructions.generated,
         );
     }
@@ -1713,7 +1713,7 @@ mod tests {
         let clean = render_recovery_log(&report);
         assert!(clean.contains("Result: complete"));
         assert!(clean.contains("No readable data was skipped."));
-        assert!(clean.contains("No source metadata required reconstruction."));
+        assert!(clean.contains("No source metadata required recovery handling."));
         assert!(clean.contains("part-0001.pst: 80 bytes"));
         assert!(!clean.contains("/private/source.pst"));
         assert!(!clean.contains("/private/job"));
@@ -1724,14 +1724,26 @@ mod tests {
         report.parts[0]
             .reconstructions
             .record_generated(ReconstructedField::AttachmentFilename);
+        report.parts[0]
+            .reconstructions
+            .record_generated(ReconstructedField::Subject);
+        report.parts[0]
+            .reconstructions
+            .record_generated(ReconstructedField::SenderName);
+        report.parts[0]
+            .reconstructions
+            .record_generated(ReconstructedField::SenderAddress);
         let reconstructed = render_recovery_log(&report);
         assert!(reconstructed.contains("Result: complete"));
         assert!(reconstructed.contains("Derived from other readable source values:"));
         assert!(reconstructed.contains("Recipient display name: 1"));
-        assert!(
-            reconstructed.contains("Generated because source metadata was absent or unusable:")
-        );
+        assert!(reconstructed.contains(
+            "Source metadata absent or unusable; defaults generated or fields left absent:"
+        ));
         assert!(reconstructed.contains("Attachment filename: 1"));
+        assert!(reconstructed.contains("Subject: 1"));
+        assert!(reconstructed.contains("Sender name: 1"));
+        assert!(reconstructed.contains("Sender address: 1"));
 
         report.partial = true;
         report.recovery.unsupported_candidates = 2;

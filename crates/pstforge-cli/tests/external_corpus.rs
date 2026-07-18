@@ -1304,17 +1304,32 @@ fn normalize_current_recovery_policy(expected: &mut MessageContentFingerprint) {
         expected.message_class = Some("IPM.Note".to_owned());
     }
     if expected.subject.as_deref().is_none_or(str::is_empty) {
-        expected.subject = Some("(no subject)".to_owned());
+        expected.subject = None;
     }
-    if !sender_optional_class(expected.message_class.as_deref().unwrap_or("IPM.Note")) {
-        match (&expected.sender_name, &expected.sender_email) {
-            (None, None) => {
-                expected.sender_name = Some("Unknown Sender".to_owned());
-                expected.sender_email = Some("Unknown Sender".to_owned());
-            }
-            (None, Some(address)) => expected.sender_name = Some(address.clone()),
-            (Some(name), None) => expected.sender_email = Some(name.clone()),
-            (Some(_), Some(_)) => {}
+    let sender_name = expected
+        .sender_name
+        .clone()
+        .filter(|value| !value.is_empty());
+    let sender_email = expected
+        .sender_email
+        .clone()
+        .filter(|value| !value.is_empty());
+    match (sender_name, sender_email) {
+        (None, None) => {
+            expected.sender_name = None;
+            expected.sender_email = None;
+        }
+        (None, Some(address)) => {
+            expected.sender_name = Some(address.clone());
+            expected.sender_email = Some(address);
+        }
+        (Some(name), None) => {
+            expected.sender_name = Some(name.clone());
+            expected.sender_email = Some(name);
+        }
+        (Some(name), Some(address)) => {
+            expected.sender_name = Some(name);
+            expected.sender_email = Some(address);
         }
     }
     let source_delivery = expected.delivery_filetime;
@@ -1339,22 +1354,27 @@ fn normalize_current_recovery_policy(expected: &mut MessageContentFingerprint) {
     expected.body_properties.sort();
 }
 
-fn sender_optional_class(value: &str) -> bool {
-    !(class_is_or_descends_from(value, "IPM.Note")
-        || class_descends_from(value, "REPORT.IPM.Note")
-        || class_descends_from(value, "IPM.Schedule.Meeting"))
-}
-
-fn class_is_or_descends_from(value: &str, root: &str) -> bool {
-    value.eq_ignore_ascii_case(root) || class_descends_from(value, root)
-}
-
-fn class_descends_from(value: &str, root: &str) -> bool {
-    value
-        .get(..root.len())
-        .is_some_and(|prefix| prefix.eq_ignore_ascii_case(root))
-        && value.as_bytes().get(root.len()) == Some(&b'.')
-        && value.len() > root.len() + 1
+#[test]
+fn recovery_policy_normalizes_explicit_empty_visible_metadata() {
+    let mut expected = MessageContentFingerprint {
+        embedded_path: Vec::new(),
+        message_class: Some("IPM.Contact".to_owned()),
+        subject: Some(String::new()),
+        sender_name: Some(String::new()),
+        sender_email: Some("contact@example.com".to_owned()),
+        submit_filetime: Some(1),
+        delivery_filetime: Some(2),
+        recipients: Vec::new(),
+        attachments: Vec::new(),
+        body_properties: Vec::new(),
+    };
+    normalize_current_recovery_policy(&mut expected);
+    assert_eq!(expected.subject, None);
+    assert_eq!(expected.sender_name.as_deref(), Some("contact@example.com"));
+    assert_eq!(
+        expected.sender_email.as_deref(),
+        Some("contact@example.com")
+    );
 }
 
 fn add_i32_fallback(properties: &mut Vec<PropertyFingerprint>, id: u32, value: i32) {

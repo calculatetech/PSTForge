@@ -172,30 +172,12 @@ fn build_part_writer_input_expected(
     let mut omitted_attachments = 0_u64;
     for mail in messages {
         source.check_interrupted()?;
-        let translated = translate_message(&source, mail, false)?;
+        let mut translated = translate_message(&source, mail, false)?;
         partial |= translated.partial;
         omitted_properties = omitted_properties.saturating_add(translated.omitted_properties);
         omitted_attachments = omitted_attachments.saturating_add(translated.omitted_attachments);
-        if mail.placement == CanonicalMessagePlacement::Associated
-            && !translated.message.raw_properties.iter().any(|property| {
-                matches!(
-                    property,
-                    RawProperty {
-                        id: 0x3001,
-                        value: RawPropertyValue::Unicode(_),
-                    }
-                )
-            })
-        {
-            if mail
-                .subject
-                .as_deref()
-                .is_some_and(|value| !value.is_empty())
-            {
-                reconstructions.record_derived(ReconstructedField::AssociatedDisplayName);
-            } else {
-                reconstructions.record_generated(ReconstructedField::AssociatedDisplayName);
-            }
+        if mail.placement == CanonicalMessagePlacement::Associated {
+            normalize_associated_display_name(&mut translated.message, &mut reconstructions);
         }
         reconstructions.merge(translated.reconstructions);
         match folders.entry((mail.folder_location, mail.folder_path.clone())) {
@@ -278,6 +260,43 @@ fn build_part_writer_input_expected(
         omitted_attachments,
         reconstructions,
     })
+}
+
+fn normalize_associated_display_name(
+    message: &mut MessageSpec,
+    reconstructions: &mut ReconstructionCounts,
+) {
+    let display_name = message
+        .raw_properties
+        .iter_mut()
+        .find_map(|property| match property {
+            RawProperty {
+                id: 0x3001,
+                value: RawPropertyValue::Unicode(value),
+            } => Some(value),
+            _ => None,
+        });
+    match display_name {
+        Some(value) if value.is_empty() && message.subject.is_empty() => {
+            *value = "(no subject)".to_owned();
+            reconstructions.record_generated(ReconstructedField::AssociatedDisplayName);
+        }
+        Some(value) if value.is_empty() => {
+            *value = message.subject.clone();
+            reconstructions.record_derived(ReconstructedField::AssociatedDisplayName);
+        }
+        Some(_) => {}
+        None if message.subject.is_empty() => {
+            message.raw_properties.push(RawProperty {
+                id: 0x3001,
+                value: RawPropertyValue::Unicode("(no subject)".to_owned()),
+            });
+            reconstructions.record_generated(ReconstructedField::AssociatedDisplayName);
+        }
+        None => {
+            reconstructions.record_derived(ReconstructedField::AssociatedDisplayName);
+        }
+    }
 }
 
 struct TranslationSource<'a> {
@@ -766,45 +785,28 @@ fn translate_message(
         .filter(|value| !value.is_empty())
         .unwrap_or_else(|| {
             reconstructions.record_generated(ReconstructedField::Subject);
-            "(no subject)".to_owned()
+            String::new()
         });
     let sender_optional = sender_optional_message_class(&message_class);
     let source_sender_name = mail.sender_name.clone().filter(|value| !value.is_empty());
     let source_sender_email = mail.sender_email.clone().filter(|value| !value.is_empty());
-    let (sender_name, sender_email) = if sender_optional {
-        match (source_sender_name, source_sender_email) {
-            (Some(name), Some(email)) => (name, email),
-            (None, None) => (String::new(), String::new()),
-            (Some(_), None) | (None, Some(_)) => {
-                partial = true;
-                omitted_properties = omitted_properties.saturating_add(1);
-                (String::new(), String::new())
-            }
+    let (sender_name, sender_email) = match (source_sender_name, source_sender_email) {
+        (Some(name), Some(email)) => (name, email),
+        (Some(name), None) => {
+            reconstructions.record_derived(ReconstructedField::SenderAddress);
+            (name.clone(), name)
         }
-    } else {
-        let sender_name = source_sender_name.or_else(|| {
-            if source_sender_email.is_some() {
-                reconstructions.record_derived(ReconstructedField::SenderName);
-                source_sender_email.clone()
-            } else {
+        (None, Some(email)) => {
+            reconstructions.record_derived(ReconstructedField::SenderName);
+            (email.clone(), email)
+        }
+        (None, None) => {
+            if !sender_optional {
                 reconstructions.record_generated(ReconstructedField::SenderName);
-                Some("Unknown Sender".to_owned())
-            }
-        });
-        let sender_name = sender_name.unwrap_or_else(|| "Unknown Sender".to_owned());
-        let sender_email = source_sender_email.unwrap_or_else(|| {
-            if mail
-                .sender_name
-                .as_deref()
-                .is_some_and(|value| !value.is_empty())
-            {
-                reconstructions.record_derived(ReconstructedField::SenderAddress);
-            } else {
                 reconstructions.record_generated(ReconstructedField::SenderAddress);
             }
-            sender_name.clone()
-        });
-        (sender_name, sender_email)
+            (String::new(), String::new())
+        }
     };
     let (sent_filetime, invalid_sent_filetime) = contained_filetime(mail.submit_filetime);
     let (received_filetime, invalid_received_filetime) = contained_filetime(mail.delivery_filetime);
@@ -1970,16 +1972,17 @@ mod tests {
         CatalogEvent, CatalogProvenance, CatalogSink, PropertyDescriptor, PropertyOwner,
         RecoveryUnit,
     };
-    use pstforge_job::{DurableCatalogSink, ReconstructedField, SpooledBlob};
+    use pstforge_job::{DurableCatalogSink, ReconstructedField, ReconstructionCounts, SpooledBlob};
     use tempfile::tempdir;
 
     use super::{
         CanonicalWriteError, PartBuildOptions, attachment_property_type_is_preservable,
         build_part_writer_input, build_part_writer_input_with_folders_interruptible,
         contain_body_metadata, extension_for_mime, named_property_set,
-        recipient_property_value_matches, record_internet_codepage_provenance,
-        supported_message_class, valid_compressed_rtf_container, valid_utf8_stream,
-        valid_utf16_stream, writer_stream_type_is_supported,
+        normalize_associated_display_name, recipient_property_value_matches,
+        record_internet_codepage_provenance, supported_message_class,
+        valid_compressed_rtf_container, valid_utf8_stream, valid_utf16_stream,
+        writer_stream_type_is_supported,
     };
     use crate::{
         CanonicalAttachment, CanonicalFolder, CanonicalFolderLocation, CanonicalFolderRole,
@@ -2492,7 +2495,7 @@ mod tests {
     }
 
     #[test]
-    fn preserves_source_contact_class_and_contains_one_sided_contact_sender()
+    fn preserves_source_contact_class_and_derives_one_sided_contact_sender()
     -> Result<(), Box<dyn std::error::Error>> {
         let directory = tempdir()?;
         let job = DurableCatalogSink::create(&directory.path().join("job"))?;
@@ -2541,10 +2544,23 @@ mod tests {
         )?;
 
         assert_eq!(input.store.folders[0].container_class, "IPF.Contact");
-        assert_eq!(input.store.folders[0].messages[0].sender_name, "");
-        assert_eq!(input.store.folders[0].messages[0].sender_email, "");
-        assert_eq!(input.omitted_properties, 1);
-        assert!(input.partial);
+        assert_eq!(
+            input.store.folders[0].messages[0].sender_name,
+            "not valid contact sender metadata"
+        );
+        assert_eq!(
+            input.store.folders[0].messages[0].sender_email,
+            "not valid contact sender metadata"
+        );
+        assert_eq!(
+            input
+                .reconstructions
+                .derived
+                .get(&ReconstructedField::SenderAddress),
+            Some(&1)
+        );
+        assert_eq!(input.omitted_properties, 0);
+        assert!(!input.partial);
         validate_mail_store_input(&input.store)?;
         Ok(())
     }
@@ -2620,7 +2636,7 @@ mod tests {
     }
 
     #[test]
-    fn generated_mail_metadata_is_accounted_without_marking_source_loss()
+    fn missing_mail_metadata_is_accounted_without_marking_source_loss()
     -> Result<(), Box<dyn std::error::Error>> {
         let directory = tempdir()?;
         let job = DurableCatalogSink::create(&directory.path().join("job"))?;
@@ -2671,9 +2687,9 @@ mod tests {
         )?;
 
         let output = &input.store.folders[0].messages[0];
-        assert_eq!(output.subject, "(no subject)");
-        assert_eq!(output.sender_name, "Unknown Sender");
-        assert_eq!(output.sender_email, "Unknown Sender");
+        assert!(output.subject.is_empty());
+        assert!(output.sender_name.is_empty());
+        assert!(output.sender_email.is_empty());
         assert!(!input.partial);
         assert_eq!(
             input
@@ -2697,6 +2713,68 @@ mod tests {
             assert_eq!(input.reconstructions.generated.get(&field), Some(&1));
         }
         assert_eq!(input.reconstructions.generated.len(), 9);
+
+        let mut associated = mail.clone();
+        associated.durable_item_key = "associated:4:-:0".to_owned();
+        associated.placement = CanonicalMessagePlacement::Associated;
+        associated.properties.clear();
+        let associated_input = build_part_writer_input(
+            &job,
+            &[&associated],
+            &"0".repeat(64),
+            "balanced",
+            4_294_967_296,
+            2,
+        )?;
+        let associated_output = &associated_input.store.folders[0].associated_messages[0];
+        assert!(associated_output.subject.is_empty());
+        assert!(associated_output.raw_properties.iter().any(|property| {
+            matches!(
+                property,
+                pstforge_pst::writer::RawProperty {
+                    id: 0x3001,
+                    value: pstforge_pst::writer::RawPropertyValue::Unicode(value),
+                } if value == "(no subject)"
+            )
+        }));
+        assert_eq!(
+            associated_input
+                .reconstructions
+                .generated
+                .get(&ReconstructedField::AssociatedDisplayName),
+            Some(&1)
+        );
+        validate_mail_store_input(&associated_input.store)?;
+
+        let mut empty_display = associated_output.clone();
+        empty_display.subject = "Readable associated subject".to_owned();
+        for property in &mut empty_display.raw_properties {
+            if let pstforge_pst::writer::RawProperty {
+                id: 0x3001,
+                value: pstforge_pst::writer::RawPropertyValue::Unicode(value),
+            } = property
+            {
+                value.clear();
+            }
+        }
+        let mut display_counts = ReconstructionCounts::default();
+        normalize_associated_display_name(&mut empty_display, &mut display_counts);
+        assert!(empty_display.raw_properties.iter().any(|property| {
+            matches!(
+                property,
+                pstforge_pst::writer::RawProperty {
+                    id: 0x3001,
+                    value: pstforge_pst::writer::RawPropertyValue::Unicode(value),
+                } if value == "Readable associated subject"
+            )
+        }));
+        assert_eq!(
+            display_counts
+                .derived
+                .get(&ReconstructedField::AssociatedDisplayName),
+            Some(&1)
+        );
+        assert!(display_counts.generated.is_empty());
         Ok(())
     }
 

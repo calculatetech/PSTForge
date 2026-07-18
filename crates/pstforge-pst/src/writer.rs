@@ -1805,6 +1805,17 @@ pub fn validate_mail_store_input(spec: &MailStoreSpec) -> Result<(), WriterError
         for component in spec.folders.iter().flat_map(|folder| &folder.path) {
             validate_unicode("folder name", component)?;
         }
+        for message in spec
+            .folders
+            .iter()
+            .flat_map(|folder| &folder.associated_messages)
+        {
+            if associated_display_name(message).is_empty() {
+                return Err(WriterError::InvalidStructure(
+                    "associated message display name must be non-empty".to_owned(),
+                ));
+            }
+        }
         let messages = spec
             .folders
             .iter()
@@ -1826,10 +1837,17 @@ pub fn validate_mail_store_input(spec: &MailStoreSpec) -> Result<(), WriterError
         validate_folder_hierarchy_shapes(&folder_plans)?;
         let named_identities = collect_named_identities_many_refs(&messages);
         property_context(&named_property_map(&named_identities)?)?;
-        for message in messages {
-            validate_aggregate_properties(message)?;
-            validate_message(message, 0)?;
-            validate_message_size_bound(message)?;
+        for folder in &spec.folders {
+            for message in &folder.messages {
+                validate_aggregate_properties(message)?;
+                validate_message(message, 0)?;
+                validate_message_size_bound(message)?;
+            }
+            for message in &folder.associated_messages {
+                validate_aggregate_properties(message)?;
+                validate_message(message, 0)?;
+                validate_message_size_bound(message)?;
+            }
         }
         Ok(())
     };
@@ -3461,16 +3479,13 @@ fn validate_property_context_shape(
 
 fn validate_message_property_context_shape(message: &MessageSpec) -> Result<(), WriterError> {
     let has_sender = !message.sender_name.is_empty() && !message.sender_email.is_empty();
-    let mut property_count = if has_sender { 18_usize } else { 12_usize };
-    let mut lengths = vec![
-        unicode_payload_len(&message.message_class)?,
-        unicode_payload_len(&message.subject)?,
-        16,
-        8,
-        8,
-        8,
-        8,
-    ];
+    let has_subject = !message.subject.is_empty();
+    let mut property_count = if has_sender { 17_usize } else { 11_usize };
+    let mut lengths = vec![unicode_payload_len(&message.message_class)?, 16, 8, 8, 8, 8];
+    if has_subject {
+        property_count += 1;
+        lengths.push(unicode_payload_len(&message.subject)?);
+    }
     if has_sender {
         lengths.extend([
             unicode_payload_len(&message.sender_name)?,
@@ -3567,28 +3582,21 @@ fn validate_message(message: &MessageSpec, depth: usize) -> Result<(), WriterErr
             "Internet codepage must be positive".to_owned(),
         ));
     }
-    for (name, value) in [
-        ("message class", &message.message_class),
-        ("subject", &message.subject),
-    ] {
-        if value.is_empty() {
-            return Err(WriterError::InvalidStructure(format!(
-                "{name} must be non-empty"
-            )));
-        }
-        validate_unicode(name, value)?;
+    if message.message_class.is_empty() {
+        return Err(WriterError::InvalidStructure(
+            "message class must be non-empty".to_owned(),
+        ));
     }
-    for (name, value) in [
-        ("sender name", &message.sender_name),
-        ("sender email", &message.sender_email),
-    ] {
-        if value.is_empty() && !sender_optional_message_class(&message.message_class) {
-            return Err(WriterError::InvalidStructure(format!(
-                "{name} must be non-empty"
-            )));
-        }
-        validate_unicode(name, value)?;
+    validate_unicode("message class", &message.message_class)?;
+    validate_unicode("subject", &message.subject)?;
+    let sender_is_incomplete = message.sender_name.is_empty() != message.sender_email.is_empty();
+    if sender_is_incomplete {
+        return Err(WriterError::InvalidStructure(
+            "sender name and email must both be present or both be absent".to_owned(),
+        ));
     }
+    validate_unicode("sender name", &message.sender_name)?;
+    validate_unicode("sender email", &message.sender_email)?;
     for recipient in &message.recipients {
         if recipient.display_name.is_empty() || recipient.email_address.is_empty() {
             return Err(WriterError::InvalidStructure(
@@ -3936,38 +3944,12 @@ fn supported_message_class(value: &str) -> bool {
     !value.is_empty()
 }
 
-fn contact_message_class(value: &str) -> bool {
-    class_is_or_descends_from(value, "IPM.Contact")
-}
-
 fn appointment_message_class(value: &str) -> bool {
     class_is_or_descends_from(value, "IPM.Appointment")
 }
 
-fn meeting_message_class(value: &str) -> bool {
-    class_descends_from(value, "IPM.Schedule.Meeting")
-}
-
-fn task_message_class(value: &str) -> bool {
-    class_is_or_descends_from(value, "IPM.Task")
-}
-
-fn sticky_note_message_class(value: &str) -> bool {
-    class_is_or_descends_from(value, "IPM.StickyNote")
-}
-
 fn calendar_exception_message_class(value: &str) -> bool {
     value.eq_ignore_ascii_case("IPM.OLE.CLASS.{00061055-0000-0000-C000-000000000046}")
-}
-
-fn sender_optional_message_class(value: &str) -> bool {
-    !(class_is_or_descends_from(value, "IPM.Note")
-        || class_descends_from(value, "REPORT.IPM.Note")
-        || meeting_message_class(value))
-        || contact_message_class(value)
-        || appointment_message_class(value)
-        || task_message_class(value)
-        || sticky_note_message_class(value)
 }
 
 fn class_is_or_descends_from(value: &str, root: &str) -> bool {
@@ -4269,6 +4251,7 @@ fn validate_completed_store(
     for (property, expected, name) in [(0x0037, &spec.message.subject, "subject")] {
         match message.properties().get(property) {
             Some(ReadValue::Unicode(value)) if value.to_string() == *expected => {}
+            None if expected.is_empty() => {}
             _ => return Err(invalid(&format!("completed store {name} mismatch"))),
         }
     }
@@ -4586,14 +4569,41 @@ fn validate_completed_folder_store(
                 .iter()
                 .position(|column| column.prop_id() == 0x0037)
                 .ok_or_else(|| invalid("completed store subject column is missing"))?;
-            let value = values[subject]
-                .as_ref()
-                .ok_or_else(|| invalid("completed store subject is missing"))?;
-            let actual =
-                contents.read_column(value, contents.context().columns()[subject].prop_type())?;
-            if !matches!(actual, crate::ltp::prop_context::PropertyValue::Unicode(value) if value.to_string() == expected.subject)
-            {
+            let subject_matches = match values[subject].as_ref() {
+                Some(value) => {
+                    let actual = contents
+                        .read_column(value, contents.context().columns()[subject].prop_type())?;
+                    matches!(
+                        actual,
+                        crate::ltp::prop_context::PropertyValue::Unicode(value)
+                            if value.to_string() == expected.subject
+                    )
+                }
+                None => expected.subject.is_empty(),
+            };
+            if !subject_matches {
                 return Err(invalid("completed store subject mismatch"));
+            }
+            let sender = contents
+                .context()
+                .columns()
+                .iter()
+                .position(|column| column.prop_id() == 0x0042)
+                .ok_or_else(|| invalid("completed store sender column is missing"))?;
+            let sender_matches = match values[sender].as_ref() {
+                Some(value) => {
+                    let actual = contents
+                        .read_column(value, contents.context().columns()[sender].prop_type())?;
+                    matches!(
+                        actual,
+                        crate::ltp::prop_context::PropertyValue::Unicode(value)
+                            if value.to_string() == expected.sender_name
+                    )
+                }
+                None => expected.sender_name.is_empty(),
+            };
+            if !sender_matches {
+                return Err(invalid("completed store sender mismatch"));
             }
             let flags = contents
                 .context()
@@ -5169,7 +5179,10 @@ fn validate_embedded_message(
 
     let invalid = |message: &str| WriterError::InvalidStructure(message.to_owned());
     let properties = actual.properties();
-    let unicode_matches = |id, expected: &str| matches!(properties.get(id), Some(ReadValue::Unicode(value)) if value.to_string() == expected);
+    let unicode_matches = |id, expected: &str| {
+        matches!(properties.get(id), Some(ReadValue::Unicode(value)) if value.to_string() == expected)
+            || (expected.is_empty() && properties.get(id).is_none())
+    };
     let sender_matches = if expected.sender_name.is_empty() && expected.sender_email.is_empty() {
         [0x0042, 0x0064, 0x0065, 0x0C1A, 0x0C1E, 0x0C1F]
             .into_iter()
@@ -5750,7 +5763,6 @@ fn message_properties(
             0x001A,
             PropertyValue::Unicode(message.message_class.clone()),
         ),
-        (0x0037, PropertyValue::Unicode(message.subject.clone())),
         (0x0E06, PropertyValue::Time(message.received_filetime)),
         (
             0x0E07,
@@ -5767,6 +5779,9 @@ fn message_properties(
         (0x300B, PropertyValue::Binary(record_key.to_vec())),
         (0x3FDE, PropertyValue::Integer32(message.internet_codepage)),
     ];
+    if !message.subject.is_empty() {
+        properties.push((0x0037, PropertyValue::Unicode(message.subject.clone())));
+    }
     if !message.sender_name.is_empty() && !message.sender_email.is_empty() {
         properties.extend([
             (0x0042, PropertyValue::Unicode(message.sender_name.clone())),
@@ -6462,7 +6477,6 @@ fn message_table_row(
             0x001A,
             PropertyValue::Unicode(message.message_class.clone()),
         ),
-        (0x0037, PropertyValue::Unicode(message.subject.clone())),
         (0x0039, PropertyValue::Time(message.sent_filetime)),
         (0x0E06, PropertyValue::Time(message.received_filetime)),
         (
@@ -6479,6 +6493,9 @@ fn message_table_row(
         ),
         (0x3008, PropertyValue::Time(message.modification_filetime)),
     ];
+    if !message.subject.is_empty() {
+        values.push((0x0037, PropertyValue::Unicode(message.subject.clone())));
+    }
     if !message.sender_name.is_empty() {
         values.push((0x0042, PropertyValue::Unicode(message.sender_name.clone())));
     }
@@ -8597,6 +8614,133 @@ mod tests {
             Some(crate::ltp::prop_context::PropertyValue::Unicode(value))
                 if value.to_string() == "second"
         ));
+        Ok(())
+    }
+
+    #[test]
+    fn empty_subject_and_sender_round_trip_without_fabricated_values()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("empty-metadata.pst");
+        let fixture = FidelityStore::default();
+        let mut existing = fixture.message.clone();
+        existing.subject = "(no subject)".to_owned();
+        existing.sender_name = "Unknown Sender".to_owned();
+        existing.sender_email = "Unknown Sender".to_owned();
+        let mut omitted = existing.clone();
+        omitted.subject.clear();
+        omitted.sender_name.clear();
+        omitted.sender_email.clear();
+        let spec = MailStoreSpec {
+            store_name: "Missing metadata comparison".to_owned(),
+            record_key: *b"PSTForgeEmptyMd!",
+            folders: vec![MailFolderSpec {
+                path: vec!["Inbox".to_owned()],
+                location: MailFolderLocation::IpmSubtree,
+                role: MailFolderRole::Ordinary,
+                container_class: "IPF.Note".to_owned(),
+                messages: vec![existing, omitted.clone()],
+                associated_messages: Vec::new(),
+            }],
+        };
+        create_mail_store(&path, &spec)?;
+
+        let store = open_store(&path)?;
+        let first = store.open_message(
+            &EntryId::new(
+                crate::messaging::store::StoreRecordKey::new(spec.record_key),
+                node(NodeIdType::NormalMessage, MESSAGE_INDEX)?,
+            ),
+            None,
+        )?;
+        assert!(matches!(
+            first.properties().get(0x0037),
+            Some(crate::ltp::prop_context::PropertyValue::Unicode(value))
+                if value.to_string() == "(no subject)"
+        ));
+        let second_node = node(NodeIdType::NormalMessage, MESSAGE_INDEX + 1)?;
+        let second = store.open_message(
+            &EntryId::new(
+                crate::messaging::store::StoreRecordKey::new(spec.record_key),
+                second_node,
+            ),
+            None,
+        )?;
+        assert!(second.properties().get(0x0037).is_none());
+        for property in [0x0042, 0x0064, 0x0065, 0x0C1A, 0x0C1E, 0x0C1F] {
+            assert!(second.properties().get(property).is_none());
+        }
+
+        let folder = store.open_folder(
+            &store
+                .properties()
+                .make_entry_id(node(NodeIdType::NormalFolder, MAIL_FOLDER_INDEX)?)?,
+        )?;
+        let contents = folder.contents_table().ok_or("missing contents table")?;
+        let subject_column = contents
+            .context()
+            .columns()
+            .iter()
+            .position(|column| column.prop_id() == 0x0037)
+            .ok_or("missing subject column")?;
+        let sender_column = contents
+            .context()
+            .columns()
+            .iter()
+            .position(|column| column.prop_id() == 0x0042)
+            .ok_or("missing sender column")?;
+        let second_row = contents.find_row(crate::ltp::table_context::TableRowId::new(
+            u32::from(second_node),
+        ))?;
+        let second_columns = second_row.columns(contents.context())?;
+        assert!(second_columns[subject_column].is_none());
+        assert!(second_columns[sender_column].is_none());
+
+        omitted.sender_name = "one-sided".to_owned();
+        assert!(matches!(
+            validate_message(&omitted, 0),
+            Err(WriterError::InvalidStructure(_))
+        ));
+
+        omitted.sender_name.clear();
+        validate_message(&omitted, 1)?;
+        let mut report = omitted.clone();
+        report.message_class = "REPORT.IPM.Note.NDR".to_owned();
+        validate_message(&report, 0)?;
+        let mut note_subclass = omitted.clone();
+        note_subclass.message_class = "IPM.Note.SMIME".to_owned();
+        validate_message(&note_subclass, 0)?;
+        let mut incomplete_contact = omitted.clone();
+        incomplete_contact.message_class = "IPM.Contact".to_owned();
+        incomplete_contact.sender_name = "one-sided contact".to_owned();
+        assert!(matches!(
+            validate_message(&incomplete_contact, 0),
+            Err(WriterError::InvalidStructure(_))
+        ));
+        let mut mail_store = MailStoreSpec {
+            store_name: "Empty metadata".to_owned(),
+            record_key: *b"PSTForgeEmptyAs!",
+            folders: vec![MailFolderSpec {
+                path: vec!["Inbox".to_owned()],
+                location: MailFolderLocation::IpmSubtree,
+                role: MailFolderRole::Ordinary,
+                container_class: "IPF.Note".to_owned(),
+                messages: Vec::new(),
+                associated_messages: vec![omitted],
+            }],
+        };
+        assert!(matches!(
+            validate_mail_store_input(&mail_store),
+            Err(WriterError::InputRejected(message))
+                if message.contains("associated message display name")
+        ));
+        mail_store.folders[0].associated_messages[0]
+            .raw_properties
+            .push(RawProperty {
+                id: 0x3001,
+                value: RawPropertyValue::Unicode("associated display".to_owned()),
+            });
+        validate_mail_store_input(&mail_store)?;
         Ok(())
     }
 
