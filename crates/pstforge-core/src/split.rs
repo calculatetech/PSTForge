@@ -724,6 +724,7 @@ fn split_recovered_job_with_interrupt(
         .iter()
         .map(|message| PackCandidate {
             key: message.key,
+            folder_location: message.folder_location,
             folder_path: message.folder_path.clone(),
             payload_bytes: message.spooled_bytes,
         })
@@ -1025,9 +1026,10 @@ fn source_folders_for_part(
     source_folders
         .iter()
         .filter(|folder| {
-            messages
-                .iter()
-                .any(|message| message.folder_path.starts_with(&folder.path))
+            messages.iter().any(|message| {
+                message.folder_location == folder.location
+                    && message.folder_path.starts_with(&folder.path)
+            })
         })
         .cloned()
         .collect()
@@ -1236,8 +1238,9 @@ fn canonical_candidate_order(
         }
     }
     candidates.sort_by(|left, right| {
-        left.folder_path
-            .cmp(&right.folder_path)
+        left.folder_location
+            .cmp(&right.folder_location)
+            .then_with(|| left.folder_path.cmp(&right.folder_path))
             .then_with(|| left.key.cmp(&right.key))
     });
     let mut keys = BTreeSet::new();
@@ -1504,6 +1507,7 @@ mod tests {
                 recovery_index: None,
                 occurrence: 0,
             },
+            folder_location: crate::CanonicalFolderLocation::IpmSubtree,
             folder_path: vec!["Inbox".to_owned()],
             payload_bytes,
         }
@@ -1514,16 +1518,19 @@ mod tests {
         let folders = [
             CanonicalFolder {
                 path: vec!["Contacts".to_owned()],
+                location: crate::CanonicalFolderLocation::IpmSubtree,
                 role: CanonicalFolderRole::Ordinary,
                 container_class: Some("IPF.Contact".to_owned()),
             },
             CanonicalFolder {
                 path: vec!["Contacts".to_owned(), "Child".to_owned()],
+                location: crate::CanonicalFolderLocation::IpmSubtree,
                 role: CanonicalFolderRole::Ordinary,
                 container_class: Some("IPF.Contact".to_owned()),
             },
             CanonicalFolder {
                 path: vec!["Contacts".to_owned(), "Empty Child".to_owned()],
+                location: crate::CanonicalFolderLocation::IpmSubtree,
                 role: CanonicalFolderRole::Ordinary,
                 container_class: Some("IPF.Contact".to_owned()),
             },
@@ -1537,7 +1544,9 @@ mod tests {
                 occurrence: 0,
             },
             folder_path: vec!["Contacts".to_owned(), "Child".to_owned()],
+            folder_location: crate::CanonicalFolderLocation::IpmSubtree,
             folder_role: CanonicalFolderRole::Ordinary,
+            placement: crate::CanonicalMessagePlacement::Normal,
             message_class: Some("IPM.Note".to_owned()),
             subject: Some("ordinary item in contacts folder".to_owned()),
             sender_name: Some("Sender".to_owned()),

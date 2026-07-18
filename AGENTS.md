@@ -152,6 +152,30 @@ that crate MIT-licensed. PSTForge application code is licensed
 retain LGPL-3.0-or-later, publish its corresponding source when distributed,
 and continue to use replaceable dynamic linking.
 
+## Writer Specification Traceability
+
+- Treat Microsoft Open Specifications and Microsoft MAPI documentation as the
+  normative source for every PST writer structure, node type, table, property,
+  flag, count, reference, and required relationship.
+- Maintain `docs/WRITER_CONFORMANCE.md` as the writer's review index. Every
+  implemented invariant must identify the authoritative document, revision or
+  page date, exact section or property, implementation symbol, validating
+  test, and independent evidence.
+- Add or update the conformance entry before changing writer behavior. A
+  writer change without an applicable authoritative reference is blocked until
+  the contract is found or the human owner approves an explicitly empirical
+  exception in the ExecPlan Decision Log.
+- Do not remove, disable, or narrow completed writer output merely because its
+  current implementation lacks a normative reference. Inventory it as
+  undocumented, preserve the existing behavior, and present the evidence,
+  compatibility impact, and options to the human owner for a decision first.
+- Do not treat successful self-read, `libpff`, `pffinfo`, `readpst`, ScanPST
+  repair, or Outlook tolerance as a substitute for the normative contract.
+  These are independent evidence in addition to documentation.
+- Audit all existing writer behavior against the conformance index before
+  adding another 0.4.2 data class. Resolve undocumented or contradictory
+  behavior in focused, reviewed checkpoints with ScanPST-first acceptance.
+
 ## CLI And Output Rules
 
 - Keep the command and option contracts in `docs/PRODUCT_SPEC.md` stable.

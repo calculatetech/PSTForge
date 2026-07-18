@@ -91,7 +91,11 @@ folder/store metadata, and associated item that another PST reader could use.
 Keep `parts/` PST-only and write one bounded human `recovery.log` explaining
 restored and unpreserved data. Deliver the milestone through reviewed,
 human-validated checkpoint commits on one 0.4.2 branch, using one focused PST
-per checkpoint before a single final 19 GB run.
+per checkpoint before a single final 19 GB run. Before admitting another item
+class, audit the complete existing writer against authoritative Microsoft
+specifications in `docs/WRITER_CONFORMANCE.md`; every remaining writer change
+must add its normative reference, implementation symbol, focused test, and
+independent evidence before implementation.
 
 ### 10. Version 0.5.0 - Operational UX and Debian Packaging
 

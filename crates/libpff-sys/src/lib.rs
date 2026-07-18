@@ -342,6 +342,13 @@ impl PffItem {
         )
     }
 
+    fn sub_associated_count(&self) -> Result<u64, PffError> {
+        self.get_count(
+            "get number of sub associated contents",
+            bindings::libpff_folder_get_number_of_sub_associated_contents,
+        )
+    }
+
     fn get_count(
         &self,
         operation: &'static str,

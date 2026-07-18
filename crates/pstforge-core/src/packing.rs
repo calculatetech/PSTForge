@@ -2,12 +2,13 @@ use std::collections::BTreeSet;
 
 use thiserror::Error;
 
-use crate::ItemKey;
+use crate::{CanonicalFolderLocation, ItemKey};
 
 /// Durable candidate metadata needed to assign mail to output parts.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PackCandidate {
     pub key: ItemKey,
+    pub folder_location: CanonicalFolderLocation,
     pub folder_path: Vec<String>,
     pub payload_bytes: u64,
 }
@@ -75,8 +76,9 @@ pub fn pack_candidates(
         }
     }
     candidates.sort_by(|left, right| {
-        left.folder_path
-            .cmp(&right.folder_path)
+        left.folder_location
+            .cmp(&right.folder_location)
+            .then_with(|| left.folder_path.cmp(&right.folder_path))
             .then_with(|| left.key.cmp(&right.key))
     });
     let mut keys = BTreeSet::new();
@@ -174,6 +176,7 @@ mod tests {
                 recovery_index: None,
                 occurrence: 0,
             },
+            folder_location: CanonicalFolderLocation::IpmSubtree,
             folder_path: path.iter().map(|value| (*value).to_owned()).collect(),
             payload_bytes: bytes,
         }

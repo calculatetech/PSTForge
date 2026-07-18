@@ -51,7 +51,9 @@ pub struct CanonicalMail {
     pub durable_item_key: String,
     pub key: ItemKey,
     pub folder_path: Vec<String>,
+    pub folder_location: CanonicalFolderLocation,
     pub folder_role: CanonicalFolderRole,
+    pub placement: CanonicalMessagePlacement,
     pub message_class: Option<String>,
     pub subject: Option<String>,
     pub sender_name: Option<String>,
@@ -68,6 +70,7 @@ pub struct CanonicalMail {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CanonicalFolder {
     pub path: Vec<String>,
+    pub location: CanonicalFolderLocation,
     pub role: CanonicalFolderRole,
     pub container_class: Option<String>,
 }
@@ -83,6 +86,20 @@ pub enum CanonicalFolderRole {
     #[default]
     Ordinary,
     DeletedItems,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
+pub enum CanonicalFolderLocation {
+    StoreRoot,
+    #[default]
+    IpmSubtree,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
+pub enum CanonicalMessagePlacement {
+    #[default]
+    Normal,
+    Associated,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -154,12 +171,6 @@ fn load_canonical_folders_expected(
         })
         .filter_map(|folder| folder.address)
         .collect::<BTreeSet<_>>();
-    if ipm_addresses.is_empty() {
-        return Ok(CanonicalFolderSet {
-            folders: Vec::new(),
-            omitted_folders: 0,
-        });
-    }
     let deleted_items_address = folders
         .iter()
         .filter(|folder| folder.source_id == NID_DELETED_ITEMS)
@@ -170,7 +181,7 @@ fn load_canonical_folders_expected(
                 .is_some_and(|parent| ipm_addresses.contains(&parent))
         })
         .min();
-    let mut by_path = BTreeMap::<Vec<String>, CanonicalFolder>::new();
+    let mut by_path = BTreeMap::<(CanonicalFolderLocation, Vec<String>), CanonicalFolder>::new();
     let mut omitted_folders = 0_u64;
     for folder in folders.iter().filter(|folder| {
         folder
@@ -183,10 +194,14 @@ fn load_canonical_folders_expected(
         let mut path = Vec::new();
         let mut current = folder.address;
         let mut seen = BTreeSet::new();
-        let mut belongs_to_ipm = false;
+        let mut location = None;
         while let Some(address) = current {
             if ipm_addresses.contains(&address) {
-                belongs_to_ipm = true;
+                location = Some(CanonicalFolderLocation::IpmSubtree);
+                break;
+            }
+            if address == FolderAddress::root() {
+                location = Some(CanonicalFolderLocation::StoreRoot);
                 break;
             }
             if path.len() == 64 || !seen.insert(address) {
@@ -204,12 +219,21 @@ fn load_canonical_folders_expected(
             );
             current = address.parent();
         }
-        if !belongs_to_ipm {
+        let Some(location) = location else {
+            continue;
+        };
+        if path.is_empty() {
+            continue;
+        }
+        if location == CanonicalFolderLocation::StoreRoot
+            && (folder.source_id & 0x1f != 0x02 || folder.source_id == 0x8042)
+        {
             continue;
         }
         path.reverse();
         let candidate = CanonicalFolder {
             path,
+            location,
             role: if folder.address == deleted_items_address {
                 CanonicalFolderRole::DeletedItems
             } else {
@@ -217,7 +241,7 @@ fn load_canonical_folders_expected(
             },
             container_class: folder.container_class.clone(),
         };
-        match by_path.entry(candidate.path.clone()) {
+        match by_path.entry((candidate.location, candidate.path.clone())) {
             std::collections::btree_map::Entry::Vacant(entry) => {
                 entry.insert(candidate);
             }
@@ -449,7 +473,7 @@ fn build_mail(
     children: &BTreeMap<(&str, u32), &SpooledCandidate>,
     unsupported_children: &BTreeMap<&str, BTreeSet<u32>>,
     active: &mut BTreeSet<String>,
-    inherited_folder: Option<(&[String], CanonicalFolderRole)>,
+    inherited_folder: Option<(&[String], CanonicalFolderLocation, CanonicalFolderRole)>,
 ) -> Result<CanonicalMail, CanonicalError> {
     if !active.insert(candidate.item_key.clone()) {
         return Err(CanonicalError::EmbeddedCycle(candidate.item_key.clone()));
@@ -474,12 +498,13 @@ fn build_mail_inner(
     children: &BTreeMap<(&str, u32), &SpooledCandidate>,
     unsupported_children: &BTreeMap<&str, BTreeSet<u32>>,
     active: &mut BTreeSet<String>,
-    inherited_folder: Option<(&[String], CanonicalFolderRole)>,
+    inherited_folder: Option<(&[String], CanonicalFolderLocation, CanonicalFolderRole)>,
 ) -> Result<CanonicalMail, CanonicalError> {
-    let (folder_path, folder_role) = match inherited_folder {
-        Some((path, role)) => (path.to_vec(), role),
+    let (folder_path, folder_location, folder_role) = match inherited_folder {
+        Some((path, location, role)) => (path.to_vec(), location, role),
         None => (
             candidate_folder_path(candidate, folders_by_address, folders_by_id)?,
+            candidate_folder_location(candidate, folders_by_address, folders_by_id),
             candidate_folder_role(candidate, folders_by_address, folders_by_id),
         ),
     };
@@ -702,7 +727,7 @@ fn build_mail_inner(
                 children,
                 unsupported_children,
                 active,
-                Some((&folder_path, folder_role)),
+                Some((&folder_path, folder_location, folder_role)),
             )?;
             spooled_bytes = spooled_bytes
                 .checked_add(embedded.spooled_bytes)
@@ -724,7 +749,13 @@ fn build_mail_inner(
             occurrence: candidate.occurrence,
         },
         folder_path,
+        folder_location,
         folder_role,
+        placement: if metadata_bool(candidate, "associated")? {
+            CanonicalMessagePlacement::Associated
+        } else {
+            CanonicalMessagePlacement::Normal
+        },
         message_class: metadata_string(candidate, "message_class")?,
         subject: metadata_string(candidate, "subject")?,
         sender_name: metadata_string(candidate, "sender_name")?,
@@ -750,7 +781,9 @@ fn candidate_folder_role(
     folders_by_id: &BTreeMap<u32, Option<&SpooledFolder>>,
 ) -> CanonicalFolderRole {
     let address = match candidate.unit {
-        Some(RecoveryUnit::Normal { folder, .. }) => Some(folder),
+        Some(RecoveryUnit::Normal { folder, .. } | RecoveryUnit::Associated { folder, .. }) => {
+            Some(folder)
+        }
         _ => metadata_u32(candidate, "folder_id")
             .ok()
             .flatten()
@@ -762,6 +795,39 @@ fn candidate_folder_role(
     } else {
         CanonicalFolderRole::Ordinary
     }
+}
+
+fn candidate_folder_location(
+    candidate: &SpooledCandidate,
+    folders_by_address: &BTreeMap<FolderAddress, &SpooledFolder>,
+    folders_by_id: &BTreeMap<u32, Option<&SpooledFolder>>,
+) -> CanonicalFolderLocation {
+    let address = match candidate.unit {
+        Some(RecoveryUnit::Normal { folder, .. } | RecoveryUnit::Associated { folder, .. }) => {
+            Some(folder)
+        }
+        _ => metadata_u32(candidate, "folder_id")
+            .ok()
+            .flatten()
+            .and_then(|id| folders_by_id.get(&id).and_then(|value| *value))
+            .and_then(|value| value.address),
+    };
+    let Some(mut current) = address else {
+        return CanonicalFolderLocation::IpmSubtree;
+    };
+    while let Some(parent) = current.parent() {
+        if folders_by_address
+            .get(&current)
+            .is_some_and(|folder| folder.source_id == 0x8022)
+        {
+            return CanonicalFolderLocation::IpmSubtree;
+        }
+        if parent == FolderAddress::root() {
+            return CanonicalFolderLocation::StoreRoot;
+        }
+        current = parent;
+    }
+    CanonicalFolderLocation::IpmSubtree
 }
 
 fn well_known_deleted_items_address(
@@ -790,7 +856,9 @@ fn candidate_folder_path(
     folders_by_address: &BTreeMap<FolderAddress, &SpooledFolder>,
     folders_by_id: &BTreeMap<u32, Option<&SpooledFolder>>,
 ) -> Result<Vec<String>, CanonicalError> {
-    if let Some(RecoveryUnit::Normal { folder, .. }) = candidate.unit {
+    if let Some(RecoveryUnit::Normal { folder, .. } | RecoveryUnit::Associated { folder, .. }) =
+        candidate.unit
+    {
         let mut path = Vec::new();
         let mut current = Some(folder);
         while let Some(address) = current {
@@ -994,6 +1062,14 @@ fn metadata_u32(candidate: &SpooledCandidate, name: &str) -> Result<Option<u32>,
         .transpose()
 }
 
+fn metadata_bool(candidate: &SpooledCandidate, name: &str) -> Result<bool, CanonicalError> {
+    candidate
+        .metadata
+        .get(name)
+        .and_then(serde_json::Value::as_bool)
+        .ok_or_else(|| invalid_error(candidate, &format!("invalid or missing {name}")))
+}
+
 fn optional_string(
     candidate: &SpooledCandidate,
     event: &SpooledEvent,
@@ -1105,7 +1181,8 @@ mod tests {
     use tempfile::tempdir;
 
     use super::{
-        CanonicalFolder, CanonicalFolderRole, load_canonical_folders, load_canonical_mail,
+        CanonicalFolder, CanonicalFolderLocation, CanonicalFolderRole, load_canonical_folders,
+        load_canonical_mail,
     };
     use crate::{build_part_writer_input, split_recovered_job};
 
@@ -1123,6 +1200,7 @@ mod tests {
             parent_message_id: parent.map(|value| value.0),
             parent_attachment_index: parent.map(|value| value.1),
             embedded_path: parent.map(|value| vec![value.1]).unwrap_or_default(),
+            associated: false,
             item_type: Some(11),
             message_class: Some("IPM.Note".to_owned()),
             subject: Some(format!("message {id}")),
@@ -1319,6 +1397,7 @@ mod tests {
             parent_message_id: Some(0),
             parent_attachment_index: Some(9),
             embedded_path: vec![3, 9],
+            associated: false,
             item_type: Some(11),
             message_class: Some("IPM.Note".to_owned()),
             subject: Some("nested embedded".to_owned()),
@@ -1444,6 +1523,7 @@ mod tests {
             parent_message_id: None,
             parent_attachment_index: None,
             embedded_path: Vec::new(),
+            associated: false,
             item_type: Some(5),
             message_class: Some("IPM.Task".to_owned()),
             subject: None,
@@ -1465,6 +1545,7 @@ mod tests {
             parent_message_id: Some(20),
             parent_attachment_index: Some(0),
             embedded_path: vec![0],
+            associated: false,
             item_type: Some(11),
             message_class: Some("IPM.Note".to_owned()),
             subject: Some("writable child".to_owned()),
@@ -1578,26 +1659,31 @@ mod tests {
             [
                 CanonicalFolder {
                     path: vec!["Deleted Items".to_owned()],
+                    location: CanonicalFolderLocation::IpmSubtree,
                     role: CanonicalFolderRole::DeletedItems,
                     container_class: None,
                 },
                 CanonicalFolder {
                     path: vec!["Deleted items".to_owned()],
+                    location: CanonicalFolderLocation::IpmSubtree,
                     role: CanonicalFolderRole::Ordinary,
                     container_class: None,
                 },
                 CanonicalFolder {
                     path: vec!["Deleted items".to_owned(), "Empty Child".to_owned()],
+                    location: CanonicalFolderLocation::IpmSubtree,
                     role: CanonicalFolderRole::Ordinary,
                     container_class: Some("IPF.Contact".to_owned()),
                 },
                 CanonicalFolder {
                     path: vec!["Inbox".to_owned()],
+                    location: CanonicalFolderLocation::IpmSubtree,
                     role: CanonicalFolderRole::Ordinary,
                     container_class: None,
                 },
                 CanonicalFolder {
                     path: vec!["Other Deleted".to_owned()],
+                    location: CanonicalFolderLocation::IpmSubtree,
                     role: CanonicalFolderRole::Ordinary,
                     container_class: None,
                 },
@@ -1662,9 +1748,85 @@ mod tests {
             folder_set.folders,
             [CanonicalFolder {
                 path: vec!["Duplicate".to_owned()],
+                location: CanonicalFolderLocation::IpmSubtree,
                 role: CanonicalFolderRole::Ordinary,
                 container_class: None,
             }]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn preserves_store_root_and_associated_placement_as_typed_source_facts()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempdir()?;
+        let mut sink = DurableCatalogSink::create(&directory.path().join("job"))?;
+        let root = FolderAddress::root();
+        let freebusy = root.child(0).ok_or("Freebusy address")?;
+        for (address, id, parent_id, name) in [
+            (root, 0x122, None, None),
+            (freebusy, 0x82C2, Some(0x122), Some("Freebusy Data")),
+        ] {
+            sink.event(CatalogEvent::UnitStart(RecoveryUnit::Folder { address }))?;
+            sink.event(CatalogEvent::Folder {
+                id,
+                parent_id,
+                name: name.map(str::to_owned),
+                container_class: None,
+            })?;
+            sink.event(CatalogEvent::UnitEnd(RecoveryUnit::Folder { address }))?;
+        }
+
+        let unit = RecoveryUnit::Associated {
+            folder: freebusy,
+            folder_id: 0x82C2,
+            message_index: 0,
+        };
+        sink.event(CatalogEvent::UnitStart(unit))?;
+        sink.event(CatalogEvent::MessageStart {
+            id: 0x9008,
+            provenance: CatalogProvenance::Normal,
+            recovery_index: None,
+            folder_id: Some(0x82C2),
+            parent_message_id: None,
+            parent_attachment_index: None,
+            embedded_path: Vec::new(),
+            associated: true,
+            item_type: Some(6),
+            message_class: Some("IPM.Configuration.PSTForge".to_owned()),
+            subject: Some("associated checkpoint".to_owned()),
+            sender_name: None,
+            sender_email: None,
+            submit_filetime: None,
+            delivery_filetime: None,
+            supported: true,
+        })?;
+        sink.event(CatalogEvent::MessageEnd {
+            id: 0x9008,
+            complete: true,
+        })?;
+        sink.event(CatalogEvent::UnitEnd(unit))?;
+
+        let folders = load_canonical_folders(&sink)?;
+        assert_eq!(
+            folders.folders,
+            [CanonicalFolder {
+                path: vec!["Freebusy Data".to_owned()],
+                location: CanonicalFolderLocation::StoreRoot,
+                role: CanonicalFolderRole::Ordinary,
+                container_class: None,
+            }]
+        );
+        let messages = load_canonical_mail(&sink)?;
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].folder_path, ["Freebusy Data"]);
+        assert_eq!(
+            messages[0].folder_location,
+            CanonicalFolderLocation::StoreRoot
+        );
+        assert_eq!(
+            messages[0].placement,
+            super::CanonicalMessagePlacement::Associated
         );
         Ok(())
     }
@@ -1752,6 +1914,7 @@ mod tests {
             parent_message_id: Some(30),
             parent_attachment_index: Some(2),
             embedded_path: vec![2],
+            associated: false,
             item_type: Some(5),
             message_class: Some("IPM.Task".to_owned()),
             subject: Some("unsupported embedded task".to_owned()),
@@ -2051,6 +2214,7 @@ mod tests {
             parent_message_id: None,
             parent_attachment_index: None,
             embedded_path: Vec::new(),
+            associated: false,
             item_type: Some(5),
             message_class: Some("IPM.Task".to_owned()),
             subject: None,
@@ -2073,6 +2237,7 @@ mod tests {
                 parent_message_id: Some(70),
                 parent_attachment_index: Some(1),
                 embedded_path: vec![1],
+                associated: false,
                 item_type: Some(11),
                 message_class: Some("IPM.Note".to_owned()),
                 subject: Some(format!("child {id}")),
@@ -2104,6 +2269,7 @@ mod tests {
                 parent_message_id: None,
                 parent_attachment_index: None,
                 embedded_path: Vec::new(),
+                associated: false,
                 item_type: Some(11),
                 message_class: Some("IPM.Note".to_owned()),
                 subject: Some(subject),

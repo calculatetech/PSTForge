@@ -23,7 +23,7 @@ use sha2::{Digest, Sha256};
 use tempfile::NamedTempFile;
 use thiserror::Error;
 
-const JOB_SCHEMA_VERSION: i64 = 13;
+const JOB_SCHEMA_VERSION: i64 = 14;
 const INLINE_BLOB_MAX_BYTES: u64 = 64 * 1024;
 const INLINE_CACHE_DIRECTORY: &str = ".pstforge-inline-cache";
 const PAYLOAD_PACK_FILENAME: &str = "payload.pack";
@@ -2314,6 +2314,7 @@ impl DurableCatalogSink {
                 parent_message_id,
                 parent_attachment_index,
                 embedded_path,
+                associated,
                 item_type,
                 message_class,
                 subject,
@@ -2328,6 +2329,7 @@ impl DurableCatalogSink {
                     "parent_message_id": parent_message_id,
                     "parent_attachment_index": parent_attachment_index,
                     "embedded_path": embedded_path,
+                    "associated": associated,
                     "item_type": item_type,
                     "message_class": message_class,
                     "subject": subject,
@@ -4630,6 +4632,7 @@ mod tests {
             parent_message_id: None,
             parent_attachment_index: None,
             embedded_path: Vec::new(),
+            associated: false,
             item_type: Some(11),
             message_class: Some("IPM.Note".to_owned()),
             subject: Some("private subject".to_owned()),

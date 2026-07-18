@@ -242,6 +242,16 @@ closes it, validates it with internal and external readers, hashes it, writes
 its sidecar manifest, syncs the directory, and atomically renames it to the
 final `.pst` name. PSTForge never modifies a published part in place.
 
+Every writer invariant is traceable through `docs/WRITER_CONFORMANCE.md` to an
+authoritative Microsoft Open Specification or Microsoft MAPI requirement, the
+implementing symbol, a focused test, and independent reader evidence.
+Undocumented writer assumptions are release blockers. Reader acceptance and
+ScanPST behavior supplement the normative source; they do not replace it.
+Existing writer behavior must complete this audit before PSTForge admits
+another source item class. An undocumented existing output is preserved while
+it is audited; PSTForge does not strip completed behavior without an explicit
+human decision based on its specification status and compatibility impact.
+
 ## Job Directory
 
 The stable output structure is:

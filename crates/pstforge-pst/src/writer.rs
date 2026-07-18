@@ -78,6 +78,7 @@ const IPM_FOLDER_INDEX: u32 = 0x401;
 const SEARCH_ROOT_INDEX: u32 = 0x402;
 const DELETED_FOLDER_INDEX: u32 = 0x403;
 const MAIL_FOLDER_INDEX: u32 = 0x404;
+const MSGFLAG_ASSOCIATED: i32 = 0x0000_0040;
 const SPAM_SEARCH_INDEX: u32 = 0x111;
 const MESSAGE_INDEX: u32 = 0x10001;
 const NID_HIERARCHY_TABLE_TEMPLATE: u32 = 0x60D;
@@ -291,12 +292,21 @@ pub struct FidelityStore {
 /// One source folder and its top-level mail in a split output part.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MailFolderSpec {
-    /// Non-empty path below the PST's mandatory IPM root.
+    /// Non-empty path below the declared PST subtree.
     pub path: Vec<String>,
+    pub location: MailFolderLocation,
     pub role: MailFolderRole,
     /// Source PR_CONTAINER_CLASS, or `IPF.Note` when the property was absent.
     pub container_class: String,
     pub messages: Vec<MessageSpec>,
+    pub associated_messages: Vec<MessageSpec>,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
+pub enum MailFolderLocation {
+    StoreRoot,
+    #[default]
+    IpmSubtree,
 }
 
 /// A source folder's structural role, independent of its display name.
@@ -320,6 +330,7 @@ struct StoreInput<'a> {
     folder_name: &'a str,
     record_key: [u8; 16],
     message: &'a MessageSpec,
+    associated: bool,
 }
 
 impl From<&MinimalStore> for FidelityStore {
@@ -1284,6 +1295,8 @@ fn message_requires_streaming(message: &MessageSpec) -> bool {
 struct FolderPlan<'a> {
     path: Vec<String>,
     messages: Vec<&'a MessageSpec>,
+    associated_messages: Vec<&'a MessageSpec>,
+    location: MailFolderLocation,
     node: NodeId,
     parent: Option<usize>,
     children: Vec<usize>,
@@ -1295,9 +1308,11 @@ fn plan_folders<'a>(
     fallback_messages: &[&'a MessageSpec],
     folders: Option<&'a [MailFolderSpec]>,
 ) -> Result<Vec<FolderPlan<'a>>, WriterError> {
-    let mut paths = BTreeMap::<Vec<String>, Vec<&MessageSpec>>::new();
-    let mut roles = BTreeMap::<Vec<String>, MailFolderRole>::new();
-    let mut container_classes = BTreeMap::<Vec<String>, String>::new();
+    let mut paths =
+        BTreeMap::<(MailFolderLocation, Vec<String>), (Vec<&MessageSpec>, Vec<&MessageSpec>)>::new(
+        );
+    let mut roles = BTreeMap::<(MailFolderLocation, Vec<String>), MailFolderRole>::new();
+    let mut container_classes = BTreeMap::<(MailFolderLocation, Vec<String>), String>::new();
     if let Some(folders) = folders {
         let mut explicit_paths = BTreeSet::new();
         for folder in folders {
@@ -1306,14 +1321,17 @@ fn plan_folders<'a>(
                     "mail folder paths and components must be non-empty".to_owned(),
                 ));
             }
-            if !explicit_paths.insert(folder.path.clone()) {
+            let key = (folder.location, folder.path.clone());
+            if !explicit_paths.insert(key.clone()) {
                 return Err(WriterError::InvalidStructure(
                     "duplicate mail folder path".to_owned(),
                 ));
             }
-            if folder.role == MailFolderRole::DeletedItems && folder.path.len() != 1 {
+            if folder.role == MailFolderRole::DeletedItems
+                && (folder.location != MailFolderLocation::IpmSubtree || folder.path.len() != 1)
+            {
                 return Err(WriterError::InvalidStructure(
-                    "the Deleted Items role must identify a top-level folder".to_owned(),
+                    "the Deleted Items role must identify a top-level IPM folder".to_owned(),
                 ));
             }
             validate_unicode("folder container class", &folder.container_class)?;
@@ -1323,14 +1341,17 @@ fn plan_folders<'a>(
                 ));
             }
             for depth in 1..=folder.path.len() {
-                paths.entry(folder.path[..depth].to_vec()).or_default();
+                paths
+                    .entry((folder.location, folder.path[..depth].to_vec()))
+                    .or_default();
             }
-            roles.insert(folder.path.clone(), folder.role);
-            container_classes.insert(folder.path.clone(), folder.container_class.clone());
-            let messages = paths.get_mut(&folder.path).ok_or_else(|| {
+            roles.insert(key.clone(), folder.role);
+            container_classes.insert(key.clone(), folder.container_class.clone());
+            let (messages, associated_messages) = paths.get_mut(&key).ok_or_else(|| {
                 WriterError::InvalidStructure("mail folder path was not planned".to_owned())
             })?;
             messages.extend(folder.messages.iter());
+            associated_messages.extend(folder.associated_messages.iter());
         }
         if roles
             .values()
@@ -1343,9 +1364,18 @@ fn plan_folders<'a>(
             ));
         }
     } else {
-        paths.insert(vec![fallback_name.to_owned()], fallback_messages.to_vec());
+        paths.insert(
+            (
+                MailFolderLocation::IpmSubtree,
+                vec![fallback_name.to_owned()],
+            ),
+            (fallback_messages.to_vec(), Vec::new()),
+        );
     }
-    if paths.values().all(Vec::is_empty) {
+    if paths
+        .values()
+        .all(|(messages, associated)| messages.is_empty() && associated.is_empty())
+    {
         return Err(WriterError::InvalidStructure(
             "mail store must contain at least one message".to_owned(),
         ));
@@ -1359,36 +1389,47 @@ fn plan_folders<'a>(
     let mut plans = paths
         .into_iter()
         .enumerate()
-        .map(|(index, (path, messages))| {
-            let index =
-                u32::try_from(index).map_err(|_| WriterError::ValueTooLarge("folder count"))?;
-            let parent = (path.len() > 1)
-                .then(|| path_indexes.get(&path[..path.len() - 1]).copied())
-                .flatten();
-            let role = roles.get(&path).copied().unwrap_or_default();
-            let container_class = container_classes
-                .get(&path)
-                .cloned()
-                .unwrap_or_else(|| "IPF.Note".to_owned());
-            let node = if role == MailFolderRole::DeletedItems {
-                node(NodeIdType::NormalFolder, DELETED_FOLDER_INDEX)?
-            } else {
-                node(
-                    NodeIdType::NormalFolder,
-                    MAIL_FOLDER_INDEX
-                        .checked_add(index)
-                        .ok_or(WriterError::ValueTooLarge("folder node"))?,
-                )?
-            };
-            Ok(FolderPlan {
-                path,
-                messages,
-                node,
-                parent,
-                children: Vec::new(),
-                container_class,
-            })
-        })
+        .map(
+            |(index, ((location, path), (messages, associated_messages)))| {
+                let index =
+                    u32::try_from(index).map_err(|_| WriterError::ValueTooLarge("folder count"))?;
+                let parent = (path.len() > 1)
+                    .then(|| {
+                        path_indexes
+                            .get(&(location, path[..path.len() - 1].to_vec()))
+                            .copied()
+                    })
+                    .flatten();
+                let role = roles
+                    .get(&(location, path.clone()))
+                    .copied()
+                    .unwrap_or_default();
+                let container_class = container_classes
+                    .get(&(location, path.clone()))
+                    .cloned()
+                    .unwrap_or_else(|| "IPF.Note".to_owned());
+                let node = if role == MailFolderRole::DeletedItems {
+                    node(NodeIdType::NormalFolder, DELETED_FOLDER_INDEX)?
+                } else {
+                    node(
+                        NodeIdType::NormalFolder,
+                        MAIL_FOLDER_INDEX
+                            .checked_add(index)
+                            .ok_or(WriterError::ValueTooLarge("folder node"))?,
+                    )?
+                };
+                Ok(FolderPlan {
+                    path,
+                    messages,
+                    associated_messages,
+                    location,
+                    node,
+                    parent,
+                    children: Vec::new(),
+                    container_class,
+                })
+            },
+        )
         .collect::<Result<Vec<_>, WriterError>>()?;
     for child in 0..plans.len() {
         if let Some(parent) = plans[child].parent {
@@ -1401,6 +1442,7 @@ fn plan_folders<'a>(
 #[allow(clippy::too_many_arguments)]
 fn build_message_blocks(
     message_spec: &MessageSpec,
+    associated: bool,
     record_key: [u8; 16],
     named_identities: &[NamedIdentity],
     recipient_block: UnicodeBlockId,
@@ -1479,6 +1521,7 @@ fn build_message_blocks(
                 let embedded_attachment_block = take_block_id(next_block_index, false)?;
                 let embedded_blocks = build_message_blocks(
                     embedded,
+                    false,
                     embedded_message_record_key(record_key, attachment_index),
                     named_identities,
                     embedded_recipient_block,
@@ -1573,7 +1616,8 @@ fn build_message_blocks(
     }
     message_subnodes.sort_by_key(|entry| u32::from(entry.node()));
     let attachment_table = table_context(&attachment_columns, &attachment_rows)?;
-    let mut top_properties = message_properties(message_spec, named_identities, record_key, 0)?;
+    let mut top_properties =
+        message_properties(message_spec, associated, named_identities, record_key, 0)?;
     if !message_spec.spooled_properties.is_empty() {
         let stream = block_stream.ok_or_else(|| {
             WriterError::InvalidStructure("spooled property requires streaming output".to_owned())
@@ -1644,6 +1688,7 @@ fn create_fidelity_store_expected(
             folder_name: &spec.folder_name,
             record_key: spec.record_key,
             message: &spec.message,
+            associated: false,
         },
         &[&spec.message],
         None,
@@ -1698,12 +1743,22 @@ fn create_mail_store_expected(
     let first_folder = spec
         .folders
         .iter()
-        .filter(|folder| !folder.messages.is_empty())
-        .min_by(|left, right| left.path.cmp(&right.path))
+        .filter(|folder| !folder.messages.is_empty() || !folder.associated_messages.is_empty())
+        .min_by_key(|folder| (folder.location, &folder.path))
         .ok_or_else(|| {
             WriterError::InvalidStructure("mail store must contain at least one message".to_owned())
         })?;
-    let first = &first_folder.messages[0];
+    let (first, associated) = first_folder
+        .messages
+        .first()
+        .map(|message| (message, false))
+        .or_else(|| {
+            first_folder
+                .associated_messages
+                .first()
+                .map(|message| (message, true))
+        })
+        .ok_or_else(|| WriterError::InvalidStructure("first mail folder is empty".to_owned()))?;
     let input = StoreInput {
         store_name: &spec.store_name,
         folder_name: first_folder
@@ -1713,11 +1768,17 @@ fn create_mail_store_expected(
             .unwrap_or("Recovered Mail"),
         record_key: spec.record_key,
         message: first,
+        associated,
     };
     let messages = spec
         .folders
         .iter()
-        .flat_map(|folder| folder.messages.iter())
+        .flat_map(|folder| {
+            folder
+                .messages
+                .iter()
+                .chain(folder.associated_messages.iter())
+        })
         .collect::<Vec<_>>();
     create_flat_store(
         path,
@@ -1744,7 +1805,12 @@ pub fn validate_mail_store_input(spec: &MailStoreSpec) -> Result<(), WriterError
         let messages = spec
             .folders
             .iter()
-            .flat_map(|folder| folder.messages.iter())
+            .flat_map(|folder| {
+                folder
+                    .messages
+                    .iter()
+                    .chain(folder.associated_messages.iter())
+            })
             .collect::<Vec<_>>();
         let fallback = spec
             .folders
@@ -1926,9 +1992,26 @@ fn create_flat_store(
 ) -> Result<FidelityWriteReport, WriterError> {
     check_interrupted(interrupted)?;
     let folder_plans = plan_folders(spec.folder_name, messages, folders)?;
-    let messages = folder_plans
+    let top_level_messages = folder_plans
         .iter()
-        .flat_map(|folder| folder.messages.iter().copied())
+        .flat_map(|folder| {
+            folder
+                .messages
+                .iter()
+                .copied()
+                .map(|message| (message, folder.node, false))
+                .chain(
+                    folder
+                        .associated_messages
+                        .iter()
+                        .copied()
+                        .map(|message| (message, folder.node, true)),
+                )
+        })
+        .collect::<Vec<_>>();
+    let messages = top_level_messages
+        .iter()
+        .map(|(message, _, _)| *message)
         .collect::<Vec<_>>();
     let mut unsupported_properties = Vec::new();
     for (index, message) in messages.iter().enumerate() {
@@ -1983,18 +2066,20 @@ fn create_flat_store(
     let mut next_block_index = 28_u64;
     let mut next_value_node = 0x4_0000_u32;
     let mut contents_rows = Vec::with_capacity(messages.len());
+    let mut associated_rows = Vec::with_capacity(messages.len());
     let mut top_nodes = Vec::with_capacity(messages.len());
     let mut single_message = None;
-    let message_parents = folder_plans
-        .iter()
-        .flat_map(|folder| std::iter::repeat_n(folder.node, folder.messages.len()))
-        .collect::<Vec<_>>();
     for (message_position, message_spec) in messages.iter().enumerate() {
         check_interrupted(interrupted)?;
         let index = u32::try_from(message_position)
             .map_err(|_| WriterError::ValueTooLarge("message count"))?;
+        let associated = top_level_messages[message_position].2;
         let message_node = node(
-            NodeIdType::NormalMessage,
+            if associated {
+                NodeIdType::AssociatedMessage
+            } else {
+                NodeIdType::NormalMessage
+            },
             MESSAGE_INDEX
                 .checked_add(index)
                 .ok_or(WriterError::ValueTooLarge("message node"))?,
@@ -2023,6 +2108,7 @@ fn create_flat_store(
         });
         let message = build_message_blocks(
             message_spec,
+            associated,
             message_record_key(spec.record_key, message_node),
             &named_identities,
             recipient_block,
@@ -2031,19 +2117,27 @@ fn create_flat_store(
             &mut next_value_node,
             block_stream.as_mut(),
         )?;
-        contents_rows.push(message_table_row(
-            message_node,
-            message_spec,
-            spec.record_key,
-            message.record_key,
-            message.message_size,
-            &contents_columns,
-        )?);
+        if associated {
+            associated_rows.push(associated_message_table_row(
+                message_node,
+                message_spec,
+                &associated_columns,
+            ));
+        } else {
+            contents_rows.push(message_table_row(
+                message_node,
+                message_spec,
+                spec.record_key,
+                message.record_key,
+                message.message_size,
+                &contents_columns,
+            )?);
+        }
         top_nodes.push(TopMessageNode {
             node: message_node,
             property_block,
             subnode_block,
-            parent: message_parents[message_position],
+            parent: top_level_messages[message_position].1,
         });
         let built = BuiltTopMessage {
             property_block,
@@ -2069,6 +2163,7 @@ fn create_flat_store(
     let mut folder_blocks = Vec::new();
     let mut top_folders = Vec::with_capacity(folder_plans.len());
     let mut row_start = 0_usize;
+    let mut associated_row_start = 0_usize;
     for (index, folder) in folder_plans.iter().enumerate() {
         check_interrupted(interrupted)?;
         let unread_count = folder_unread_count(&folder.messages)?;
@@ -2153,9 +2248,36 @@ fn create_flat_store(
             folder_blocks.extend(contents.blocks);
             (data, Some(subnode))
         };
-        let parent = folder
-            .parent
-            .map_or(ipm_folder, |parent| folder_plans[parent].node);
+        let associated_row_end = associated_row_start
+            .checked_add(folder.associated_messages.len())
+            .ok_or(WriterError::ValueTooLarge("associated folder row range"))?;
+        let rows = &associated_rows[associated_row_start..associated_row_end];
+        associated_row_start = associated_row_end;
+        let (associated_block, associated_subnode) = if rows.is_empty() {
+            (leaf_bid(13)?, None)
+        } else if rows.len() == 1 {
+            let block = take_block_id(&mut next_block_index, false)?;
+            folder_blocks.push(BlockSpec {
+                id: block,
+                payload: BlockPayload::Data(table_context(&associated_columns, rows)?),
+                ref_count: 2,
+            });
+            (block, None)
+        } else {
+            let associated =
+                table_context_external(&associated_columns, rows, &mut next_block_index)?;
+            let data = associated.data_block;
+            let subnode = associated.subnode_block;
+            folder_blocks.extend(associated.blocks);
+            (data, Some(subnode))
+        };
+        let parent = folder.parent.map_or_else(
+            || match folder.location {
+                MailFolderLocation::StoreRoot => root_folder,
+                MailFolderLocation::IpmSubtree => ipm_folder,
+            },
+            |parent| folder_plans[parent].node,
+        );
         top_folders.push(TopFolderNode {
             node: folder.node,
             parent,
@@ -2163,6 +2285,8 @@ fn create_flat_store(
             hierarchy_block,
             contents_block,
             contents_subnode,
+            associated_block,
+            associated_subnode,
         });
     }
     let deleted_plan = folder_plans
@@ -2183,10 +2307,11 @@ fn create_flat_store(
         )],
         None => vec![folder_table_row(deleted_folder, "Deleted Items", 0, false)],
     };
-    for folder in folder_plans
-        .iter()
-        .filter(|folder| folder.parent.is_none() && folder.node != deleted_folder)
-    {
+    for folder in folder_plans.iter().filter(|folder| {
+        folder.location == MailFolderLocation::IpmSubtree
+            && folder.parent.is_none()
+            && folder.node != deleted_folder
+    }) {
         ipm_rows.push(folder_table_row_with_unread(
             folder.node,
             folder
@@ -2211,6 +2336,27 @@ fn create_flat_store(
     let deleted_uses_shared_contents = deleted_plan.is_none_or(|folder| folder.messages.is_empty());
     let deleted_uses_shared_hierarchy =
         deleted_plan.is_none_or(|folder| folder.children.is_empty());
+    let mut root_rows = vec![
+        folder_table_row(ipm_folder, "Top of Personal Folders", 0, true),
+        folder_table_row(search_root, "Search Root", 0, false),
+        folder_table_row(spam_search, "SPAM Search Folder 2", 0, false),
+    ];
+    for folder in folder_plans.iter().filter(|folder| {
+        folder.location == MailFolderLocation::StoreRoot && folder.parent.is_none()
+    }) {
+        root_rows.push(folder_table_row_with_unread(
+            folder.node,
+            folder
+                .path
+                .last()
+                .ok_or_else(|| WriterError::InvalidStructure("folder path is empty".to_owned()))?,
+            i32::try_from(folder.messages.len())
+                .map_err(|_| WriterError::ValueTooLarge("folder message count"))?,
+            folder_unread_count(&folder.messages)?,
+            !folder.children.is_empty(),
+            &folder.container_class,
+        ));
+    }
     // BBT cRef includes one ownership count beyond the NBT references.
     let shared_ref_count = |base: usize, extra: usize| {
         u16::try_from(base.saturating_add(extra))
@@ -2239,14 +2385,7 @@ fn create_flat_store(
         },
         BlockSpec {
             id: leaf_bid(4)?,
-            payload: BlockPayload::Data(table_context(
-                &hierarchy_columns,
-                &[
-                    folder_table_row(ipm_folder, "Top of Personal Folders", 0, true),
-                    folder_table_row(search_root, "Search Root", 0, false),
-                    folder_table_row(spam_search, "SPAM Search Folder 2", 0, false),
-                ],
-            )?),
+            payload: BlockPayload::Data(table_context(&hierarchy_columns, &root_rows)?),
             ref_count: 2,
         },
         BlockSpec {
@@ -2303,7 +2442,9 @@ fn create_flat_store(
                 6,
                 folder_plans
                     .iter()
-                    .filter(|folder| folder.node != deleted_folder)
+                    .filter(|folder| {
+                        folder.node != deleted_folder && folder.associated_messages.is_empty()
+                    })
                     .count(),
             )?,
         },
@@ -2452,8 +2593,15 @@ fn create_flat_store(
         .map_err(completed_validation_error)?;
     }
     check_interrupted(interrupted)?;
-    validate_completed_store(&validated_path, spec, message_parents[0], &named_identities)
+    if !spec.associated {
+        validate_completed_store(
+            &validated_path,
+            spec,
+            top_level_messages[0].1,
+            &named_identities,
+        )
         .map_err(completed_validation_error)?;
+    }
     check_interrupted(interrupted)?;
     validate_completed_folder_store(&validated_path, spec.record_key, &folder_plans)
         .map_err(completed_validation_error)?;
@@ -3774,15 +3922,7 @@ fn validate_contents_raw_property_types(message: &MessageSpec) -> Result<(), Wri
 }
 
 fn supported_message_class(value: &str) -> bool {
-    class_is_or_descends_from(value, "IPM.Note")
-        || class_descends_from(value, "REPORT.IPM.Note")
-        || contact_message_class(value)
-        || appointment_message_class(value)
-        || meeting_message_class(value)
-        || task_message_class(value)
-        || sticky_note_message_class(value)
-        || post_message_class(value)
-        || calendar_exception_message_class(value)
+    !value.is_empty()
 }
 
 fn contact_message_class(value: &str) -> bool {
@@ -3805,16 +3945,15 @@ fn sticky_note_message_class(value: &str) -> bool {
     class_is_or_descends_from(value, "IPM.StickyNote")
 }
 
-fn post_message_class(value: &str) -> bool {
-    class_is_or_descends_from(value, "IPM.Post")
-}
-
 fn calendar_exception_message_class(value: &str) -> bool {
     value.eq_ignore_ascii_case("IPM.OLE.CLASS.{00061055-0000-0000-C000-000000000046}")
 }
 
 fn sender_optional_message_class(value: &str) -> bool {
-    contact_message_class(value)
+    !(class_is_or_descends_from(value, "IPM.Note")
+        || class_descends_from(value, "REPORT.IPM.Note")
+        || meeting_message_class(value))
+        || contact_message_class(value)
         || appointment_message_class(value)
         || task_message_class(value)
         || sticky_note_message_class(value)
@@ -4147,7 +4286,7 @@ fn validate_completed_store(
             }
         }
     }
-    let expected_flags = output_message_flags(spec.message);
+    let expected_flags = output_message_flags(spec.message, spec.associated);
     if !matches!(message.properties().get(0x0E07), Some(ReadValue::Integer32(value)) if *value == expected_flags)
         || !matches!(message.properties().get(0x0E1B), Some(ReadValue::Boolean(value)) if *value != spec.message.attachments.is_empty())
         || !matches!(
@@ -4354,6 +4493,8 @@ fn validate_completed_folder_store(
 ) -> Result<(), WriterError> {
     let invalid = |message: &str| WriterError::InvalidStructure(message.to_owned());
     let store = crate::open_store(path)?;
+    let root_node = NID_ROOT_FOLDER;
+    let root = store.open_folder(&store.properties().make_entry_id(root_node)?)?;
     let ipm_node = node(NodeIdType::NormalFolder, IPM_FOLDER_INDEX)?;
     let ipm = store.open_folder(&store.properties().make_entry_id(ipm_node)?)?;
     let mut message_index = 0_u32;
@@ -4361,7 +4502,10 @@ fn validate_completed_folder_store(
         let actual_parent = if let Some(parent) = folder_plan.parent {
             store.open_folder(&store.properties().make_entry_id(folders[parent].node)?)?
         } else {
-            ipm.clone()
+            match folder_plan.location {
+                MailFolderLocation::StoreRoot => root.clone(),
+                MailFolderLocation::IpmSubtree => ipm.clone(),
+            }
         };
         actual_parent
             .hierarchy_table()
@@ -4451,11 +4595,83 @@ fn validate_completed_folder_store(
                 .ok_or_else(|| invalid("completed store message flags are missing"))?;
             let actual =
                 contents.read_column(value, contents.context().columns()[flags].prop_type())?;
-            if !matches!(actual, crate::ltp::prop_context::PropertyValue::Integer32(value) if value == output_message_flags(expected))
+            if !matches!(actual, crate::ltp::prop_context::PropertyValue::Integer32(value) if value == output_message_flags(expected, false))
             {
                 return Err(invalid("completed store message flags mismatch"));
             }
-            store.open_message(&store.properties().make_entry_id(message)?, Some(&[]))?;
+            let opened =
+                store.open_message(&store.properties().make_entry_id(message)?, Some(&[0x001A]))?;
+            if opened.properties().message_class()? != expected.message_class {
+                return Err(invalid("completed normal message class mismatch"));
+            }
+        }
+        let associated = folder
+            .associated_table()
+            .ok_or_else(|| invalid("completed folder associated table is missing"))?;
+        if associated.rows_matrix().count() != folder_plan.associated_messages.len() {
+            return Err(invalid(
+                "completed folder associated message count mismatch",
+            ));
+        }
+        for expected in &folder_plan.associated_messages {
+            let message = node(
+                NodeIdType::AssociatedMessage,
+                MESSAGE_INDEX
+                    .checked_add(message_index)
+                    .ok_or(WriterError::ValueTooLarge("associated message node"))?,
+            )?;
+            message_index = message_index
+                .checked_add(1)
+                .ok_or(WriterError::ValueTooLarge("message count"))?;
+            let row = associated
+                .find_row(crate::ltp::table_context::TableRowId::new(u32::from(
+                    message,
+                )))
+                .map_err(|_| invalid("completed associated message is not indexed"))?;
+            let values = row.columns(associated.context())?;
+            let subject = associated
+                .context()
+                .columns()
+                .iter()
+                .position(|column| column.prop_id() == 0x3001)
+                .ok_or_else(|| invalid("completed associated display-name column is missing"))?;
+            let value = values[subject]
+                .as_ref()
+                .ok_or_else(|| invalid("completed associated display name is missing"))?;
+            let actual = associated
+                .read_column(value, associated.context().columns()[subject].prop_type())?;
+            if !matches!(actual, crate::ltp::prop_context::PropertyValue::Unicode(value) if value.to_string() == associated_display_name(expected))
+            {
+                return Err(invalid("completed associated display-name mismatch"));
+            }
+            let flags = associated
+                .context()
+                .columns()
+                .iter()
+                .position(|column| column.prop_id() == 0x0E07)
+                .ok_or_else(|| invalid("completed associated message-flags column is missing"))?;
+            let value = values[flags]
+                .as_ref()
+                .ok_or_else(|| invalid("completed associated message flags are missing"))?;
+            let actual =
+                associated.read_column(value, associated.context().columns()[flags].prop_type())?;
+            if !matches!(actual, crate::ltp::prop_context::PropertyValue::Integer32(value) if value == output_message_flags(expected, true))
+            {
+                return Err(invalid("completed associated message-flags mismatch"));
+            }
+            let opened = store.open_message(
+                &store.properties().make_entry_id(message)?,
+                Some(&[0x001A, 0x0E07]),
+            )?;
+            if opened.properties().message_class()? != expected.message_class {
+                return Err(invalid("completed associated message class mismatch"));
+            }
+            if !matches!(opened.properties().get(0x0E07), Some(crate::ltp::prop_context::PropertyValue::Integer32(value)) if *value == output_message_flags(expected, true))
+            {
+                return Err(invalid(
+                    "completed associated message property flags mismatch",
+                ));
+            }
         }
     }
     validate_spooled_attachment_identities(path, record_key, folders)
@@ -4480,7 +4696,18 @@ fn validate_spooled_attachment_identities(
     let pst = Rc::new(UnicodePstFile::open(path)?);
     let store = UnicodeStore::read(pst)?;
     let mut message_index = 0_u32;
-    for message_spec in folders.iter().flat_map(|folder| &folder.messages) {
+    for (message_spec, associated) in folders.iter().flat_map(|folder| {
+        folder
+            .messages
+            .iter()
+            .map(|message| (message, false))
+            .chain(
+                folder
+                    .associated_messages
+                    .iter()
+                    .map(|message| (message, true)),
+            )
+    }) {
         let validate_streamed_attachments = message_index != 0;
         let streamed_ids = message_spec
             .spooled_properties
@@ -4488,7 +4715,11 @@ fn validate_spooled_attachment_identities(
             .map(|property| property.id)
             .collect::<Vec<_>>();
         let message_node = node(
-            NodeIdType::NormalMessage,
+            if associated {
+                NodeIdType::AssociatedMessage
+            } else {
+                NodeIdType::NormalMessage
+            },
             MESSAGE_INDEX
                 .checked_add(message_index)
                 .ok_or(WriterError::ValueTooLarge("message node"))?,
@@ -4948,7 +5179,7 @@ fn validate_embedded_message(
         || !matches!(properties.get(0x3007), Some(ReadValue::Time(value)) if *value == expected.creation_filetime)
         || !matches!(properties.get(0x3008), Some(ReadValue::Time(value)) if *value == expected.modification_filetime)
         || !matches!(properties.get(0x300B), Some(ReadValue::Binary(value)) if value.buffer() == record_key)
-        || !matches!(properties.get(0x0E07), Some(ReadValue::Integer32(value)) if *value == output_message_flags(expected))
+        || !matches!(properties.get(0x0E07), Some(ReadValue::Integer32(value)) if *value == output_message_flags(expected, false))
         || !matches!(properties.get(0x0E1B), Some(ReadValue::Boolean(value)) if *value != expected.attachments.is_empty())
         || !matches!(properties.get(0x3FDE), Some(ReadValue::Integer32(value)) if *value == expected.internet_codepage)
     {
@@ -5498,6 +5729,7 @@ fn named_property_map(named: &[NamedIdentity]) -> Result<Vec<(u16, PropertyValue
 
 fn message_properties(
     message: &MessageSpec,
+    associated: bool,
     named_identities: &[NamedIdentity],
     record_key: [u8; 16],
     message_size: i32,
@@ -5511,7 +5743,7 @@ fn message_properties(
         (0x0E06, PropertyValue::Time(message.received_filetime)),
         (
             0x0E07,
-            PropertyValue::Integer32(output_message_flags(message)),
+            PropertyValue::Integer32(output_message_flags(message, associated)),
         ),
         (0x0E08, PropertyValue::Integer32(message_size)),
         (0x0E17, PropertyValue::Integer32(0)),
@@ -5578,14 +5810,16 @@ fn message_properties(
     Ok(properties)
 }
 
-fn output_message_flags(message: &MessageSpec) -> i32 {
+fn output_message_flags(message: &MessageSpec, associated: bool) -> i32 {
     const HAS_ATTACHMENTS: i32 = 0x10;
-    let flags = message.message_flags & !HAS_ATTACHMENTS;
-    if message.attachments.is_empty() {
-        flags
-    } else {
-        flags | HAS_ATTACHMENTS
+    let mut flags = message.message_flags & !(HAS_ATTACHMENTS | MSGFLAG_ASSOCIATED);
+    if !message.attachments.is_empty() {
+        flags |= HAS_ATTACHMENTS;
     }
+    if associated {
+        flags |= MSGFLAG_ASSOCIATED;
+    }
+    flags
 }
 
 fn display_recipient_properties(recipients: &[RecipientSpec]) -> Vec<(u16, PropertyValue)> {
@@ -6222,7 +6456,7 @@ fn message_table_row(
         (0x0E06, PropertyValue::Time(message.received_filetime)),
         (
             0x0E07,
-            PropertyValue::Integer32(output_message_flags(message)),
+            PropertyValue::Integer32(output_message_flags(message, false)),
         ),
         (0x0E08, PropertyValue::Integer32(message_size)),
         (0x0E17, PropertyValue::Integer32(0)),
@@ -6261,12 +6495,58 @@ fn message_table_row(
     Ok(TableRowSpec { id, values })
 }
 
+fn associated_message_table_row(
+    id: NodeId,
+    message: &MessageSpec,
+    columns: &[TableColumnDescriptor],
+) -> TableRowSpec {
+    let mut values = vec![
+        (
+            0x001A,
+            PropertyValue::Unicode(message.message_class.clone()),
+        ),
+        (
+            0x0E07,
+            PropertyValue::Integer32(output_message_flags(message, true)),
+        ),
+        (0x0E17, PropertyValue::Integer32(0)),
+        (
+            0x3001,
+            PropertyValue::Unicode(associated_display_name(message).to_owned()),
+        ),
+    ];
+    for raw in &message.raw_properties {
+        if values.iter().any(|(property_id, _)| *property_id == raw.id) {
+            continue;
+        }
+        let Some(column) = columns.iter().find(|column| column.prop_id() == raw.id) else {
+            continue;
+        };
+        if column.prop_type() != raw_property_value(&raw.value).property_type() {
+            continue;
+        }
+        values.push((raw.id, raw_property_value(&raw.value)));
+    }
+    TableRowSpec { id, values }
+}
+
+fn associated_display_name(message: &MessageSpec) -> &str {
+    message
+        .raw_properties
+        .iter()
+        .find_map(|property| match (&property.id, &property.value) {
+            (0x3001, RawPropertyValue::Unicode(value)) => Some(value.as_str()),
+            _ => None,
+        })
+        .unwrap_or(&message.subject)
+}
+
 fn folder_unread_count(messages: &[&MessageSpec]) -> Result<i32, WriterError> {
     const MSGFLAG_READ: i32 = 0x0000_0001;
     i32::try_from(
         messages
             .iter()
-            .filter(|message| output_message_flags(message) & MSGFLAG_READ == 0)
+            .filter(|message| output_message_flags(message, false) & MSGFLAG_READ == 0)
             .count(),
     )
     .map_err(|_| WriterError::ValueTooLarge("folder unread count"))
@@ -7263,6 +7543,8 @@ struct TopFolderNode {
     hierarchy_block: UnicodeBlockId,
     contents_block: UnicodeBlockId,
     contents_subnode: Option<UnicodeBlockId>,
+    associated_block: UnicodeBlockId,
+    associated_subnode: Option<UnicodeBlockId>,
 }
 
 fn node_entries(
@@ -7279,6 +7561,9 @@ fn node_entries(
     let deleted_hierarchy = deleted_override.map_or(leaf_bid(9)?, |folder| folder.hierarchy_block);
     let deleted_contents = deleted_override.map_or(leaf_bid(5)?, |folder| folder.contents_block);
     let deleted_contents_subnode = deleted_override.and_then(|folder| folder.contents_subnode);
+    let deleted_associated =
+        deleted_override.map_or(leaf_bid(13)?, |folder| folder.associated_block);
+    let deleted_associated_subnode = deleted_override.and_then(|folder| folder.associated_subnode);
     let mut entries = vec![
         UnicodeNodeBTreeEntry::new(NID_MESSAGE_STORE, leaf_bid(1)?, None, None),
         UnicodeNodeBTreeEntry::new(NID_NAME_TO_ID_MAP, leaf_bid(2)?, None, None),
@@ -7386,7 +7671,12 @@ fn node_entries(
             deleted_contents,
             deleted_contents_subnode,
         )?,
-        table_node(deleted, NodeIdType::AssociatedContentsTable, leaf_bid(13)?)?,
+        table_node_with_subnode(
+            deleted,
+            NodeIdType::AssociatedContentsTable,
+            deleted_associated,
+            deleted_associated_subnode,
+        )?,
         UnicodeNodeBTreeEntry::new(spam_search, leaf_bid(15)?, None, Some(root)),
         UnicodeNodeBTreeEntry::new(
             node(NodeIdType::SearchUpdateQueue, SPAM_SEARCH_INDEX)?,
@@ -7427,10 +7717,11 @@ fn node_entries(
                 folder.contents_block,
                 folder.contents_subnode,
             )?,
-            table_node(
+            table_node_with_subnode(
                 folder.node,
                 NodeIdType::AssociatedContentsTable,
-                leaf_bid(13)?,
+                folder.associated_block,
+                folder.associated_subnode,
             )?,
         ]);
     }
@@ -7781,19 +8072,20 @@ mod tests {
     use std::fs::OpenOptions;
 
     #[test]
-    fn only_the_exact_calendar_exception_class_is_supported() {
+    fn arbitrary_nonempty_classes_are_supported_but_calendar_exception_stays_exact() {
         assert!(supported_message_class(
             "IPM.OLE.CLASS.{00061055-0000-0000-C000-000000000046}"
         ));
         assert!(supported_message_class(
             "ipm.ole.class.{00061055-0000-0000-c000-000000000046}"
         ));
-        assert!(!supported_message_class(
+        assert!(supported_message_class(
             "IPM.OLE.CLASS.{00061055-0000-0000-C000-000000000046}.Custom"
         ));
-        assert!(!supported_message_class(
+        assert!(supported_message_class(
             "IPM.OLE.CLASS.{00061056-0000-0000-C000-000000000046}"
         ));
+        assert!(!supported_message_class(""));
     }
 
     #[test]
@@ -7975,7 +8267,7 @@ mod tests {
         let recipients = table_context(&recipient_columns()?, &[])?;
         let attachments = table_context(&attachment_columns()?, &[])?;
         let record_key = message_record_key(spec.record_key, message);
-        let mut properties = message_properties(&spec.message, &[], record_key, 0)?;
+        let mut properties = message_properties(&spec.message, false, &[], record_key, 0)?;
         let message_size = i32::try_from(
             property_context(&properties)?.len() + recipients.len() + attachments.len(),
         )?;
@@ -8259,9 +8551,11 @@ mod tests {
             record_key: base.record_key,
             folders: vec![MailFolderSpec {
                 path: vec![base.folder_name.clone()],
+                location: MailFolderLocation::IpmSubtree,
                 role: MailFolderRole::Ordinary,
                 container_class: "IPF.Note".to_owned(),
                 messages: vec![base.message.clone(), second],
+                associated_messages: Vec::new(),
             }],
         };
         create_mail_store(&path, &spec)?;
@@ -8296,6 +8590,152 @@ mod tests {
     }
 
     #[test]
+    fn root_folders_and_associated_messages_keep_their_source_placement()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("root-associated.pst");
+        let base = FidelityStore::default();
+        let mut sniff = base.message.clone();
+        sniff.message_class = "IPM.Microsoft.SniffData".to_owned();
+        sniff.subject = "structural root item".to_owned();
+        sniff.message_flags |= MSGFLAG_ASSOCIATED;
+        sniff.sender_name.clear();
+        sniff.sender_email.clear();
+        let mut configuration = sniff.clone();
+        configuration.message_class = "IPM.Configuration.PSTForge".to_owned();
+        configuration.subject = "subject fallback must not replace display name".to_owned();
+        configuration.raw_properties = vec![RawProperty {
+            id: 0x3001,
+            value: RawPropertyValue::Unicode("hidden associated item".to_owned()),
+        }];
+        let spec = MailStoreSpec {
+            store_name: "PSTForge root and associated placement".to_owned(),
+            record_key: *b"PSTForgeAssoc001",
+            folders: vec![
+                MailFolderSpec {
+                    path: vec!["Freebusy Data".to_owned()],
+                    location: MailFolderLocation::StoreRoot,
+                    role: MailFolderRole::Ordinary,
+                    container_class: "IPF.Note".to_owned(),
+                    messages: vec![sniff],
+                    associated_messages: Vec::new(),
+                },
+                MailFolderSpec {
+                    path: vec!["IPM_COMMON_VIEWS".to_owned()],
+                    location: MailFolderLocation::StoreRoot,
+                    role: MailFolderRole::Ordinary,
+                    container_class: "IPF.Note".to_owned(),
+                    messages: Vec::new(),
+                    associated_messages: vec![configuration],
+                },
+            ],
+        };
+        create_mail_store(&path, &spec)?;
+
+        let store = open_store(&path)?;
+        let root = store.open_folder(&store.properties().make_entry_id(NID_ROOT_FOLDER)?)?;
+        let hierarchy = root.hierarchy_table().ok_or("missing root hierarchy")?;
+        assert_eq!(hierarchy.rows_matrix().count(), 5);
+        let freebusy_node = node(NodeIdType::NormalFolder, MAIL_FOLDER_INDEX)?;
+        let views_node = node(NodeIdType::NormalFolder, MAIL_FOLDER_INDEX + 1)?;
+        for folder in [freebusy_node, views_node] {
+            hierarchy.find_row(crate::ltp::table_context::TableRowId::new(u32::from(
+                folder,
+            )))?;
+        }
+        let freebusy = store.open_folder(&store.properties().make_entry_id(freebusy_node)?)?;
+        assert_eq!(
+            freebusy
+                .contents_table()
+                .ok_or("missing Freebusy contents")?
+                .rows_matrix()
+                .count(),
+            1
+        );
+        let normal_message = store.open_message(
+            &store
+                .properties()
+                .make_entry_id(node(NodeIdType::NormalMessage, MESSAGE_INDEX)?)?,
+            Some(&[0x0E07]),
+        )?;
+        assert!(matches!(
+            normal_message.properties().get(0x0E07),
+            Some(crate::ltp::prop_context::PropertyValue::Integer32(value))
+                if *value & MSGFLAG_ASSOCIATED == 0
+        ));
+        assert_eq!(
+            freebusy
+                .associated_table()
+                .ok_or("missing Freebusy associated contents")?
+                .rows_matrix()
+                .count(),
+            0
+        );
+        let views = store.open_folder(&store.properties().make_entry_id(views_node)?)?;
+        assert_eq!(
+            views
+                .contents_table()
+                .ok_or("missing views contents")?
+                .rows_matrix()
+                .count(),
+            0
+        );
+        let associated_table = views
+            .associated_table()
+            .ok_or("missing views associated contents")?;
+        assert_eq!(associated_table.rows_matrix().count(), 1);
+        let associated_row =
+            associated_table.find_row(crate::ltp::table_context::TableRowId::new(u32::from(
+                node(NodeIdType::AssociatedMessage, MESSAGE_INDEX + 1)?,
+            )))?;
+        let associated_values = associated_row.columns(associated_table.context())?;
+        let display_name_column = associated_table
+            .context()
+            .columns()
+            .iter()
+            .position(|column| column.prop_id() == 0x3001)
+            .ok_or("missing associated display-name column")?;
+        let display_name = associated_values[display_name_column]
+            .as_ref()
+            .ok_or("missing associated display-name value")?;
+        assert!(matches!(
+            associated_table.read_column(
+                display_name,
+                associated_table.context().columns()[display_name_column].prop_type(),
+            )?,
+            crate::ltp::prop_context::PropertyValue::Unicode(value)
+                if value.to_string() == "hidden associated item"
+        ));
+        let associated_message = store.open_message(
+            &store
+                .properties()
+                .make_entry_id(node(NodeIdType::AssociatedMessage, MESSAGE_INDEX + 1)?)?,
+            Some(&[0x0E07]),
+        )?;
+        assert!(matches!(
+            associated_message.properties().get(0x0E07),
+            Some(crate::ltp::prop_context::PropertyValue::Integer32(value))
+                if *value & MSGFLAG_ASSOCIATED != 0
+        ));
+
+        let associated_only = MailStoreSpec {
+            store_name: "PSTForge associated-only placement".to_owned(),
+            record_key: *b"PSTForgeAssocOnl",
+            folders: vec![spec.folders[1].clone()],
+        };
+        let associated_only_path = directory.path().join("associated-only.pst");
+        create_mail_store(&associated_only_path, &associated_only)?;
+        let associated_store = open_store(&associated_only_path)?;
+        associated_store.open_message(
+            &associated_store
+                .properties()
+                .make_entry_id(node(NodeIdType::AssociatedMessage, MESSAGE_INDEX)?)?,
+            Some(&[]),
+        )?;
+        Ok(())
+    }
+
+    #[test]
     fn multi_message_validation_uses_the_store_wide_named_property_map()
     -> Result<(), Box<dyn std::error::Error>> {
         let directory = tempfile::tempdir()?;
@@ -8320,15 +8760,19 @@ mod tests {
             folders: vec![
                 MailFolderSpec {
                     path: vec!["Notes".to_owned()],
+                    location: MailFolderLocation::IpmSubtree,
                     role: MailFolderRole::Ordinary,
                     container_class: "IPF.Note".to_owned(),
                     messages: vec![named(0x0E, "lexically first folder")],
+                    associated_messages: Vec::new(),
                 },
                 MailFolderSpec {
                     path: vec!["Tasks".to_owned()],
+                    location: MailFolderLocation::IpmSubtree,
                     role: MailFolderRole::Ordinary,
                     container_class: "IPF.Task".to_owned(),
                     messages: vec![named(0x03, "globally first named property")],
+                    associated_messages: Vec::new(),
                 },
             ],
         };
@@ -8376,9 +8820,11 @@ mod tests {
             record_key: *b"PSTForgeContact1",
             folders: vec![MailFolderSpec {
                 path: vec!["Contacts".to_owned()],
+                location: MailFolderLocation::IpmSubtree,
                 role: MailFolderRole::Ordinary,
                 container_class: "IPF.Contact".to_owned(),
                 messages: vec![message],
+                associated_messages: Vec::new(),
             }],
         };
         create_mail_store(&path, &spec)?;
@@ -8444,9 +8890,11 @@ mod tests {
             record_key: *b"PSTForgeAppt0001",
             folders: vec![MailFolderSpec {
                 path: vec!["Calendar".to_owned()],
+                location: MailFolderLocation::IpmSubtree,
                 role: MailFolderRole::Ordinary,
                 container_class: "IPF.Appointment".to_owned(),
                 messages: vec![message],
+                associated_messages: Vec::new(),
             }],
         };
         create_mail_store(&path, &spec)?;
@@ -8507,9 +8955,11 @@ mod tests {
             folders: (0..1_000)
                 .map(|index| MailFolderSpec {
                     path: vec![format!("Folder {index:04}")],
+                    location: MailFolderLocation::IpmSubtree,
                     role: MailFolderRole::Ordinary,
                     container_class: "IPF.Note".to_owned(),
                     messages: vec![base.message.clone()],
+                    associated_messages: Vec::new(),
                 })
                 .collect(),
         };
@@ -8539,9 +8989,11 @@ mod tests {
             record_key: *b"PSTForgeHugeBlob",
             folders: vec![MailFolderSpec {
                 path: vec!["Inbox".to_owned()],
+                location: MailFolderLocation::IpmSubtree,
                 role: MailFolderRole::Ordinary,
                 container_class: "IPF.Note".to_owned(),
                 messages: vec![huge_message],
+                associated_messages: Vec::new(),
             }],
         };
         assert!(matches!(
@@ -8730,9 +9182,11 @@ mod tests {
             record_key: base.record_key,
             folders: vec![MailFolderSpec {
                 path: vec![base.folder_name],
+                location: MailFolderLocation::IpmSubtree,
                 role: MailFolderRole::Ordinary,
                 container_class: "IPF.Note".to_owned(),
                 messages: vec![first, second],
+                associated_messages: Vec::new(),
             }],
         };
         let destination = directory.path().join("later.pst");
@@ -8860,9 +9314,11 @@ mod tests {
             record_key: base.record_key,
             folders: vec![MailFolderSpec {
                 path: vec![base.folder_name.clone()],
+                location: MailFolderLocation::IpmSubtree,
                 role: MailFolderRole::Ordinary,
                 container_class: "IPF.Note".to_owned(),
                 messages,
+                associated_messages: Vec::new(),
             }],
         };
         create_mail_store(&path, &spec)?;
@@ -9083,33 +9539,43 @@ mod tests {
             folders: vec![
                 MailFolderSpec {
                     path: vec!["Deleted Items".to_owned()],
+                    location: MailFolderLocation::IpmSubtree,
                     role: MailFolderRole::DeletedItems,
                     container_class: "IPF.Note".to_owned(),
                     messages: vec![message("deleted")],
+                    associated_messages: Vec::new(),
                 },
                 MailFolderSpec {
                     path: vec!["Deleted items".to_owned()],
+                    location: MailFolderLocation::IpmSubtree,
                     role: MailFolderRole::Ordinary,
                     container_class: "IPF.Note".to_owned(),
                     messages: vec![message("user-created deleted items")],
+                    associated_messages: Vec::new(),
                 },
                 MailFolderSpec {
                     path: vec!["Inbox".to_owned(), "Projects".to_owned()],
+                    location: MailFolderLocation::IpmSubtree,
                     role: MailFolderRole::Ordinary,
                     container_class: "IPF.Note".to_owned(),
                     messages: vec![message("projects")],
+                    associated_messages: Vec::new(),
                 },
                 MailFolderSpec {
                     path: vec!["Archive".to_owned()],
+                    location: MailFolderLocation::IpmSubtree,
                     role: MailFolderRole::Ordinary,
                     container_class: "IPF.Note".to_owned(),
                     messages: vec![message("archive")],
+                    associated_messages: Vec::new(),
                 },
                 MailFolderSpec {
                     path: vec!["Inbox".to_owned(), "Personal".to_owned()],
+                    location: MailFolderLocation::IpmSubtree,
                     role: MailFolderRole::Ordinary,
                     container_class: "IPF.Note".to_owned(),
                     messages: vec![message("personal")],
+                    associated_messages: Vec::new(),
                 },
             ],
         };
@@ -9187,21 +9653,27 @@ mod tests {
             folders: vec![
                 MailFolderSpec {
                     path: vec!["Deleted Items".to_owned()],
+                    location: MailFolderLocation::IpmSubtree,
                     role: MailFolderRole::DeletedItems,
                     container_class: "IPF.Note".to_owned(),
                     messages: vec![message("deleted")],
+                    associated_messages: Vec::new(),
                 },
                 MailFolderSpec {
                     path: vec!["Deleted Items".to_owned(), "Child".to_owned()],
+                    location: MailFolderLocation::IpmSubtree,
                     role: MailFolderRole::Ordinary,
                     container_class: "IPF.Note".to_owned(),
                     messages: vec![message("deleted child")],
+                    associated_messages: Vec::new(),
                 },
                 MailFolderSpec {
                     path: vec!["Inbox".to_owned()],
+                    location: MailFolderLocation::IpmSubtree,
                     role: MailFolderRole::Ordinary,
                     container_class: "IPF.Note".to_owned(),
                     messages: vec![message("inbox")],
+                    associated_messages: Vec::new(),
                 },
             ],
         };
@@ -9934,14 +10406,14 @@ mod tests {
             (NativeBody::Html, 3),
         ] {
             spec.message.native_body = Some(native_body);
-            let properties = message_properties(&spec.message, &identities, [0; 16], 0)?;
+            let properties = message_properties(&spec.message, false, &identities, [0; 16], 0)?;
             assert!(matches!(
                 properties.iter().find(|(id, _)| *id == 0x1016),
                 Some((_, PropertyValue::Integer32(actual))) if *actual == expected
             ));
         }
         spec.message.native_body = None;
-        let properties = message_properties(&spec.message, &identities, [0; 16], 0)?;
+        let properties = message_properties(&spec.message, false, &identities, [0; 16], 0)?;
         assert!(properties.iter().all(|(id, _)| *id != 0x1016));
         Ok(())
     }
@@ -10179,6 +10651,7 @@ mod tests {
         assert_eq!(identities.len(), 4);
         let properties = message_properties(
             embedded,
+            false,
             &identities,
             embedded_message_record_key(
                 message_record_key(

@@ -1383,10 +1383,105 @@ work. Hash and identity evidence show that the source was not modified.
       exception linkage is proven by the independent libpff roundtrip rather
       than visible recurrence UI. This closes checkpoint 7 for commit and
       push.
-  - [ ] Checkpoints 8 onward: distribution lists; documents and reference
-    attachments; associated/configuration data; task
-    communications; journal/activity objects; and remaining generic classes,
-    each proven separately where feasible.
+  - [x] Checkpoint 8: source-root hierarchy and associated/configuration data.
+    - [x] (2026-07-18) Read-only inspection of the completed 19 GB schema-5
+      ledger proves the remaining `IPM.Microsoft.SniffData` candidate is a
+      complete normal message in `Freebusy Data`, whose parent is the PST
+      store root rather than the IPM subtree. Its ten readable properties are
+      ordinary MAPI values; no class-specific translation is required.
+    - [x] (2026-07-18) The installed libpff 20231205 API exposes associated
+      contents separately through
+      `libpff_folder_get_number_of_sub_associated_contents` and
+      `libpff_folder_get_sub_associated_content`. PSTForge currently calls
+      neither function, so the old ledger cannot establish that the source has
+      no additional hidden items.
+    - [x] (2026-07-18) Extended recovery units, supervised events, durable
+      state, canonical
+      items, packing, and writer inputs with explicit folder location
+      (`store_root` or `ipm_subtree`) and message placement (`normal` or
+      `associated`). Placement comes only from source traversal, never a
+      message-class or display-name heuristic. Worker protocol 3 carries the
+      new field, and job schema 14 refuses schema-13 resume.
+    - [x] (2026-07-18) Traverse every folder's normal and associated collections
+      independently, with bounded counts, isolated per-item recovery units,
+      source identity checks, crash containment, deterministic order, and
+      durable resume compatibility.
+    - [x] (2026-07-18) Reproduce store-root child folders under the output
+      store root,
+      retain IPM folders beneath the IPM subtree, emit associated messages as
+      `AssociatedMessage` nodes in the owning folder's associated-contents
+      table, and keep them out of normal contents and visible message counts.
+      Associated-only parts are valid and independently reopen.
+    - [x] (2026-07-18) Preserve arbitrary readable item classes by serializing
+      their
+      supported raw and named properties. A malformed or unsupported property
+      makes only that item partial and is reported in `recovery.log`; class
+      names alone must not discard an otherwise representable item.
+    - [x] (2026-07-18) Focused writer, canonical, worker, and supervised CLI
+      tests prove normal root placement and associated placement. The generated
+      source and output fingerprints match folder parent location, placement,
+      class, and custom raw-property identities, lengths, and hashes for both
+      items, including an associated item's source `PR_DISPLAY_NAME` distinct
+      from its subject fallback; `pffinfo` accepts the output and source
+      identity is unchanged.
+      The complete fast gate passes at
+      `.agent/test-results/1784385982-fast`.
+    - [x] (2026-07-18) Proved the final one-part qualification candidate with
+      writer/parser tests and a one-part external libpff roundtrip. The source
+      and output fingerprints include folder parent location, placement,
+      class, and every representable property; independent `pffinfo` opened
+      the candidate before ScanPST and Outlook acceptance.
+      Candidate:
+      `qualification-v042-associated-r1/parts/part-0001.pst`,
+      271,360 bytes, SHA-256
+      `4c65af2b3ed1f51ec3f9be459eb3f4fdf7525f9839ea24521b3c69f1be333256`.
+      PSTForge verification found zero corruption, traversal issues, or
+      unsupported messages, `pffinfo` 20231205 opened it as a Unicode 64-bit
+      PST, and `recovery.log` reports that no readable data was skipped.
+    - [x] (2026-07-18) ScanPST rejected the r1 candidate because associated
+      message node `0x200048` lacked `MSGFLAG_ASSOCIATED`; its associated
+      contents-table row therefore did not match the sub-object. The repaired
+      reference retained both items and provided a comparison baseline.
+      Microsoft explicitly requires `MSGFLAG_ASSOCIATED` in
+      `PidTagMessageFlags` for every message in an associated contents table.
+      Writer flag generation now derives that bit from typed placement: it is
+      forced in both the message property context and associated table for
+      associated messages, and cleared for normal and embedded messages even
+      if untrusted source flags contain it. Completed-store validation and the
+      supervised libpff roundtrip assert the same invariant.
+    - [x] (2026-07-18) Generated and independently verified the r2 candidate:
+      `qualification-v042-associated-r2/parts/part-0001.pst`,
+      271,360 bytes, SHA-256
+      `6e179d8980fc23b4eba5cd776a4b169f93b24a59df22d1f30039c05a994e7cdf`.
+      PSTForge verification found zero corruption, traversal issues, or
+      unsupported messages; the placement fingerprint includes
+      `PidTagMessageFlags`; `pffinfo` 20231205 opened the Unicode 64-bit PST;
+      and `recovery.log` reports that no readable data was skipped.
+    - [x] (2026-07-18) The owner reports that the unrepaired r2 candidate
+      passes ScanPST and opens cleanly in Outlook. Associated configuration
+      objects are intentionally not visible as ordinary messages; clean
+      ScanPST and stable Outlook attachment close the human acceptance gate.
+  - [ ] Checkpoint 9: writer-wide Microsoft specification conformance audit.
+    - [ ] Create `docs/WRITER_CONFORMANCE.md` with one traceable row for every
+      existing store, NDB, LTP, folder, message, recipient, attachment,
+      embedded-message, associated-content, named-property, and publication
+      invariant. Each row names the authoritative Microsoft document,
+      revision/page date, exact section or property, implementation symbol,
+      focused test, and independent evidence.
+    - [ ] Audit the full existing writer against that index before admitting
+      another item class. Treat an undocumented literal or relationship as an
+      unresolved requirement, not as established behavior. Preserve
+      undocumented existing output until the owner decides whether to retain,
+      revise, or remove it.
+    - [ ] Resolve verified gaps as separate reviewed recovery points. Each fix
+      must add the normative reference and regression before code changes are
+      accepted, and each structural output change requires ScanPST-first human
+      acceptance.
+    - [ ] Require every remaining 0.4.2 checkpoint to complete its Microsoft
+      specification entries before implementation begins.
+  - [ ] Checkpoints 10 onward: distribution lists; documents and reference
+    attachments; task communications; journal/activity objects; and remaining
+    generic classes, each proven separately where feasible.
   - [ ] Run the complete 19 GB split once after all focused checkpoints pass
     and reconcile discovered unique items against written plus explicitly
     unwritten items across every part.
@@ -1479,6 +1574,32 @@ work. Hash and identity evidence show that the source was not modified.
   Evidence: read-only SQLite inspection of
   `/storage/PSTForge/qualification-v041-pack-r11/.pstforge/job.sqlite3` and
   Microsoft MS-OXOCAL property contracts on 2026-07-18.
+
+- Observation: The remaining `IPM.Microsoft.SniffData` item is not hidden
+  associated content. The schema-5 ledger records it as a normal, complete
+  candidate in source folder node 33474 (`Freebusy Data`), directly below
+  source root node 290, with ten readable ordinary properties. Separately,
+  libpff exposes associated contents through folder APIs that the current
+  catalog does not call, so associated-data completeness cannot be inferred
+  from the old ledger.
+  Evidence: read-only SQLite inspection of the completed 19 GB ledger and
+  `/usr/include/libpff.h` from libpff 20231205 on 2026-07-18.
+
+- Observation: Associated/configuration items may carry `PR_DISPLAY_NAME`
+  independently of `PR_SUBJECT`. Using the normalized subject fallback in the
+  associated-contents table overwrites that source identity even when the
+  message property context retains it.
+  Evidence: checkpoint-8 adversarial review and the subject/display-name
+  divergence regression through the supervised libpff roundtrip on 2026-07-18.
+
+- Observation: A node of type `AssociatedMessage` and membership in an
+  associated contents table are not sufficient for Outlook consistency.
+  `PidTagMessageFlags` in the message property context and table row must also
+  carry `MSGFLAG_ASSOCIATED` (`0x00000040`). ScanPST reports a row/sub-object
+  mismatch when that bit is absent.
+  Evidence:
+  `qualification-v042-associated-r1/parts/part-0001.log`, its repaired PST,
+  and Microsoft's Folder-Associated Information Tables contract on 2026-07-18.
 
 - Observation: `PidTagHasAttachments` alone is insufficient for broad reader
   behavior. `PidTagMessageFlags` must also carry `MSGFLAG_HASATTACH`, and each
@@ -2548,6 +2669,48 @@ work. Hash and identity evidence show that the source was not modified.
   Rationale: Folder hierarchy overhead is divisible metadata and cannot justify
   the product's exception for an indivisible message.
   Date/Author: 2026-07-17 / Codex from checkpoint-2b adversarial review.
+
+- Decision: Checkpoint 8 models folder location and message placement as
+  independent typed source facts. A folder is beneath either the store root or
+  IPM subtree; a message belongs to either the normal or associated contents
+  table. Neither fact may be inferred from a display name, message class, or
+  libpff's coarse item-type classification. Job schema 14 is the first
+  resume-compatible schema for this placement contract and for associated
+  recovery units.
+  Rationale: The 19 GB source contains a normal `SniffData` item in a store-root
+  folder, while libpff exposes associated contents through a distinct API.
+  Class-based admission alone would move the former into the visible IPM tree
+  and continue to miss the latter. A schema-13 ledger cannot prove it traversed
+  associated collections and cannot safely resume as complete.
+  Date/Author: 2026-07-18 / Codex from read-only source-ledger and installed
+  libpff API evidence.
+
+- Decision: No further PST writer feature may be implemented until every
+  existing writer invariant is indexed in `docs/WRITER_CONFORMANCE.md` against
+  an authoritative Microsoft Open Specification or Microsoft MAPI document.
+  Every future writer change updates that index before implementation and
+  includes the exact section/property, implementation symbol, focused test,
+  and independent evidence. If Microsoft does not publish the needed
+  contract, the behavior remains blocked unless the owner approves a clearly
+  labeled empirical exception in this Decision Log.
+  Rationale: Checkpoint 8 produced an internally valid, libpff-readable PST
+  that ScanPST rejected because the implementation created an associated node
+  and table row without the separately documented `MSGFLAG_ASSOCIATED`
+  requirement. Reader tolerance cannot prove that all normative relationships
+  were implemented.
+  Date/Author: 2026-07-18 / human owner requirement after checkpoint-8 r1
+  ScanPST failure and r2 acceptance.
+
+- Decision: The conformance audit is non-destructive. An undocumented existing
+  output remains implemented while it is classified. Before removing,
+  disabling, or narrowing completed behavior, document the available Microsoft
+  requirements, empirical interoperability evidence, data-preservation impact,
+  and concrete options, then wait for the human owner to decide.
+  Rationale: Missing traceability identifies uncertainty; it does not prove
+  that completed behavior is wrong or expendable. Silent removal would violate
+  the milestone's data-preservation and trust goals.
+  Date/Author: 2026-07-18 / human owner clarification before checkpoint-9
+  conformance audit.
 
 ## Outcomes & Retrospective
 

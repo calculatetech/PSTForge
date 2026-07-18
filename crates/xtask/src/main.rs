@@ -260,6 +260,7 @@ fn run() -> Result<(), String> {
             Some("calendar-exceptions") => {
                 qualify_calendar_exceptions(&root, Path::new(&output))
             }
+            Some("associated-data") => qualify_associated_data(&root, Path::new(&output)),
             _ => Err("unknown qualification checkpoint; expected embedded-attachments, named-properties, empty-folders, contacts, appointments, meetings, pim-items, or calendar-exceptions".to_owned()),
         };
     }
@@ -292,7 +293,7 @@ fn run() -> Result<(), String> {
 }
 
 fn usage() -> String {
-    "usage: cargo xtask gate <fast|full|release> | qualify <embedded-attachments|named-properties|empty-folders|contacts|appointments|meetings|pim-items|calendar-exceptions> <output>"
+    "usage: cargo xtask gate <fast|full|release> | qualify <embedded-attachments|named-properties|empty-folders|contacts|appointments|meetings|pim-items|calendar-exceptions|associated-data> <output>"
         .to_owned()
 }
 
@@ -386,33 +387,43 @@ fn qualify_empty_folders(root: &Path, output: &Path) -> Result<(), String> {
         folders: vec![
             MailFolderSpec {
                 path: vec!["Deleted Items".to_owned()],
+                location: pstforge_pst::writer::MailFolderLocation::IpmSubtree,
                 role: MailFolderRole::DeletedItems,
                 container_class: "IPF.Note".to_owned(),
                 messages: Vec::new(),
+                associated_messages: Vec::new(),
             },
             MailFolderSpec {
                 path: vec!["Deleted items".to_owned()],
+                location: pstforge_pst::writer::MailFolderLocation::IpmSubtree,
                 role: MailFolderRole::Ordinary,
                 container_class: "IPF.Note".to_owned(),
                 messages: Vec::new(),
+                associated_messages: Vec::new(),
             },
             MailFolderSpec {
                 path: vec!["Empty Parent".to_owned()],
+                location: pstforge_pst::writer::MailFolderLocation::IpmSubtree,
                 role: MailFolderRole::Ordinary,
                 container_class: "IPF.Note".to_owned(),
                 messages: Vec::new(),
+                associated_messages: Vec::new(),
             },
             MailFolderSpec {
                 path: vec!["Empty Parent".to_owned(), "Empty Child".to_owned()],
+                location: pstforge_pst::writer::MailFolderLocation::IpmSubtree,
                 role: MailFolderRole::Ordinary,
                 container_class: "IPF.Note".to_owned(),
                 messages: Vec::new(),
+                associated_messages: Vec::new(),
             },
             MailFolderSpec {
                 path: vec!["Inbox".to_owned()],
+                location: pstforge_pst::writer::MailFolderLocation::IpmSubtree,
                 role: MailFolderRole::Ordinary,
                 container_class: "IPF.Note".to_owned(),
                 messages: vec![fixture.message],
+                associated_messages: Vec::new(),
             },
         ],
     };
@@ -498,9 +509,11 @@ fn qualify_contacts(root: &Path, output: &Path) -> Result<(), String> {
         record_key: fixture.record_key,
         folders: vec![MailFolderSpec {
             path: vec!["Contacts".to_owned()],
+            location: pstforge_pst::writer::MailFolderLocation::IpmSubtree,
             role: MailFolderRole::Ordinary,
             container_class: "IPF.Contact".to_owned(),
             messages: vec![fixture.message],
+            associated_messages: Vec::new(),
         }],
     };
     publish_qualification(root, output, 1, |part| {
@@ -612,9 +625,11 @@ fn qualify_appointments(root: &Path, output: &Path) -> Result<(), String> {
         record_key: fixture.record_key,
         folders: vec![MailFolderSpec {
             path: vec!["Calendar".to_owned()],
+            location: pstforge_pst::writer::MailFolderLocation::IpmSubtree,
             role: MailFolderRole::Ordinary,
             container_class: "IPF.Appointment".to_owned(),
             messages: vec![fixture.message],
+            associated_messages: Vec::new(),
         }],
     };
     publish_qualification(root, output, 1, |part| {
@@ -774,9 +789,11 @@ fn qualify_meetings(root: &Path, output: &Path) -> Result<(), String> {
         record_key: fixture.record_key,
         folders: vec![MailFolderSpec {
             path: vec!["Inbox".to_owned()],
+            location: pstforge_pst::writer::MailFolderLocation::IpmSubtree,
             role: MailFolderRole::Ordinary,
             container_class: "IPF.Note".to_owned(),
             messages: vec![fixture.message],
+            associated_messages: Vec::new(),
         }],
     };
     publish_qualification(root, output, 1, |part| {
@@ -883,21 +900,27 @@ fn qualify_pim_items(root: &Path, output: &Path) -> Result<(), String> {
         folders: vec![
             MailFolderSpec {
                 path: vec!["Tasks".to_owned()],
+                location: pstforge_pst::writer::MailFolderLocation::IpmSubtree,
                 role: MailFolderRole::Ordinary,
                 container_class: "IPF.Task".to_owned(),
                 messages: vec![fixture.message],
+                associated_messages: Vec::new(),
             },
             MailFolderSpec {
                 path: vec!["Notes".to_owned()],
+                location: pstforge_pst::writer::MailFolderLocation::IpmSubtree,
                 role: MailFolderRole::Ordinary,
                 container_class: "IPF.StickyNote".to_owned(),
                 messages: vec![sticky_note],
+                associated_messages: Vec::new(),
             },
             MailFolderSpec {
                 path: vec!["Posts".to_owned()],
+                location: pstforge_pst::writer::MailFolderLocation::IpmSubtree,
                 role: MailFolderRole::Ordinary,
                 container_class: "IPF.Note".to_owned(),
                 messages: vec![post],
+                associated_messages: Vec::new(),
             },
         ],
     };
@@ -983,10 +1006,86 @@ fn qualify_calendar_exceptions(root: &Path, output: &Path) -> Result<(), String>
         record_key: fixture.record_key,
         folders: vec![MailFolderSpec {
             path: vec!["Calendar".to_owned()],
+            location: pstforge_pst::writer::MailFolderLocation::IpmSubtree,
             role: MailFolderRole::Ordinary,
             container_class: "IPF.Appointment".to_owned(),
             messages: vec![appointment],
+            associated_messages: Vec::new(),
         }],
+    };
+    publish_qualification(root, output, 2, |part| {
+        pstforge_pst::writer::create_mail_store(part, &spec)
+    })
+}
+
+fn qualify_associated_data(root: &Path, output: &Path) -> Result<(), String> {
+    use pstforge_pst::writer::{
+        FidelityStore, MailFolderLocation, MailFolderRole, MailFolderSpec, MailStoreSpec,
+        RawProperty, RawPropertyValue,
+    };
+
+    let fixture = FidelityStore::default();
+    let mut normal = fixture.message;
+    normal.message_class = "IPM.Microsoft.SniffData".to_owned();
+    normal.subject = "Root configuration checkpoint".to_owned();
+    normal.sender_name.clear();
+    normal.sender_email.clear();
+    normal.recipients.clear();
+    normal.attachments.clear();
+    normal.body_text = None;
+    normal.body_html = None;
+    normal.body_rtf = None;
+    normal.native_body = None;
+    normal.rtf_in_sync = false;
+    normal.internet_headers = None;
+    normal.named_properties.clear();
+    normal.spooled_properties.clear();
+    normal.unsupported_properties.clear();
+    normal.raw_properties = vec![
+        RawProperty {
+            id: 0x6000,
+            value: RawPropertyValue::Integer32(42),
+        },
+        RawProperty {
+            id: 0x6001,
+            value: RawPropertyValue::Unicode("root property checkpoint".to_owned()),
+        },
+        RawProperty {
+            id: 0x6002,
+            value: RawPropertyValue::Binary(vec![0, 1, 2, 3, 0xFE, 0xFF]),
+        },
+    ];
+    let mut associated = normal.clone();
+    associated.message_class = "IPM.Configuration.PSTForge".to_owned();
+    associated.subject = "Subject fallback must not replace display name".to_owned();
+    associated.raw_properties[0].value = RawPropertyValue::Integer32(84);
+    associated.raw_properties[1].value =
+        RawPropertyValue::Unicode("associated property checkpoint".to_owned());
+    associated.raw_properties.push(RawProperty {
+        id: 0x3001,
+        value: RawPropertyValue::Unicode("Associated configuration checkpoint".to_owned()),
+    });
+    let spec = MailStoreSpec {
+        store_name: "PSTForge root and associated data".to_owned(),
+        record_key: *b"PSTForgePlace001",
+        folders: vec![
+            MailFolderSpec {
+                path: vec!["Freebusy Data".to_owned()],
+                location: MailFolderLocation::StoreRoot,
+                role: MailFolderRole::Ordinary,
+                container_class: "IPF.Note".to_owned(),
+                messages: vec![normal],
+                associated_messages: Vec::new(),
+            },
+            MailFolderSpec {
+                path: vec!["IPM_COMMON_VIEWS".to_owned()],
+                location: MailFolderLocation::StoreRoot,
+                role: MailFolderRole::Ordinary,
+                container_class: "IPF.Note".to_owned(),
+                messages: Vec::new(),
+                associated_messages: vec![associated],
+            },
+        ],
     };
     publish_qualification(root, output, 2, |part| {
         pstforge_pst::writer::create_mail_store(part, &spec)

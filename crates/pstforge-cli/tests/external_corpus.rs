@@ -48,6 +48,162 @@ struct PropertyFingerprint {
     sha256: [u8; 32],
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct PlacementFingerprint {
+    folder_name: String,
+    folder_parent_is_store_root: bool,
+    associated: bool,
+    message_class: String,
+    properties: Vec<PropertyFingerprint>,
+}
+
+#[derive(Default)]
+struct PlacementSink {
+    folders: BTreeMap<u32, (Option<u32>, Option<String>)>,
+    messages: BTreeMap<u32, (u32, bool, String)>,
+    active: BTreeMap<(u32, u32, u32), ActivePlacementProperty>,
+    properties: BTreeMap<u32, Vec<PropertyFingerprint>>,
+}
+
+struct ActivePlacementProperty {
+    id: u32,
+    value_type: Option<u32>,
+    hasher: Sha256,
+    byte_len: u64,
+}
+
+impl CatalogSink for PlacementSink {
+    fn event(&mut self, event: CatalogEvent<'_>) -> Result<(), String> {
+        match event {
+            CatalogEvent::Folder {
+                id,
+                parent_id,
+                name,
+                ..
+            } => {
+                self.folders.insert(id, (parent_id, name));
+            }
+            CatalogEvent::MessageStart {
+                id,
+                folder_id: Some(folder_id),
+                associated,
+                message_class: Some(message_class),
+                ..
+            } => {
+                self.messages
+                    .insert(id, (folder_id, associated, message_class));
+            }
+            CatalogEvent::PropertyStart(descriptor)
+                if matches!(descriptor.owner, PropertyOwner::Message(_))
+                    && descriptor.entry_type.is_some_and(|id| {
+                        matches!(id, 0x0E07 | 0x3001) || (0x6000..=0x6002).contains(&id)
+                    }) =>
+            {
+                let PropertyOwner::Message(message_id) = descriptor.owner else {
+                    return Err("placement property owner changed during matching".to_owned());
+                };
+                self.active.insert(
+                    (
+                        message_id,
+                        descriptor.record_set_index,
+                        descriptor.entry_index,
+                    ),
+                    ActivePlacementProperty {
+                        id: descriptor.entry_type.unwrap_or_default(),
+                        value_type: descriptor.value_type,
+                        hasher: Sha256::new(),
+                        byte_len: 0,
+                    },
+                );
+            }
+            CatalogEvent::PropertyData { descriptor, bytes } => {
+                let PropertyOwner::Message(message_id) = descriptor.owner else {
+                    return Ok(());
+                };
+                if let Some(active) = self.active.get_mut(&(
+                    message_id,
+                    descriptor.record_set_index,
+                    descriptor.entry_index,
+                )) {
+                    active.hasher.update(bytes);
+                    active.byte_len = active
+                        .byte_len
+                        .checked_add(
+                            u64::try_from(bytes.len())
+                                .map_err(|_| "placement property chunk is too large")?,
+                        )
+                        .ok_or("placement property length overflow")?;
+                }
+            }
+            CatalogEvent::PropertyEnd(descriptor) => {
+                let PropertyOwner::Message(message_id) = descriptor.owner else {
+                    return Ok(());
+                };
+                if let Some(active) = self.active.remove(&(
+                    message_id,
+                    descriptor.record_set_index,
+                    descriptor.entry_index,
+                )) {
+                    self.properties
+                        .entry(message_id)
+                        .or_default()
+                        .push(PropertyFingerprint {
+                            id: active.id,
+                            value_type: active.value_type,
+                            byte_len: active.byte_len,
+                            sha256: active.hasher.finalize().into(),
+                        });
+                }
+            }
+            CatalogEvent::PropertyAbort { descriptor, .. } => {
+                let PropertyOwner::Message(message_id) = descriptor.owner else {
+                    return Ok(());
+                };
+                self.active.remove(&(
+                    message_id,
+                    descriptor.record_set_index,
+                    descriptor.entry_index,
+                ));
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+}
+
+impl PlacementSink {
+    fn finish(mut self) -> Result<Vec<PlacementFingerprint>, Box<dyn std::error::Error>> {
+        if !self.active.is_empty() {
+            return Err("placement property stream did not terminate".into());
+        }
+        let mut output = Vec::with_capacity(self.messages.len());
+        for (message_id, (folder_id, associated, message_class)) in self.messages {
+            let (parent_id, folder_name) = self
+                .folders
+                .get(&folder_id)
+                .ok_or("placement message folder is missing")?;
+            let parent_id = parent_id.ok_or("placement message folder has no parent")?;
+            let parent = self
+                .folders
+                .get(&parent_id)
+                .ok_or("placement parent folder is missing")?;
+            let mut properties = self.properties.remove(&message_id).unwrap_or_default();
+            properties.sort();
+            output.push(PlacementFingerprint {
+                folder_name: folder_name
+                    .clone()
+                    .ok_or("placement folder has no display name")?,
+                folder_parent_is_store_root: parent.0.is_none(),
+                associated,
+                message_class,
+                properties,
+            });
+        }
+        output.sort();
+        Ok(output)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct NamedPropertyFingerprint {
     owner: NamedPropertyOwner,
@@ -883,6 +1039,151 @@ fn independent_folder_classes(
         }
     }
     Ok(output)
+}
+
+fn independent_placement(
+    path: &std::path::Path,
+) -> Result<Vec<PlacementFingerprint>, Box<dyn std::error::Error>> {
+    let file = fs::File::open(path)?;
+    let native = libpff_sys::PffFile::open_fd(file.as_fd())?;
+    let mut sink = PlacementSink::default();
+    let catalog = native.catalog(&mut sink)?;
+    if !catalog.issues.is_empty()
+        || catalog.issues_dropped != 0
+        || catalog.unsupported_messages != 0
+    {
+        return Err("libpff placement catalog was incomplete".into());
+    }
+    sink.finish()
+}
+
+#[test]
+fn root_and_associated_data_roundtrip_through_the_supervised_split()
+-> Result<(), Box<dyn std::error::Error>> {
+    use pstforge_pst::writer::{
+        FidelityStore, MailFolderLocation, MailFolderRole, MailFolderSpec, MailStoreSpec,
+        RawProperty, RawPropertyValue,
+    };
+
+    let directory = tempfile::tempdir()?;
+    let source = directory.path().join("source.pst");
+    let mut normal = FidelityStore::default().message;
+    normal.message_class = "IPM.Microsoft.SniffData".to_owned();
+    normal.subject = "root placement checkpoint".to_owned();
+    normal.sender_name.clear();
+    normal.sender_email.clear();
+    normal.recipients.clear();
+    normal.attachments.clear();
+    normal.body_text = None;
+    normal.body_html = None;
+    normal.body_rtf = None;
+    normal.native_body = None;
+    normal.rtf_in_sync = false;
+    normal.internet_headers = None;
+    normal.named_properties.clear();
+    normal.spooled_properties.clear();
+    normal.unsupported_properties.clear();
+    normal.raw_properties = vec![
+        RawProperty {
+            id: 0x6000,
+            value: RawPropertyValue::Integer32(42),
+        },
+        RawProperty {
+            id: 0x6001,
+            value: RawPropertyValue::Unicode("normal root value".to_owned()),
+        },
+        RawProperty {
+            id: 0x6002,
+            value: RawPropertyValue::Binary(vec![0, 1, 2, 3, 0xFE, 0xFF]),
+        },
+    ];
+    let mut associated = normal.clone();
+    associated.message_class = "IPM.Configuration.PSTForge".to_owned();
+    associated.subject = "subject fallback must not replace display name".to_owned();
+    associated.raw_properties[0].value = RawPropertyValue::Integer32(84);
+    associated.raw_properties[1].value =
+        RawPropertyValue::Unicode("hidden associated value".to_owned());
+    associated.raw_properties.push(RawProperty {
+        id: 0x3001,
+        value: RawPropertyValue::Unicode("associated placement checkpoint".to_owned()),
+    });
+    let fixture = MailStoreSpec {
+        store_name: "PSTForge placement source".to_owned(),
+        record_key: *b"PSTForgePlace001",
+        folders: vec![
+            MailFolderSpec {
+                path: vec!["Freebusy Data".to_owned()],
+                location: MailFolderLocation::StoreRoot,
+                role: MailFolderRole::Ordinary,
+                container_class: "IPF.Note".to_owned(),
+                messages: vec![normal],
+                associated_messages: Vec::new(),
+            },
+            MailFolderSpec {
+                path: vec!["IPM_COMMON_VIEWS".to_owned()],
+                location: MailFolderLocation::StoreRoot,
+                role: MailFolderRole::Ordinary,
+                container_class: "IPF.Note".to_owned(),
+                messages: Vec::new(),
+                associated_messages: vec![associated],
+            },
+        ],
+    };
+    pstforge_pst::writer::create_mail_store(&source, &fixture)?;
+    let source_identity = pstforge_core::SourceFile::open(&source)?.identity().clone();
+    let expected = independent_placement(&source)?;
+    if expected.len() != 2
+        || expected
+            .iter()
+            .any(|item| !item.folder_parent_is_store_root)
+        || expected.iter().filter(|item| item.associated).count() != 1
+        || expected
+            .iter()
+            .any(|item| item.properties.len() != if item.associated { 5 } else { 4 })
+    {
+        return Err("source placement fixture does not meet its contract".into());
+    }
+
+    let output = directory.path().join("split");
+    let result = Command::new(env!("CARGO_BIN_EXE_pstforge"))
+        .arg("split")
+        .arg(&source)
+        .arg("--output")
+        .arg(&output)
+        .arg("--max-pst-size")
+        .arg("4GiB")
+        .arg("--json")
+        .arg("--color")
+        .arg("never")
+        .output()?;
+    if !result.status.success() {
+        return Err(format!(
+            "placement split failed: {}",
+            String::from_utf8_lossy(&result.stderr)
+        )
+        .into());
+    }
+    let report: serde_json::Value = serde_json::from_slice(&result.stdout)?;
+    if report["partial"].as_bool() != Some(false)
+        || report["parts"].as_array().map(Vec::len) != Some(1)
+    {
+        return Err("placement split was not a complete one-part result".into());
+    }
+    let generated = output.join("parts/part-0001.pst");
+    if independent_placement(&generated)? != expected {
+        return Err("root hierarchy, associated placement, class, or property changed".into());
+    }
+    let pffinfo = Command::new("pffinfo").arg(&generated).output()?;
+    if !pffinfo.status.success() {
+        return Err("pffinfo rejected the placement output".into());
+    }
+    pstforge_core::SourceFile::open(&source)?
+        .verify_unchanged()
+        .map_err(|_| "placement source changed during split")?;
+    if pstforge_core::SourceFile::open(&source)?.identity() != &source_identity {
+        return Err("placement source identity changed during split".into());
+    }
+    Ok(())
 }
 
 fn verify_exact_message_fidelity(

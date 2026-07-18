@@ -109,6 +109,11 @@ pub enum RecoveryUnit {
         folder_id: u32,
         message_index: u64,
     },
+    Associated {
+        folder: FolderAddress,
+        folder_id: u32,
+        message_index: u64,
+    },
     Recovered {
         index: u64,
     },
@@ -182,6 +187,7 @@ pub enum CatalogEvent<'a> {
         parent_message_id: Option<u32>,
         parent_attachment_index: Option<u32>,
         embedded_path: Vec<u32>,
+        associated: bool,
         item_type: Option<u8>,
         message_class: Option<String>,
         subject: Option<String>,
@@ -435,13 +441,30 @@ impl PffFile {
                 )?;
             }
 
-            let message_count = match folder.sub_message_count() {
+            let message_count = match folder
+                .sub_message_count()
+                .and_then(|count| bounded_folder_item_count(count, "folder message count"))
+            {
                 Ok(count) => count,
                 Err(error) => {
                     record_item_issue(
                         &mut catalog,
                         Some(folder_id),
                         "count folder messages",
+                        error,
+                    )?;
+                    0
+                }
+            };
+            let associated_count = match folder.sub_associated_count().and_then(|count| {
+                bounded_folder_item_count(count, "folder associated contents count")
+            }) {
+                Ok(count) => count,
+                Err(error) => {
+                    record_item_issue(
+                        &mut catalog,
+                        Some(folder_id),
+                        "count folder associated contents",
                         error,
                     )?;
                     0
@@ -539,6 +562,7 @@ impl PffFile {
                     depth: 0,
                     provenance: CatalogProvenance::Normal,
                     recovery_index: None,
+                    associated: false,
                 }];
                 while let Some(work) = messages.pop() {
                     if let Err(error) = process_message(
@@ -554,6 +578,66 @@ impl PffFile {
                                 &mut catalog,
                                 None,
                                 "process folder message",
+                                error,
+                            )?,
+                        }
+                    }
+                }
+                emit(sink, "end recovery unit", CatalogEvent::UnitEnd(unit))?;
+            }
+            for index in 0..associated_count {
+                let unit = RecoveryUnit::Associated {
+                    folder: folder_address,
+                    folder_id,
+                    message_index: index,
+                };
+                if skipped.contains(&unit) {
+                    catalog.record_issue(CatalogIssue {
+                        node_id: Some(folder_id),
+                        operation: "skip isolated recovery unit",
+                        message: format!("associated content index {index} was isolated"),
+                    });
+                    continue;
+                }
+                emit(sink, "start recovery unit", CatalogEvent::UnitStart(unit))?;
+                let item = match folder.sub_associated(index) {
+                    Ok(item) => item,
+                    Err(error) => {
+                        record_item_issue(
+                            &mut catalog,
+                            Some(folder_id),
+                            "read folder associated content",
+                            error,
+                        )?;
+                        emit(sink, "end recovery unit", CatalogEvent::UnitEnd(unit))?;
+                        continue;
+                    }
+                };
+                let mut messages = vec![MessageWork {
+                    item,
+                    folder_id: Some(folder_id),
+                    parent_message_id: None,
+                    parent_attachment_index: None,
+                    embedded_path: Vec::new(),
+                    depth: 0,
+                    provenance: CatalogProvenance::Normal,
+                    recovery_index: None,
+                    associated: true,
+                }];
+                while let Some(work) = messages.pop() {
+                    if let Err(error) = process_message(
+                        work,
+                        &mut messages,
+                        &mut visited_messages,
+                        sink,
+                        &mut catalog,
+                    ) {
+                        match error {
+                            error @ PffError::Sink { .. } => return Err(error),
+                            error => record_item_issue(
+                                &mut catalog,
+                                None,
+                                "process folder associated content",
                                 error,
                             )?,
                         }
@@ -645,6 +729,7 @@ impl PffFile {
                 depth: 0,
                 provenance,
                 recovery_index: Some(recovery_index),
+                associated: false,
             }];
             while let Some(work) = pending.pop() {
                 if let Err(error) =
@@ -672,6 +757,18 @@ impl PffFile {
     }
 }
 
+fn bounded_folder_item_count(count: u64, field: &'static str) -> Result<u64, PffError> {
+    if count > MAX_MESSAGES {
+        Err(PffError::LimitExceeded {
+            field,
+            value: count,
+            limit: MAX_MESSAGES,
+        })
+    } else {
+        Ok(count)
+    }
+}
+
 fn recovery_flags(mode: RecoveryMode) -> u8 {
     match mode {
         RecoveryMode::Balanced => 0,
@@ -695,6 +792,7 @@ struct MessageWork {
     depth: u32,
     provenance: CatalogProvenance,
     recovery_index: Option<u64>,
+    associated: bool,
 }
 
 fn process_message(
@@ -840,6 +938,7 @@ fn process_message(
             parent_message_id: work.parent_message_id,
             parent_attachment_index: work.parent_attachment_index,
             embedded_path: work.embedded_path.clone(),
+            associated: work.associated,
             item_type,
             message_class,
             subject,
@@ -897,31 +996,11 @@ fn process_message(
 }
 
 fn supported_message_class(value: &str, embedded: bool) -> bool {
-    class_is_or_descends_from(value, "IPM.Note")
-        || class_descends_from(value, "REPORT.IPM.Note")
-        || class_is_or_descends_from(value, "IPM.Contact")
-        || class_is_or_descends_from(value, "IPM.Appointment")
-        || class_descends_from(value, "IPM.Schedule.Meeting")
-        || class_is_or_descends_from(value, "IPM.Task")
-        || class_is_or_descends_from(value, "IPM.StickyNote")
-        || class_is_or_descends_from(value, "IPM.Post")
-        || (embedded && calendar_exception_message_class(value))
+    !value.is_empty() && (!calendar_exception_message_class(value) || embedded)
 }
 
 fn calendar_exception_message_class(value: &str) -> bool {
     value.eq_ignore_ascii_case("IPM.OLE.CLASS.{00061055-0000-0000-C000-000000000046}")
-}
-
-fn class_is_or_descends_from(value: &str, root: &str) -> bool {
-    value.eq_ignore_ascii_case(root) || class_descends_from(value, root)
-}
-
-fn class_descends_from(value: &str, root: &str) -> bool {
-    value
-        .get(..root.len())
-        .is_some_and(|prefix| prefix.eq_ignore_ascii_case(root))
-        && value.as_bytes().get(root.len()) == Some(&b'.')
-        && value.len() > root.len() + 1
 }
 
 fn stable_top_level_identifier_seen(
@@ -1188,6 +1267,7 @@ fn stream_attachments(
                     depth,
                     provenance: work.provenance,
                     recovery_index: work.recovery_index,
+                    associated: false,
                 })
             })();
             match embedded_work {
@@ -1735,6 +1815,20 @@ impl PffItem {
         Self::from_raw(raw, "get submessage")
     }
 
+    fn sub_associated(&self, index: u64) -> Result<Self, PffError> {
+        let index = native_index(index, "associated content index")?;
+        let mut raw = ptr::null_mut();
+        let mut error = ptr::null_mut();
+        // SAFETY: self.raw is valid and outputs are initialized.
+        let result = unsafe {
+            bindings::libpff_folder_get_sub_associated_content(
+                self.raw, index, &mut raw, &mut error,
+            )
+        };
+        check_one(result, error, "get sub associated content")?;
+        Self::from_raw(raw, "get sub associated content")
+    }
+
     fn record_set_count(&self) -> Result<u64, PffError> {
         native_count(
             self.raw,
@@ -2270,7 +2364,7 @@ mod tests {
     use crate::PffError;
 
     #[test]
-    fn only_the_exact_calendar_exception_class_is_supported() {
+    fn arbitrary_classes_are_supported_but_exact_calendar_exception_must_be_embedded() {
         assert!(supported_message_class(
             "IPM.OLE.CLASS.{00061055-0000-0000-C000-000000000046}",
             true
@@ -2283,14 +2377,15 @@ mod tests {
             "IPM.OLE.CLASS.{00061055-0000-0000-C000-000000000046}",
             false
         ));
-        assert!(!supported_message_class(
+        assert!(supported_message_class(
             "IPM.OLE.CLASS.{00061055-0000-0000-C000-000000000046}.Custom",
             true
         ));
-        assert!(!supported_message_class(
+        assert!(supported_message_class(
             "IPM.OLE.CLASS.{00061056-0000-0000-C000-000000000046}",
             true
         ));
+        assert!(!supported_message_class("", true));
     }
 
     #[test]

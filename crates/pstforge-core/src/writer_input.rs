@@ -4,16 +4,17 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use pstforge_job::{DurableCatalogSink, JobError, SpooledBlob};
 use pstforge_pst::writer::{
-    AttachmentContent, AttachmentSpec, FileBlobSpec, MailFolderRole, MailFolderSpec, MailStoreSpec,
-    MessageSpec, NamedProperty, NamedPropertyName, NamedPropertySet, NativeBody, RawProperty,
-    RawPropertyValue, RecipientKind, RecipientSpec, SpooledPropertySpec, UnsupportedProperty,
+    AttachmentContent, AttachmentSpec, FileBlobSpec, MailFolderLocation, MailFolderRole,
+    MailFolderSpec, MailStoreSpec, MessageSpec, NamedProperty, NamedPropertyName, NamedPropertySet,
+    NativeBody, RawProperty, RawPropertyValue, RecipientKind, RecipientSpec, SpooledPropertySpec,
+    UnsupportedProperty,
 };
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 use crate::{
-    CanonicalAttachment, CanonicalFolder, CanonicalFolderRole, CanonicalMail, CanonicalProperty,
-    CanonicalRecipient,
+    CanonicalAttachment, CanonicalFolder, CanonicalFolderLocation, CanonicalFolderRole,
+    CanonicalMail, CanonicalMessagePlacement, CanonicalProperty, CanonicalRecipient,
 };
 
 #[derive(Debug, Error)]
@@ -138,7 +139,7 @@ fn build_part_writer_input_expected(
         .iter()
         .map(|folder| {
             (
-                folder.path.clone(),
+                (folder.location, folder.path.clone()),
                 (
                     folder.role,
                     folder
@@ -147,10 +148,19 @@ fn build_part_writer_input_expected(
                         .filter(|value| !value.is_empty())
                         .unwrap_or_else(|| "IPF.Note".to_owned()),
                     Vec::new(),
+                    Vec::new(),
                 ),
             )
         })
-        .collect::<BTreeMap<Vec<String>, (CanonicalFolderRole, String, Vec<MessageSpec>)>>();
+        .collect::<BTreeMap<
+            (CanonicalFolderLocation, Vec<String>),
+            (
+                CanonicalFolderRole,
+                String,
+                Vec<MessageSpec>,
+                Vec<MessageSpec>,
+            ),
+        >>();
     let mut item_keys = Vec::with_capacity(messages.len());
     let mut unsupported_item_keys = Vec::new();
     let mut partial = false;
@@ -162,20 +172,33 @@ fn build_part_writer_input_expected(
         partial |= translated.partial;
         omitted_properties = omitted_properties.saturating_add(translated.omitted_properties);
         omitted_attachments = omitted_attachments.saturating_add(translated.omitted_attachments);
-        match folders.entry(mail.folder_path.clone()) {
+        match folders.entry((mail.folder_location, mail.folder_path.clone())) {
             std::collections::btree_map::Entry::Vacant(entry) => {
+                let mut normal = Vec::new();
+                let mut associated = Vec::new();
+                match mail.placement {
+                    CanonicalMessagePlacement::Normal => normal.push(translated.message),
+                    CanonicalMessagePlacement::Associated => associated.push(translated.message),
+                }
                 entry.insert((
                     mail.folder_role,
-                    default_container_class(&translated.message.message_class).to_owned(),
-                    vec![translated.message],
+                    default_container_class(mail.message_class.as_deref().unwrap_or("IPM.Note"))
+                        .to_owned(),
+                    normal,
+                    associated,
                 ));
             }
             std::collections::btree_map::Entry::Occupied(mut entry) => {
-                let (role, _, messages) = entry.get_mut();
+                let (role, _, messages, associated_messages) = entry.get_mut();
                 if mail.folder_role == CanonicalFolderRole::DeletedItems {
                     *role = CanonicalFolderRole::DeletedItems;
                 }
-                messages.push(translated.message);
+                match mail.placement {
+                    CanonicalMessagePlacement::Normal => messages.push(translated.message),
+                    CanonicalMessagePlacement::Associated => {
+                        associated_messages.push(translated.message);
+                    }
+                }
             }
         }
         item_keys.extend(translated.item_keys);
@@ -183,15 +206,24 @@ fn build_part_writer_input_expected(
     }
     let folders = folders
         .into_iter()
-        .map(|(path, (role, container_class, messages))| MailFolderSpec {
-            path,
-            role: match role {
-                CanonicalFolderRole::Ordinary => MailFolderRole::Ordinary,
-                CanonicalFolderRole::DeletedItems => MailFolderRole::DeletedItems,
+        .map(
+            |((location, path), (role, container_class, messages, associated_messages))| {
+                MailFolderSpec {
+                    path,
+                    location: match location {
+                        CanonicalFolderLocation::StoreRoot => MailFolderLocation::StoreRoot,
+                        CanonicalFolderLocation::IpmSubtree => MailFolderLocation::IpmSubtree,
+                    },
+                    role: match role {
+                        CanonicalFolderRole::Ordinary => MailFolderRole::Ordinary,
+                        CanonicalFolderRole::DeletedItems => MailFolderRole::DeletedItems,
+                    },
+                    container_class,
+                    messages,
+                    associated_messages,
+                }
             },
-            container_class,
-            messages,
-        })
+        )
         .collect();
     unsupported_item_keys.sort();
     unsupported_item_keys.dedup();
@@ -1217,15 +1249,7 @@ fn writer_stream_type_is_supported(property_type: u16) -> bool {
 }
 
 fn supported_message_class(value: &str) -> bool {
-    class_is_or_descends_from(value, "IPM.Note")
-        || class_descends_from(value, "REPORT.IPM.Note")
-        || contact_message_class(value)
-        || appointment_message_class(value)
-        || meeting_message_class(value)
-        || task_message_class(value)
-        || sticky_note_message_class(value)
-        || post_message_class(value)
-        || calendar_exception_message_class(value)
+    !value.is_empty()
 }
 
 fn contact_message_class(value: &str) -> bool {
@@ -1248,16 +1272,15 @@ fn sticky_note_message_class(value: &str) -> bool {
     class_is_or_descends_from(value, "IPM.StickyNote")
 }
 
-fn post_message_class(value: &str) -> bool {
-    class_is_or_descends_from(value, "IPM.Post")
-}
-
 fn calendar_exception_message_class(value: &str) -> bool {
     value.eq_ignore_ascii_case("IPM.OLE.CLASS.{00061055-0000-0000-C000-000000000046}")
 }
 
 fn sender_optional_message_class(value: &str) -> bool {
-    contact_message_class(value)
+    !(class_is_or_descends_from(value, "IPM.Note")
+        || class_descends_from(value, "REPORT.IPM.Note")
+        || meeting_message_class(value))
+        || contact_message_class(value)
         || appointment_message_class(value)
         || task_message_class(value)
         || sticky_note_message_class(value)
@@ -1742,8 +1765,9 @@ mod tests {
         valid_utf16_stream, writer_stream_type_is_supported,
     };
     use crate::{
-        CanonicalAttachment, CanonicalFolder, CanonicalFolderRole, CanonicalMail,
-        CanonicalProperty, CanonicalRecipient, ContentCompleteness, ItemKey, RecoveryProvenance,
+        CanonicalAttachment, CanonicalFolder, CanonicalFolderLocation, CanonicalFolderRole,
+        CanonicalMail, CanonicalMessagePlacement, CanonicalProperty, CanonicalRecipient,
+        ContentCompleteness, ItemKey, RecoveryProvenance,
     };
     use pstforge_pst::writer::{
         AttachmentContent, MailFolderRole, NamedPropertySet, NativeBody, validate_mail_store_input,
@@ -1768,7 +1792,9 @@ mod tests {
                 occurrence: 0,
             },
             folder_path: vec!["Deleted Items".to_owned()],
+            folder_location: CanonicalFolderLocation::IpmSubtree,
             folder_role: CanonicalFolderRole::Ordinary,
+            placement: CanonicalMessagePlacement::Normal,
             message_class: Some("IPM.Note".to_owned()),
             subject: Some("colliding folder message".to_owned()),
             sender_name: None,
@@ -1783,6 +1809,7 @@ mod tests {
         };
         let retained = [CanonicalFolder {
             path: vec!["Deleted Items".to_owned()],
+            location: CanonicalFolderLocation::IpmSubtree,
             role: CanonicalFolderRole::DeletedItems,
             container_class: Some("IPF.Note".to_owned()),
         }];
@@ -1823,7 +1850,9 @@ mod tests {
                 occurrence: 0,
             },
             folder_path: vec!["Contacts".to_owned()],
+            folder_location: CanonicalFolderLocation::IpmSubtree,
             folder_role: CanonicalFolderRole::Ordinary,
+            placement: CanonicalMessagePlacement::Normal,
             message_class: Some("IPM.Contact".to_owned()),
             subject: Some("Ada Lovelace".to_owned()),
             sender_name: Some("not valid contact sender metadata".to_owned()),
@@ -1838,6 +1867,7 @@ mod tests {
         };
         let retained = [CanonicalFolder {
             path: vec!["Contacts".to_owned()],
+            location: CanonicalFolderLocation::IpmSubtree,
             role: CanonicalFolderRole::Ordinary,
             container_class: Some("IPF.Contact".to_owned()),
         }];
@@ -1878,7 +1908,9 @@ mod tests {
                 occurrence: 0,
             },
             folder_path: vec!["Calendar".to_owned()],
+            folder_location: CanonicalFolderLocation::IpmSubtree,
             folder_role: CanonicalFolderRole::Ordinary,
+            placement: CanonicalMessagePlacement::Normal,
             message_class: Some("IPM.Appointment".to_owned()),
             subject: Some("Appointment fidelity checkpoint".to_owned()),
             sender_name: None,
@@ -1893,6 +1925,7 @@ mod tests {
         };
         let retained = [CanonicalFolder {
             path: vec!["Calendar".to_owned()],
+            location: CanonicalFolderLocation::IpmSubtree,
             role: CanonicalFolderRole::Ordinary,
             container_class: Some("IPF.Appointment".to_owned()),
         }];
@@ -1933,7 +1966,9 @@ mod tests {
                 occurrence: 0,
             },
             folder_path: vec!["Inbox".to_owned()],
+            folder_location: CanonicalFolderLocation::IpmSubtree,
             folder_role: CanonicalFolderRole::Ordinary,
+            placement: CanonicalMessagePlacement::Normal,
             message_class: Some("IPM.Note".to_owned()),
             subject: Some("large attachment".to_owned()),
             sender_name: Some("Sender".to_owned()),
@@ -2062,7 +2097,9 @@ mod tests {
                 occurrence: 0,
             },
             folder_path: vec!["Inbox".to_owned()],
+            folder_location: CanonicalFolderLocation::IpmSubtree,
             folder_role: CanonicalFolderRole::Ordinary,
+            placement: CanonicalMessagePlacement::Normal,
             message_class: Some("IPM.Note".to_owned()),
             subject: Some("contained properties".to_owned()),
             sender_name: Some("Sender".to_owned()),
@@ -2219,21 +2256,22 @@ mod tests {
         assert!(supported_message_class(
             "ipm.ole.class.{00061055-0000-0000-c000-000000000046}"
         ));
-        assert!(!supported_message_class("IPM.NoteCustom"));
-        assert!(!supported_message_class("IPM.ContactCustom"));
-        assert!(!supported_message_class("IPM.AppointmentCustom"));
-        assert!(!supported_message_class("IPM.Schedule.Meeting"));
-        assert!(!supported_message_class("IPM.Schedule.MeetingRequest"));
-        assert!(!supported_message_class("IPM.TaskRequest"));
-        assert!(!supported_message_class("IPM.StickyNoteCustom"));
-        assert!(!supported_message_class("IPM.PostCustom"));
-        assert!(!supported_message_class(
+        assert!(supported_message_class("IPM.NoteCustom"));
+        assert!(supported_message_class("IPM.ContactCustom"));
+        assert!(supported_message_class("IPM.AppointmentCustom"));
+        assert!(supported_message_class("IPM.Schedule.Meeting"));
+        assert!(supported_message_class("IPM.Schedule.MeetingRequest"));
+        assert!(supported_message_class("IPM.TaskRequest"));
+        assert!(supported_message_class("IPM.StickyNoteCustom"));
+        assert!(supported_message_class("IPM.PostCustom"));
+        assert!(supported_message_class(
             "IPM.OLE.CLASS.{00061055-0000-0000-C000-000000000046}.Custom"
         ));
-        assert!(!supported_message_class(
+        assert!(supported_message_class(
             "IPM.OLE.CLASS.{00061056-0000-0000-C000-000000000046}"
         ));
-        assert!(!supported_message_class("REPORT.IPM.NoteDR"));
+        assert!(supported_message_class("REPORT.IPM.NoteDR"));
+        assert!(!supported_message_class(""));
         assert!(attachment_property_type_is_preservable(0x7FFB, 0x0040));
         assert!(!attachment_property_type_is_preservable(0x7FFB, 0x000B));
 
@@ -2248,7 +2286,9 @@ mod tests {
                 occurrence: 0,
             },
             folder_path: vec!["Inbox".to_owned()],
+            folder_location: CanonicalFolderLocation::IpmSubtree,
             folder_role: CanonicalFolderRole::Ordinary,
+            placement: CanonicalMessagePlacement::Normal,
             message_class: Some(class.to_owned()),
             subject: Some(format!("message {id}")),
             sender_name: Some("Sender".to_owned()),

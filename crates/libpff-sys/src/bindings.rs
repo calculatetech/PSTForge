@@ -284,6 +284,17 @@ unsafe extern "C" {
         sub_message: *mut *mut libpff_item_t,
         error: *mut *mut libpff_error_t,
     ) -> c_int;
+    pub(crate) fn libpff_folder_get_number_of_sub_associated_contents(
+        folder: *mut libpff_item_t,
+        number_of_sub_associated_contents: *mut c_int,
+        error: *mut *mut libpff_error_t,
+    ) -> c_int;
+    pub(crate) fn libpff_folder_get_sub_associated_content(
+        folder: *mut libpff_item_t,
+        sub_associated_content_index: c_int,
+        sub_associated_content: *mut *mut libpff_item_t,
+        error: *mut *mut libpff_error_t,
+    ) -> c_int;
 
     pub(crate) fn libpff_message_get_entry_value_utf8_string_size(
         message: *mut libpff_item_t,
