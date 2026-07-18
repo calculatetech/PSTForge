@@ -257,7 +257,10 @@ fn run() -> Result<(), String> {
             Some("appointments") => qualify_appointments(&root, Path::new(&output)),
             Some("meetings") => qualify_meetings(&root, Path::new(&output)),
             Some("pim-items") => qualify_pim_items(&root, Path::new(&output)),
-            _ => Err("unknown qualification checkpoint; expected embedded-attachments, named-properties, empty-folders, contacts, appointments, meetings, or pim-items".to_owned()),
+            Some("calendar-exceptions") => {
+                qualify_calendar_exceptions(&root, Path::new(&output))
+            }
+            _ => Err("unknown qualification checkpoint; expected embedded-attachments, named-properties, empty-folders, contacts, appointments, meetings, pim-items, or calendar-exceptions".to_owned()),
         };
     }
     if command != std::ffi::OsStr::new("gate") {
@@ -289,7 +292,7 @@ fn run() -> Result<(), String> {
 }
 
 fn usage() -> String {
-    "usage: cargo xtask gate <fast|full|release> | qualify <embedded-attachments|named-properties|empty-folders|contacts|appointments|meetings|pim-items> <output>"
+    "usage: cargo xtask gate <fast|full|release> | qualify <embedded-attachments|named-properties|empty-folders|contacts|appointments|meetings|pim-items|calendar-exceptions> <output>"
         .to_owned()
 }
 
@@ -316,6 +319,7 @@ fn qualify_embedded_attachments(root: &Path, output: &Path) -> Result<(), String
         content_location: Some("nested/payload.bin".to_owned()),
         rendering_position: Some(42),
         flags: 7,
+        raw_properties: Vec::new(),
         content: AttachmentContent::Binary(b"nested payload checkpoint".to_vec()),
     });
     embedded.attachments.push(AttachmentSpec {
@@ -325,6 +329,7 @@ fn qualify_embedded_attachments(root: &Path, output: &Path) -> Result<(), String
         content_location: None,
         rendering_position: None,
         flags: 0,
+        raw_properties: Vec::new(),
         content: AttachmentContent::Binary(b"embedded payload checkpoint".to_vec()),
     });
     embedded.attachments.push(AttachmentSpec {
@@ -334,6 +339,7 @@ fn qualify_embedded_attachments(root: &Path, output: &Path) -> Result<(), String
         content_location: None,
         rendering_position: None,
         flags: 0,
+        raw_properties: Vec::new(),
         content: AttachmentContent::Embedded(Box::new(nested)),
     });
     publish_fidelity_qualification(root, output, &fixture, 3)
@@ -896,6 +902,93 @@ fn qualify_pim_items(root: &Path, output: &Path) -> Result<(), String> {
         ],
     };
     publish_qualification(root, output, 3, |part| {
+        pstforge_pst::writer::create_mail_store(part, &spec)
+    })
+}
+
+fn qualify_calendar_exceptions(root: &Path, output: &Path) -> Result<(), String> {
+    use pstforge_pst::writer::{
+        AttachmentContent, AttachmentSpec, FidelityStore, MailFolderRole, MailFolderSpec,
+        MailStoreSpec, RawProperty, RawPropertyValue,
+    };
+
+    const ORIGINAL_START: i64 = 133_815_132_000_000_000;
+    const ORIGINAL_END: i64 = 133_815_168_000_000_000;
+
+    let fixture = FidelityStore::default();
+    let mut appointment = fixture.message;
+    appointment.message_class = "IPM.Appointment".to_owned();
+    appointment.subject = "Recurring appointment exception checkpoint".to_owned();
+    appointment.recipients.clear();
+    appointment.attachments.clear();
+    appointment.raw_properties.clear();
+
+    let mut exception = appointment.clone();
+    exception.message_class = "IPM.OLE.CLASS.{00061055-0000-0000-C000-000000000046}".to_owned();
+    exception.subject = "Modified recurrence instance checkpoint".to_owned();
+    exception.attachments.clear();
+
+    appointment.attachments.push(AttachmentSpec {
+        filename: "Modified recurrence instance.msg".to_owned(),
+        mime_type: Some("application/vnd.ms-outlook".to_owned()),
+        content_id: None,
+        content_location: None,
+        rendering_position: None,
+        flags: 0,
+        raw_properties: vec![
+            RawProperty {
+                id: 0x3001,
+                value: RawPropertyValue::Unicode(
+                    "Modified recurrence instance checkpoint".to_owned(),
+                ),
+            },
+            RawProperty {
+                id: 0x3702,
+                value: RawPropertyValue::Binary(Vec::new()),
+            },
+            RawProperty {
+                id: 0x3709,
+                value: RawPropertyValue::Binary(vec![0x01, 0x00, 0x00, 0x00]),
+            },
+            RawProperty {
+                id: 0x7FFA,
+                value: RawPropertyValue::Integer32(0),
+            },
+            RawProperty {
+                id: 0x7FFB,
+                value: RawPropertyValue::Time(ORIGINAL_START),
+            },
+            RawProperty {
+                id: 0x7FFC,
+                value: RawPropertyValue::Time(ORIGINAL_END),
+            },
+            RawProperty {
+                id: 0x7FFD,
+                value: RawPropertyValue::Integer32(2),
+            },
+            RawProperty {
+                id: 0x7FFE,
+                value: RawPropertyValue::Boolean(true),
+            },
+            RawProperty {
+                id: 0x7FFF,
+                value: RawPropertyValue::Boolean(false),
+            },
+        ],
+        content: AttachmentContent::Embedded(Box::new(exception)),
+    });
+
+    let spec = MailStoreSpec {
+        store_name: fixture.store_name,
+        record_key: fixture.record_key,
+        folders: vec![MailFolderSpec {
+            path: vec!["Calendar".to_owned()],
+            role: MailFolderRole::Ordinary,
+            container_class: "IPF.Appointment".to_owned(),
+            messages: vec![appointment],
+        }],
+    };
+    publish_qualification(root, output, 2, |part| {
         pstforge_pst::writer::create_mail_store(part, &spec)
     })
 }

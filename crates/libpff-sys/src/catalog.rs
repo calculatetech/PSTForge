@@ -765,9 +765,11 @@ fn process_message(
         "get recipient count",
         work.item.optional_u32(RECIPIENT_COUNT),
     )?;
+    // Catalog support is a class/intake capability. Parent class and
+    // attachment-linkage validity are enforced after the full graph is durable.
     let supported = message_class
         .as_deref()
-        .is_some_and(supported_message_class);
+        .is_some_and(|value| supported_message_class(value, work.parent_message_id.is_some()));
     let unsupported_messages = if supported {
         catalog.unsupported_messages
     } else {
@@ -894,7 +896,7 @@ fn process_message(
     )
 }
 
-fn supported_message_class(value: &str) -> bool {
+fn supported_message_class(value: &str, embedded: bool) -> bool {
     class_is_or_descends_from(value, "IPM.Note")
         || class_descends_from(value, "REPORT.IPM.Note")
         || class_is_or_descends_from(value, "IPM.Contact")
@@ -903,6 +905,11 @@ fn supported_message_class(value: &str) -> bool {
         || class_is_or_descends_from(value, "IPM.Task")
         || class_is_or_descends_from(value, "IPM.StickyNote")
         || class_is_or_descends_from(value, "IPM.Post")
+        || (embedded && calendar_exception_message_class(value))
+}
+
+fn calendar_exception_message_class(value: &str) -> bool {
+    value.eq_ignore_ascii_case("IPM.OLE.CLASS.{00061055-0000-0000-C000-000000000046}")
 }
 
 fn class_is_or_descends_from(value: &str, root: &str) -> bool {
@@ -2257,9 +2264,34 @@ mod tests {
         RecoveryMode, RecoveryUnit, STREAM_CHUNK_BYTES, checked_increment, contain_filetime,
         decode_native_identity_string, decode_native_string, mark_stable_top_level_identifier,
         record_attachment_issue, record_item_issue, recover_item_value, recovered_provenance,
-        recovery_flags, stable_top_level_identifier_seen, validate_string_size,
+        recovery_flags, stable_top_level_identifier_seen, supported_message_class,
+        validate_string_size,
     };
     use crate::PffError;
+
+    #[test]
+    fn only_the_exact_calendar_exception_class_is_supported() {
+        assert!(supported_message_class(
+            "IPM.OLE.CLASS.{00061055-0000-0000-C000-000000000046}",
+            true
+        ));
+        assert!(supported_message_class(
+            "ipm.ole.class.{00061055-0000-0000-c000-000000000046}",
+            true
+        ));
+        assert!(!supported_message_class(
+            "IPM.OLE.CLASS.{00061055-0000-0000-C000-000000000046}",
+            false
+        ));
+        assert!(!supported_message_class(
+            "IPM.OLE.CLASS.{00061055-0000-0000-C000-000000000046}.Custom",
+            true
+        ));
+        assert!(!supported_message_class(
+            "IPM.OLE.CLASS.{00061056-0000-0000-C000-000000000046}",
+            true
+        ));
+    }
 
     #[test]
     fn named_property_identity_rejects_invalid_utf8() {

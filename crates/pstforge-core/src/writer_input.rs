@@ -158,7 +158,7 @@ fn build_part_writer_input_expected(
     let mut omitted_attachments = 0_u64;
     for mail in messages {
         source.check_interrupted()?;
-        let translated = translate_message(&source, mail)?;
+        let translated = translate_message(&source, mail, false)?;
         partial |= translated.partial;
         omitted_properties = omitted_properties.saturating_add(translated.omitted_properties);
         omitted_attachments = omitted_attachments.saturating_add(translated.omitted_attachments);
@@ -259,6 +259,7 @@ struct TranslatedMessage {
 fn translate_message(
     job: &TranslationSource<'_>,
     mail: &CanonicalMail,
+    allow_calendar_exception: bool,
 ) -> Result<TranslatedMessage, CanonicalWriteError> {
     let mut partial = !matches!(mail.completeness, crate::ContentCompleteness::Complete);
     let mut omitted_properties = 0_u64;
@@ -658,7 +659,9 @@ fn translate_message(
         .message_class
         .clone()
         .unwrap_or_else(|| "IPM.Note".to_owned());
-    if !supported_message_class(&message_class) {
+    if !supported_message_class(&message_class)
+        || (calendar_exception_message_class(&message_class) && !allow_calendar_exception)
+    {
         return invalid(mail, format!("unsupported message class {message_class:?}"));
     }
     let subject = mail
@@ -783,8 +786,17 @@ fn translate_attachment(
     let mut content_location = None;
     let mut rendering_position = None;
     let mut flags = 0;
+    let mut raw_properties = Vec::new();
     let mut omitted_properties = 0_u64;
     let mut mapped_property_ids = BTreeSet::new();
+    let parent_class = mail.message_class.as_deref().unwrap_or("IPM.Note");
+    let preserves_calendar_exception = appointment_message_class(parent_class)
+        && attachment
+            .embedded
+            .as_ref()
+            .and_then(|message| message.message_class.as_deref())
+            .is_some_and(calendar_exception_message_class)
+        && calendar_exception_attachment_has_linkage(attachment);
     for property in &attachment.properties {
         let Some(property_id) = property.property_id else {
             omitted_properties = omitted_properties.saturating_add(1);
@@ -822,6 +834,54 @@ fn translate_attachment(
                 }
             }
             id if attachment_property_is_mapped(id) => {}
+            id if preserves_calendar_exception
+                && attachment_property_is_preservable(id)
+                && property.named_property.is_none() =>
+            {
+                let Some(property_type) = omit_malformed(
+                    checked_property_type(mail, property),
+                    &mut omitted_properties,
+                )?
+                else {
+                    continue;
+                };
+                if !attachment_property_type_is_preservable(id, property_type) {
+                    omitted_properties = omitted_properties.saturating_add(1);
+                    continue;
+                }
+                let id = u16::try_from(id).map_err(|_| CanonicalWriteError::InvalidProperty {
+                    item_key: mail.durable_item_key.clone(),
+                    property_id: id,
+                    detail: "attachment property identifier is out of range".to_owned(),
+                })?;
+                let omissions_before_value = omitted_properties;
+                let value = match property_type {
+                    0x001F => match omit_malformed(
+                        read_unicode(job, mail, property),
+                        &mut omitted_properties,
+                    )? {
+                        Some(Some(value)) => Some(RawPropertyValue::Unicode(value)),
+                        Some(None) => {
+                            omitted_properties = omitted_properties.saturating_add(1);
+                            None
+                        }
+                        None => None,
+                    },
+                    0x0102 if property.blob.byte_len <= 1_048_576 => Some(
+                        RawPropertyValue::Binary(read_blob(job, mail, property, 1_048_576)?),
+                    ),
+                    _ => omit_malformed(
+                        scalar_property(job, mail, property, id, property_type),
+                        &mut omitted_properties,
+                    )?
+                    .flatten(),
+                };
+                if let Some(value) = value {
+                    raw_properties.push(RawProperty { id, value });
+                } else if omitted_properties == omissions_before_value {
+                    omitted_properties = omitted_properties.saturating_add(1);
+                }
+            }
             _ => omitted_properties = omitted_properties.saturating_add(1),
         }
     }
@@ -834,7 +894,11 @@ fn translate_attachment(
         child_omitted_attachments,
     ) = if let Some(embedded) = &attachment.embedded {
         let message_class = embedded.message_class.as_deref().unwrap_or("IPM.Note");
-        if !supported_message_class(message_class) {
+        let calendar_exception = calendar_exception_message_class(message_class);
+        if !supported_message_class(message_class)
+            || (calendar_exception && !preserves_calendar_exception)
+            || (calendar_exception && !calendar_exception_raw_linkage_is_complete(&raw_properties))
+        {
             let mut unsupported_item_keys = Vec::new();
             collect_message_item_keys(embedded, &mut unsupported_item_keys);
             return Ok(Some(TranslatedAttachment {
@@ -846,7 +910,7 @@ fn translate_attachment(
                 omitted_attachments: 1,
             }));
         }
-        let translated = translate_message(job, embedded)?;
+        let translated = translate_message(job, embedded, calendar_exception)?;
         (
             AttachmentContent::Embedded(Box::new(translated.message)),
             translated.item_keys,
@@ -893,6 +957,7 @@ fn translate_attachment(
             content_location,
             rendering_position,
             flags,
+            raw_properties,
             content,
         }),
         item_keys,
@@ -1160,6 +1225,7 @@ fn supported_message_class(value: &str) -> bool {
         || task_message_class(value)
         || sticky_note_message_class(value)
         || post_message_class(value)
+        || calendar_exception_message_class(value)
 }
 
 fn contact_message_class(value: &str) -> bool {
@@ -1184,6 +1250,10 @@ fn sticky_note_message_class(value: &str) -> bool {
 
 fn post_message_class(value: &str) -> bool {
     class_is_or_descends_from(value, "IPM.Post")
+}
+
+fn calendar_exception_message_class(value: &str) -> bool {
+    value.eq_ignore_ascii_case("IPM.OLE.CLASS.{00061055-0000-0000-C000-000000000046}")
 }
 
 fn sender_optional_message_class(value: &str) -> bool {
@@ -1568,7 +1638,39 @@ fn expected_recipient_property_value(
 }
 
 fn attachment_property_is_mapped(id: u32) -> bool {
-    matches!(id, 0x0E20 | 0x3701 | 0x3704 | 0x3705 | 0x3707)
+    matches!(id, 0x0E20 | 0x0E21 | 0x3701 | 0x3704 | 0x3705 | 0x3707)
+}
+
+fn attachment_property_is_preservable(id: u32) -> bool {
+    matches!(id, 0x3001 | 0x3702 | 0x3709 | 0x7FFA..=0x7FFF)
+}
+
+fn attachment_property_type_is_preservable(id: u32, property_type: u16) -> bool {
+    matches!(
+        (id, property_type),
+        (0x3001, 0x001F)
+            | (0x3702 | 0x3709, 0x0102)
+            | (0x7FFA | 0x7FFD, 0x0003)
+            | (0x7FFB | 0x7FFC, 0x0040)
+            | (0x7FFE | 0x7FFF, 0x000B)
+    )
+}
+
+fn calendar_exception_attachment_has_linkage(attachment: &CanonicalAttachment) -> bool {
+    (0x7FFA..=0x7FFE).all(|id| {
+        attachment
+            .properties
+            .iter()
+            .any(|property| property.record_set_index == 0 && property.property_id == Some(id))
+    })
+}
+
+fn calendar_exception_raw_linkage_is_complete(properties: &[RawProperty]) -> bool {
+    (0x7FFA..=0x7FFE).all(|id| {
+        properties
+            .iter()
+            .any(|property| u32::from(property.id) == id)
+    })
 }
 
 fn checked_property_type(
@@ -1633,11 +1735,11 @@ mod tests {
     use tempfile::tempdir;
 
     use super::{
-        PartBuildOptions, build_part_writer_input,
-        build_part_writer_input_with_folders_interruptible, contain_body_metadata,
-        named_property_set, recipient_property_value_matches, supported_message_class,
-        valid_compressed_rtf_container, valid_utf8_stream, valid_utf16_stream,
-        writer_stream_type_is_supported,
+        CanonicalWriteError, PartBuildOptions, attachment_property_type_is_preservable,
+        build_part_writer_input, build_part_writer_input_with_folders_interruptible,
+        contain_body_metadata, named_property_set, recipient_property_value_matches,
+        supported_message_class, valid_compressed_rtf_container, valid_utf8_stream,
+        valid_utf16_stream, writer_stream_type_is_supported,
     };
     use crate::{
         CanonicalAttachment, CanonicalFolder, CanonicalFolderRole, CanonicalMail,
@@ -2111,6 +2213,12 @@ mod tests {
         assert!(supported_message_class("ipm.stickynote.custom"));
         assert!(supported_message_class("IPM.Post"));
         assert!(supported_message_class("ipm.post.custom"));
+        assert!(supported_message_class(
+            "IPM.OLE.CLASS.{00061055-0000-0000-C000-000000000046}"
+        ));
+        assert!(supported_message_class(
+            "ipm.ole.class.{00061055-0000-0000-c000-000000000046}"
+        ));
         assert!(!supported_message_class("IPM.NoteCustom"));
         assert!(!supported_message_class("IPM.ContactCustom"));
         assert!(!supported_message_class("IPM.AppointmentCustom"));
@@ -2119,7 +2227,15 @@ mod tests {
         assert!(!supported_message_class("IPM.TaskRequest"));
         assert!(!supported_message_class("IPM.StickyNoteCustom"));
         assert!(!supported_message_class("IPM.PostCustom"));
+        assert!(!supported_message_class(
+            "IPM.OLE.CLASS.{00061055-0000-0000-C000-000000000046}.Custom"
+        ));
+        assert!(!supported_message_class(
+            "IPM.OLE.CLASS.{00061056-0000-0000-C000-000000000046}"
+        ));
         assert!(!supported_message_class("REPORT.IPM.NoteDR"));
+        assert!(attachment_property_type_is_preservable(0x7FFB, 0x0040));
+        assert!(!attachment_property_type_is_preservable(0x7FFB, 0x000B));
 
         let directory = tempdir()?;
         let job = DurableCatalogSink::create(&directory.path().join("job"))?;
@@ -2188,6 +2304,86 @@ mod tests {
             directory.path().join("report-message.pst"),
             &clean.store,
         )?;
+
+        let top_level_exception =
+            message(4, "IPM.OLE.CLASS.{00061055-0000-0000-C000-000000000046}");
+        assert!(matches!(
+            build_part_writer_input(
+                &job,
+                &[&top_level_exception],
+                &"0".repeat(64),
+                "balanced",
+                4_294_967_296,
+                1,
+            ),
+            Err(CanonicalWriteError::InvalidCandidate { .. })
+        ));
+
+        let mut malformed_exception = report.clone();
+        malformed_exception.message_class = Some("IPM.Appointment".to_owned());
+        let exception = malformed_exception.attachments[0]
+            .embedded
+            .as_mut()
+            .ok_or("missing exception child")?;
+        exception.message_class =
+            Some("IPM.OLE.CLASS.{00061055-0000-0000-C000-000000000046}".to_owned());
+        malformed_exception.attachments[0].properties = (0x7FFA..=0x7FFE)
+            .enumerate()
+            .map(|(entry_index, property_id)| CanonicalProperty {
+                owner: "attachment".to_owned(),
+                owner_index: Some(0),
+                record_set_index: 0,
+                entry_index: u32::try_from(entry_index).unwrap_or(u32::MAX),
+                property_id: Some(property_id),
+                value_type: None,
+                named_property: None,
+                blob: SpooledBlob {
+                    sha256: "0".repeat(64),
+                    byte_len: 0,
+                    pack_offset: None,
+                },
+            })
+            .collect();
+        let mut duplicate_linkage = malformed_exception.attachments[0].properties[0].clone();
+        duplicate_linkage.entry_index = 5;
+        malformed_exception.attachments[0]
+            .properties
+            .push(duplicate_linkage);
+        malformed_exception.attachments[0]
+            .properties
+            .push(CanonicalProperty {
+                owner: "attachment".to_owned(),
+                owner_index: Some(0),
+                record_set_index: 0,
+                entry_index: 6,
+                property_id: Some(0x3709),
+                value_type: Some(0x0102),
+                named_property: None,
+                blob: SpooledBlob {
+                    sha256: "0".repeat(64),
+                    byte_len: 1_048_577,
+                    pack_offset: None,
+                },
+            });
+        let contained_exception = build_part_writer_input(
+            &job,
+            &[&malformed_exception],
+            &"0".repeat(64),
+            "balanced",
+            4_294_967_296,
+            1,
+        )?;
+        assert!(contained_exception.partial);
+        assert_eq!(contained_exception.item_keys, ["normal:2:-:0"]);
+        assert_eq!(contained_exception.unsupported_item_keys, ["normal:3:-:0"]);
+        assert_eq!(contained_exception.omitted_properties, 7);
+        assert_eq!(contained_exception.omitted_attachments, 1);
+        assert!(
+            contained_exception.store.folders[0].messages[0]
+                .attachments
+                .is_empty()
+        );
+        pstforge_pst::writer::validate_mail_store_input(&contained_exception.store)?;
 
         let mut nested = report.clone();
         let nested_child = message(4, "IPM.Note");

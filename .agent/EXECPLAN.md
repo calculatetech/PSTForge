@@ -1289,8 +1289,102 @@ work. Hash and identity evidence show that the source was not modified.
       the task, sticky note, and post as their native item forms; the Post form
       shows the expected `Task notes checkpoint.` body. This closes checkpoint
       6 for commit and push.
-  - [ ] Checkpoints 7 onward: distribution lists; OLE, documents, and
-    reference attachments; associated/configuration data; task
+  - [ ] Checkpoint 7: recurring-calendar exception objects.
+    - [x] (2026-07-18) Read-only inspection of the completed 19 GB schema-5
+      ledger found four remaining
+      `IPM.OLE.CLASS.{00061055-0000-0000-C000-000000000046}` items. All four
+      are embedded children of two `IPM.Appointment` parents in Calendar and
+      are owned by attachments carrying the MS-OXOCAL exception-link, original
+      start/end, flags, hidden, display-name, encoding, and rendering-data
+      properties. This evidence narrows the checkpoint to recurrence
+      exceptions rather than generic OLE admission.
+    - [x] (2026-07-18) Admit only the exact Microsoft calendar-exception class,
+      case-insensitively, and preserve only attachment properties `0x3001`,
+      `0x3702`, `0x3709`, and `0x7FFA..=0x7FFF` through a bounded raw-property
+      path. Writer-managed attachment number `0x0E21` is explicitly
+      reconstructed rather than falsely counted as omitted. Unknown OLE
+      classes and exact-class suffix lookalikes remain unsupported.
+    - [x] (2026-07-18) Job schema 13 refuses schema-12 resumes because the old
+      durable catalog can already contain exact calendar-exception children
+      marked unsupported. The focused refusal regression passes.
+    - [x] (2026-07-18) Added external case
+      `v042-calendar-exception-source`, 271,360 bytes, SHA-256
+      `149b6e4eb4eddfe2a5dc26e48e4e1d91e26e6a41324120613b9d5c70a0e48e22`.
+      It contains one Calendar appointment with one embedded exact-class
+      exception object and all nine exception attachment properties.
+      Independent libpff fingerprints bind property identifier, type, length,
+      payload hash, attachment owner, exact embedded class, and embedded path.
+    - [x] (2026-07-18) The focused CLI split writes two complete candidates in
+      one part with zero folder, property, or attachment omissions. Exact
+      source/output fingerprints match after excluding only `PR_ATTACH_SIZE`
+      for embedded messages: that value is a derived byte size of the newly
+      serialized child object, while binary attachment sizes remain exact.
+    - [x] (2026-07-18) Complete fast automation passes at
+      `.agent/test-results/1784378221-fast`; the exact ignored libpff
+      source/output roundtrip passes again after the gate.
+    - [x] (2026-07-18) The first focused review found one high containment
+      defect and one medium boundary expansion. Malformed exception values
+      could reject the whole appointment graph, and the exact OLE class/raw
+      attachment fields were not structurally limited to an embedded child of
+      an appointment.
+    - [x] (2026-07-18) Remediation contains malformed exception values as
+      property omissions. If required linkage cannot be retained, only the
+      exception attachment and child become unsupported while the appointment
+      remains writable and partial. Catalog intake rejects the exact exception
+      class at top level, and writer validation requires an appointment parent,
+      embedded exact-class child, and `0x7FFA..=0x7FFE` linkage. Focused
+      containment, top-level, wrong-parent, missing-linkage, wrong-type, and
+      exact external roundtrip tests pass.
+    - [x] (2026-07-18) Remediation passes the complete fast gate at
+      `.agent/test-results/1784378783-fast`; the exact ignored libpff
+      source/output roundtrip passes again after the gate.
+    - [x] (2026-07-18) The remediation review identified oversized-binary
+      omission accounting and retained-evidence gaps, both applicable. It also
+      raised duplicate raw IDs and catalog parent/linkage admission. Duplicate
+      IDs were already contained by the shared attachment property-ID set
+      before translation, now covered explicitly by the malformed exception
+      regression. Catalog `supported` records class/intake capability; full
+      parent and linkage structure is deliberately decided after the durable
+      graph exists, where core marks the child unsupported before publication.
+    - [x] (2026-07-18) An exception binary over the 1 MiB bounded-copy limit now
+      increments exact omission accounting. The containment regression combines
+      absent types, a duplicate linkage ID, and an oversized rendering payload:
+      the parent remains writable, the unusable exception child and attachment
+      are omitted, and all seven property omissions are counted. The external
+      test now rechecks source identity after the split.
+    - [x] (2026-07-18) Final remediation passes the complete fast gate at
+      `.agent/test-results/1784379147-fast`. The exact external roundtrip and
+      post-run source identity check pass with retained transcript at
+      `.agent/test-results/1784379148-calendar-exception/external-roundtrip.log`.
+    - [x] (2026-07-18) The final reviewer found one medium evidence-placement
+      error: the post-run source identity assertion had landed in the earlier
+      appointment test rather than this checkpoint's test. The assertion now
+      executes in the calendar-exception roundtrip; its retained transcript is
+      refreshed, and the complete fast gate passes at
+      `.agent/test-results/1784379372-fast`.
+    - [x] (2026-07-18) A fresh focused review confirms the source-identity
+      assertion relocation and final uncommitted checkpoint state are clean
+      with no blocker, high, or medium finding.
+    - [x] (2026-07-18) Generated the single bounded human candidate at
+      `qualification-v042-calendar-exception-r1/parts/part-0001.pst`: 271,360
+      bytes, SHA-256
+      `149b6e4eb4eddfe2a5dc26e48e4e1d91e26e6a41324120613b9d5c70a0e48e22`.
+      PSTForge full verification reports Unicode64, no observed corruption,
+      two complete items, one embedded message, one attachment, zero
+      unsupported items, and zero issues; `pffinfo` opens it successfully.
+      The recovery log reports no readable data skipped. Superseded source r1
+      and bounded debug jobs were removed; source r2 remains the external
+      manifest reference.
+    - [x] (2026-07-18) The owner reports all-green ScanPST and Outlook
+      acceptance for the original, unrepaired candidate. Outlook search finds
+      the appointment and it opens and remains editable without corruption.
+      The deliberately structural fixture has no parent appointment date, so
+      Outlook displays no calendar date until one is assigned; exact hidden
+      exception linkage is proven by the independent libpff roundtrip rather
+      than visible recurrence UI. This closes checkpoint 7 for commit and
+      push.
+  - [ ] Checkpoints 8 onward: distribution lists; documents and reference
+    attachments; associated/configuration data; task
     communications; journal/activity objects; and remaining generic classes,
     each proven separately where feasible.
   - [ ] Run the complete 19 GB split once after all focused checkpoints pass
@@ -1374,6 +1468,17 @@ work. Hash and identity evidence show that the source was not modified.
   Evidence: the generated 0.2.1 fixture initially reported one attachment and
   an invalid local-descriptor lookup; after the nested descriptor correction,
   `libpff` reported two attachments and one embedded message without issues.
+
+- Observation: The completed 19 GB ledger contains four unsupported OLE-class
+  items, but all four use Microsoft's exact calendar-exception class and are
+  embedded under two recurring appointments. Their owning attachments contain
+  the documented MS-OXOCAL `0x7FFA..=0x7FFF` exception linkage and timing
+  fields. The only other unsupported item in that source is one root-level
+  `IPM.Microsoft.SniffData` configuration item, so generic OLE admission would
+  be broader than the measured source requires.
+  Evidence: read-only SQLite inspection of
+  `/storage/PSTForge/qualification-v041-pack-r11/.pstforge/job.sqlite3` and
+  Microsoft MS-OXOCAL property contracts on 2026-07-18.
 
 - Observation: `PidTagHasAttachments` alone is insufficient for broad reader
   behavior. `PidTagMessageFlags` must also carry `MSGFLAG_HASATTACH`, and each
@@ -2413,6 +2518,19 @@ work. Hash and identity evidence show that the source was not modified.
   would conceal materially different integrity risks.
   Date/Author: 2026-07-18 / Codex from checkpoint-6 implementation evidence.
 
+- Decision: Job schema 13 admits only the exact
+  `IPM.OLE.CLASS.{00061055-0000-0000-C000-000000000046}` calendar-exception
+  class and preserves its attachment-owned recurrence linkage separately from
+  generic OLE, document, and associated-message storage.
+  Rationale: MS-OXOCAL defines this exact embedded class and its exception
+  attachment properties, and the 19 GB source confirms that exact shape.
+  Dotted descendants and other OLE GUIDs have no demonstrated equivalent
+  contract. `PR_ATTACH_SIZE` for an embedded object is recalculated from the
+  output child and is therefore compared semantically rather than byte-for-byte;
+  exception properties and binary attachment content remain exact.
+  Date/Author: 2026-07-18 / Codex from checkpoint-7 implementation and
+  independent libpff roundtrip evidence.
+
 - Decision: The appointment checkpoint proves a standalone, non-recurring
   `IPM.Appointment` before meeting and recurrence families. Preserve the exact
   PSETID_Appointment and PSETID_Common named-property identities and values;
@@ -2993,6 +3111,18 @@ percent complete, incomplete state, and the expected notes. Confirm the
 and the expected body. Confirm the `Posts` folder contains
 `Post fidelity checkpoint` from `PSTForge Poster`, opens as a Post item, and
 shows the expected body. Stop and provide the ScanPST log if ScanPST reports
+any error or requests repair.
+
+For checkpoint 7, select external case
+`v042-calendar-exception-source`, run ignored test
+`milestone_0_4_2_calendar_exceptions_roundtrip_through_libpff`, and scan only
+`qualification-v042-calendar-exception-r1/parts/part-0001.pst`. Then open the
+original, unrepaired candidate in Outlook. Confirm the `Calendar` folder opens
+normally and the `Recurring appointment exception checkpoint` appointment can
+be opened without an item-corruption warning. The bounded fixture proves the
+hidden exception object and its attachment-owned linkage through exact libpff
+fingerprints; it does not fabricate a complete recurrence pattern for visible
+calendar-instance testing. Stop and provide the ScanPST log if ScanPST reports
 any error or requests repair.
 
 After every available focused checkpoint succeeds, run the complete 19 GB

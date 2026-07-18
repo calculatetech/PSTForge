@@ -174,6 +174,7 @@ pub struct AttachmentSpec {
     pub content_location: Option<String>,
     pub rendering_position: Option<i32>,
     pub flags: i32,
+    pub raw_properties: Vec<RawProperty>,
     pub content: AttachmentContent,
 }
 
@@ -443,6 +444,7 @@ impl Default for FidelityStore {
                         content_location: Some("checkpoint.txt".to_owned()),
                         rendering_position: Some(0),
                         flags: 4,
+                        raw_properties: Vec::new(),
                         content: AttachmentContent::Binary(
                             (0..16 * 1024)
                                 .map(|index| b'A' + (index % 26) as u8)
@@ -456,6 +458,7 @@ impl Default for FidelityStore {
                         content_location: None,
                         rendering_position: None,
                         flags: 0,
+                        raw_properties: Vec::new(),
                         content: AttachmentContent::Embedded(Box::new(embedded)),
                     },
                 ],
@@ -3239,6 +3242,12 @@ fn validate_attachment_property_context_shape(
             .ok_or(WriterError::ValueTooLarge("attachment property count"))?;
         lengths.push(unicode_payload_len(value)?);
     }
+    property_count = property_count
+        .checked_add(attachment.raw_properties.len())
+        .ok_or(WriterError::ValueTooLarge("attachment property count"))?;
+    for property in &attachment.raw_properties {
+        lengths.push(raw_value_payload_len(&property.value)?);
+    }
     match &attachment.content {
         AttachmentContent::Binary(data) if data.len() <= 2048 => lengths.push(data.len()),
         AttachmentContent::Embedded(_) => lengths.push(8),
@@ -3396,6 +3405,11 @@ fn validate_message(message: &MessageSpec, depth: usize) -> Result<(), WriterErr
             "unsupported message class: {}",
             message.message_class
         )));
+    }
+    if depth == 0 && calendar_exception_message_class(&message.message_class) {
+        return Err(WriterError::InvalidStructure(
+            "calendar-exception messages must be embedded".to_owned(),
+        ));
     }
     if message.internet_codepage <= 0 {
         return Err(WriterError::InvalidStructure(
@@ -3582,6 +3596,75 @@ fn validate_message(message: &MessageSpec, depth: usize) -> Result<(), WriterErr
             }
             validate_unicode("attachment content location", content_location)?;
         }
+        let embedded_calendar_exception = matches!(
+            &attachment.content,
+            AttachmentContent::Embedded(child)
+                if calendar_exception_message_class(&child.message_class)
+        );
+        if embedded_calendar_exception
+            && (!appointment_message_class(&message.message_class)
+                || !calendar_exception_attachment_has_linkage(attachment))
+        {
+            return Err(WriterError::InvalidStructure(
+                "calendar-exception messages require an appointment parent and linkage properties"
+                    .to_owned(),
+            ));
+        }
+        if !attachment.raw_properties.is_empty()
+            && (!appointment_message_class(&message.message_class) || !embedded_calendar_exception)
+        {
+            return Err(WriterError::InvalidStructure(
+                "calendar-exception attachment properties require an embedded exception".to_owned(),
+            ));
+        }
+        if attachment.raw_properties.len() > MAX_FIDELITY_COLLECTION_ITEMS {
+            return Err(WriterError::ValueTooLarge("attachment raw-property count"));
+        }
+        let mut raw_ids = attachment
+            .raw_properties
+            .iter()
+            .map(|property| property.id)
+            .collect::<Vec<_>>();
+        raw_ids.sort_unstable();
+        if raw_ids.windows(2).any(|pair| pair[0] == pair[1]) {
+            return Err(WriterError::InvalidStructure(
+                "duplicate attachment raw property identifier".to_owned(),
+            ));
+        }
+        let raw_bytes =
+            attachment
+                .raw_properties
+                .iter()
+                .try_fold(0_usize, |total, property| {
+                    if property.id == 0
+                        || property.id >= 0x8000
+                        || explicit_attachment_property(property.id)
+                        || !calendar_exception_attachment_property(property.id)
+                    {
+                        return Err(WriterError::InvalidStructure(format!(
+                            "attachment raw property 0x{:04X} is not a supported calendar-exception property",
+                            property.id
+                        )));
+                    }
+                    if !calendar_exception_attachment_property_type_is_valid(
+                        property.id,
+                        &property.value,
+                    ) {
+                        return Err(WriterError::InvalidStructure(format!(
+                            "attachment raw property 0x{:04X} has the wrong calendar-exception type",
+                            property.id
+                        )));
+                    }
+                    validate_raw_value(&property.value)?;
+                    total.checked_add(raw_value_payload_len(&property.value)?).ok_or(
+                        WriterError::ValueTooLarge("aggregate attachment raw-property payload"),
+                    )
+                })?;
+        if raw_bytes > MAX_FIDELITY_CUSTOM_PROPERTY_BYTES {
+            return Err(WriterError::ValueTooLarge(
+                "aggregate attachment raw-property payload",
+            ));
+        }
         if let AttachmentContent::Binary(data) = &attachment.content {
             validate_payload_len("attachment payload", data.len())?;
         }
@@ -3699,6 +3782,7 @@ fn supported_message_class(value: &str) -> bool {
         || task_message_class(value)
         || sticky_note_message_class(value)
         || post_message_class(value)
+        || calendar_exception_message_class(value)
 }
 
 fn contact_message_class(value: &str) -> bool {
@@ -3723,6 +3807,10 @@ fn sticky_note_message_class(value: &str) -> bool {
 
 fn post_message_class(value: &str) -> bool {
     class_is_or_descends_from(value, "IPM.Post")
+}
+
+fn calendar_exception_message_class(value: &str) -> bool {
+    value.eq_ignore_ascii_case("IPM.OLE.CLASS.{00061055-0000-0000-C000-000000000046}")
 }
 
 fn sender_optional_message_class(value: &str) -> bool {
@@ -3844,6 +3932,47 @@ fn explicit_message_property(id: u16) -> bool {
             | 0x300B
             | 0x3FDE
     )
+}
+
+fn explicit_attachment_property(id: u16) -> bool {
+    matches!(
+        id,
+        0x0E20
+            | 0x0E21
+            | 0x3701
+            | 0x3704
+            | 0x3705
+            | 0x3707
+            | 0x370B
+            | 0x370E
+            | 0x3712
+            | 0x3713
+            | 0x3714
+    )
+}
+
+fn calendar_exception_attachment_property(id: u16) -> bool {
+    matches!(id, 0x3001 | 0x3702 | 0x3709 | 0x7FFA..=0x7FFF)
+}
+
+fn calendar_exception_attachment_property_type_is_valid(id: u16, value: &RawPropertyValue) -> bool {
+    matches!(
+        (id, value),
+        (0x3001, RawPropertyValue::Unicode(_))
+            | (0x3702 | 0x3709, RawPropertyValue::Binary(_))
+            | (0x7FFA | 0x7FFD, RawPropertyValue::Integer32(_))
+            | (0x7FFB | 0x7FFC, RawPropertyValue::Time(_))
+            | (0x7FFE | 0x7FFF, RawPropertyValue::Boolean(_))
+    )
+}
+
+fn calendar_exception_attachment_has_linkage(attachment: &AttachmentSpec) -> bool {
+    (0x7FFA..=0x7FFE).all(|id| {
+        attachment
+            .raw_properties
+            .iter()
+            .any(|property| property.id == id)
+    })
 }
 
 fn validation_property_ids(
@@ -4642,6 +4771,14 @@ fn validate_attachment_fidelity(
         {
             return Err(invalid("completed store attachment metadata mismatch"));
         }
+        for property in &expected.raw_properties {
+            if !properties
+                .get(property.id)
+                .is_some_and(|actual| raw_value_matches(&property.value, actual))
+            {
+                return Err(invalid("completed store attachment raw-property mismatch"));
+            }
+        }
         match (&expected.content, attachment.data()) {
             (AttachmentContent::Binary(expected_data), Some(AttachmentData::Binary(actual))) => {
                 let expected_size = attachment_property_size(&attachment_properties(
@@ -5073,6 +5210,16 @@ fn validate_embedded_message(
             return Err(invalid(
                 "completed store nested attachment metadata mismatch",
             ));
+        }
+        for property in &expected_attachment.raw_properties {
+            if !properties
+                .get(property.id)
+                .is_some_and(|actual| raw_value_matches(&property.value, actual))
+            {
+                return Err(invalid(
+                    "completed store nested attachment raw-property mismatch",
+                ));
+            }
         }
         match (&expected_attachment.content, attachment.data()) {
             (AttachmentContent::Binary(expected), Some(AttachmentData::Binary(actual))) => {
@@ -5852,6 +5999,9 @@ fn attachment_properties(
         properties.push((0x3713, PropertyValue::Unicode(content_location.clone())));
     }
     properties.push((0x3714, PropertyValue::Integer32(attachment.flags)));
+    for property in &attachment.raw_properties {
+        properties.push((property.id, raw_property_value(&property.value)));
+    }
     properties
 }
 
@@ -5865,7 +6015,16 @@ fn attachment_property_size_with_stream(
 ) -> Result<i32, WriterError> {
     let size = properties.iter().try_fold(0_usize, |total, (_, value)| {
         let value_size = match value {
+            PropertyValue::Integer16(_) => 2,
             PropertyValue::Integer32(_) => 4,
+            PropertyValue::Integer64(_)
+            | PropertyValue::Floating64(_)
+            | PropertyValue::Currency(_)
+            | PropertyValue::FloatingTime(_)
+            | PropertyValue::Time(_) => 8,
+            PropertyValue::Floating32(_) | PropertyValue::ErrorCode(_) => 4,
+            PropertyValue::Boolean(_) => 1,
+            PropertyValue::Guid(_) => 16,
             PropertyValue::Unicode(value) => unicode_payload_len(value)?,
             PropertyValue::Binary(value) => value.len(),
             PropertyValue::Object(_, size) => usize::try_from(*size)
@@ -7622,6 +7781,22 @@ mod tests {
     use std::fs::OpenOptions;
 
     #[test]
+    fn only_the_exact_calendar_exception_class_is_supported() {
+        assert!(supported_message_class(
+            "IPM.OLE.CLASS.{00061055-0000-0000-C000-000000000046}"
+        ));
+        assert!(supported_message_class(
+            "ipm.ole.class.{00061055-0000-0000-c000-000000000046}"
+        ));
+        assert!(!supported_message_class(
+            "IPM.OLE.CLASS.{00061055-0000-0000-C000-000000000046}.Custom"
+        ));
+        assert!(!supported_message_class(
+            "IPM.OLE.CLASS.{00061056-0000-0000-C000-000000000046}"
+        ));
+    }
+
+    #[test]
     fn compressed_rtf_has_normative_end_reference() -> Result<(), Box<dyn std::error::Error>> {
         for length in 0..=8 {
             let raw = (0..length)
@@ -8351,6 +8526,7 @@ mod tests {
             content_location: None,
             rendering_position: None,
             flags: 0,
+            raw_properties: Vec::new(),
             content: AttachmentContent::Spooled(FileBlobSpec {
                 path: PathBuf::from("/dev/null"),
                 offset: 0,
@@ -8541,6 +8717,7 @@ mod tests {
             content_location: None,
             rendering_position: None,
             flags: 0,
+            raw_properties: Vec::new(),
             content: AttachmentContent::Spooled(FileBlobSpec {
                 path: source,
                 offset: 0,
@@ -9665,6 +9842,7 @@ mod tests {
                 content_location: None,
                 rendering_position: None,
                 flags: 0,
+                raw_properties: Vec::new(),
                 content: AttachmentContent::Binary(vec![1]),
             });
         }
@@ -9702,6 +9880,7 @@ mod tests {
                 content_location: None,
                 rendering_position: None,
                 flags: 0,
+                raw_properties: Vec::new(),
                 content: AttachmentContent::Embedded(Box::new(child)),
             });
             child = parent;
@@ -9876,6 +10055,7 @@ mod tests {
                 content_location: None,
                 rendering_position: None,
                 flags: 0,
+                raw_properties: Vec::new(),
                 content: AttachmentContent::Binary(Vec::new()),
             })
             .collect();
@@ -10020,6 +10200,104 @@ mod tests {
                 && usize::from(*id - 0x8000) == expected_index
                 && matches!(value, PropertyValue::Boolean(true))
         }));
+        Ok(())
+    }
+
+    #[test]
+    fn calendar_exception_attachment_properties_round_trip()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut spec = FidelityStore::default();
+        spec.message.message_class = "IPM.Appointment".to_owned();
+        let attachment = &mut spec.message.attachments[1];
+        let AttachmentContent::Embedded(message) = &mut attachment.content else {
+            return Err("expected embedded fixture".into());
+        };
+        message.message_class = "IPM.OLE.CLASS.{00061055-0000-0000-C000-000000000046}".to_owned();
+        attachment.raw_properties = vec![
+            RawProperty {
+                id: 0x3001,
+                value: RawPropertyValue::Unicode("exception".to_owned()),
+            },
+            RawProperty {
+                id: 0x3702,
+                value: RawPropertyValue::Binary(Vec::new()),
+            },
+            RawProperty {
+                id: 0x3709,
+                value: RawPropertyValue::Binary(vec![1, 2, 3, 4]),
+            },
+            RawProperty {
+                id: 0x7FFA,
+                value: RawPropertyValue::Integer32(0),
+            },
+            RawProperty {
+                id: 0x7FFB,
+                value: RawPropertyValue::Time(133_815_132_000_000_000),
+            },
+            RawProperty {
+                id: 0x7FFC,
+                value: RawPropertyValue::Time(133_815_168_000_000_000),
+            },
+            RawProperty {
+                id: 0x7FFD,
+                value: RawPropertyValue::Integer32(2),
+            },
+            RawProperty {
+                id: 0x7FFE,
+                value: RawPropertyValue::Boolean(true),
+            },
+            RawProperty {
+                id: 0x7FFF,
+                value: RawPropertyValue::Boolean(false),
+            },
+        ];
+
+        let directory = tempfile::tempdir()?;
+        create_fidelity_store(directory.path().join("calendar-exception.pst"), &spec)?;
+
+        let mut top_level = FidelityStore::default();
+        top_level.message.message_class =
+            "IPM.OLE.CLASS.{00061055-0000-0000-C000-000000000046}".to_owned();
+        assert!(matches!(
+            validate_spec(&top_level),
+            Err(WriterError::InvalidStructure(message))
+                if message.contains("must be embedded")
+        ));
+        let mut wrong_parent = spec.clone();
+        wrong_parent.message.message_class = "IPM.Note".to_owned();
+        assert!(matches!(
+            validate_spec(&wrong_parent),
+            Err(WriterError::InvalidStructure(message))
+                if message.contains("appointment parent")
+        ));
+        let mut missing_linkage = spec.clone();
+        missing_linkage.message.attachments[1]
+            .raw_properties
+            .retain(|property| property.id != 0x7FFA);
+        assert!(matches!(
+            validate_spec(&missing_linkage),
+            Err(WriterError::InvalidStructure(message))
+                if message.contains("linkage properties")
+        ));
+
+        spec.message.attachments[1]
+            .raw_properties
+            .push(RawProperty {
+                id: 0x370A,
+                value: RawPropertyValue::Integer32(1),
+            });
+        assert!(matches!(
+            validate_spec(&spec),
+            Err(WriterError::InvalidStructure(message))
+                if message.contains("not a supported calendar-exception property")
+        ));
+        spec.message.attachments[1].raw_properties.pop();
+        spec.message.attachments[1].raw_properties[4].value = RawPropertyValue::Boolean(true);
+        assert!(matches!(
+            validate_spec(&spec),
+            Err(WriterError::InvalidStructure(message))
+                if message.contains("wrong calendar-exception type")
+        ));
         Ok(())
     }
 

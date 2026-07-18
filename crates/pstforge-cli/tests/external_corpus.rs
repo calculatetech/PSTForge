@@ -488,7 +488,11 @@ impl CatalogSink for IndependentMessageSink {
                         index,
                         attachment_type: attachment.attachment_type,
                         filename: attachment.filename,
-                        declared_size: attachment.declared_size,
+                        declared_size: if attachment.attachment_type == Some(i32::from(b'i')) {
+                            None
+                        } else {
+                            attachment.declared_size
+                        },
                         streamed_size: attachment.streamed_size,
                         sha256: attachment.hasher.finalize().into(),
                         rendering_properties: attachment.rendering_properties,
@@ -544,7 +548,18 @@ impl CatalogSink for IndependentMessageSink {
             CatalogEvent::PropertyStart(descriptor)
                 if matches!(descriptor.owner, PropertyOwner::Attachment { .. })
                     && descriptor.entry_type.is_some_and(|id| {
-                        matches!(id, 0x370b | 0x370e | 0x3712 | 0x3713 | 0x3714)
+                        matches!(
+                            id,
+                            0x3001
+                                | 0x3702
+                                | 0x3709
+                                | 0x370b
+                                | 0x370e
+                                | 0x3712
+                                | 0x3713
+                                | 0x3714
+                                | 0x7ffa..=0x7fff
+                        )
                     }) =>
             {
                 let PropertyOwner::Attachment { message_id, index } = descriptor.owner else {
@@ -1710,6 +1725,100 @@ fn milestone_0_4_2_pim_items_roundtrip_through_libpff() -> Result<(), Box<dyn st
     }
     if independent_folder_classes(&generated)? != source_classes {
         return Err("PIM folder classes changed during the split".into());
+    }
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires the external v042-calendar-exception-source corpus case"]
+fn milestone_0_4_2_calendar_exceptions_roundtrip_through_libpff()
+-> Result<(), Box<dyn std::error::Error>> {
+    let manifest_path = std::env::var_os("PSTFORGE_CORPUS_MANIFEST")
+        .ok_or("PSTFORGE_CORPUS_MANIFEST is required")?;
+    let manifest: Manifest = toml::from_str(&fs::read_to_string(&manifest_path)?)?;
+    let case = manifest
+        .cases
+        .iter()
+        .find(|case| case.name == "v042-calendar-exception-source")
+        .ok_or("manifest has no v042-calendar-exception-source case")?;
+    let identity = pstforge_core::SourceFile::open(&case.path)?
+        .identity()
+        .clone();
+    if identity.sha256 != case.sha256 {
+        return Err("calendar-exception source SHA-256 does not match its manifest".into());
+    }
+
+    let source_messages = independent_messages(&case.path)?;
+    if source_messages.len() != 2
+        || !source_messages.iter().all(|message| message.complete)
+        || !source_messages.iter().any(|message| {
+            message.folder_path == ["Calendar"]
+                && message.content.message_class.as_deref() == Some("IPM.Appointment")
+                && message.content.subject.as_deref()
+                    == Some("Recurring appointment exception checkpoint")
+                && message.content.attachments.len() == 1
+                && message.content.attachments[0]
+                    .rendering_properties
+                    .iter()
+                    .map(|property| property.id)
+                    .collect::<BTreeSet<_>>()
+                    == BTreeSet::from([
+                        0x3001, 0x3702, 0x3709, 0x370b, 0x370e, 0x3714, 0x7ffa, 0x7ffb, 0x7ffc,
+                        0x7ffd, 0x7ffe, 0x7fff,
+                    ])
+        })
+        || !source_messages.iter().any(|message| {
+            message.content.message_class.as_deref()
+                == Some("IPM.OLE.CLASS.{00061055-0000-0000-C000-000000000046}")
+                && message.content.subject.as_deref()
+                    == Some("Modified recurrence instance checkpoint")
+                && message.content.embedded_path == [0]
+        })
+    {
+        return Err("calendar-exception source does not match the structural contract".into());
+    }
+
+    let directory = tempfile::tempdir()?;
+    let job = directory.path().join("job");
+    let output = Command::new(env!("CARGO_BIN_EXE_pstforge"))
+        .arg("split")
+        .arg(&case.path)
+        .arg("--output")
+        .arg(&job)
+        .arg("--max-pst-size")
+        .arg("4GiB")
+        .arg("--json")
+        .arg("--color")
+        .arg("never")
+        .output()?;
+    if !output.status.success() {
+        return Err(format!(
+            "calendar-exception split failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        )
+        .into());
+    }
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+    if report["partial"].as_bool() != Some(false)
+        || report["written_candidates"].as_u64() != Some(2)
+        || report["parts"].as_array().map(Vec::len) != Some(1)
+        || report["parts"][0]["omitted_folders"].as_u64() != Some(0)
+        || report["parts"][0]["omitted_properties"].as_u64() != Some(0)
+        || report["parts"][0]["omitted_attachments"].as_u64() != Some(0)
+    {
+        return Err("calendar-exception split did not report complete preservation".into());
+    }
+    let generated = job.join("parts/part-0001.pst");
+    verify_exact_message_fidelity(source_messages, independent_messages(&generated)?)?;
+    if independent_folder_classes(&generated)?
+        .get(&vec!["Calendar".to_owned()])
+        .map(String::as_str)
+        != Some("IPF.Appointment")
+    {
+        return Err("generated calendar folder is not IPF.Appointment".into());
+    }
+    if pstforge_core::SourceFile::open(&case.path)?.identity() != &identity {
+        return Err("calendar-exception source identity changed during the split".into());
     }
     Ok(())
 }
