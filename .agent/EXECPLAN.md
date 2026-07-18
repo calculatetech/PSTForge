@@ -1688,6 +1688,14 @@ work. Hash and identity evidence show that the source was not modified.
       rejected `Verified` on grouped rows that also use accepted exceptions;
       define `Accepted mixed conformance` so their verified normative portions
       and approved empirical/conflicting portions remain distinguishable.
+    - [x] (2026-07-18) Accepted the source-derived portion of EMP-14 and EMP-15
+      without changing writer bytes. Folder class from message class, the
+      readable half of sender and recipient identity pairs, valid delivery time
+      for creation/modification time, and associated display name from subject
+      remain permanent recovery policy. Each derivation retains a readable
+      source fact, remains separately counted in `recovery.log`, and never
+      authorizes an unrelated generated value. The combined-manifest full gate
+      passed at `.agent/test-results/1784395507-full`.
     - [x] Create `docs/WRITER_CONFORMANCE.md` with one traceable row for every
       existing store, NDB, LTP, folder, message, recipient, attachment,
       embedded-message, associated-content, named-property, and publication
@@ -2982,6 +2990,19 @@ work. Hash and identity evidence show that the source was not modified.
   interoperability and preservation risk without improving recovered data.
   Date/Author: 2026-07-18 / human owner approval of the structural empirical
   checkpoint and reality-over-conflicting-specification rule.
+
+- Decision: Retain the source-derived values in EMP-14 and EMP-15 as permanent
+  recovery policy. Derive folder class from a readable message class, copy the
+  readable half of sender and recipient identity pairs, use a valid delivery
+  time when creation/modification time is absent, and derive an associated
+  display name from its readable subject.
+  Rationale: These transformations preserve usable source facts and improve
+  imported-object identity without fabricating unrelated information. Leaving
+  the destination fields empty would discard available context, while
+  independent defaults would be less trustworthy. Typed `recovery.log` counts
+  keep every derivation visible without exposing source values.
+  Date/Author: 2026-07-18 / human owner approval of the derived-value
+  checkpoint.
 
 ## Outcomes & Retrospective
 
