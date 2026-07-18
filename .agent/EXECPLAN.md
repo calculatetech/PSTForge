@@ -1167,9 +1167,72 @@ work. Hash and identity evidence show that the source was not modified.
     - [x] (2026-07-17) The owner reports all-green ScanPST and Outlook
       acceptance for the original, unrepaired appointment candidate. This
       closes checkpoint 4 for commit and push.
-  - [ ] Checkpoints 5 onward: meetings, distribution lists, tasks,
-    notes/posts, OLE/documents, associated/configuration data, and remaining
-    generic classes, each proven separately where feasible.
+  - [x] Checkpoint 5: meeting objects.
+    - [x] (2026-07-17) Admit the exact `IPM.Schedule.Meeting.*` descendant
+      family while rejecting the non-item root and missing-separator lookalike
+      classes. Meeting objects retain ordinary mail sender/recipient rules.
+    - [x] (2026-07-17) Job schema 11 refuses schema-10 resumes because an older
+      durable catalog may already have classified meeting requests, responses,
+      updates, or cancellations as unsupported.
+    - [x] (2026-07-17) Added external case `v042-meeting-source`, 271,360
+      bytes, SHA-256
+      `702fddfff3876153813bc3759fa4157321f9226da3721834be860bf523a0544f`.
+      It contains one initial non-recurring meeting request with organizer,
+      To and Cc attendees, UTC start/end, location, state, reminder, meeting type,
+      appointment message class, and valid 56-byte Global Object ID and Clean
+      Global Object ID values. The independent libpff comparison requires
+      exact message, routing, folder class, GUID/LID/type/length, and payload
+      fidelity with zero omissions.
+    - [x] (2026-07-17) The first split exposed ten false recipient-property
+      omissions. All ten were deterministic recipient-table schema columns
+      that the writer reconstructs, including row identity/version, role,
+      display/address metadata, and optional empty columns. The mapped schema
+      now matches the writer's complete recipient table; a focused regression
+      and the external request roundtrip both pass with zero omissions. Both
+      bounded debug jobs were removed.
+    - [x] (2026-07-17) Complete fast automation passes at
+      `.agent/test-results/1784347648-fast`; the exact ignored meeting
+      roundtrip passes again after the gate.
+    - [x] (2026-07-17) The focused review found one applicable high issue:
+      recipient properties were considered reconstructed by tag alone, so a
+      populated EntryID/SearchKey/RecordKey or a differing structural value
+      could be changed while reporting zero omissions. Reconstruction now
+      requires exact record set, type, and value equivalence for every source
+      property. Populated optional binary values, legacy SMTP-address tags,
+      type mismatches, or any differing role/identity/address value remain
+      explicit omissions. The focused mismatch regression and exact meeting
+      roundtrip pass; the final bounded debug job was removed.
+    - [x] (2026-07-17) Recipient remediation passes the complete fast gate at
+      `.agent/test-results/1784348066-fast`, the focused mismatch regression,
+      and the exact ignored meeting roundtrip.
+    - [x] (2026-07-17) The remediation review found one remaining medium
+      accounting issue: libpff assigns each recipient's property record set
+      that recipient's index, while the exact-equivalence check accepted only
+      record set zero. The ownership check now matches
+      `record_set_index == recipient.index`; the external fixture now has To
+      and Cc rows so second-row schema, row identity/version, routing, and
+      zero-omission behavior are exercised end to end.
+    - [x] (2026-07-17) The two-recipient external roundtrip and complete fast
+      gate pass at `.agent/test-results/1784348390-fast`; the superseded
+      one-recipient external source was removed.
+    - [x] (2026-07-17) The final focused clean-context review found no blocker,
+      high, or medium issue after tracing exact recipient values and
+      second-row ownership through the meeting roundtrip.
+    - [x] (2026-07-17) Generated the single bounded human candidate at
+      `qualification-v042-meeting-r1/parts/part-0001.pst`: 271,360 bytes,
+      SHA-256
+      `54beac2bb4d39c7ee9fbfb112e618f7f53add51912d35cd4e8e2fb345771570e`.
+      PSTForge full verification reports Unicode64, no observed corruption,
+      one complete meeting request, two recipients, zero unsupported items,
+      and zero issues; `pffinfo` opens it successfully. The recovery log
+      reports no readable data skipped, and transient schema-11 job/spool
+      state was removed after verification.
+    - [x] (2026-07-18) The owner reports all-green ScanPST and Outlook
+      acceptance for the original, unrepaired meeting candidate. This closes
+      checkpoint 5 for commit and push.
+  - [ ] Checkpoints 6 onward: distribution lists, tasks, notes/posts,
+    OLE/documents, associated/configuration data, and remaining generic
+    classes, each proven separately where feasible.
   - [ ] Run the complete 19 GB split once after all focused checkpoints pass
     and reconcile discovered unique items against written plus explicitly
     unwritten items across every part.
@@ -2268,6 +2331,15 @@ work. Hash and identity evidence show that the source was not modified.
   Date/Author: 2026-07-17 / Codex from checkpoint-3 and checkpoint-4
   implementation evidence.
 
+- Decision: Job schema 11 is the first resume-compatible schema for meeting
+  objects, and the admitted boundary is descendants of
+  `IPM.Schedule.Meeting` rather than the non-item root itself.
+  Rationale: Schema 10 can contain meeting objects already classified
+  unsupported. The dotted family covers requests, responses, updates, and
+  cancellations without admitting separator lookalikes or synthesizing
+  meeting semantics absent from the source.
+  Date/Author: 2026-07-17 / Codex from checkpoint-5 implementation evidence.
+
 - Decision: The appointment checkpoint proves a standalone, non-recurring
   `IPM.Appointment` before meeting and recurrence families. Preserve the exact
   PSETID_Appointment and PSETID_Common named-property identities and values;
@@ -2826,6 +2898,16 @@ view and contains one `Appointment fidelity checkpoint` appointment on
 January 15, 2025 from 10:00 AM to 11:00 AM America/Detroit (15:00-16:00 UTC),
 located in `Conference Room 42`, shown as Busy, with a 15-minute reminder,
 non-recurring status, and the expected notes.
+
+For checkpoint 5, select external case `v042-meeting-source`, run ignored test
+`milestone_0_4_2_meetings_roundtrip_through_libpff`, and scan only
+`qualification-v042-meeting-r1/parts/part-0001.pst`. Then open the original,
+unrepaired candidate in Outlook. Confirm Inbox contains one
+`Meeting request fidelity checkpoint` request from `PSTForge Organizer` to the
+attendee, January 15, 2025 from 10:00 AM to 11:00 AM America/Detroit
+(15:00-16:00 UTC), located in `Conference Room 42`, shown as Busy, with the
+15-minute reminder and expected notes. Confirm Outlook presents meeting
+request controls without an item-corruption warning; do not send a response.
 
 After every available focused checkpoint succeeds, run the complete 19 GB
 split once. Unique source items assigned across all output parts must equal the

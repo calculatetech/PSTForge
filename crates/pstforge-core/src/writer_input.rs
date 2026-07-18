@@ -13,6 +13,7 @@ use thiserror::Error;
 
 use crate::{
     CanonicalAttachment, CanonicalFolder, CanonicalFolderRole, CanonicalMail, CanonicalProperty,
+    CanonicalRecipient,
 };
 
 #[derive(Debug, Error)]
@@ -543,13 +544,34 @@ fn translate_message(
         }
     }
 
-    let recipient_property_count = mail
-        .recipients
-        .iter()
-        .flat_map(|recipient| &recipient.properties)
-        .filter(|property| !recipient_property_is_mapped(property))
-        .count();
-    let recipient_property_count = saturating_len(recipient_property_count);
+    let mut recipient_property_count = 0_u64;
+    for recipient in &mail.recipients {
+        for property in &recipient.properties {
+            let reconstructed =
+                match recipient_property_is_reconstructed(job, mail, recipient, property) {
+                    Ok(value) => value,
+                    Err(
+                        error
+                        @ (CanonicalWriteError::Job(_) | CanonicalWriteError::BlobRead { .. }),
+                    ) => return Err(error),
+                    Err(
+                        CanonicalWriteError::InvalidCandidate { .. }
+                        | CanonicalWriteError::InvalidProperty { .. },
+                    ) => false,
+                };
+            if !reconstructed {
+                tracing::debug!(
+                    property_id = property.property_id,
+                    value_type = property.value_type,
+                    record_set_index = property.record_set_index,
+                    entry_index = property.entry_index,
+                    byte_len = property.blob.byte_len,
+                    "recipient property is not reconstructed exactly"
+                );
+                recipient_property_count = recipient_property_count.saturating_add(1);
+            }
+        }
+    }
     let non_smtp_recipient = mail.recipients.iter().any(|recipient| {
         recipient
             .address_type
@@ -1134,6 +1156,7 @@ fn supported_message_class(value: &str) -> bool {
         || class_descends_from(value, "REPORT.IPM.Note")
         || contact_message_class(value)
         || appointment_message_class(value)
+        || meeting_message_class(value)
 }
 
 fn contact_message_class(value: &str) -> bool {
@@ -1142,6 +1165,10 @@ fn contact_message_class(value: &str) -> bool {
 
 fn appointment_message_class(value: &str) -> bool {
     class_is_or_descends_from(value, "IPM.Appointment")
+}
+
+fn meeting_message_class(value: &str) -> bool {
+    class_descends_from(value, "IPM.Schedule.Meeting")
 }
 
 fn sender_optional_message_class(value: &str) -> bool {
@@ -1440,12 +1467,82 @@ fn is_writer_managed(id: u16) -> bool {
     )
 }
 
-fn recipient_property_is_mapped(property: &CanonicalProperty) -> bool {
-    property.record_set_index == 0
-        && matches!(
-            property.property_id,
-            Some(0x0C15 | 0x3001 | 0x3002 | 0x3003 | 0x39FE)
-        )
+fn recipient_property_is_reconstructed(
+    job: &TranslationSource<'_>,
+    mail: &CanonicalMail,
+    recipient: &CanonicalRecipient,
+    property: &CanonicalProperty,
+) -> Result<bool, CanonicalWriteError> {
+    if property.record_set_index != recipient.index {
+        return Ok(false);
+    }
+    let Some(id) = property
+        .property_id
+        .and_then(|value| u16::try_from(value).ok())
+    else {
+        return Ok(false);
+    };
+    if expected_recipient_property_value(recipient, id).is_none() {
+        return Ok(false);
+    }
+    let Some(property_type) = property
+        .value_type
+        .and_then(|value| u16::try_from(value).ok())
+    else {
+        return Ok(false);
+    };
+    let actual = match property_type {
+        0x001F => read_unicode(job, mail, property)?.map(RawPropertyValue::Unicode),
+        0x0102 => Some(RawPropertyValue::Binary(read_blob(
+            job,
+            mail,
+            property,
+            16 * 1024,
+        )?)),
+        _ => scalar_property(job, mail, property, id, property_type)?,
+    };
+    Ok(actual
+        .as_ref()
+        .is_some_and(|actual| recipient_property_value_matches(recipient, id, actual)))
+}
+
+fn recipient_property_value_matches(
+    recipient: &CanonicalRecipient,
+    id: u16,
+    actual: &RawPropertyValue,
+) -> bool {
+    expected_recipient_property_value(recipient, id).as_ref() == Some(actual)
+}
+
+fn expected_recipient_property_value(
+    recipient: &CanonicalRecipient,
+    id: u16,
+) -> Option<RawPropertyValue> {
+    let display_name = recipient
+        .display_name
+        .as_ref()
+        .or(recipient.email_address.as_ref())?;
+    let email_address = recipient.email_address.as_ref().unwrap_or(display_name);
+    match id {
+        0x0C15 => recipient
+            .recipient_type
+            .and_then(|value| i32::try_from(value).ok())
+            .map(RawPropertyValue::Integer32),
+        0x0E0F | 0x3A40 => Some(RawPropertyValue::Boolean(false)),
+        0x0FF9 | 0x0FFF | 0x300B => Some(RawPropertyValue::Binary(Vec::new())),
+        0x0FFE => Some(RawPropertyValue::Integer32(6)),
+        0x3001 => Some(RawPropertyValue::Unicode(display_name.clone())),
+        0x3002 => Some(RawPropertyValue::Unicode("SMTP".to_owned())),
+        0x3003 | 0x39FF => Some(RawPropertyValue::Unicode(email_address.clone())),
+        0x3900 => Some(RawPropertyValue::Integer32(0)),
+        0x67F3 => Some(RawPropertyValue::Integer32(1)),
+        0x67F2 => recipient
+            .index
+            .checked_add(1)
+            .and_then(|value| i32::try_from(value).ok())
+            .map(RawPropertyValue::Integer32),
+        _ => None,
+    }
 }
 
 fn attachment_property_is_mapped(id: u32) -> bool {
@@ -1485,10 +1582,6 @@ fn omit_malformed<T>(
     }
 }
 
-fn saturating_len(length: usize) -> u64 {
-    u64::try_from(length).unwrap_or(u64::MAX)
-}
-
 fn u64_le(bytes: &[u8]) -> u64 {
     let mut value = [0_u8; 8];
     value.copy_from_slice(bytes);
@@ -1520,12 +1613,13 @@ mod tests {
     use super::{
         PartBuildOptions, build_part_writer_input,
         build_part_writer_input_with_folders_interruptible, contain_body_metadata,
-        named_property_set, supported_message_class, valid_compressed_rtf_container,
-        valid_utf8_stream, valid_utf16_stream, writer_stream_type_is_supported,
+        named_property_set, recipient_property_value_matches, supported_message_class,
+        valid_compressed_rtf_container, valid_utf8_stream, valid_utf16_stream,
+        writer_stream_type_is_supported,
     };
     use crate::{
         CanonicalAttachment, CanonicalFolder, CanonicalFolderRole, CanonicalMail,
-        CanonicalProperty, ContentCompleteness, ItemKey, RecoveryProvenance,
+        CanonicalProperty, CanonicalRecipient, ContentCompleteness, ItemKey, RecoveryProvenance,
     };
     use pstforge_pst::writer::{
         AttachmentContent, MailFolderRole, NamedPropertySet, NativeBody, validate_mail_store_input,
@@ -1987,9 +2081,13 @@ mod tests {
         assert!(supported_message_class("ipm.contact.custom"));
         assert!(supported_message_class("IPM.Appointment"));
         assert!(supported_message_class("ipm.appointment.custom"));
+        assert!(supported_message_class("IPM.Schedule.Meeting.Request"));
+        assert!(supported_message_class("ipm.schedule.meeting.resp.pos"));
         assert!(!supported_message_class("IPM.NoteCustom"));
         assert!(!supported_message_class("IPM.ContactCustom"));
         assert!(!supported_message_class("IPM.AppointmentCustom"));
+        assert!(!supported_message_class("IPM.Schedule.Meeting"));
+        assert!(!supported_message_class("IPM.Schedule.MeetingRequest"));
         assert!(!supported_message_class("REPORT.IPM.NoteDR"));
 
         let directory = tempdir()?;
@@ -2167,5 +2265,42 @@ mod tests {
             .join()
             .map_err(|_| std::io::Error::other("deep embedded checkpoint terminated"))??;
         Ok(())
+    }
+
+    #[test]
+    fn recipient_table_schema_requires_exact_reconstructed_values() {
+        let recipient = CanonicalRecipient {
+            index: 0,
+            recipient_type: Some(1),
+            display_name: Some("Attendee".to_owned()),
+            email_address: Some("attendee@example.com".to_owned()),
+            address_type: Some("SMTP".to_owned()),
+            properties: Vec::new(),
+        };
+        assert!(recipient_property_value_matches(
+            &recipient,
+            0x0FFE,
+            &pstforge_pst::writer::RawPropertyValue::Integer32(6)
+        ));
+        assert!(recipient_property_value_matches(
+            &recipient,
+            0x39FF,
+            &pstforge_pst::writer::RawPropertyValue::Unicode("attendee@example.com".to_owned())
+        ));
+        assert!(!recipient_property_value_matches(
+            &recipient,
+            0x0FFE,
+            &pstforge_pst::writer::RawPropertyValue::Integer32(7)
+        ));
+        assert!(!recipient_property_value_matches(
+            &recipient,
+            0x0FF9,
+            &pstforge_pst::writer::RawPropertyValue::Binary(vec![1])
+        ));
+        assert!(!recipient_property_value_matches(
+            &recipient,
+            0x39FE,
+            &pstforge_pst::writer::RawPropertyValue::Unicode("legacy@example.com".to_owned())
+        ));
     }
 }

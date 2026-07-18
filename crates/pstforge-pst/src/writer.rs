@@ -3695,6 +3695,7 @@ fn supported_message_class(value: &str) -> bool {
         || class_descends_from(value, "REPORT.IPM.Note")
         || contact_message_class(value)
         || appointment_message_class(value)
+        || meeting_message_class(value)
 }
 
 fn contact_message_class(value: &str) -> bool {
@@ -3703,6 +3704,10 @@ fn contact_message_class(value: &str) -> bool {
 
 fn appointment_message_class(value: &str) -> bool {
     class_is_or_descends_from(value, "IPM.Appointment")
+}
+
+fn meeting_message_class(value: &str) -> bool {
+    class_descends_from(value, "IPM.Schedule.Meeting")
 }
 
 fn sender_optional_message_class(value: &str) -> bool {

@@ -255,7 +255,8 @@ fn run() -> Result<(), String> {
             Some("empty-folders") => qualify_empty_folders(&root, Path::new(&output)),
             Some("contacts") => qualify_contacts(&root, Path::new(&output)),
             Some("appointments") => qualify_appointments(&root, Path::new(&output)),
-            _ => Err("unknown qualification checkpoint; expected embedded-attachments, named-properties, empty-folders, contacts, or appointments".to_owned()),
+            Some("meetings") => qualify_meetings(&root, Path::new(&output)),
+            _ => Err("unknown qualification checkpoint; expected embedded-attachments, named-properties, empty-folders, contacts, appointments, or meetings".to_owned()),
         };
     }
     if command != std::ffi::OsStr::new("gate") {
@@ -287,7 +288,7 @@ fn run() -> Result<(), String> {
 }
 
 fn usage() -> String {
-    "usage: cargo xtask gate <fast|full|release> | qualify <embedded-attachments|named-properties|empty-folders|contacts|appointments> <output>"
+    "usage: cargo xtask gate <fast|full|release> | qualify <embedded-attachments|named-properties|empty-folders|contacts|appointments|meetings> <output>"
         .to_owned()
 }
 
@@ -606,6 +607,168 @@ fn qualify_appointments(root: &Path, output: &Path) -> Result<(), String> {
             path: vec!["Calendar".to_owned()],
             role: MailFolderRole::Ordinary,
             container_class: "IPF.Appointment".to_owned(),
+            messages: vec![fixture.message],
+        }],
+    };
+    publish_qualification(root, output, 1, |part| {
+        pstforge_pst::writer::create_mail_store(part, &spec)
+    })
+}
+
+fn qualify_meetings(root: &Path, output: &Path) -> Result<(), String> {
+    use pstforge_pst::writer::{
+        FidelityStore, MailFolderRole, MailFolderSpec, MailStoreSpec, MinimalStore, NamedProperty,
+        NamedPropertyName, NamedPropertySet, NativeBody, RawPropertyValue, RecipientKind,
+        RecipientSpec,
+    };
+
+    const PSETID_APPOINTMENT: [u8; 16] = [
+        0x02, 0x20, 0x06, 0x00, 0x00, 0x00, 0x00, 0x00, 0xC0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x46,
+    ];
+    const PSETID_COMMON: [u8; 16] = [
+        0x08, 0x20, 0x06, 0x00, 0x00, 0x00, 0x00, 0x00, 0xC0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x46,
+    ];
+    const PSETID_MEETING: [u8; 16] = [
+        0x90, 0xDA, 0xD8, 0x6E, 0x0B, 0x45, 0x1B, 0x10, 0x98, 0xDA, 0x00, 0xAA, 0x00, 0x3F, 0x13,
+        0x05,
+    ];
+    const START: i64 = 133_814_268_000_000_000;
+    const END: i64 = 133_814_304_000_000_000;
+    let mut global_object_id = vec![
+        0x04, 0x00, 0x00, 0x00, 0x82, 0x00, 0xE0, 0x00, 0x74, 0xC5, 0xB7, 0x10, 0x1A, 0x82, 0xE0,
+        0x08, 0x00, 0x00, 0x00, 0x00,
+    ];
+    global_object_id.extend_from_slice(&START.to_le_bytes());
+    global_object_id.extend_from_slice(&[0; 8]);
+    global_object_id.extend_from_slice(&16_u32.to_le_bytes());
+    global_object_id.extend_from_slice(b"PSTForgeMeeting!");
+    if global_object_id.len() != 56 {
+        return Err("meeting Global Object ID is not 56 bytes".to_owned());
+    }
+
+    let mut fixture = FidelityStore::from(&MinimalStore {
+        store_name: "PSTForge meeting source".to_owned(),
+        folder_name: "Inbox".to_owned(),
+        subject: "Meeting request fidelity checkpoint".to_owned(),
+        body: "Meeting request notes checkpoint.".to_owned(),
+        sender_name: "PSTForge Organizer".to_owned(),
+        sender_email: "organizer@example.com".to_owned(),
+        recipient: "attendee@example.com".to_owned(),
+        record_key: *b"PSTForgeMeeting1",
+    });
+    fixture.message.message_class = "IPM.Schedule.Meeting.Request".to_owned();
+    fixture.message.native_body = Some(NativeBody::PlainText);
+    fixture.message.recipients.push(RecipientSpec {
+        kind: RecipientKind::Cc,
+        display_name: "Optional Attendee".to_owned(),
+        email_address: "optional@example.com".to_owned(),
+    });
+    fixture.message.named_properties = vec![
+        NamedProperty {
+            set: NamedPropertySet::Guid(PSETID_APPOINTMENT),
+            name: NamedPropertyName::Numeric(0x8201),
+            value: RawPropertyValue::Integer32(0),
+        },
+        NamedProperty {
+            set: NamedPropertySet::Guid(PSETID_APPOINTMENT),
+            name: NamedPropertyName::Numeric(0x8205),
+            value: RawPropertyValue::Integer32(2),
+        },
+        NamedProperty {
+            set: NamedPropertySet::Guid(PSETID_APPOINTMENT),
+            name: NamedPropertyName::Numeric(0x8208),
+            value: RawPropertyValue::Unicode("Conference Room 42".to_owned()),
+        },
+        NamedProperty {
+            set: NamedPropertySet::Guid(PSETID_APPOINTMENT),
+            name: NamedPropertyName::Numeric(0x820D),
+            value: RawPropertyValue::Time(START),
+        },
+        NamedProperty {
+            set: NamedPropertySet::Guid(PSETID_APPOINTMENT),
+            name: NamedPropertyName::Numeric(0x820E),
+            value: RawPropertyValue::Time(END),
+        },
+        NamedProperty {
+            set: NamedPropertySet::Guid(PSETID_APPOINTMENT),
+            name: NamedPropertyName::Numeric(0x8213),
+            value: RawPropertyValue::Integer32(60),
+        },
+        NamedProperty {
+            set: NamedPropertySet::Guid(PSETID_APPOINTMENT),
+            name: NamedPropertyName::Numeric(0x8215),
+            value: RawPropertyValue::Boolean(false),
+        },
+        NamedProperty {
+            set: NamedPropertySet::Guid(PSETID_APPOINTMENT),
+            name: NamedPropertyName::Numeric(0x8217),
+            value: RawPropertyValue::Integer32(3),
+        },
+        NamedProperty {
+            set: NamedPropertySet::Guid(PSETID_APPOINTMENT),
+            name: NamedPropertyName::Numeric(0x8218),
+            value: RawPropertyValue::Integer32(0),
+        },
+        NamedProperty {
+            set: NamedPropertySet::Guid(PSETID_APPOINTMENT),
+            name: NamedPropertyName::Numeric(0x8223),
+            value: RawPropertyValue::Boolean(false),
+        },
+        NamedProperty {
+            set: NamedPropertySet::Guid(PSETID_COMMON),
+            name: NamedPropertyName::Numeric(0x8501),
+            value: RawPropertyValue::Integer32(15),
+        },
+        NamedProperty {
+            set: NamedPropertySet::Guid(PSETID_COMMON),
+            name: NamedPropertyName::Numeric(0x8502),
+            value: RawPropertyValue::Time(START),
+        },
+        NamedProperty {
+            set: NamedPropertySet::Guid(PSETID_COMMON),
+            name: NamedPropertyName::Numeric(0x8503),
+            value: RawPropertyValue::Boolean(true),
+        },
+        NamedProperty {
+            set: NamedPropertySet::Guid(PSETID_COMMON),
+            name: NamedPropertyName::Numeric(0x8516),
+            value: RawPropertyValue::Time(START),
+        },
+        NamedProperty {
+            set: NamedPropertySet::Guid(PSETID_COMMON),
+            name: NamedPropertyName::Numeric(0x8517),
+            value: RawPropertyValue::Time(END),
+        },
+        NamedProperty {
+            set: NamedPropertySet::Guid(PSETID_MEETING),
+            name: NamedPropertyName::Numeric(0x0003),
+            value: RawPropertyValue::Binary(global_object_id.clone()),
+        },
+        NamedProperty {
+            set: NamedPropertySet::Guid(PSETID_MEETING),
+            name: NamedPropertyName::Numeric(0x0023),
+            value: RawPropertyValue::Binary(global_object_id),
+        },
+        NamedProperty {
+            set: NamedPropertySet::Guid(PSETID_MEETING),
+            name: NamedPropertyName::Numeric(0x0024),
+            value: RawPropertyValue::Unicode("IPM.Appointment".to_owned()),
+        },
+        NamedProperty {
+            set: NamedPropertySet::Guid(PSETID_MEETING),
+            name: NamedPropertyName::Numeric(0x0026),
+            value: RawPropertyValue::Integer32(1),
+        },
+    ];
+    let spec = MailStoreSpec {
+        store_name: fixture.store_name,
+        record_key: fixture.record_key,
+        folders: vec![MailFolderSpec {
+            path: vec!["Inbox".to_owned()],
+            role: MailFolderRole::Ordinary,
+            container_class: "IPF.Note".to_owned(),
             messages: vec![fixture.message],
         }],
     };

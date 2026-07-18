@@ -1356,6 +1356,146 @@ fn milestone_0_4_2_appointments_roundtrip_through_libpff() -> Result<(), Box<dyn
 }
 
 #[test]
+#[ignore = "requires the external v042-meeting-source corpus case"]
+fn milestone_0_4_2_meetings_roundtrip_through_libpff() -> Result<(), Box<dyn std::error::Error>> {
+    let manifest_path = std::env::var_os("PSTFORGE_CORPUS_MANIFEST")
+        .ok_or("PSTFORGE_CORPUS_MANIFEST is required")?;
+    let manifest: Manifest = toml::from_str(&fs::read_to_string(&manifest_path)?)?;
+    let case = manifest
+        .cases
+        .iter()
+        .find(|case| case.name == "v042-meeting-source")
+        .ok_or("manifest has no v042-meeting-source case")?;
+    let identity = pstforge_core::SourceFile::open(&case.path)?
+        .identity()
+        .clone();
+    if identity.sha256 != case.sha256 {
+        return Err("meeting source SHA-256 does not match its manifest".into());
+    }
+
+    let source_messages = independent_messages(&case.path)?;
+    if source_messages.len() != 1
+        || source_messages[0].folder_path != ["Inbox"]
+        || source_messages[0].content.message_class.as_deref()
+            != Some("IPM.Schedule.Meeting.Request")
+        || source_messages[0].content.subject.as_deref()
+            != Some("Meeting request fidelity checkpoint")
+        || source_messages[0].content.sender_name.as_deref() != Some("PSTForge Organizer")
+        || source_messages[0].content.sender_email.as_deref() != Some("organizer@example.com")
+        || source_messages[0].content.recipients.len() != 2
+        || source_messages[0].content.recipients[0].recipient_type != Some(1)
+        || source_messages[0].content.recipients[0]
+            .email_address
+            .as_deref()
+            != Some("attendee@example.com")
+        || source_messages[0].content.recipients[1].recipient_type != Some(2)
+        || source_messages[0].content.recipients[1]
+            .email_address
+            .as_deref()
+            != Some("optional@example.com")
+        || !source_messages[0].complete
+    {
+        return Err("meeting source does not match the request contract".into());
+    }
+    let source_named = independent_named_properties(&case.path)?;
+    let expected_named = [
+        (0x02, 0x8201, 0x0003, None),
+        (0x02, 0x8205, 0x0003, None),
+        (0x02, 0x8208, 0x001F, None),
+        (0x02, 0x820D, 0x0040, None),
+        (0x02, 0x820E, 0x0040, None),
+        (0x02, 0x8213, 0x0003, None),
+        (0x02, 0x8215, 0x000B, None),
+        (0x02, 0x8217, 0x0003, None),
+        (0x02, 0x8218, 0x0003, None),
+        (0x02, 0x8223, 0x000B, None),
+        (0x08, 0x8501, 0x0003, None),
+        (0x08, 0x8502, 0x0040, None),
+        (0x08, 0x8503, 0x000B, None),
+        (0x08, 0x8516, 0x0040, None),
+        (0x08, 0x8517, 0x0040, None),
+        (0x90, 0x0003, 0x0102, Some(56)),
+        (0x90, 0x0023, 0x0102, Some(56)),
+        (0x90, 0x0024, 0x001F, None),
+        (0x90, 0x0026, 0x0003, None),
+    ];
+    if source_named.len() != expected_named.len()
+        || !source_named.iter().zip(expected_named).all(
+            |(property, (guid_first, expected_lid, expected_type, expected_len))| {
+                let expected_guid = if guid_first == 0x90 {
+                    [
+                        0x90, 0xDA, 0xD8, 0x6E, 0x0B, 0x45, 0x1B, 0x10, 0x98, 0xDA, 0x00, 0xAA,
+                        0x00, 0x3F, 0x13, 0x05,
+                    ]
+                } else {
+                    [
+                        guid_first, 0x20, 0x06, 0x00, 0x00, 0x00, 0x00, 0x00, 0xC0, 0x00, 0x00,
+                        0x00, 0x00, 0x00, 0x00, 0x46,
+                    ]
+                };
+                property.identity.guid == expected_guid
+                    && property.identity.name == NamedPropertyName::Numeric(expected_lid)
+                    && property.value_type == Some(expected_type)
+                    && expected_len.is_none_or(|length| property.byte_len == length)
+            },
+        )
+    {
+        return Err("meeting source named-property contract changed".into());
+    }
+    if independent_folder_classes(&case.path)?
+        .get(&vec!["Inbox".to_owned()])
+        .map(String::as_str)
+        != Some("IPF.Note")
+    {
+        return Err("meeting source Inbox is not IPF.Note".into());
+    }
+
+    let directory = tempfile::tempdir()?;
+    let job = directory.path().join("job");
+    let output = Command::new(env!("CARGO_BIN_EXE_pstforge"))
+        .arg("split")
+        .arg(&case.path)
+        .arg("--output")
+        .arg(&job)
+        .arg("--max-pst-size")
+        .arg("4GiB")
+        .arg("--json")
+        .arg("--color")
+        .arg("never")
+        .output()?;
+    if !output.status.success() {
+        return Err(format!(
+            "meeting split failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        )
+        .into());
+    }
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+    if report["partial"].as_bool() != Some(false)
+        || report["written_candidates"].as_u64() != Some(1)
+        || report["parts"].as_array().map(Vec::len) != Some(1)
+        || report["parts"][0]["omitted_folders"].as_u64() != Some(0)
+        || report["parts"][0]["omitted_properties"].as_u64() != Some(0)
+        || report["parts"][0]["omitted_attachments"].as_u64() != Some(0)
+    {
+        return Err("meeting split did not report complete preservation".into());
+    }
+    let generated = job.join("parts/part-0001.pst");
+    verify_exact_message_fidelity(source_messages, independent_messages(&generated)?)?;
+    if independent_named_properties(&generated)? != source_named {
+        return Err("meeting named-property identity or payload changed".into());
+    }
+    if independent_folder_classes(&generated)?
+        .get(&vec!["Inbox".to_owned()])
+        .map(String::as_str)
+        != Some("IPF.Note")
+    {
+        return Err("generated meeting Inbox is not IPF.Note".into());
+    }
+    Ok(())
+}
+
+#[test]
 #[ignore = "requires PSTFORGE_CORPUS_MANIFEST with external real PST files"]
 fn milestone_0_4_real_pst_splits_deterministically_without_mutation()
 -> Result<(), Box<dyn std::error::Error>> {
