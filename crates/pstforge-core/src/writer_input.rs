@@ -5,8 +5,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use pstforge_job::{DurableCatalogSink, JobError, SpooledBlob};
 use pstforge_pst::writer::{
     AttachmentContent, AttachmentSpec, FileBlobSpec, MailFolderRole, MailFolderSpec, MailStoreSpec,
-    MessageSpec, NativeBody, RawProperty, RawPropertyValue, RecipientKind, RecipientSpec,
-    SpooledPropertySpec, UnsupportedProperty,
+    MessageSpec, NamedProperty, NamedPropertyName, NamedPropertySet, NativeBody, RawProperty,
+    RawPropertyValue, RecipientKind, RecipientSpec, SpooledPropertySpec, UnsupportedProperty,
 };
 use sha2::{Digest, Sha256};
 use thiserror::Error;
@@ -199,6 +199,7 @@ fn translate_message(
     let mut omitted_properties = 0_u64;
     let mut omitted_attachments = 0_u64;
     let mut raw_properties = Vec::new();
+    let mut named_properties = Vec::new();
     let mut spooled_properties = Vec::new();
     let mut unsupported_properties = Vec::new();
     let mut native_body = None;
@@ -210,20 +211,60 @@ fn translate_message(
     let mut internet_codepage = None;
     let mut html_property = None;
     let mut serialized_ids = BTreeSet::new();
+    let mut serialized_named = BTreeSet::new();
     let mut item_keys = vec![mail.durable_item_key.clone()];
     let mut unsupported_item_keys = Vec::new();
 
     for property in &mail.properties {
-        let Some(id) = property
-            .property_id
+        let Some(property_type) = property
+            .value_type
             .and_then(|value| u16::try_from(value).ok())
         else {
             partial = true;
             omitted_properties = omitted_properties.saturating_add(1);
             continue;
         };
-        let Some(property_type) = property
-            .value_type
+        if let Some(identity) = &property.named_property {
+            let transient_id = property
+                .property_id
+                .and_then(|value| u16::try_from(value).ok())
+                .unwrap_or(0x8000);
+            let set = named_property_set(identity.guid);
+            let name = match &identity.name {
+                libpff_sys::NamedPropertyName::Numeric(value) => NamedPropertyName::Numeric(*value),
+                libpff_sys::NamedPropertyName::String(value) => {
+                    NamedPropertyName::String(value.clone())
+                }
+            };
+            if !serialized_named.insert((set, name.clone())) {
+                partial = true;
+                omitted_properties = omitted_properties.saturating_add(1);
+                continue;
+            }
+            let value = match property_type {
+                0x001F => read_unicode(job, mail, property)?
+                    .map(RawPropertyValue::Unicode)
+                    .or_else(|| Some(RawPropertyValue::Unicode(String::new()))),
+                0x0102 if property.blob.byte_len <= 1_048_576 => Some(RawPropertyValue::Binary(
+                    read_blob(job, mail, property, 1_048_576)?,
+                )),
+                _ => scalar_property(job, mail, property, transient_id, property_type)?,
+            };
+            if let Some(value) = value {
+                named_properties.push(NamedProperty { set, name, value });
+            } else {
+                partial = true;
+                omitted_properties = omitted_properties.saturating_add(1);
+                unsupported_properties.push(UnsupportedProperty {
+                    id: transient_id,
+                    property_type,
+                    byte_len: property.blob.byte_len,
+                });
+            }
+            continue;
+        }
+        let Some(id) = property
+            .property_id
             .and_then(|value| u16::try_from(value).ok())
         else {
             partial = true;
@@ -583,7 +624,7 @@ fn translate_message(
             rtf_in_sync,
             internet_headers: None,
             attachments,
-            named_properties: Vec::new(),
+            named_properties,
             raw_properties,
             spooled_properties,
             unsupported_properties,
@@ -930,6 +971,25 @@ fn decode_sha256(value: &str) -> Result<[u8; 32], CanonicalWriteError> {
         output[index] = (hex(pair[0])? << 4) | hex(pair[1])?;
     }
     Ok(output)
+}
+
+fn named_property_set(guid: [u8; 16]) -> NamedPropertySet {
+    // libpff exposes the reserved NAMEID_GUID_MAPI selector as a zero GUID.
+    // A literal custom zero GUID is not a valid named-property set identity.
+    const LIBPFF_RESERVED_MAPI: [u8; 16] = [0; 16];
+    const PS_MAPI: [u8; 16] = [
+        0x28, 0x03, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0xC0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x46,
+    ];
+    const PS_PUBLIC_STRINGS: [u8; 16] = [
+        0x29, 0x03, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0xC0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x46,
+    ];
+    match guid {
+        LIBPFF_RESERVED_MAPI | PS_MAPI => NamedPropertySet::Mapi,
+        PS_PUBLIC_STRINGS => NamedPropertySet::PublicStrings,
+        value => NamedPropertySet::Guid(value),
+    }
 }
 
 fn hex(value: u8) -> Result<u8, CanonicalWriteError> {
@@ -1353,15 +1413,20 @@ mod tests {
     use tempfile::tempdir;
 
     use super::{
-        build_part_writer_input, contain_body_metadata, supported_message_class,
-        valid_compressed_rtf_container, valid_utf8_stream, valid_utf16_stream,
-        writer_stream_type_is_supported,
+        build_part_writer_input, contain_body_metadata, named_property_set,
+        supported_message_class, valid_compressed_rtf_container, valid_utf8_stream,
+        valid_utf16_stream, writer_stream_type_is_supported,
     };
     use crate::{
         CanonicalAttachment, CanonicalFolderRole, CanonicalMail, CanonicalProperty,
         ContentCompleteness, ItemKey, RecoveryProvenance,
     };
-    use pstforge_pst::writer::{AttachmentContent, NativeBody};
+    use pstforge_pst::writer::{AttachmentContent, NamedPropertySet, NativeBody};
+
+    #[test]
+    fn libpff_reserved_mapi_guid_is_normalized() {
+        assert_eq!(named_property_set([0; 16]), NamedPropertySet::Mapi);
+    }
 
     #[test]
     fn attachment_larger_than_writer_field_is_omitted_without_losing_parent()
@@ -1490,6 +1555,7 @@ mod tests {
             entry_index,
             property_id: Some(property_id),
             value_type: Some(value_type),
+            named_property: None,
             blob: SpooledBlob {
                 sha256: "0".repeat(64),
                 byte_len,
@@ -1690,6 +1756,7 @@ mod tests {
                     entry_index: u32::try_from(entry_index).unwrap_or(u32::MAX),
                     property_id: Some(property_id),
                     value_type: None,
+                    named_property: None,
                     blob: SpooledBlob {
                         sha256: "0".repeat(64),
                         byte_len: 0,

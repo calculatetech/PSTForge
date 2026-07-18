@@ -4,8 +4,8 @@ use std::os::fd::AsFd;
 use std::path::Path;
 
 use libpff_sys::{
-    CatalogEvent, CatalogProvenance, CatalogSink, PffError, PffFile, PropertyDescriptor,
-    RawCatalog, RecoveryMode, RecoveryUnit, STREAM_CHUNK_BYTES,
+    CatalogEvent, CatalogProvenance, CatalogSink, NamedPropertyIdentity, PffError, PffFile,
+    PropertyDescriptor, RawCatalog, RecoveryMode, RecoveryUnit, STREAM_CHUNK_BYTES,
 };
 use pstforge_job::ReplayCandidate;
 use serde::{Deserialize, Serialize};
@@ -14,7 +14,7 @@ use thiserror::Error;
 
 use crate::{SourceError, SourceFile};
 
-const PROTOCOL_VERSION: u32 = 1;
+const PROTOCOL_VERSION: u32 = 2;
 const MAX_CONTROL_FRAME_BYTES: usize = 32 * 1024 * 1024;
 
 #[derive(Debug, Error)]
@@ -105,6 +105,10 @@ enum ControlFrame {
     },
     PropertyStart {
         descriptor: PropertyDescriptor,
+    },
+    NamedProperty {
+        descriptor: PropertyDescriptor,
+        identity: NamedPropertyIdentity,
     },
     PropertyData {
         descriptor: PropertyDescriptor,
@@ -405,6 +409,13 @@ impl CatalogSink for ProtocolSink<'_> {
             CatalogEvent::PropertyStart(descriptor) => {
                 self.send(&ControlFrame::PropertyStart { descriptor })
             }
+            CatalogEvent::NamedProperty {
+                descriptor,
+                identity,
+            } => self.send(&ControlFrame::NamedProperty {
+                descriptor,
+                identity,
+            }),
             CatalogEvent::PropertyData { descriptor, bytes } => {
                 let byte_len = u32::try_from(bytes.len())
                     .map_err(|_| "property frame length exceeds u32".to_owned())?;
@@ -884,6 +895,13 @@ fn send_control_to_sink(
             CatalogEvent::AttachmentAbort { message_id, index }
         }
         ControlFrame::PropertyStart { descriptor } => CatalogEvent::PropertyStart(descriptor),
+        ControlFrame::NamedProperty {
+            descriptor,
+            identity,
+        } => CatalogEvent::NamedProperty {
+            descriptor,
+            identity,
+        },
         ControlFrame::PropertyEnd { descriptor } => CatalogEvent::PropertyEnd(descriptor),
         ControlFrame::PropertyAbort { descriptor, reason } => {
             CatalogEvent::PropertyAbort { descriptor, reason }
@@ -976,7 +994,10 @@ fn require_end_of_stream(input: &mut dyn Read) -> Result<(), WorkerProtocolError
 mod tests {
     use std::io::Cursor;
 
-    use libpff_sys::{CatalogEvent, CatalogIssue, CatalogProvenance, CatalogSink, RawCatalog};
+    use libpff_sys::{
+        CatalogEvent, CatalogIssue, CatalogProvenance, CatalogSink, NamedPropertyIdentity,
+        NamedPropertyName, PropertyDescriptor, PropertyOwner, RawCatalog,
+    };
     use pstforge_job::ReplayCandidate;
     use serde_json::json;
 
@@ -989,6 +1010,7 @@ mod tests {
     struct RecordingSink {
         messages: Vec<u32>,
         payload: Vec<u8>,
+        named_properties: Vec<NamedPropertyIdentity>,
     }
 
     impl CatalogSink for RecordingSink {
@@ -997,6 +1019,9 @@ mod tests {
                 CatalogEvent::MessageStart { id, .. } => self.messages.push(id),
                 CatalogEvent::AttachmentData { bytes, .. } => {
                     self.payload.extend_from_slice(bytes);
+                }
+                CatalogEvent::NamedProperty { identity, .. } => {
+                    self.named_properties.push(identity);
                 }
                 _ => {}
             }
@@ -1038,6 +1063,22 @@ mod tests {
             })
             .expect("message frame");
         output
+            .event(CatalogEvent::NamedProperty {
+                descriptor: PropertyDescriptor {
+                    owner: PropertyOwner::Message(7),
+                    record_set_index: 0,
+                    entry_index: 0,
+                    entry_type: Some(0x8000),
+                    value_type: Some(0x0003),
+                    data_size: 4,
+                },
+                identity: NamedPropertyIdentity {
+                    guid: [0xAB; 16],
+                    name: NamedPropertyName::String("ProtocolCheckpoint".to_owned()),
+                },
+            })
+            .expect("named property frame");
+        output
             .event(CatalogEvent::AttachmentData {
                 message_id: 7,
                 index: 0,
@@ -1056,13 +1097,20 @@ mod tests {
             receive_worker_catalog(&mut Cursor::new(bytes), &mut sink).expect("receive protocol");
         assert_eq!(sink.messages, vec![7]);
         assert_eq!(sink.payload, b"raw\0payload");
+        assert_eq!(
+            sink.named_properties,
+            [NamedPropertyIdentity {
+                guid: [0xAB; 16],
+                name: NamedPropertyName::String("ProtocolCheckpoint".to_owned()),
+            }]
+        );
         assert_eq!(catalog.recovered_messages, 1);
     }
 
     #[test]
     fn oversized_payload_header_is_rejected_before_allocation() {
         let mut bytes = Vec::new();
-        write_control(&mut bytes, &ControlFrame::Hello { version: 1 }).expect("hello");
+        write_control(&mut bytes, &ControlFrame::Hello { version: 2 }).expect("hello");
         write_control(
             &mut bytes,
             &ControlFrame::AttachmentData {

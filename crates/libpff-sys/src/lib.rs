@@ -49,8 +49,9 @@ pub enum PffError {
 }
 
 pub use catalog::{
-    CatalogEvent, CatalogIssue, CatalogProvenance, CatalogSink, FolderAddress, PropertyDescriptor,
-    PropertyOwner, RawCatalog, RecoveryMode, RecoveryUnit, STREAM_CHUNK_BYTES,
+    CatalogEvent, CatalogIssue, CatalogProvenance, CatalogSink, FolderAddress,
+    NamedPropertyIdentity, NamedPropertyName, PropertyDescriptor, PropertyOwner, RawCatalog,
+    RecoveryMode, RecoveryUnit, STREAM_CHUNK_BYTES,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

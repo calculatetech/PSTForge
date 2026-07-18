@@ -940,9 +940,43 @@ work. Hash and identity evidence show that the source was not modified.
       containment gap: a corrupt ledger could encode an embedded path beyond
       256 and reach recursive canonical reconstruction before writer
       validation. Canonical intake now rejects such ownership before building
-      parent/child trees, with a direct schema-6 corruption regression.
+      parent/child trees, with a direct durable-ledger corruption regression.
   - [ ] Checkpoint 2: lossless native intake for store, folder, associated,
     named-property, and arbitrary item-class data.
+    - [x] (2026-07-17) Checkpoint 2a preserves numeric and string named-property
+      identity from libpff through the supervised worker protocol, schema-7
+      ledger, canonical reconstruction, and store-wide writer mapping. Durable
+      identity records the GUID set and numeric identifier or string name;
+      transient source `0x8000+` property IDs are never reused as identity.
+      Malformed or unsupported named values remain explicit partial omissions.
+    - [x] (2026-07-17) Added a one-purpose external corpus fixture containing
+      one plain mail item, no attachments or recipients, and exactly two named
+      properties: numeric PS_MAPI `0x8005` with a Unicode value and string
+      `CustomCheckpoint` in a custom GUID set with an integer value. The
+      ignored external-corpus regression independently reads source and output
+      through libpff and compares GUID/name identity, type, byte length, and
+      payload SHA-256. The native split completes with zero omissions and one
+      271,360-byte candidate part at
+      `qualification-v042-named-r1/parts/part-0001.pst`, SHA-256
+      `c3c560f3f6c3e7ae4815c91dac04b7a117fda142ff88bf3cc764d69bcca25ed3`.
+    - [x] (2026-07-17) Fresh adversarial review found that an interrupted
+      schema-6 job could resume already-spooled properties without the newly
+      durable name-to-ID identity and omit them. Checkpoint 2a bumps the job
+      schema to 7 and explicitly refuses schema-6 resume; a regression mutates
+      a fully bound ledger to the old version and proves both validation and
+      resume refuse it.
+    - [x] (2026-07-17) Final remediation review confirmed the schema refusal
+      but found that the shared display-string decoder would replace invalid
+      UTF-8 in a named-property string identity. Identity strings now use a
+      strict decoder and malformed bytes produce a contained read issue instead
+      of a different successful property name; display metadata remains lossy
+      by design.
+    - [x] (2026-07-17) The owner reported that
+      `qualification-v042-named-r1/parts/part-0001.pst` passes ScanPST and
+      Outlook, and approved the checkpoint for commit. Exact named-property
+      identity and payload fidelity remain proven by the independent libpff
+      source/output comparison because Outlook does not expose these properties
+      in its ordinary message UI.
   - [ ] Checkpoints 3 onward: contacts, appointments, meetings, distribution
     lists, tasks, notes/posts, OLE/documents, associated/configuration data,
     and remaining generic classes, each proven separately where feasible.
@@ -1062,15 +1096,14 @@ work. Hash and identity evidence show that the source was not modified.
   and string/GUID identity and byte-compares all regenerated NAMEID streams and
   buckets; the fixture spans two custom GUID sets plus PS_MAPI.
 
-- Observation: `libpff` reports a named property's store-local `0x8000+`
-  identifier but does not expose the NAMEID GUID/name identity required to
-  preserve it in a new store. Reusing that numeric identifier in another PST
-  can silently change the property's meaning.
-  Evidence: the recovery catalog supplies `entry_type` and value type only;
-  the adapted writer's independent NAMEID validator requires GUID set plus
-  numeric/string name before assigning a new per-store ID. Version 0.4.0
-  therefore records these properties as omitted and marks the message/part
-  partial instead of guessing.
+- Observation: The older recovery path recorded only a named property's
+  store-local `0x8000+` identifier even though libpff's lower-level record-entry
+  API also exposes its name-to-ID map entry. Reusing the transient identifier
+  in another PST would silently change meaning.
+  Evidence: checkpoint 2a now calls
+  `libpff_record_entry_get_name_to_id_map_entry`, captures GUID plus numeric or
+  string name before the property stream, transports it through the worker and
+  durable ledger, and assigns a new output-local ID from that identity.
 
 - Observation: Deleting a publication scratch directory by a pathname derived
   from a held descriptor creates a same-UID stale-path race after another
@@ -1994,6 +2027,25 @@ work. Hash and identity evidence show that the source was not modified.
   user directories or substituting synthetic data for later source behavior.
   Date/Author: 2026-07-17 / Codex.
 
+- Decision: Treat the all-zero GUID returned by libpff for the reserved MAPI
+  name-to-ID selector as `PS_MAPI`; preserve nonzero custom GUID bytes exactly.
+  Rationale: MS-PST encodes MAPI and Public Strings as reserved selector values
+  rather than entries in the custom GUID stream. Libpff 20231205 returns zero
+  through `libpff_name_to_id_map_entry_get_guid` for the reserved MAPI selector.
+  The native two-generation regression proves that normalizing zero regenerates
+  the same numeric PS_MAPI identity and payload, while a literal custom zero
+  GUID is not a valid competing named-property set identity.
+  Date/Author: 2026-07-17 / Codex from upstream format documentation and native
+  roundtrip evidence.
+
+- Decision: Version 0.4.2 job schema 7 makes named-property GUID/name identity
+  part of the durable property contract and refuses resume from schema 6.
+  Rationale: A schema-6 candidate may already be spooled with only its transient
+  `0x8000+` identifier. Replaying that candidate without reparsing would omit
+  recoverable named properties, so compatibility must fail closed rather than
+  silently downgrade data correctness.
+  Date/Author: 2026-07-17 / Codex from checkpoint-2a adversarial review.
+
 ## Outcomes & Retrospective
 
 Version 0.1.0 now lets an operator inspect a healthy PST in human or JSON form
@@ -2490,6 +2542,23 @@ command stages the directory beside its destination and publishes it only
 after completed-store, `pffinfo`, and `readpst` validation. Scan only
 `parts/part-0001.pst`; then open that same unrepaired PST in Outlook and inspect
 both nested attachment levels.
+
+For checkpoint 2a, the private source PST must remain outside the repository
+and be selected by the `v042-named-property-source` case in
+`PSTFORGE_CORPUS_MANIFEST`. Run the ignored external-corpus regression to prove
+the libpff-to-writer roundtrip, then inspect only the bounded native output:
+
+    PSTFORGE_CORPUS_MANIFEST=/absolute/private/manifest.toml \
+      cargo test -p pstforge-cli --test external_corpus --locked \
+      milestone_0_4_2_named_properties_roundtrip_through_libpff \
+      -- --ignored --exact
+
+    scanpst qualification-v042-named-r1/parts/part-0001.pst
+
+After ScanPST, open the unrepaired original candidate in Outlook and confirm the
+single `Named property fidelity checkpoint` message opens normally. Named
+properties are not asserted through Outlook's visible UI; the exact independent
+libpff comparison is the semantic acceptance evidence.
 
 After every available focused checkpoint succeeds, run the complete 19 GB
 split once. Unique source items assigned across all output parts must equal the

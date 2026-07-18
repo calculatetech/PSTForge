@@ -13,7 +13,8 @@ use std::thread;
 use std::time::Duration;
 
 use libpff_sys::{
-    CatalogEvent, CatalogProvenance, CatalogSink, PropertyDescriptor, PropertyOwner, RecoveryUnit,
+    CatalogEvent, CatalogProvenance, CatalogSink, NamedPropertyIdentity, PropertyDescriptor,
+    PropertyOwner, RecoveryUnit,
 };
 use rusqlite::{Connection, ErrorCode, OpenFlags, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
@@ -22,7 +23,7 @@ use sha2::{Digest, Sha256};
 use tempfile::NamedTempFile;
 use thiserror::Error;
 
-const JOB_SCHEMA_VERSION: i64 = 6;
+const JOB_SCHEMA_VERSION: i64 = 7;
 const INLINE_BLOB_MAX_BYTES: u64 = 64 * 1024;
 const INLINE_CACHE_DIRECTORY: &str = ".pstforge-inline-cache";
 const PAYLOAD_PACK_FILENAME: &str = "payload.pack";
@@ -227,6 +228,7 @@ pub struct DurableCatalogSink {
     batch_pack_start: Cell<u64>,
     active: Option<ActiveCandidate>,
     property: Option<ActiveProperty>,
+    pending_named_property: Option<(PropertyDescriptor, NamedPropertyIdentity)>,
     attachment: Option<ActiveAttachment>,
     unit: Option<RecoveryUnit>,
     recent_candidates: HashMap<Vec<u32>, String>,
@@ -256,6 +258,7 @@ struct CandidateStart {
 
 struct ActiveProperty {
     descriptor: PropertyDescriptor,
+    named_property: Option<NamedPropertyIdentity>,
     blob: BlobWriter,
     record: bool,
 }
@@ -406,6 +409,7 @@ impl DurableCatalogSink {
             batch_pack_start: Cell::new(0),
             active: None,
             property: None,
+            pending_named_property: None,
             attachment: None,
             unit: None,
             recent_candidates: HashMap::new(),
@@ -584,6 +588,7 @@ impl DurableCatalogSink {
             batch_pack_start: Cell::new(0),
             active: None,
             property: None,
+            pending_named_property: None,
             attachment: None,
             unit: None,
             recent_candidates: HashMap::new(),
@@ -1843,6 +1848,11 @@ impl DurableCatalogSink {
             embedded_path,
             supported,
         } = start;
+        if self.pending_named_property.is_some() {
+            return Err(JobError::EventSequence(
+                "message started after an unmatched named property identity".to_owned(),
+            ));
+        }
         if self
             .property
             .as_ref()
@@ -2007,7 +2017,11 @@ impl DurableCatalogSink {
         }
         if active.record {
             let blob = self.finish_blob(active.blob, Some(descriptor.data_size))?;
-            self.record_event("property", property_json(descriptor), Some(blob))
+            self.record_event(
+                "property",
+                property_json(descriptor, active.named_property.as_ref()),
+                Some(blob),
+            )
         } else {
             self.discard_blob(active.blob, descriptor.data_size)
         }
@@ -2163,6 +2177,7 @@ impl DurableCatalogSink {
 
     fn rollback(&mut self) {
         self.property = None;
+        self.pending_named_property = None;
         self.attachment = None;
         self.unit = None;
         self.recent_candidates.clear();
@@ -2226,7 +2241,7 @@ impl DurableCatalogSink {
     fn handle_event(&mut self, event: CatalogEvent<'_>) -> Result<(), JobError> {
         match event {
             CatalogEvent::UnitStart(unit) => {
-                if self.active.is_some() {
+                if self.active.is_some() || self.pending_named_property.is_some() {
                     return Err(JobError::EventSequence(
                         "recovery unit boundary occurred during a candidate".to_owned(),
                     ));
@@ -2240,7 +2255,10 @@ impl DurableCatalogSink {
                 self.replayed_source_ids.clear();
             }
             CatalogEvent::UnitEnd(unit) => {
-                if self.active.is_some() || self.unit.take() != Some(unit) {
+                if self.active.is_some()
+                    || self.pending_named_property.is_some()
+                    || self.unit.take() != Some(unit)
+                {
                     return Err(JobError::EventSequence(
                         "recovery unit ended out of sequence".to_owned(),
                     ));
@@ -2252,7 +2270,7 @@ impl DurableCatalogSink {
                 parent_id,
                 name,
             } => {
-                if self.active.is_some() {
+                if self.active.is_some() || self.pending_named_property.is_some() {
                     return Err(JobError::EventSequence(
                         "folder event occurred during a message".to_owned(),
                     ));
@@ -2448,11 +2466,37 @@ impl DurableCatalogSink {
                     self.attachment.as_ref(),
                     descriptor.owner,
                 )?;
+                let named_property = match self.pending_named_property.take() {
+                    Some((pending, identity)) if pending == descriptor => Some(identity),
+                    Some(_) => {
+                        return Err(JobError::EventSequence(
+                            "named property identity does not match property start".to_owned(),
+                        ));
+                    }
+                    None => None,
+                };
                 self.property = Some(ActiveProperty {
                     descriptor,
+                    named_property,
                     blob: BlobWriter::new(&mut self.payload_pack, &self.payload_pack_path)?,
                     record: !matches!(descriptor.owner, PropertyOwner::Folder(_)),
                 });
+            }
+            CatalogEvent::NamedProperty {
+                descriptor,
+                identity,
+            } => {
+                if self.property.is_some() || self.pending_named_property.is_some() {
+                    return Err(JobError::EventSequence(
+                        "named property identity occurred out of sequence".to_owned(),
+                    ));
+                }
+                validate_property_owner(
+                    self.active.as_ref(),
+                    self.attachment.as_ref(),
+                    descriptor.owner,
+                )?;
+                self.pending_named_property = Some((descriptor, identity));
             }
             CatalogEvent::PropertyData { descriptor, bytes } => {
                 let property = self.property.as_mut().ok_or_else(|| {
@@ -2482,7 +2526,10 @@ impl DurableCatalogSink {
                     self.record_event(
                         "property_incomplete",
                         json!({
-                            "property": property_json(property.descriptor),
+                            "property": property_json(
+                                property.descriptor,
+                                property.named_property.as_ref(),
+                            ),
                             "reason": reason,
                         }),
                         None,
@@ -2491,6 +2538,11 @@ impl DurableCatalogSink {
             }
             CatalogEvent::MessageEnd { id, complete } => {
                 require_message(self.active.as_ref(), id)?;
+                if self.pending_named_property.is_some() {
+                    return Err(JobError::EventSequence(
+                        "message ended after an unmatched named property identity".to_owned(),
+                    ));
+                }
                 if complete && self.property.is_some() {
                     return Err(JobError::EventSequence(
                         "message ended during a property".to_owned(),
@@ -2507,7 +2559,10 @@ impl DurableCatalogSink {
                         self.record_event(
                             "property_incomplete",
                             json!({
-                                "property": property_json(property.descriptor),
+                                "property": property_json(
+                                    property.descriptor,
+                                    property.named_property.as_ref(),
+                                ),
                                 "reason": "message ended before property completion",
                             }),
                             None,
@@ -3016,7 +3071,10 @@ fn create_schema(connection: &Connection) -> Result<(), JobError> {
     Ok(())
 }
 
-fn property_json(descriptor: PropertyDescriptor) -> serde_json::Value {
+fn property_json(
+    descriptor: PropertyDescriptor,
+    named_property: Option<&NamedPropertyIdentity>,
+) -> serde_json::Value {
     let (owner, owner_id, index) = match descriptor.owner {
         PropertyOwner::Folder(id) => ("folder", id, None),
         PropertyOwner::Message(id) => ("message", id, None),
@@ -3032,6 +3090,7 @@ fn property_json(descriptor: PropertyDescriptor) -> serde_json::Value {
         "entry_type": descriptor.entry_type,
         "value_type": descriptor.value_type,
         "data_size": descriptor.data_size,
+        "named_property": named_property,
     })
 }
 
@@ -4345,6 +4404,52 @@ mod tests {
         ));
         let after = Sha256::digest(std::fs::read(&database)?);
         assert_eq!(before, after);
+        Ok(())
+    }
+
+    #[test]
+    fn resume_rejects_schema_six_without_named_property_identity()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempdir()?;
+        let job = directory.path().join("job");
+        let sink = DurableCatalogSink::create(&job)?;
+        let source = JobSourceIdentity {
+            canonical_path: "/external/mail.pst".to_owned(),
+            device: 1,
+            inode: 2,
+            size_bytes: 3,
+            modified_at: "2026-07-16T00:00:00Z".to_owned(),
+            sha256: "a".repeat(64),
+        };
+        let configuration = JobConfiguration {
+            tool_compatibility_major: 0,
+            split_schema_version: "0.4.2".to_owned(),
+            recovery_mode: "balanced".to_owned(),
+            maximum_pst_bytes: 4_294_967_296,
+            part_size_policy: "hard-maximum-v1".to_owned(),
+            writer_format: "unicode-pst-v23".to_owned(),
+        };
+        sink.bind_source(&source)?;
+        sink.bind_recovery_mode("balanced")?;
+        sink.bind_configuration(&configuration)?;
+        sink.checkpoint()?;
+        drop(sink);
+
+        let database = job.join(".pstforge/job.sqlite3");
+        let connection = Connection::open(&database)?;
+        connection.execute(
+            "UPDATE job_metadata SET value = '6' WHERE key = 'schema_version'",
+            [],
+        )?;
+        drop(connection);
+        assert!(matches!(
+            DurableCatalogSink::validate_resume(&job, &source, &configuration),
+            Err(JobError::ResumeMismatch("job schema version"))
+        ));
+        assert!(matches!(
+            DurableCatalogSink::open_resume(&job, &source, &configuration),
+            Err(JobError::ResumeMismatch("job schema version"))
+        ));
         Ok(())
     }
 

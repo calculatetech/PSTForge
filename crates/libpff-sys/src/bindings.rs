@@ -29,6 +29,11 @@ pub(crate) struct libpff_record_entry_t {
     _private: [u8; 0],
 }
 
+#[repr(C)]
+pub(crate) struct libpff_name_to_id_map_entry_t {
+    _private: [u8; 0],
+}
+
 unsafe extern "C" {
     pub(crate) fn libpff_get_version() -> *const c_char;
     pub(crate) fn libpff_get_access_flags_read() -> c_int;
@@ -184,6 +189,38 @@ unsafe extern "C" {
     pub(crate) fn libpff_record_entry_get_value_type(
         record_entry: *mut libpff_record_entry_t,
         value_type: *mut u32,
+        error: *mut *mut libpff_error_t,
+    ) -> c_int;
+    pub(crate) fn libpff_record_entry_get_name_to_id_map_entry(
+        record_entry: *mut libpff_record_entry_t,
+        name_to_id_map_entry: *mut *mut libpff_name_to_id_map_entry_t,
+        error: *mut *mut libpff_error_t,
+    ) -> c_int;
+    pub(crate) fn libpff_name_to_id_map_entry_get_type(
+        name_to_id_map_entry: *mut libpff_name_to_id_map_entry_t,
+        entry_type: *mut u8,
+        error: *mut *mut libpff_error_t,
+    ) -> c_int;
+    pub(crate) fn libpff_name_to_id_map_entry_get_number(
+        name_to_id_map_entry: *mut libpff_name_to_id_map_entry_t,
+        number: *mut u32,
+        error: *mut *mut libpff_error_t,
+    ) -> c_int;
+    pub(crate) fn libpff_name_to_id_map_entry_get_utf8_string_size(
+        name_to_id_map_entry: *mut libpff_name_to_id_map_entry_t,
+        string_size: *mut usize,
+        error: *mut *mut libpff_error_t,
+    ) -> c_int;
+    pub(crate) fn libpff_name_to_id_map_entry_get_utf8_string(
+        name_to_id_map_entry: *mut libpff_name_to_id_map_entry_t,
+        string: *mut u8,
+        string_size: usize,
+        error: *mut *mut libpff_error_t,
+    ) -> c_int;
+    pub(crate) fn libpff_name_to_id_map_entry_get_guid(
+        name_to_id_map_entry: *mut libpff_name_to_id_map_entry_t,
+        guid: *mut u8,
+        size: usize,
         error: *mut *mut libpff_error_t,
     ) -> c_int;
     pub(crate) fn libpff_record_entry_get_data_size(

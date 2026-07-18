@@ -9,7 +9,10 @@ use std::process::Command;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use libpff_sys::{CatalogEvent, CatalogSink, PropertyOwner};
+use libpff_sys::{
+    CatalogEvent, CatalogSink, NamedPropertyIdentity, NamedPropertyName, PropertyDescriptor,
+    PropertyOwner,
+};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
@@ -43,6 +46,119 @@ struct PropertyFingerprint {
     value_type: Option<u32>,
     byte_len: u64,
     sha256: [u8; 32],
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct NamedPropertyFingerprint {
+    identity: NamedPropertyIdentity,
+    value_type: Option<u32>,
+    byte_len: u64,
+    sha256: [u8; 32],
+}
+
+struct ActiveNamedProperty {
+    identity: NamedPropertyIdentity,
+    value_type: Option<u32>,
+    byte_len: u64,
+    hasher: Sha256,
+}
+
+#[derive(Default)]
+struct NamedPropertySink {
+    pending: Option<(PropertyDescriptor, NamedPropertyIdentity)>,
+    active: BTreeMap<(u32, u32, u32), ActiveNamedProperty>,
+    completed: Vec<NamedPropertyFingerprint>,
+}
+
+impl CatalogSink for NamedPropertySink {
+    fn event(&mut self, event: CatalogEvent<'_>) -> Result<(), String> {
+        match event {
+            CatalogEvent::NamedProperty {
+                descriptor,
+                identity,
+            } => {
+                if self.pending.replace((descriptor, identity)).is_some() {
+                    return Err("named property identity was not consumed".to_owned());
+                }
+            }
+            CatalogEvent::PropertyStart(descriptor) => {
+                let Some((expected, identity)) = self.pending.take() else {
+                    return Ok(());
+                };
+                if descriptor != expected {
+                    return Err("named property identity did not precede its value".to_owned());
+                }
+                let PropertyOwner::Message(message_id) = descriptor.owner else {
+                    return Ok(());
+                };
+                let key = (
+                    message_id,
+                    descriptor.record_set_index,
+                    descriptor.entry_index,
+                );
+                if self
+                    .active
+                    .insert(
+                        key,
+                        ActiveNamedProperty {
+                            identity,
+                            value_type: descriptor.value_type,
+                            byte_len: 0,
+                            hasher: Sha256::new(),
+                        },
+                    )
+                    .is_some()
+                {
+                    return Err("duplicate active named property".to_owned());
+                }
+            }
+            CatalogEvent::PropertyData { descriptor, bytes } => {
+                let PropertyOwner::Message(message_id) = descriptor.owner else {
+                    return Ok(());
+                };
+                if let Some(property) = self.active.get_mut(&(
+                    message_id,
+                    descriptor.record_set_index,
+                    descriptor.entry_index,
+                )) {
+                    property.byte_len = property
+                        .byte_len
+                        .checked_add(u64::try_from(bytes.len()).map_err(|error| error.to_string())?)
+                        .ok_or_else(|| "named property size overflow".to_owned())?;
+                    property.hasher.update(bytes);
+                }
+            }
+            CatalogEvent::PropertyEnd(descriptor) => {
+                let PropertyOwner::Message(message_id) = descriptor.owner else {
+                    return Ok(());
+                };
+                if let Some(property) = self.active.remove(&(
+                    message_id,
+                    descriptor.record_set_index,
+                    descriptor.entry_index,
+                )) {
+                    self.completed.push(NamedPropertyFingerprint {
+                        identity: property.identity,
+                        value_type: property.value_type,
+                        byte_len: property.byte_len,
+                        sha256: property.hasher.finalize().into(),
+                    });
+                }
+            }
+            CatalogEvent::PropertyAbort { descriptor, .. } => {
+                let PropertyOwner::Message(message_id) = descriptor.owner else {
+                    return Ok(());
+                };
+                self.active.remove(&(
+                    message_id,
+                    descriptor.record_set_index,
+                    descriptor.entry_index,
+                ));
+            }
+            _ => {}
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -486,6 +602,22 @@ fn independent_messages(
     Ok(sink.completed)
 }
 
+fn independent_named_properties(
+    path: &std::path::Path,
+) -> Result<Vec<NamedPropertyFingerprint>, Box<dyn std::error::Error>> {
+    let file = fs::File::open(path)?;
+    let native = libpff_sys::PffFile::open_fd(file.as_fd())?;
+    let mut sink = NamedPropertySink::default();
+    let catalog = native.catalog(&mut sink)?;
+    if !catalog.issues.is_empty() || catalog.issues_dropped != 0 {
+        return Err("named property catalog reported read issues".into());
+    }
+    if sink.pending.is_some() || !sink.active.is_empty() {
+        return Err("named property stream ended with unfinished state".into());
+    }
+    Ok(sink.completed)
+}
+
 fn verify_exact_message_fidelity(
     expected: Vec<MessageFingerprint>,
     actual: Vec<MessageFingerprint>,
@@ -616,6 +748,89 @@ fn fingerprint_difference(
         fields.push("body properties");
     }
     fields
+}
+
+#[test]
+#[ignore = "requires the external v042-named-property-source corpus case"]
+fn milestone_0_4_2_named_properties_roundtrip_through_libpff()
+-> Result<(), Box<dyn std::error::Error>> {
+    let manifest_path = std::env::var_os("PSTFORGE_CORPUS_MANIFEST")
+        .ok_or("PSTFORGE_CORPUS_MANIFEST is required")?;
+    let manifest: Manifest = toml::from_str(&fs::read_to_string(&manifest_path)?)?;
+    let case = manifest
+        .cases
+        .iter()
+        .find(|case| case.name == "v042-named-property-source")
+        .ok_or("manifest has no v042-named-property-source case")?;
+    let identity = pstforge_core::SourceFile::open(&case.path)?
+        .identity()
+        .clone();
+    if identity.sha256 != case.sha256 {
+        return Err("named-property source SHA-256 does not match its manifest".into());
+    }
+
+    let source = independent_named_properties(&case.path)?;
+    let expected = [
+        NamedPropertyFingerprint {
+            identity: NamedPropertyIdentity {
+                guid: [0; 16],
+                name: NamedPropertyName::Numeric(0x8005),
+            },
+            value_type: Some(0x001f),
+            byte_len: 50,
+            sha256: Sha256::digest(
+                "named property checkpoint"
+                    .encode_utf16()
+                    .flat_map(|unit| unit.to_le_bytes())
+                    .collect::<Vec<_>>(),
+            )
+            .into(),
+        },
+        NamedPropertyFingerprint {
+            identity: NamedPropertyIdentity {
+                guid: *b"PSTForgeNamedSet",
+                name: NamedPropertyName::String("CustomCheckpoint".to_owned()),
+            },
+            value_type: Some(0x0003),
+            byte_len: 4,
+            sha256: Sha256::digest(21_i32.to_le_bytes()).into(),
+        },
+    ];
+    if source != expected {
+        return Err("named-property source does not match the qualification contract".into());
+    }
+
+    let directory = tempfile::tempdir()?;
+    let job = directory.path().join("job");
+    let output = Command::new(env!("CARGO_BIN_EXE_pstforge"))
+        .arg("split")
+        .arg(&case.path)
+        .arg("--output")
+        .arg(&job)
+        .arg("--max-pst-size")
+        .arg("4GiB")
+        .arg("--json")
+        .arg("--color")
+        .arg("never")
+        .output()?;
+    if !output.status.success() {
+        return Err(format!(
+            "named-property split failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        )
+        .into());
+    }
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+    if report["partial"].as_bool() != Some(false)
+        || report["parts"].as_array().map(Vec::len) != Some(1)
+    {
+        return Err("named-property split was not a complete one-part result".into());
+    }
+    let generated = independent_named_properties(&job.join("parts/part-0001.pst"))?;
+    if generated != source {
+        return Err("named-property identity or value changed during the split".into());
+    }
+    Ok(())
 }
 
 #[test]

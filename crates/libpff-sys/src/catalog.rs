@@ -151,6 +151,19 @@ pub struct PropertyDescriptor {
     pub data_size: u64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", content = "value", rename_all = "snake_case")]
+pub enum NamedPropertyName {
+    Numeric(u32),
+    String(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NamedPropertyIdentity {
+    pub guid: [u8; 16],
+    pub name: NamedPropertyName,
+}
+
 #[derive(Debug)]
 pub enum CatalogEvent<'a> {
     UnitStart(RecoveryUnit),
@@ -206,6 +219,10 @@ pub enum CatalogEvent<'a> {
         index: u32,
     },
     PropertyStart(PropertyDescriptor),
+    NamedProperty {
+        descriptor: PropertyDescriptor,
+        identity: NamedPropertyIdentity,
+    },
     PropertyData {
         descriptor: PropertyDescriptor,
         bytes: &'a [u8],
@@ -1243,6 +1260,16 @@ fn stream_record_set(
             )?,
             data_size: entry.data_size()?,
         };
+        if let Some(identity) = entry.named_property_identity()? {
+            emit(
+                sink,
+                "named property identity",
+                CatalogEvent::NamedProperty {
+                    descriptor,
+                    identity,
+                },
+            )?;
+        }
         emit(
             sink,
             "property start",
@@ -1414,6 +1441,81 @@ impl PffRecordEntry {
             }
             _ => Err(native_error(error, operation)),
         }
+    }
+
+    fn named_property_identity(&self) -> Result<Option<NamedPropertyIdentity>, PffError> {
+        let mut raw = ptr::null_mut();
+        let mut error = ptr::null_mut();
+        // SAFETY: self.raw is valid and the borrowed map-entry output is initialized.
+        let result = unsafe {
+            bindings::libpff_record_entry_get_name_to_id_map_entry(self.raw, &mut raw, &mut error)
+        };
+        match result {
+            0 => {
+                free_error(error);
+                return Ok(None);
+            }
+            1 => free_error(error),
+            _ => return Err(native_error(error, "get named property identity")),
+        }
+        if raw.is_null() {
+            return Err(PffError::NullPointer {
+                operation: "get named property identity",
+            });
+        }
+        let mut guid = [0_u8; 16];
+        error = ptr::null_mut();
+        // SAFETY: raw remains owned by the live record entry and guid has exactly 16 bytes.
+        let result = unsafe {
+            bindings::libpff_name_to_id_map_entry_get_guid(
+                raw,
+                guid.as_mut_ptr(),
+                guid.len(),
+                &mut error,
+            )
+        };
+        check_one(result, error, "get named property GUID")?;
+
+        let mut entry_type = 0_u8;
+        error = ptr::null_mut();
+        // SAFETY: raw remains valid and entry_type is initialized.
+        let result = unsafe {
+            bindings::libpff_name_to_id_map_entry_get_type(raw, &mut entry_type, &mut error)
+        };
+        check_one(result, error, "get named property kind")?;
+        let name = match entry_type {
+            b'n' => {
+                let mut number = 0_u32;
+                error = ptr::null_mut();
+                // SAFETY: raw remains valid and number is initialized.
+                let result = unsafe {
+                    bindings::libpff_name_to_id_map_entry_get_number(raw, &mut number, &mut error)
+                };
+                check_one(result, error, "get named property number")?;
+                NamedPropertyName::Numeric(number)
+            }
+            b's' => {
+                let value = read_optional_identity_string(
+                    raw,
+                    "get named property string size",
+                    "get named property string",
+                    bindings::libpff_name_to_id_map_entry_get_utf8_string_size,
+                    bindings::libpff_name_to_id_map_entry_get_utf8_string,
+                )?
+                .ok_or(PffError::Native {
+                    operation: "get named property string",
+                    detail: "value is absent".to_owned(),
+                })?;
+                NamedPropertyName::String(value)
+            }
+            value => {
+                return Err(PffError::InvalidValue {
+                    field: "named property kind",
+                    value: i64::from(value),
+                });
+            }
+        };
+        Ok(Some(NamedPropertyIdentity { guid, name }))
     }
 
     fn data_size(&self) -> Result<u64, PffError> {
@@ -1906,6 +2008,31 @@ fn read_optional_string<T>(
     size_fn: unsafe extern "C" fn(*mut T, *mut usize, *mut *mut libpff_error_t) -> i32,
     read_fn: unsafe extern "C" fn(*mut T, *mut u8, usize, *mut *mut libpff_error_t) -> i32,
 ) -> Result<Option<String>, PffError> {
+    Ok(
+        read_optional_string_bytes(raw, size_operation, read_operation, size_fn, read_fn)?
+            .map(decode_native_string),
+    )
+}
+
+fn read_optional_identity_string<T>(
+    raw: *mut T,
+    size_operation: &'static str,
+    read_operation: &'static str,
+    size_fn: unsafe extern "C" fn(*mut T, *mut usize, *mut *mut libpff_error_t) -> i32,
+    read_fn: unsafe extern "C" fn(*mut T, *mut u8, usize, *mut *mut libpff_error_t) -> i32,
+) -> Result<Option<String>, PffError> {
+    read_optional_string_bytes(raw, size_operation, read_operation, size_fn, read_fn)?
+        .map(decode_native_identity_string)
+        .transpose()
+}
+
+fn read_optional_string_bytes<T>(
+    raw: *mut T,
+    size_operation: &'static str,
+    read_operation: &'static str,
+    size_fn: unsafe extern "C" fn(*mut T, *mut usize, *mut *mut libpff_error_t) -> i32,
+    read_fn: unsafe extern "C" fn(*mut T, *mut u8, usize, *mut *mut libpff_error_t) -> i32,
+) -> Result<Option<Vec<u8>>, PffError> {
     let mut size = 0_usize;
     let mut error = ptr::null_mut();
     // SAFETY: raw is a valid native object and outputs are initialized.
@@ -1927,7 +2054,7 @@ fn read_optional_string<T>(
     // SAFETY: raw is valid and bytes is writable for size bytes.
     let result = unsafe { read_fn(raw, bytes.as_mut_ptr(), bytes.len(), &mut error) };
     check_one(result, error, read_operation)?;
-    Ok(Some(decode_native_string(bytes)))
+    Ok(Some(bytes))
 }
 
 fn decode_native_string(mut bytes: Vec<u8>) -> String {
@@ -1935,6 +2062,16 @@ fn decode_native_string(mut bytes: Vec<u8>) -> String {
         bytes.pop();
     }
     String::from_utf8_lossy(&bytes).into_owned()
+}
+
+fn decode_native_identity_string(mut bytes: Vec<u8>) -> Result<String, PffError> {
+    if bytes.last() == Some(&0) {
+        bytes.pop();
+    }
+    String::from_utf8(bytes).map_err(|error| PffError::Native {
+        operation: "decode named property string",
+        detail: error.to_string(),
+    })
 }
 
 fn validate_string_size(size: usize) -> Result<(), PffError> {
@@ -2103,11 +2240,26 @@ mod tests {
         MAX_CATALOG_ISSUES, PropertyDescriptor, PropertyOwner,
         RECOVERY_FLAG_IGNORE_ALLOCATION_DATA, RECOVERY_FLAG_SCAN_FOR_FRAGMENTS, RawCatalog,
         RecoveryMode, RecoveryUnit, STREAM_CHUNK_BYTES, checked_increment, contain_filetime,
-        decode_native_string, mark_stable_top_level_identifier, record_attachment_issue,
-        record_item_issue, recover_item_value, recovered_provenance, recovery_flags,
-        stable_top_level_identifier_seen, validate_string_size,
+        decode_native_identity_string, decode_native_string, mark_stable_top_level_identifier,
+        record_attachment_issue, record_item_issue, recover_item_value, recovered_provenance,
+        recovery_flags, stable_top_level_identifier_seen, validate_string_size,
     };
     use crate::PffError;
+
+    #[test]
+    fn named_property_identity_rejects_invalid_utf8() {
+        assert!(matches!(
+            decode_native_identity_string(b"Checkpoint\0".to_vec()),
+            Ok(value) if value == "Checkpoint"
+        ));
+        assert!(matches!(
+            decode_native_identity_string(vec![0xff, 0]),
+            Err(PffError::Native {
+                operation: "decode named property string",
+                ..
+            })
+        ));
+    }
 
     #[test]
     fn aggressive_mode_uses_both_native_flags_without_relabeling_generic_recovery_items() {

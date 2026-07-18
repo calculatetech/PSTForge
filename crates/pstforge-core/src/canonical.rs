@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use libpff_sys::{CatalogProvenance, FolderAddress, RecoveryUnit};
+use libpff_sys::{CatalogProvenance, FolderAddress, NamedPropertyIdentity, RecoveryUnit};
 use pstforge_job::{
     CandidateOwnership, DurableCatalogSink, JobError, SpooledBlob, SpooledCandidate, SpooledEvent,
     SpooledFolder,
@@ -30,6 +30,7 @@ pub struct CanonicalProperty {
     pub entry_index: u32,
     pub property_id: Option<u32>,
     pub value_type: Option<u32>,
+    pub named_property: Option<NamedPropertyIdentity>,
     pub blob: SpooledBlob,
 }
 
@@ -734,6 +735,15 @@ fn canonical_property(
     event: &SpooledEvent,
 ) -> Result<CanonicalProperty, CanonicalError> {
     let (owner, owner_index) = validate_property_owner(candidate, &event.metadata)?;
+    let named_property = match event.metadata.get("named_property") {
+        None | Some(serde_json::Value::Null) => None,
+        Some(value) => Some(serde_json::from_value(value.clone()).map_err(|error| {
+            invalid_error(
+                candidate,
+                &format!("invalid named property identity: {error}"),
+            )
+        })?),
+    };
     Ok(CanonicalProperty {
         owner,
         owner_index,
@@ -741,6 +751,7 @@ fn canonical_property(
         entry_index: required_u32(candidate, event, "entry_index")?,
         property_id: optional_u32(candidate, event, "entry_type")?,
         value_type: optional_u32(candidate, event, "value_type")?,
+        named_property,
         blob: event
             .blob
             .clone()
@@ -933,8 +944,8 @@ fn invalid_error(candidate: &SpooledCandidate, detail: &str) -> CanonicalError {
 #[cfg(test)]
 mod tests {
     use libpff_sys::{
-        CatalogEvent, CatalogProvenance, CatalogSink, FolderAddress, PropertyDescriptor,
-        PropertyOwner, RecoveryMode, RecoveryUnit,
+        CatalogEvent, CatalogProvenance, CatalogSink, FolderAddress, NamedPropertyIdentity,
+        NamedPropertyName, PropertyDescriptor, PropertyOwner, RecoveryMode, RecoveryUnit,
     };
     use pstforge_job::DurableCatalogSink;
     use rusqlite::{Connection, params};
@@ -1049,6 +1060,44 @@ mod tests {
             },
             b"bad",
         )?;
+        let named_descriptor = PropertyDescriptor {
+            owner: PropertyOwner::Message(0),
+            record_set_index: 0,
+            entry_index: 2,
+            entry_type: Some(0x8001),
+            value_type: Some(0x0003),
+            data_size: 4,
+        };
+        sink.event(CatalogEvent::NamedProperty {
+            descriptor: named_descriptor,
+            identity: NamedPropertyIdentity {
+                guid: [
+                    0x28, 0x03, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0xC0, 0x00, 0x00, 0x00, 0x00,
+                    0x00, 0x00, 0x46,
+                ],
+                name: NamedPropertyName::Numeric(0x6204),
+            },
+        })?;
+        property(&mut sink, named_descriptor, &42_i32.to_le_bytes())?;
+        let string_named_descriptor = PropertyDescriptor {
+            owner: PropertyOwner::Message(0),
+            record_set_index: 0,
+            entry_index: 3,
+            entry_type: Some(0x8002),
+            value_type: Some(0x001F),
+            data_size: 12,
+        };
+        sink.event(CatalogEvent::NamedProperty {
+            descriptor: string_named_descriptor,
+            identity: NamedPropertyIdentity {
+                guid: [
+                    0x29, 0x03, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0xC0, 0x00, 0x00, 0x00, 0x00,
+                    0x00, 0x00, 0x46,
+                ],
+                name: NamedPropertyName::String("CheckpointName".to_owned()),
+            },
+        })?;
+        property(&mut sink, string_named_descriptor, b"n\0a\0m\0e\0d\0\0\0")?;
         sink.event(CatalogEvent::AttachmentStart {
             message_id: 0,
             index: 3,
@@ -1153,7 +1202,7 @@ mod tests {
                 .map(|message| message.durable_item_key.as_str()),
             Some("normal:-:-:3")
         );
-        assert_eq!(mail[0].spooled_bytes, 9);
+        assert_eq!(mail[0].spooled_bytes, 25);
         let input = build_part_writer_input(
             &sink,
             &[&mail[0]],
@@ -1164,6 +1213,14 @@ mod tests {
         )?;
         assert_eq!(input.store.folders[0].path, ["Inbox"]);
         assert_eq!(input.store.folders[0].messages[0].attachments.len(), 2);
+        assert_eq!(
+            input.store.folders[0].messages[0].named_properties[0].name,
+            pstforge_pst::writer::NamedPropertyName::Numeric(0x6204)
+        );
+        assert_eq!(
+            input.store.folders[0].messages[0].named_properties[1].name,
+            pstforge_pst::writer::NamedPropertyName::String("CheckpointName".to_owned())
+        );
         let pstforge_pst::writer::AttachmentContent::Embedded(embedded) =
             &input.store.folders[0].messages[0].attachments[0].content
         else {

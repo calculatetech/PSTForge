@@ -238,10 +238,7 @@ fn run() -> Result<(), String> {
         .and_then(Path::parent)
         .ok_or_else(|| "cannot locate workspace root".to_owned())?
         .to_path_buf();
-    let command = arguments.next().ok_or_else(|| {
-        "usage: cargo xtask gate <fast|full|release> | qualify embedded-attachments <output>"
-            .to_owned()
-    })?;
+    let command = arguments.next().ok_or_else(usage)?;
     if command == std::ffi::OsStr::new("qualify") {
         let checkpoint = arguments
             .next()
@@ -254,14 +251,15 @@ fn run() -> Result<(), String> {
         }
         return match checkpoint.to_str() {
             Some("embedded-attachments") => qualify_embedded_attachments(&root, Path::new(&output)),
-            _ => Err("unknown qualification checkpoint; expected embedded-attachments".to_owned()),
+            Some("named-properties") => qualify_named_properties(&root, Path::new(&output)),
+            _ => Err(
+                "unknown qualification checkpoint; expected embedded-attachments or named-properties"
+                    .to_owned(),
+            ),
         };
     }
     if command != std::ffi::OsStr::new("gate") {
-        return Err(
-            "usage: cargo xtask gate <fast|full|release> | qualify embedded-attachments <output>"
-                .to_owned(),
-        );
+        return Err(usage());
     }
     let tier = arguments
         .next()
@@ -288,30 +286,13 @@ fn run() -> Result<(), String> {
     }
 }
 
-fn qualify_embedded_attachments(root: &Path, output: &Path) -> Result<(), String> {
-    use pstforge_pst::writer::{
-        AttachmentContent, AttachmentSpec, FidelityStore, create_fidelity_store,
-    };
+fn usage() -> String {
+    "usage: cargo xtask gate <fast|full|release> | qualify <embedded-attachments|named-properties> <output>"
+        .to_owned()
+}
 
-    if !output.is_absolute() || output.starts_with(root) || output.exists() {
-        return Err(
-            "qualification output must be a new absolute directory outside the repository"
-                .to_owned(),
-        );
-    }
-    let parent = output
-        .parent()
-        .filter(|path| path.is_dir())
-        .ok_or_else(|| "qualification output parent must already exist".to_owned())?;
-    let temporary = tempfile::Builder::new()
-        .prefix(".pstforge-0.4.2-")
-        .tempdir_in(parent)
-        .map_err(|error| format!("cannot create qualification staging directory: {error}"))?;
-    let parts = temporary.path().join("parts");
-    fs::create_dir(&parts)
-        .map_err(|error| format!("cannot create qualification parts directory: {error}"))?;
-    fs::set_permissions(&parts, fs::Permissions::from_mode(0o700))
-        .map_err(|error| format!("cannot secure qualification parts directory: {error}"))?;
+fn qualify_embedded_attachments(root: &Path, output: &Path) -> Result<(), String> {
+    use pstforge_pst::writer::{AttachmentContent, AttachmentSpec, FidelityStore};
 
     let mut fixture = FidelityStore::default();
     let embedded = fixture
@@ -353,9 +334,55 @@ fn qualify_embedded_attachments(root: &Path, output: &Path) -> Result<(), String
         flags: 0,
         content: AttachmentContent::Embedded(Box::new(nested)),
     });
+    publish_fidelity_qualification(root, output, &fixture, 3)
+}
 
+fn qualify_named_properties(root: &Path, output: &Path) -> Result<(), String> {
+    let mut fixture = pstforge_pst::writer::FidelityStore::default();
+    fixture.message.subject = "Named property fidelity checkpoint".to_owned();
+    fixture.message.recipients.clear();
+    fixture.message.attachments.clear();
+    fixture.message.body_html = None;
+    fixture.message.body_rtf = None;
+    fixture.message.native_body = Some(pstforge_pst::writer::NativeBody::PlainText);
+    fixture.message.rtf_in_sync = false;
+    fixture.message.internet_headers = None;
+    fixture.message.raw_properties.clear();
+    fixture.message.spooled_properties.clear();
+    fixture.message.unsupported_properties.clear();
+    if fixture.message.named_properties.len() != 2 {
+        return Err("writer fixture does not contain both named-property forms".to_owned());
+    }
+    publish_fidelity_qualification(root, output, &fixture, 1)
+}
+
+fn publish_fidelity_qualification(
+    root: &Path,
+    output: &Path,
+    fixture: &pstforge_pst::writer::FidelityStore,
+    item_count: u64,
+) -> Result<(), String> {
+    if !output.is_absolute() || output.starts_with(root) || output.exists() {
+        return Err(
+            "qualification output must be a new absolute directory outside the repository"
+                .to_owned(),
+        );
+    }
+    let parent = output
+        .parent()
+        .filter(|path| path.is_dir())
+        .ok_or_else(|| "qualification output parent must already exist".to_owned())?;
+    let temporary = tempfile::Builder::new()
+        .prefix(".pstforge-0.4.2-")
+        .tempdir_in(parent)
+        .map_err(|error| format!("cannot create qualification staging directory: {error}"))?;
+    let parts = temporary.path().join("parts");
+    fs::create_dir(&parts)
+        .map_err(|error| format!("cannot create qualification parts directory: {error}"))?;
+    fs::set_permissions(&parts, fs::Permissions::from_mode(0o700))
+        .map_err(|error| format!("cannot secure qualification parts directory: {error}"))?;
     let part = parts.join("part-0001.pst");
-    let report = create_fidelity_store(&part, &fixture)
+    let report = pstforge_pst::writer::create_fidelity_store(&part, fixture)
         .map_err(|error| format!("cannot create qualification PST: {error}"))?;
     if !report.unsupported_properties.is_empty() {
         return Err("qualification PST omitted writer properties".to_owned());
@@ -379,7 +406,7 @@ fn qualify_embedded_attachments(root: &Path, output: &Path) -> Result<(), String
         .map_err(|error| format!("cannot inspect qualification PST: {error}"))?
         .len();
     let log = format!(
-        "PSTForge recovery log\nVersion: {}\nResult: complete\n\nRecovery summary\nItems written: 3\nOutput files: 1\n\nData not copied\nNo readable data was skipped.\n\nOutput files\npart-0001.pst: {byte_len} bytes, SHA-256 {:x}\n",
+        "PSTForge recovery log\nVersion: {}\nResult: complete\n\nRecovery summary\nItems written: {item_count}\nOutput files: 1\n\nData not copied\nNo readable data was skipped.\n\nOutput files\npart-0001.pst: {byte_len} bytes, SHA-256 {:x}\n",
         env!("CARGO_PKG_VERSION"),
         hasher.finalize()
     );
