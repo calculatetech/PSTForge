@@ -866,6 +866,89 @@ work. Hash and identity evidence show that the source was not modified.
     the job for diagnosis and another resume. A direct failed-resume regression
     preserved a sentinel, shell syntax passed, and the complete fast gate passes
     at `.agent/test-results/1784329593-fast`.
+- [ ] Milestone 0.4.2: Incremental Data Correctness.
+  - [x] (2026-07-17) The owner approved an incremental checkpoint workflow.
+    Each data family produces one focused validation PST, pauses for ScanPST
+    and Outlook, and receives a local and pushed branch commit only after human
+    acceptance. Progress documentation travels with the corresponding code
+    commit; it never creates a standalone commit.
+  - [x] Checkpoint 1: private part manifests, bounded human `recovery.log`, and
+    recursive attachments inside embedded items.
+    - [x] (2026-07-17) Recursive translation and writer serialization now
+      preserve attachments at every supported embedded-message level. The
+      parser and writer now accept 256 embedded levels, based on measured stack
+      behavior rather than an MS-PST format claim. Generated output is
+      independently validated with `pffinfo` and `readpst`, and an unsupported
+      embedded class is contained without discarding its readable parent
+      message.
+    - [x] (2026-07-17) New schema-6 jobs keep `parts/` PST-only and publish
+      private part manifests beneath `.pstforge/manifests/` through the
+      existing crash-reconciled intent transaction. A bounded mode-0600
+      `recovery.log` is atomically regenerated for complete, partial, and
+      interrupted split reports. This first checkpoint records exact aggregate
+      omissions; source-folder grouping is installed with the durable omission
+      ledger in checkpoint 2.
+    - [x] (2026-07-17) Added the private command
+      `cargo xtask qualify embedded-attachments <absolute-output>` and generated
+      `qualification-v042-embedded-r3/parts/part-0001.pst` outside the
+      repository. It contains a message attachment whose embedded message has
+      both a by-value attachment and another embedded message with its own
+      attachment and non-default attachment metadata. The 271,360-byte PST
+      passed completed-store, `pffinfo`, and `readpst` validation with SHA-256
+      `487e58c56b66cb9aa1bb63f60d39a6e4793f3d819b8b39fd63a975553699bdf8`.
+      Superseded r2 was removed.
+    - [x] (2026-07-17) The owner reported that r3 is clean in ScanPST and
+      Outlook through `nested-payload.bin`. MailPlus was intentionally omitted
+      because its known nested-message compatibility defect is tracked in an
+      escalated Synology engineering ticket and does not indicate PST data
+      loss. The owner approved commit, push, and continuation.
+    - [x] (2026-07-17) The first checkpoint review found two highs and two
+      outcome-relevant mediums. Repeated attachment-local node IDs could
+      duplicate embedded message record keys; unbounded per-part log detail
+      could fail after successful PST publication; interrupted reports could
+      omit durable parts and unsupported counts; and completed-store
+      validation checked only nested attachment row counts. The fixes derive
+      embedded record keys from the full parent chain, cap detail at 10,000
+      part lines while retaining exact totals, snapshot durable state for
+      interrupted reports, and recursively reopen and compare nested
+      attachment metadata/content. Rejected r1 was removed before r2.
+    - [x] (2026-07-17) The fixed checkpoint passes the complete fast gate at
+      `.agent/test-results/1784336515-fast`: formatting, locked workspace
+      check, Clippy with warnings denied, all workspace tests, rustdoc,
+      documentation/schema validation, and diff validation.
+    - [x] (2026-07-17) A second focused review identified a real cleanup gap:
+      the private qualification command relinquished its temporary-directory
+      guard before atomic rename, so a rename failure could retain staging
+      output. It now keeps the guard through rename. Two other findings were
+      challenged rather than accepted: `create_fidelity_store` already invokes
+      completed-store, `pffinfo`, and `readpst` validation before publication;
+      and adding a translation-side depth cutoff would silently omit valid
+      descendants based on an arbitrary number. The owner challenged the
+      unmeasured 64-level parser/writer ceiling. A 256-level end-to-end fixture
+      overflowed a 4 MiB test stack, passed at 6 MiB and 8 MiB, and passes with
+      the writer's new explicit 32 MiB stack. The parser uses a pending-work
+      stack rather than recursive calls. The supported ceiling is now 256 at
+      intake and writing, with all 257 messages in the root-plus-descendant
+      fixture translated, serialized, and recursively reopened.
+    - [x] (2026-07-17) The final review also found that recursive validation
+      compared nested filenames and payloads but not the nested attachment
+      table and remaining property-context metadata. It now compares row size,
+      number, method, rendering position, short and long filename, MIME type,
+      content ID, content location, flags, object size, and payload identity at
+      every level. The r3 fixture exercises non-default nested values.
+    - [x] (2026-07-17) The r3 review found one remaining durable-state
+      containment gap: a corrupt ledger could encode an embedded path beyond
+      256 and reach recursive canonical reconstruction before writer
+      validation. Canonical intake now rejects such ownership before building
+      parent/child trees, with a direct schema-6 corruption regression.
+  - [ ] Checkpoint 2: lossless native intake for store, folder, associated,
+    named-property, and arbitrary item-class data.
+  - [ ] Checkpoints 3 onward: contacts, appointments, meetings, distribution
+    lists, tasks, notes/posts, OLE/documents, associated/configuration data,
+    and remaining generic classes, each proven separately where feasible.
+  - [ ] Run the complete 19 GB split once after all focused checkpoints pass
+    and reconcile discovered unique items against written plus explicitly
+    unwritten items across every part.
 - [ ] Milestone 0.5.0: Operational UX and Debian Packaging.
 - [ ] Milestone 0.5.1: GitHub CI and Private-Corpus Automation; the remote is
   reachable, and work begins after the approved baseline is pushed.
@@ -1447,7 +1530,9 @@ work. Hash and identity evidence show that the source was not modified.
 - Decision: Version 0.1.1 exposes native catalog data as ordered events with
   owned metadata and borrowed payload slices no larger than 64 KiB. Direct
   messages and embedded messages use explicit work stacks, native strings are
-  capped at 1 MiB, embedded depth at 64, and retained diagnostics at 10,000.
+  capped at 1 MiB, embedded depth was initially capped at 64, and retained
+  diagnostics at 10,000. The measured 0.4.2 decision below supersedes that
+  initial depth value with 256.
   Rationale: The future durable candidate spool needs complete property data
   without making memory proportional to a large body, attachment, or damage
   count. Explicit relationships avoid recursive native-handle ownership.
@@ -1874,6 +1959,40 @@ work. Hash and identity evidence show that the source was not modified.
   Rationale: This is the representation accepted by ScanPST's repaired r6
   reference and preserves both valid XBLOCK sizing and row lookup semantics.
   Date/Author: 2026-07-17 / Codex after r6 evidence and clean-context review.
+
+- Decision: Version 0.4.2 job schema 6 moves part JSON into
+  `.pstforge/manifests/` and publishes one bounded root `recovery.log`; only PST
+  files remain in `parts/`.
+  Rationale: Import directories must contain only interchange artifacts, while
+  resume still requires private crash-reconciled part metadata. The human log
+  replaces the sidecars as the operator-facing omission record.
+  Date/Author: 2026-07-17 / Codex from the owner-approved 0.4.2 plan.
+
+- Decision: Build embedded messages with the same recursive writer path as
+  top-level messages and support 256 embedded levels consistently at native
+  intake and writing. An unsupported message class omits only that attachment
+  subtree, not its readable parent.
+  Rationale: The former one-level builder deliberately emitted an empty
+  attachment table for embedded messages and converted readable nested
+  attachments into data loss. A shared bounded path keeps tables, size
+  accounting, streaming, and validation uniform. No MS-PST nesting boundary was
+  found. The former 64 was unmeasured. The 256-level end-to-end fixture
+  overflowed a 4 MiB test stack and passed at 6 MiB and 8 MiB; writer execution
+  now receives a controlled 32 MiB stack, over five times the observed passing
+  threshold. The parser already uses an explicit pending-work stack. Supporting
+  substantially deeper input requires converting the remaining recursive
+  canonical, translation, writer, and validation paths to explicit work stacks
+  rather than guessing another larger constant.
+  Date/Author: 2026-07-17 / Codex from checkpoint-1 implementation evidence.
+
+- Decision: The checkpoint-1 human candidate may be a deterministic nested
+  writer fixture; later checkpoints that depend on source interpretation must
+  select a named real case through `PSTFORGE_CORPUS_MANIFEST`.
+  Rationale: This checkpoint changes writer structure, its parser ownership
+  path has a separate event-to-writer integration test, and no external corpus
+  manifest is configured on this host. The exception does not permit scanning
+  user directories or substituting synthetic data for later source behavior.
+  Date/Author: 2026-07-17 / Codex.
 
 ## Outcomes & Retrospective
 
@@ -2326,7 +2445,61 @@ complete, open each original part independently in Outlook, then import each
 into the dedicated MailPlus test mailbox and compare folder/message counts,
 unread/deleted placement, sampled bodies, and attachments.
 
-### Milestone 9: Version 0.5.0 - Operational UX and Debian Packaging
+### Milestone 9: Version 0.4.2 - Incremental Data Correctness
+
+Preserve all readable native PST data that Outlook, MailPlus, or another PST
+consumer could use. No item class is excluded merely because MailPlus does not
+display it. Full success requires zero semantic omissions; corruption,
+unreadable values, unusable source-store references, or legal PST output limits
+produce partial success and a plain-language explanation.
+
+Implement on `milestone/v0.4.2-data-correctness` through checkpoint commits
+that all retain version 0.4.2. Before each commit, run focused automation,
+produce one bounded PST containing the affected data type, finish a fresh
+checkpoint review, and stop for ScanPST followed by Outlook. Use a real named
+external-corpus case whenever the checkpoint depends on source behavior; a
+deterministic writer fixture is sufficient only when parser ownership is
+separately covered and the checkpoint changes writer structure. Fix a rejected
+candidate without committing. After human acceptance, update this ExecPlan in
+the same code commit and push the milestone branch. Do not create progress-only
+commits or merge checkpoints into `main`.
+
+Checkpoint order is recursive embedded attachments; lossless native intake;
+contacts; appointments; meeting objects; distribution lists; tasks; notes and
+post families; OLE, documents, and reference attachments; associated and
+configuration data; then remaining generic classes. Private `xtask`
+qualification commands write one bounded candidate part without adding public
+CLI filtering. Commands that consume real PSTs read only a named case from
+`PSTFORGE_CORPUS_MANIFEST`; they never scan user directories.
+
+New jobs keep `parts/` PST-only. Private JSON manifests live beneath
+`.pstforge/manifests/`. One mode-`0600` job-root `recovery.log` is atomically
+regenerated from durable state and groups exact preserved, relocated, and
+unpreserved totals by source-visible folder and human reason. It excludes
+subjects, addresses, filenames, payloads, property tags, internal keys, and
+native error jargon. Exact totals are never capped; folder detail is bounded to
+10,000 lines and 4 MiB.
+
+For checkpoint 1, run:
+
+    cargo xtask qualify embedded-attachments \
+      /home/mbeutler/.local/share/pstforge/acceptance/qualification-v042-embedded-r3
+
+The output directory must be new, absolute, and outside the repository. The
+command stages the directory beside its destination and publishes it only
+after completed-store, `pffinfo`, and `readpst` validation. Scan only
+`parts/part-0001.pst`; then open that same unrepaired PST in Outlook and inspect
+both nested attachment levels.
+
+After every available focused checkpoint succeeds, run the complete 19 GB
+split once. Unique source items assigned across all output parts must equal the
+readable source inventory, or the recovery record must establish high
+confidence by exactly reconciling readable items, failed source slots,
+recovery-collection boundaries, written fingerprints, and explicitly
+unwritten content. Validate all final parts with independent readers, ScanPST,
+Outlook, and MailPlus. The 50 GB source remains a later release gate.
+
+### Milestone 10: Version 0.5.0 - Operational UX and Debian Packaging
 
 Finalize report schemas, privacy redaction, exit statuses, error wording,
 report regeneration, install diagnostics, spool cleanup, and operator docs.
@@ -2339,7 +2512,7 @@ Acceptance: installing the package on clean Debian 13 makes `pstforge info`,
 it leaves user jobs and source PSTs untouched; package contents, licenses, and
 dependency metadata pass inspection.
 
-### Milestone 10: Version 0.5.1 - GitHub CI and Private-Corpus Automation
+### Milestone 11: Version 0.5.1 - GitHub CI and Private-Corpus Automation
 
 Begin after the human-approved documentation baseline is pushed to the
 reachable `origin` remote and repository settings can be configured. This
@@ -2354,7 +2527,7 @@ Add a release workflow that builds but cannot publish without an approved tag
 and environment. Repository automation does not waive the rule that agents may
 not push, merge, tag, or publish without explicit human approval.
 
-### Milestone 11: Version 0.6.0 - Interoperability Release Candidate
+### Milestone 12: Version 0.6.0 - Interoperability Release Candidate
 
 Freeze CLI/schema changes, run every local and GitHub gate, fuzz parsers and
 writer structures, inject disk and process failures, and complete security,
@@ -2366,7 +2539,7 @@ No blocker or high-severity review finding may remain. Medium findings must be
 fixed or explicitly accepted by the human owner in the Decision Log. A release
 candidate is not 1.0 until the real 50 GB rehearsal succeeds from clean state.
 
-### Milestone 12: Version 1.0.0 - MailPlus-Ready Release
+### Milestone 13: Version 1.0.0 - MailPlus-Ready Release
 
 From a clean Debian package install, repeat balanced recovery of the real 50 GB
 source, validate all parts, and import them into MailPlus. Confirm source

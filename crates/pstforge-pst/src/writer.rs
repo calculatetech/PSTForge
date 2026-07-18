@@ -98,6 +98,8 @@ const INITIAL_NID_COUNTERS: [u32; 32] = [
     0x400, 0x400, 0x400, 0x400, 0x400, 0x400, 0x400, 0x400, 0x400, 0x400, 0x400, 0x400, 0x400,
     0x400, 0x400, 0x400, 0x400, 0x400, 0x400,
 ];
+const MAX_EMBEDDED_MESSAGE_DEPTH: usize = 256;
+const WRITER_STACK_BYTES: usize = 32 * 1024 * 1024;
 
 /// Inputs for the first observable writer milestone.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -544,8 +546,26 @@ pub enum WriterError {
     InputRejected(String),
     #[error("completed PST validation failed: {0}")]
     CompletedValidation(String),
+    #[error("PST writer execution thread terminated unexpectedly")]
+    ExecutionTerminated,
     #[error("I/O error: {0}")]
     Io(#[from] io::Error),
+}
+
+fn with_writer_stack<T, F>(operation: F) -> Result<T, WriterError>
+where
+    T: Send,
+    F: FnOnce() -> Result<T, WriterError> + Send,
+{
+    std::thread::scope(|scope| {
+        std::thread::Builder::new()
+            .name("pstforge-writer".to_owned())
+            .stack_size(WRITER_STACK_BYTES)
+            .spawn_scoped(scope, operation)
+            .map_err(WriterError::Io)?
+            .join()
+            .map_err(|_| WriterError::ExecutionTerminated)?
+    })
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -1196,6 +1216,7 @@ struct MessageBlocks {
     dynamic_blocks: Vec<BlockSpec>,
     record_key: [u8; 16],
     message_size: i32,
+    streamed_logical_size: usize,
 }
 
 struct BuiltTopMessage {
@@ -1361,8 +1382,7 @@ fn plan_folders<'a>(
 #[allow(clippy::too_many_arguments)]
 fn build_message_blocks(
     message_spec: &MessageSpec,
-    store_key: [u8; 16],
-    message: NodeId,
+    record_key: [u8; 16],
     named_identities: &[NamedIdentity],
     recipient_block: UnicodeBlockId,
     attachment_table_block: UnicodeBlockId,
@@ -1435,104 +1455,49 @@ fn build_message_blocks(
                         .checked_add(attachment_index)
                         .ok_or(WriterError::ValueTooLarge("embedded message node"))?,
                 )?;
-                let embedded_recipient_rows = embedded
-                    .recipients
-                    .iter()
-                    .enumerate()
-                    .map(|(row, recipient)| recipient_table_row(row, recipient))
-                    .collect::<Result<Vec<_>, _>>()?;
-                let embedded_recipients =
-                    table_context(&recipient_columns, &embedded_recipient_rows)?;
-                let embedded_attachments = table_context(&attachment_columns, &[])?;
-                let embedded_blocks_start = dynamic_blocks.len();
                 let embedded_pc_block = take_block_id(next_block_index, false)?;
                 let embedded_recipient_block = take_block_id(next_block_index, false)?;
                 let embedded_attachment_block = take_block_id(next_block_index, false)?;
-                let mut embedded_subnodes = vec![
-                    UnicodeLeafSubNodeTreeEntry::new(
-                        NodeId::from(NID_RECIPIENT_TABLE_TEMPLATE),
-                        embedded_recipient_block,
-                        None,
-                    ),
-                    UnicodeLeafSubNodeTreeEntry::new(
-                        NodeId::from(NID_ATTACHMENT_TABLE_TEMPLATE),
-                        embedded_attachment_block,
-                        None,
-                    ),
-                ];
-                let embedded_key = message_record_key(store_key, embedded_node);
-                let mut embedded_properties =
-                    message_properties(embedded, named_identities, embedded_key, 0)?;
-                let embedded_streamed_size = if embedded.spooled_properties.is_empty() {
-                    0
-                } else {
-                    let stream = block_stream.as_deref_mut().ok_or_else(|| {
-                        WriterError::InvalidStructure(
-                            "embedded spooled property requires streaming output".to_owned(),
-                        )
-                    })?;
-                    append_spooled_properties(
-                        &embedded.spooled_properties,
-                        &mut embedded_properties,
-                        &mut embedded_subnodes,
-                        next_block_index,
-                        next_value_node,
-                        stream,
-                    )?
-                };
-                streamed_logical_size = streamed_logical_size
-                    .checked_add(embedded_streamed_size)
-                    .ok_or(WriterError::ValueTooLarge("message size"))?;
-                externalize_large_properties(
-                    &mut embedded_properties,
+                let embedded_blocks = build_message_blocks(
+                    embedded,
+                    embedded_message_record_key(record_key, attachment_index),
+                    named_identities,
+                    embedded_recipient_block,
+                    embedded_attachment_block,
                     next_block_index,
                     next_value_node,
-                    &mut dynamic_blocks,
-                    &mut embedded_subnodes,
+                    block_stream.as_deref_mut(),
                 )?;
-                let embedded_pc_zero = property_context(&embedded_properties)?;
-                let embedded_bytes = embedded_pc_zero
-                    .len()
-                    .checked_add(embedded_recipients.len())
-                    .and_then(|total| total.checked_add(embedded_attachments.len()))
-                    .and_then(|total| total.checked_add(embedded_streamed_size))
-                    .and_then(|total| {
-                        dynamic_blocks[embedded_blocks_start..]
-                            .iter()
-                            .try_fold(total, |sum, block| {
-                                sum.checked_add(block.payload.logical_size())
-                            })
-                    })
-                    .ok_or(WriterError::ValueTooLarge("embedded message size"))?;
-                let embedded_size = i32::try_from(embedded_bytes)
-                    .map_err(|_| WriterError::ValueTooLarge("embedded message size"))?;
-                set_message_size(&mut embedded_properties, embedded_size)?;
+                streamed_logical_size = streamed_logical_size
+                    .checked_add(embedded_blocks.streamed_logical_size)
+                    .ok_or(WriterError::ValueTooLarge("message size"))?;
+                let embedded_size = embedded_blocks.message_size;
                 let embedded_object_size = u32::try_from(embedded_size)
                     .map_err(|_| WriterError::ValueTooLarge("embedded message"))?;
                 let embedded_subnode_block = take_block_id(next_block_index, true)?;
-                embedded_subnodes.sort_by_key(|entry| u32::from(entry.node()));
                 dynamic_blocks.extend([
                     BlockSpec {
                         id: embedded_pc_block,
-                        payload: BlockPayload::Data(property_context(&embedded_properties)?),
+                        payload: BlockPayload::Data(embedded_blocks.property_context),
                         ref_count: 2,
                     },
                     BlockSpec {
                         id: embedded_recipient_block,
-                        payload: BlockPayload::Data(embedded_recipients),
+                        payload: BlockPayload::Data(embedded_blocks.recipient_table),
                         ref_count: 2,
                     },
                     BlockSpec {
                         id: embedded_attachment_block,
-                        payload: BlockPayload::Data(embedded_attachments),
+                        payload: BlockPayload::Data(embedded_blocks.attachment_table),
                         ref_count: 2,
                     },
                     BlockSpec {
                         id: embedded_subnode_block,
-                        payload: BlockPayload::Subnode(embedded_subnodes),
+                        payload: BlockPayload::Subnode(embedded_blocks.subnodes),
                         ref_count: 2,
                     },
                 ]);
+                dynamic_blocks.extend(embedded_blocks.dynamic_blocks);
                 attachment_local_subnodes.push(UnicodeLeafSubNodeTreeEntry::new(
                     embedded_node,
                     embedded_pc_block,
@@ -1589,7 +1554,6 @@ fn build_message_blocks(
     }
     message_subnodes.sort_by_key(|entry| u32::from(entry.node()));
     let attachment_table = table_context(&attachment_columns, &attachment_rows)?;
-    let record_key = message_record_key(store_key, message);
     let mut top_properties = message_properties(message_spec, named_identities, record_key, 0)?;
     if !message_spec.spooled_properties.is_empty() {
         let stream = block_stream.ok_or_else(|| {
@@ -1636,6 +1600,7 @@ fn build_message_blocks(
         dynamic_blocks,
         record_key,
         message_size,
+        streamed_logical_size,
     })
 }
 
@@ -1644,9 +1609,17 @@ pub fn create_fidelity_store(
     path: impl AsRef<Path>,
     spec: &FidelityStore,
 ) -> Result<FidelityWriteReport, WriterError> {
+    let path = path.as_ref();
+    with_writer_stack(|| create_fidelity_store_expected(path, spec))
+}
+
+fn create_fidelity_store_expected(
+    path: &Path,
+    spec: &FidelityStore,
+) -> Result<FidelityWriteReport, WriterError> {
     validate_spec(spec)?;
     create_flat_store(
-        path.as_ref(),
+        path,
         &StoreInput {
             store_name: &spec.store_name,
             folder_name: &spec.folder_name,
@@ -1668,7 +1641,8 @@ pub fn create_mail_store(
     path: impl AsRef<Path>,
     spec: &MailStoreSpec,
 ) -> Result<FidelityWriteReport, WriterError> {
-    create_mail_store_expected(path.as_ref(), spec, &NEVER_INTERRUPTED, None)
+    let path = path.as_ref();
+    with_writer_stack(|| create_mail_store_expected(path, spec, &NEVER_INTERRUPTED, None))
 }
 
 /// Create a deterministic PST part while honoring an operator interruption.
@@ -1677,7 +1651,8 @@ pub fn create_mail_store_interruptible(
     spec: &MailStoreSpec,
     interrupted: &AtomicBool,
 ) -> Result<FidelityWriteReport, WriterError> {
-    create_mail_store_expected(path.as_ref(), spec, interrupted, None)
+    let path = path.as_ref();
+    with_writer_stack(|| create_mail_store_expected(path, spec, interrupted, None))
 }
 
 /// Create a PST part with validators supervised by the PSTForge executable.
@@ -1687,12 +1662,10 @@ pub fn create_mail_store_supervised(
     interrupted: &AtomicBool,
     supervisor_executable: &Path,
 ) -> Result<FidelityWriteReport, WriterError> {
-    create_mail_store_expected(
-        path.as_ref(),
-        spec,
-        interrupted,
-        Some(supervisor_executable),
-    )
+    let path = path.as_ref();
+    with_writer_stack(|| {
+        create_mail_store_expected(path, spec, interrupted, Some(supervisor_executable))
+    })
 }
 
 fn create_mail_store_expected(
@@ -1767,7 +1740,7 @@ pub fn validate_mail_store_input(spec: &MailStoreSpec) -> Result<(), WriterError
         property_context(&named_property_map(&named_identities)?)?;
         for message in messages {
             validate_aggregate_properties(message)?;
-            validate_message(message, false)?;
+            validate_message(message, 0)?;
             validate_message_size_bound(message)?;
         }
         Ok(())
@@ -2028,8 +2001,7 @@ fn create_flat_store(
         });
         let message = build_message_blocks(
             message_spec,
-            spec.record_key,
-            message_node,
+            message_record_key(spec.record_key, message_node),
             &named_identities,
             recipient_block,
             attachment_block,
@@ -2909,7 +2881,7 @@ fn validate_spec(spec: &FidelityStore) -> Result<(), WriterError> {
         }
     }
     validate_aggregate_properties(&spec.message)?;
-    validate_message(&spec.message, false)
+    validate_message(&spec.message, 0)
 }
 
 fn validate_aggregate_properties(message: &MessageSpec) -> Result<(), WriterError> {
@@ -3389,7 +3361,7 @@ fn validate_message_property_context_shape(message: &MessageSpec) -> Result<(), 
     validate_property_context_shape("message property context", property_count, &lengths)
 }
 
-fn validate_message(message: &MessageSpec, embedded: bool) -> Result<(), WriterError> {
+fn validate_message(message: &MessageSpec, depth: usize) -> Result<(), WriterError> {
     if !supported_message_class(&message.message_class) {
         return Err(WriterError::InvalidStructure(format!(
             "unsupported message class: {}",
@@ -3581,12 +3553,13 @@ fn validate_message(message: &MessageSpec, embedded: bool) -> Result<(), WriterE
             }
         }
         if let AttachmentContent::Embedded(child) = &attachment.content {
-            if embedded || !child.attachments.is_empty() {
-                return Err(WriterError::InvalidStructure(
-                    "nested attachments inside an embedded message are not supported".to_owned(),
-                ));
+            let child_depth = depth
+                .checked_add(1)
+                .ok_or(WriterError::ValueTooLarge("embedded message depth"))?;
+            if child_depth > MAX_EMBEDDED_MESSAGE_DEPTH {
+                return Err(WriterError::ValueTooLarge("embedded message depth"));
             }
-            validate_message(child, true)?;
+            validate_message(child, child_depth)?;
         }
     }
     if message.named_properties.len() > MAX_FIDELITY_COLLECTION_ITEMS {
@@ -3654,7 +3627,7 @@ fn validate_message(message: &MessageSpec, embedded: bool) -> Result<(), WriterE
         }
         validate_raw_value(&property.value)?;
     }
-    if !embedded {
+    if depth == 0 {
         validate_contents_raw_property_types(message)?;
     }
     validate_message_property_context_shape(message)?;
@@ -4633,10 +4606,13 @@ fn validate_attachment_fidelity(
                     return Err(invalid("completed store embedded attachment size mismatch"));
                 }
                 validate_embedded_message(
-                    actual.as_ref(),
+                    actual.clone(),
                     expected_message,
                     named_identities,
-                    message_record_key(spec.record_key, embedded_node),
+                    embedded_message_record_key(
+                        message_record_key(spec.record_key, top_node),
+                        index_u32,
+                    ),
                 )?;
             }
             _ => return Err(invalid("completed store attachment content mismatch")),
@@ -4709,7 +4685,7 @@ fn validate_named_map(
 }
 
 fn validate_embedded_message(
-    actual: &dyn crate::messaging::message::Message,
+    actual: std::rc::Rc<dyn crate::messaging::message::Message>,
     expected: &MessageSpec,
     named_identities: &[NamedIdentity],
     record_key: [u8; 16],
@@ -4893,6 +4869,186 @@ fn validate_embedded_message(
             || !matches!(read(smtp)?, ReadValue::Unicode(value) if value.to_string() == expected.email_address)
         {
             return Err(invalid("completed store embedded recipient mismatch"));
+        }
+    }
+    for (index, expected_attachment) in expected.attachments.iter().enumerate() {
+        use crate::messaging::attachment::AttachmentData;
+
+        let index_u32 =
+            u32::try_from(index).map_err(|_| WriterError::ValueTooLarge("attachment count"))?;
+        let attachment_node = node(
+            NodeIdType::Attachment,
+            0x2_0000_u32
+                .checked_add(index_u32)
+                .ok_or(WriterError::ValueTooLarge("attachment node"))?,
+        )?;
+        let validation_ids = match &expected_attachment.content {
+            AttachmentContent::Embedded(message) => {
+                Some(validation_property_ids(message, named_identities)?)
+            }
+            AttachmentContent::Binary(_) | AttachmentContent::Spooled(_) => None,
+        };
+        let streamed_ids = match &expected_attachment.content {
+            AttachmentContent::Embedded(message) => message
+                .spooled_properties
+                .iter()
+                .map(|property| property.id)
+                .collect::<Vec<_>>(),
+            AttachmentContent::Binary(_) | AttachmentContent::Spooled(_) => Vec::new(),
+        };
+        let attachment = actual
+            .clone()
+            .read_attachment(
+                attachment_node,
+                validation_ids.as_deref(),
+                &streamed_ids,
+                !matches!(&expected_attachment.content, AttachmentContent::Spooled(_)),
+            )
+            .map_err(|error| {
+                invalid(&format!(
+                    "completed store nested attachment {index} cannot be read: {error}"
+                ))
+            })?;
+        let properties = attachment.properties();
+        let row = attachments
+            .find_row(crate::ltp::table_context::TableRowId::new(u32::from(
+                attachment_node,
+            )))
+            .map_err(|_| invalid("completed store nested attachment row is missing"))?;
+        let row_values = row.columns(attachments.context())?;
+        let table_value = |property_id| -> Result<ReadValue, WriterError> {
+            let column = attachments
+                .context()
+                .columns()
+                .iter()
+                .position(|column| column.prop_id() == property_id)
+                .ok_or_else(|| invalid("completed store nested attachment column is missing"))?;
+            let value = row_values[column]
+                .as_ref()
+                .ok_or_else(|| invalid("completed store nested attachment value is missing"))?;
+            Ok(attachments
+                .read_column(value, attachments.context().columns()[column].prop_type())?)
+        };
+        let expected_number =
+            i32::try_from(index).map_err(|_| WriterError::ValueTooLarge("attachment number"))?;
+        let pc_size = properties.attachment_size()?;
+        let pc_method = properties.attachment_method()?;
+        let pc_rendering = properties.rendering_position()?;
+        if !matches!(table_value(0x0E20)?, ReadValue::Integer32(value) if value == pc_size)
+            || !matches!(table_value(0x0E21)?, ReadValue::Integer32(value) if value == expected_number)
+            || !matches!(properties.get(0x0E21), Some(ReadValue::Integer32(value)) if *value == expected_number)
+            || !matches!(table_value(0x3704)?, ReadValue::Unicode(value) if value.to_string() == expected_attachment.filename)
+            || !matches!(table_value(0x3705)?, ReadValue::Integer32(value) if value == pc_method)
+            || !matches!(table_value(0x370B)?, ReadValue::Integer32(value) if value == pc_rendering)
+        {
+            return Err(invalid(
+                "completed store nested attachment table value mismatch",
+            ));
+        }
+        let unicode_matches = |id, value: &Option<String>| match value {
+            Some(expected) => matches!(
+                properties.get(id),
+                Some(ReadValue::Unicode(actual)) if actual.to_string() == *expected
+            ),
+            None => properties.get(id).is_none(),
+        };
+        if !matches!(
+            properties.get(0x3704),
+            Some(ReadValue::Unicode(value)) if value.to_string() == expected_attachment.filename
+        ) || !matches!(
+            properties.get(0x3707),
+            Some(ReadValue::Unicode(value)) if value.to_string() == expected_attachment.filename
+        ) || !unicode_matches(0x370E, &expected_attachment.mime_type)
+            || !unicode_matches(0x3712, &expected_attachment.content_id)
+            || !unicode_matches(0x3713, &expected_attachment.content_location)
+            || pc_rendering != expected_attachment.rendering_position.unwrap_or(-1)
+            || !matches!(
+                properties.get(0x3714),
+                Some(ReadValue::Integer32(value)) if *value == expected_attachment.flags
+            )
+        {
+            return Err(invalid(
+                "completed store nested attachment metadata mismatch",
+            ));
+        }
+        match (&expected_attachment.content, attachment.data()) {
+            (AttachmentContent::Binary(expected), Some(AttachmentData::Binary(actual))) => {
+                let expected_size = attachment_property_size(&attachment_properties(
+                    expected_attachment,
+                    expected_number,
+                    1,
+                    0,
+                    PropertyValue::Binary(expected.clone()),
+                ))?;
+                if actual.buffer() != expected || pc_method != 1 || pc_size != expected_size {
+                    return Err(invalid(
+                        "completed store nested binary attachment size mismatch",
+                    ));
+                }
+            }
+            (AttachmentContent::Spooled(expected), None) => {
+                let expected_size = attachment_property_size_with_stream(
+                    &attachment_properties(
+                        expected_attachment,
+                        expected_number,
+                        1,
+                        0,
+                        PropertyValue::External(
+                            PropertyType::Binary,
+                            node(NodeIdType::ListsTablesProperties, 1)?,
+                        ),
+                    ),
+                    Some(expected.byte_len),
+                )?;
+                if pc_method != 1
+                    || pc_size != expected_size
+                    || attachment.streamed_data_identity()
+                        != Some((expected.byte_len, expected.sha256))
+                {
+                    return Err(invalid(
+                        "completed store nested spooled attachment size mismatch",
+                    ));
+                }
+            }
+            (
+                AttachmentContent::Embedded(expected_child),
+                Some(AttachmentData::Message(actual_child)),
+            ) => {
+                let embedded_node = node(
+                    NodeIdType::NormalMessage,
+                    0x3_0000_u32
+                        .checked_add(index_u32)
+                        .ok_or(WriterError::ValueTooLarge("embedded message node"))?,
+                )?;
+                let embedded_size = actual_child.properties().message_size()?;
+                let expected_size = attachment_property_size(&attachment_properties(
+                    expected_attachment,
+                    expected_number,
+                    5,
+                    0,
+                    PropertyValue::Object(
+                        embedded_node,
+                        u32::try_from(embedded_size)
+                            .map_err(|_| WriterError::ValueTooLarge("embedded message"))?,
+                    ),
+                ))?;
+                if pc_method != 5 || pc_size != expected_size {
+                    return Err(invalid(
+                        "completed store nested embedded attachment size mismatch",
+                    ));
+                }
+                validate_embedded_message(
+                    actual_child.clone(),
+                    expected_child,
+                    named_identities,
+                    embedded_message_record_key(record_key, index_u32),
+                )?;
+            }
+            _ => {
+                return Err(invalid(
+                    "completed store nested attachment content mismatch",
+                ));
+            }
         }
     }
     Ok(())
@@ -5866,6 +6022,17 @@ fn message_record_key(store_key: [u8; 16], message: NodeId) -> [u8; 16] {
     for (index, byte) in key.iter_mut().enumerate() {
         *byte ^= node[index % node.len()].wrapping_add(index as u8);
     }
+    key
+}
+
+fn embedded_message_record_key(parent_key: [u8; 16], attachment_index: u32) -> [u8; 16] {
+    let mut hasher = Sha256::new();
+    hasher.update(b"PSTForge embedded record key");
+    hasher.update(parent_key);
+    hasher.update(attachment_index.to_le_bytes());
+    let digest = hasher.finalize();
+    let mut key = [0_u8; 16];
+    key.copy_from_slice(&digest[..16]);
     key
 }
 
@@ -7858,6 +8025,7 @@ mod tests {
                 dynamic_blocks: Vec::new(),
                 record_key: [0; 16],
                 message_size: 0,
+                streamed_logical_size: 0,
             },
         });
         assert_eq!(blocks[1].ref_count, 2);
@@ -9185,9 +9353,50 @@ mod tests {
             });
         }
         let directory = tempfile::tempdir()?;
+        let nested_path = directory.path().join("nested.pst");
+        create_fidelity_store(&nested_path, &nested)?;
+        assert!(nested_path.is_file());
+        let top_key = message_record_key(
+            nested.record_key,
+            node(NodeIdType::NormalMessage, MESSAGE_INDEX)?,
+        );
+        let embedded_key = embedded_message_record_key(top_key, 1);
+        let nested_key = embedded_message_record_key(embedded_key, 1);
+        assert_ne!(top_key, embedded_key);
+        assert_ne!(embedded_key, nested_key);
+        assert_ne!(top_key, nested_key);
+
+        let template = match &FidelityStore::default().message.attachments[1].content {
+            AttachmentContent::Embedded(message) => {
+                let mut message = message.as_ref().clone();
+                message.attachments.clear();
+                message
+            }
+            AttachmentContent::Binary(_) | AttachmentContent::Spooled(_) => {
+                return Err("expected embedded fixture".into());
+            }
+        };
+        let mut child = template.clone();
+        for _ in 0..=MAX_EMBEDDED_MESSAGE_DEPTH {
+            let mut parent = template.clone();
+            parent.attachments.push(AttachmentSpec {
+                filename: "nested.msg".to_owned(),
+                mime_type: Some("message/rfc822".to_owned()),
+                content_id: None,
+                content_location: None,
+                rendering_position: None,
+                flags: 0,
+                content: AttachmentContent::Embedded(Box::new(child)),
+            });
+            child = parent;
+        }
+        let too_deep = FidelityStore {
+            message: child,
+            ..FidelityStore::default()
+        };
         assert!(matches!(
-            create_fidelity_store(directory.path().join("nested.pst"), &nested),
-            Err(WriterError::InvalidStructure(_))
+            validate_spec(&too_deep),
+            Err(WriterError::ValueTooLarge("embedded message depth"))
         ));
 
         let mut embedded_collision = FidelityStore::default();
@@ -9475,7 +9684,13 @@ mod tests {
         let properties = message_properties(
             embedded,
             &identities,
-            message_record_key(spec.record_key, node(NodeIdType::NormalMessage, 0x3_0001)?),
+            embedded_message_record_key(
+                message_record_key(
+                    spec.record_key,
+                    node(NodeIdType::NormalMessage, MESSAGE_INDEX)?,
+                ),
+                1,
+            ),
             0,
         )?;
         let expected_index = identities

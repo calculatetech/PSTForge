@@ -10,6 +10,8 @@ use thiserror::Error;
 
 use crate::{ContentCompleteness, ItemKey, RecoveryProvenance};
 
+const MAX_EMBEDDED_MESSAGE_DEPTH: usize = 256;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CanonicalRecipient {
     pub index: u32,
@@ -245,6 +247,12 @@ fn validate_ownership(
     ownership: &CandidateOwnership,
     by_key: &BTreeMap<&str, &CandidateOwnership>,
 ) -> Result<(), CanonicalError> {
+    if ownership.embedded_path.len() > MAX_EMBEDDED_MESSAGE_DEPTH {
+        return invalid_ownership(
+            ownership,
+            "embedded path exceeds the supported depth of 256",
+        );
+    }
     let metadata: OwnershipMetadata =
         serde_json::from_value(ownership.metadata.clone()).map_err(|error| {
             CanonicalError::InvalidCandidate {
@@ -1163,9 +1171,15 @@ mod tests {
         };
         assert_eq!(embedded.spooled_properties[0].id, 0x1000);
         assert_eq!(embedded.spooled_properties[0].blob.byte_len, 4);
-        assert!(embedded.attachments.is_empty());
-        assert_eq!(input.omitted_attachments, 1);
-        assert_eq!(input.unsupported_item_keys, ["normal:-:-:2"]);
+        assert_eq!(embedded.attachments.len(), 1);
+        let pstforge_pst::writer::AttachmentContent::Embedded(nested) =
+            &embedded.attachments[0].content
+        else {
+            return Err("nested attachment is not embedded".into());
+        };
+        assert_eq!(nested.subject, "nested embedded");
+        assert_eq!(input.omitted_attachments, 0);
+        assert!(input.unsupported_item_keys.is_empty());
         let output = directory.path().join("translated.pst");
         pstforge_pst::writer::create_mail_store(&output, &input.store)?;
         assert!(output.is_file());
@@ -1178,12 +1192,17 @@ mod tests {
         )?;
         assert_eq!(parts.len(), 1);
         assert!(parts[0].oversize);
-        assert_eq!(written, 3);
+        assert_eq!(written, 4);
         assert!(partial);
         assert!(directory.path().join("job/parts/part-0001.pst").is_file());
-        assert!(directory.path().join("job/parts/part-0001.json").is_file());
+        assert!(
+            directory
+                .path()
+                .join("job/.pstforge/manifests/part-0001.json")
+                .is_file()
+        );
         let reopened = DurableCatalogSink::open(&directory.path().join("job"))?;
-        assert_eq!(reopened.summary()?.unsupported_candidates, 1);
+        assert_eq!(reopened.summary()?.unsupported_candidates, 0);
         assert!(reopened.spooled_candidates()?.is_empty());
         drop(reopened);
         let (resumed_parts, resumed_written, resumed_partial) = split_recovered_job(
@@ -1554,6 +1573,64 @@ mod tests {
         let error = load_canonical_mail(&reopened)
             .expect_err("unknown incomplete property owner must fail");
         assert!(error.to_string().contains("owns unknown recipient"));
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_overdepth_durable_ownership_before_recursive_rebuild()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempdir()?;
+        let job = directory.path().join("overdepth-job");
+        let mut sink = DurableCatalogSink::create(&job)?;
+        message_start(&mut sink, 80, None, None)?;
+        sink.event(CatalogEvent::AttachmentStart {
+            message_id: 80,
+            index: 1,
+            attachment_type: Some(i32::from(b'i')),
+            data_size: None,
+            filename: Some("embedded.msg".to_owned()),
+        })?;
+        sink.event(CatalogEvent::AttachmentEnd {
+            message_id: 80,
+            index: 1,
+        })?;
+        sink.event(CatalogEvent::MessageEnd {
+            id: 80,
+            complete: true,
+        })?;
+        message_start(&mut sink, 81, None, Some((80, 1)))?;
+        sink.event(CatalogEvent::MessageEnd {
+            id: 81,
+            complete: true,
+        })?;
+        sink.checkpoint()?;
+        drop(sink);
+
+        let connection = Connection::open(job.join(".pstforge/job.sqlite3"))?;
+        let item_key = "normal:81:-:0";
+        let metadata_json: String = connection.query_row(
+            "SELECT metadata_json FROM candidates WHERE item_key = ?1",
+            [item_key],
+            |row| row.get(0),
+        )?;
+        let mut metadata: serde_json::Value = serde_json::from_str(&metadata_json)?;
+        let embedded_path = vec![1_u32; 257];
+        metadata["embedded_path"] = serde_json::to_value(&embedded_path)?;
+        connection.execute(
+            "UPDATE candidates SET embedded_path_json = ?1, metadata_json = ?2 \
+             WHERE item_key = ?3",
+            params![
+                serde_json::to_string(&embedded_path)?,
+                serde_json::to_string(&metadata)?,
+                item_key
+            ],
+        )?;
+        drop(connection);
+
+        let reopened = DurableCatalogSink::open(&job)?;
+        let error =
+            load_canonical_mail(&reopened).expect_err("overdepth durable state must be rejected");
+        assert!(error.to_string().contains("supported depth of 256"));
         Ok(())
     }
 

@@ -5,7 +5,7 @@
 PSTForge is a Linux command-line recovery utility for operators who have a
 large or damaged Outlook Personal Storage Table (PST) that existing tools
 cannot process reliably. It reads the source without modification, accounts
-for reachable and recoverable mail, and produces smaller PST files that can be
+for reachable and recoverable PST content, and produces smaller PST files that can be
 imported independently into Synology MailPlus Server. Smaller parts provide
 restart and import checkpoints and limit the scope of a failed import.
 
@@ -16,10 +16,14 @@ runs, while retaining concise human progress and machine-readable reports.
 ## Scope
 
 PSTForge 1.0 supports healthy and damaged ANSI and Unicode PST input that
-`libpff` can open. It recovers the normal folder tree, email, recipients,
-message bodies, attachments, embedded messages, deleted or disconnected mail
-exposed by `libpff`, orphan items, and fragment candidates in explicit
-aggressive mode when the input library can prove fragment origin.
+`libpff` can open. It preserves every readable native item and useful property
+that a PST reader could consume, including mail, contacts, distribution lists,
+appointments, meetings, tasks, notes, documents, unknown message classes,
+recipients, attachments, recursively embedded items, named properties,
+folder/store metadata, and hidden associated contents. It also recovers
+deleted or disconnected items exposed by `libpff`, orphan items, and fragment
+candidates in explicit aggressive mode when the input library can prove
+fragment origin.
 
 PSTForge 1.0 always writes new 64-bit Unicode PST version 23 files with
 512-byte pages. Output uses the format's compressible permutation encoding for
@@ -28,10 +32,11 @@ Each part is a complete PST with its own message store identity and required
 folder tables.
 
 The following are outside 1.0: editing or repairing the source, PST merging,
-OST conversion, password cracking, contacts, calendars, tasks, notes, journal
-items, distribution lists, EML, Maildir, PDF, general attachment export, GUI
-work, date-range partitioning, and folder-based partitioning. Unsupported
-source items are counted and reported.
+OST conversion, password cracking, EML, Maildir, PDF, general attachment
+export, GUI work, date-range partitioning, and folder-based partitioning.
+Readable native PST content is never excluded merely because MailPlus does not
+display its item class. Data that source corruption or the output PST format
+prevents PSTForge from preserving is counted and explained.
 
 ## Command-Line Interface
 
@@ -242,23 +247,24 @@ final `.pst` name. PSTForge never modifies a published part in place.
 The stable output structure is:
 
     job-dir/
-      manifest.json
-      report.json
-      report.txt
+      recovery.log
       parts/
         part-0001.pst
-        part-0001.json
       .pstforge/
         job.sqlite3
+        manifests/
+          part-0001.json
         spool/
         partial/
 
-`manifest.json` records schema version, immutable options, source identity,
-tool and library versions, job state, part summaries, and aggregate counts.
-`report.json` is the machine recovery report. `report.txt` is the concise human
-summary. Part sidecars contain size, SHA-256, store identity, counts,
-oversize status, and bounded error totals. The SQLite ledger and spool are
-private implementation data and are not an interchange format.
+`recovery.log` is the bounded human recovery record. It states what was
+preserved, what was restored outside its original location, and what could not
+be preserved, grouped by source-visible folder and plain-language reason.
+Part manifests contain size, SHA-256, store identity, counts, oversize status,
+and bounded error totals under private job state rather than beside the PST
+files. CLI `--json` output remains the machine-readable summary. The JSON
+manifests, SQLite ledger, and spool are private implementation data and are not
+an interchange format.
 
 On successful completion, private spool payloads and stale partial output are
 deleted unless `--keep-work` was specified. Empty private directories and the
@@ -316,9 +322,18 @@ names, attachment content, or raw properties. Full user data remains inside the
 private spool and output PST files. JSON schemas include `schema_version` and
 use decimal byte counts that safely represent values beyond 4 GiB.
 
+The job-root `recovery.log` is mode `0600`, atomically replaced from durable
+state, and never appended across resume. It uses human item descriptions and
+source-visible folder paths, but excludes subjects, addresses, attachment
+filenames, bodies, payloads, property identifiers, internal item keys, and
+native parser jargon. Exact totals are never truncated. Folder-level detail is
+limited to 10,000 lines and 4 MiB; additional groups are coalesced into exact
+plain-language totals.
+
 ## Exit Status
 
-    0   All selected mail was written to validated parts.
+    0   Every readable useful source value was preserved or safely regenerated
+        in validated parts.
     1   Valid parts were produced, but some content was partial, unsupported,
         failed, or required an oversize part.
     2   Command-line usage was invalid.

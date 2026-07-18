@@ -1,7 +1,9 @@
 #![deny(unsafe_code)]
 
 use std::fs;
+use std::io::Read as _;
 use std::os::fd::AsFd;
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode, Output};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -231,8 +233,35 @@ fn main() -> ExitCode {
 
 fn run() -> Result<(), String> {
     let mut arguments = std::env::args_os().skip(1);
-    if arguments.next().as_deref() != Some(std::ffi::OsStr::new("gate")) {
-        return Err("usage: cargo xtask gate <fast|full|release>".to_owned());
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(Path::parent)
+        .ok_or_else(|| "cannot locate workspace root".to_owned())?
+        .to_path_buf();
+    let command = arguments.next().ok_or_else(|| {
+        "usage: cargo xtask gate <fast|full|release> | qualify embedded-attachments <output>"
+            .to_owned()
+    })?;
+    if command == std::ffi::OsStr::new("qualify") {
+        let checkpoint = arguments
+            .next()
+            .ok_or_else(|| "missing qualification checkpoint".to_owned())?;
+        let output = arguments
+            .next()
+            .ok_or_else(|| "missing qualification output directory".to_owned())?;
+        if arguments.next().is_some() {
+            return Err("unexpected arguments after qualification output directory".to_owned());
+        }
+        return match checkpoint.to_str() {
+            Some("embedded-attachments") => qualify_embedded_attachments(&root, Path::new(&output)),
+            _ => Err("unknown qualification checkpoint; expected embedded-attachments".to_owned()),
+        };
+    }
+    if command != std::ffi::OsStr::new("gate") {
+        return Err(
+            "usage: cargo xtask gate <fast|full|release> | qualify embedded-attachments <output>"
+                .to_owned(),
+        );
     }
     let tier = arguments
         .next()
@@ -240,12 +269,6 @@ fn run() -> Result<(), String> {
     if arguments.next().is_some() {
         return Err("unexpected arguments after gate tier".to_owned());
     }
-
-    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .and_then(Path::parent)
-        .ok_or_else(|| "cannot locate workspace root".to_owned())?
-        .to_path_buf();
     let stamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_err(|error| format!("system clock is before Unix epoch: {error}"))?
@@ -263,6 +286,116 @@ fn run() -> Result<(), String> {
         Some("release") => gate.release(),
         _ => Err("unknown gate tier; expected fast, full, or release".to_owned()),
     }
+}
+
+fn qualify_embedded_attachments(root: &Path, output: &Path) -> Result<(), String> {
+    use pstforge_pst::writer::{
+        AttachmentContent, AttachmentSpec, FidelityStore, create_fidelity_store,
+    };
+
+    if !output.is_absolute() || output.starts_with(root) || output.exists() {
+        return Err(
+            "qualification output must be a new absolute directory outside the repository"
+                .to_owned(),
+        );
+    }
+    let parent = output
+        .parent()
+        .filter(|path| path.is_dir())
+        .ok_or_else(|| "qualification output parent must already exist".to_owned())?;
+    let temporary = tempfile::Builder::new()
+        .prefix(".pstforge-0.4.2-")
+        .tempdir_in(parent)
+        .map_err(|error| format!("cannot create qualification staging directory: {error}"))?;
+    let parts = temporary.path().join("parts");
+    fs::create_dir(&parts)
+        .map_err(|error| format!("cannot create qualification parts directory: {error}"))?;
+    fs::set_permissions(&parts, fs::Permissions::from_mode(0o700))
+        .map_err(|error| format!("cannot secure qualification parts directory: {error}"))?;
+
+    let mut fixture = FidelityStore::default();
+    let embedded = fixture
+        .message
+        .attachments
+        .iter_mut()
+        .find_map(|attachment| match &mut attachment.content {
+            AttachmentContent::Embedded(message) => Some(message.as_mut()),
+            AttachmentContent::Binary(_) | AttachmentContent::Spooled(_) => None,
+        })
+        .ok_or_else(|| "writer fixture has no embedded message".to_owned())?;
+    let mut nested = embedded.clone();
+    nested.subject = "Nested embedded attachment checkpoint".to_owned();
+    nested.attachments.clear();
+    nested.attachments.push(AttachmentSpec {
+        filename: "nested-payload.bin".to_owned(),
+        mime_type: Some("application/octet-stream".to_owned()),
+        content_id: Some("nested-payload@pstforge".to_owned()),
+        content_location: Some("nested/payload.bin".to_owned()),
+        rendering_position: Some(42),
+        flags: 7,
+        content: AttachmentContent::Binary(b"nested payload checkpoint".to_vec()),
+    });
+    embedded.attachments.push(AttachmentSpec {
+        filename: "embedded-payload.txt".to_owned(),
+        mime_type: Some("text/plain".to_owned()),
+        content_id: None,
+        content_location: None,
+        rendering_position: None,
+        flags: 0,
+        content: AttachmentContent::Binary(b"embedded payload checkpoint".to_vec()),
+    });
+    embedded.attachments.push(AttachmentSpec {
+        filename: "nested-message.msg".to_owned(),
+        mime_type: Some("message/rfc822".to_owned()),
+        content_id: None,
+        content_location: None,
+        rendering_position: None,
+        flags: 0,
+        content: AttachmentContent::Embedded(Box::new(nested)),
+    });
+
+    let part = parts.join("part-0001.pst");
+    let report = create_fidelity_store(&part, &fixture)
+        .map_err(|error| format!("cannot create qualification PST: {error}"))?;
+    if !report.unsupported_properties.is_empty() {
+        return Err("qualification PST omitted writer properties".to_owned());
+    }
+
+    let mut file = fs::File::open(&part)
+        .map_err(|error| format!("cannot reopen qualification PST: {error}"))?;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let read = file
+            .read(&mut buffer)
+            .map_err(|error| format!("cannot hash qualification PST: {error}"))?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    let byte_len = file
+        .metadata()
+        .map_err(|error| format!("cannot inspect qualification PST: {error}"))?
+        .len();
+    let log = format!(
+        "PSTForge recovery log\nVersion: {}\nResult: complete\n\nRecovery summary\nItems written: 3\nOutput files: 1\n\nData not copied\nNo readable data was skipped.\n\nOutput files\npart-0001.pst: {byte_len} bytes, SHA-256 {:x}\n",
+        env!("CARGO_PKG_VERSION"),
+        hasher.finalize()
+    );
+    let log_path = temporary.path().join("recovery.log");
+    fs::write(&log_path, log)
+        .map_err(|error| format!("cannot write qualification recovery log: {error}"))?;
+    fs::set_permissions(&log_path, fs::Permissions::from_mode(0o600))
+        .map_err(|error| format!("cannot secure qualification recovery log: {error}"))?;
+    fs::rename(temporary.path(), output)
+        .map_err(|error| format!("cannot publish qualification directory: {error}"))?;
+    let _published = temporary.keep();
+    println!(
+        "qualification PST: {}",
+        output.join("parts/part-0001.pst").display()
+    );
+    Ok(())
 }
 
 impl Gate {

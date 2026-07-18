@@ -83,14 +83,24 @@ remains for later optimization and release-scale qualification. Content
 fidelity findings discovered during qualification are planned separately as
 version 0.4.2 and are not folded into the accepted splitting branch.
 
-### 9. Version 0.5.0 - Operational UX and Debian Packaging
+### 9. Version 0.4.2 - Incremental Data Correctness
+
+Remove policy-based content loss. Preserve recursive embedded attachments and
+every readable native PST item class, useful property, named-property identity,
+folder/store metadata, and associated item that another PST reader could use.
+Keep `parts/` PST-only and write one bounded human `recovery.log` explaining
+restored and unpreserved data. Deliver the milestone through reviewed,
+human-validated checkpoint commits on one 0.4.2 branch, using one focused PST
+per checkpoint before a single final 19 GB run.
+
+### 10. Version 0.5.0 - Operational UX and Debian Packaging
 
 Finalize human and JSON reports, documented exit codes, privacy-preserving
 diagnostics, installation checks, and a reproducible Debian 13 x86_64 package.
 Verify operation with Debian's older supported `libpff` ABI as well as the
 newer Ubuntu development host package.
 
-### 10. Version 0.5.1 - GitHub CI and Private-Corpus Automation
+### 11. Version 0.5.1 - GitHub CI and Private-Corpus Automation
 
 The GitHub remote and approved documentation baseline are available. Add branch
 checks, scheduled security and fuzzing jobs, release automation, and an
@@ -98,14 +108,14 @@ explicitly invoked private self-hosted corpus runner that never uploads PST
 content or sensitive logs. This repository does not use pull requests, so
 required checks apply to milestone branches and pre-merge local gates.
 
-### 11. Version 0.6.0 - Interoperability Release Candidate
+### 12. Version 0.6.0 - Interoperability Release Candidate
 
 Freeze the candidate CLI and schemas, run the complete external corpus,
 exercise fault injection and resource limits, import generated parts into a
 test Synology MailPlus mailbox, and perform secondary Outlook checks. Resolve
 all blocker and high-severity adversarial review findings.
 
-### 12. Version 1.0.0 - MailPlus-Ready Release
+### 13. Version 1.0.0 - MailPlus-Ready Release
 
 Repeat the 50 GB recovery and MailPlus import rehearsal from a clean install,
 reproduce the Debian package, verify licenses and notices, finalize operator

@@ -107,7 +107,7 @@ fn build_part_writer_input_expected(
     let mut omitted_attachments = 0_u64;
     for mail in messages {
         source.check_interrupted()?;
-        let translated = translate_message(&source, mail, true)?;
+        let translated = translate_message(&source, mail)?;
         partial |= translated.partial;
         omitted_properties = omitted_properties.saturating_add(translated.omitted_properties);
         omitted_attachments = omitted_attachments.saturating_add(translated.omitted_attachments);
@@ -194,7 +194,6 @@ struct TranslatedMessage {
 fn translate_message(
     job: &TranslationSource<'_>,
     mail: &CanonicalMail,
-    include_attachments: bool,
 ) -> Result<TranslatedMessage, CanonicalWriteError> {
     let mut partial = !matches!(mail.completeness, crate::ContentCompleteness::Complete);
     let mut omitted_properties = 0_u64;
@@ -507,32 +506,23 @@ fn translate_message(
     );
 
     let mut attachments = Vec::new();
-    if include_attachments {
-        for attachment in &mail.attachments {
-            match translate_attachment(job, mail, attachment)? {
-                Some(translated) => {
-                    partial |= translated.partial;
-                    omitted_properties =
-                        omitted_properties.saturating_add(translated.omitted_properties);
-                    omitted_attachments =
-                        omitted_attachments.saturating_add(translated.omitted_attachments);
-                    item_keys.extend(translated.item_keys);
-                    unsupported_item_keys.extend(translated.unsupported_item_keys);
-                    attachments.push(translated.attachment);
-                }
-                None => {
-                    partial = true;
-                    omitted_attachments = omitted_attachments.saturating_add(1);
+    for attachment in &mail.attachments {
+        match translate_attachment(job, mail, attachment)? {
+            Some(translated) => {
+                partial |= translated.partial;
+                omitted_properties =
+                    omitted_properties.saturating_add(translated.omitted_properties);
+                omitted_attachments =
+                    omitted_attachments.saturating_add(translated.omitted_attachments);
+                item_keys.extend(translated.item_keys);
+                unsupported_item_keys.extend(translated.unsupported_item_keys);
+                if let Some(attachment) = translated.attachment {
+                    attachments.push(attachment);
                 }
             }
-        }
-    } else if !mail.attachments.is_empty() {
-        partial = true;
-        omitted_attachments =
-            omitted_attachments.saturating_add(saturating_len(mail.attachments.len()));
-        for attachment in &mail.attachments {
-            if let Some(embedded) = &attachment.embedded {
-                collect_message_item_keys(embedded, &mut unsupported_item_keys);
+            None => {
+                partial = true;
+                omitted_attachments = omitted_attachments.saturating_add(1);
             }
         }
     }
@@ -638,7 +628,7 @@ fn materialize_copied_contents_property(
 }
 
 struct TranslatedAttachment {
-    attachment: AttachmentSpec,
+    attachment: Option<AttachmentSpec>,
     item_keys: Vec<String>,
     unsupported_item_keys: Vec<String>,
     partial: bool,
@@ -706,7 +696,20 @@ fn translate_attachment(
         child_omitted_properties,
         child_omitted_attachments,
     ) = if let Some(embedded) = &attachment.embedded {
-        let translated = translate_message(job, embedded, false)?;
+        let message_class = embedded.message_class.as_deref().unwrap_or("IPM.Note");
+        if !supported_message_class(message_class) {
+            let mut unsupported_item_keys = Vec::new();
+            collect_message_item_keys(embedded, &mut unsupported_item_keys);
+            return Ok(Some(TranslatedAttachment {
+                attachment: None,
+                item_keys: Vec::new(),
+                unsupported_item_keys,
+                partial: true,
+                omitted_properties,
+                omitted_attachments: 1,
+            }));
+        }
+        let translated = translate_message(job, embedded)?;
         (
             AttachmentContent::Embedded(Box::new(translated.message)),
             translated.item_keys,
@@ -731,7 +734,7 @@ fn translate_attachment(
         return Ok(None);
     };
     Ok(Some(TranslatedAttachment {
-        attachment: AttachmentSpec {
+        attachment: Some(AttachmentSpec {
             filename: attachment
                 .filename
                 .clone()
@@ -754,7 +757,7 @@ fn translate_attachment(
             rendering_position,
             flags,
             content,
-        },
+        }),
         item_keys,
         unsupported_item_keys,
         partial: (attachment.embedded.is_none() && !attachment.data_complete)
@@ -1735,10 +1738,13 @@ mod tests {
             4_294_967_296,
             1,
         )?;
-        assert_eq!(nested_input.item_keys, ["normal:2:-:0", "normal:3:-:0"]);
-        assert_eq!(nested_input.unsupported_item_keys, ["normal:4:-:0"]);
-        assert!(nested_input.partial);
-        assert_eq!(nested_input.omitted_attachments, 1);
+        assert_eq!(
+            nested_input.item_keys,
+            ["normal:2:-:0", "normal:3:-:0", "normal:4:-:0"]
+        );
+        assert!(nested_input.unsupported_item_keys.is_empty());
+        assert!(!nested_input.partial);
+        assert_eq!(nested_input.omitted_attachments, 0);
 
         let mut duplicate_attachment_properties = report.clone();
         let attachment = &mut duplicate_attachment_properties.attachments[0];
@@ -1772,6 +1778,48 @@ mod tests {
         assert!(malformed_time.partial);
         assert_eq!(malformed_time.omitted_properties, 1);
         assert_eq!(malformed_time.store.folders[0].messages[0].sent_filetime, 0);
+
+        std::thread::Builder::new()
+            .name("deep-embedded-checkpoint".to_owned())
+            .stack_size(32 * 1024 * 1024)
+            .spawn(move || -> Result<(), std::io::Error> {
+                let mut child = message(356, "IPM.Note");
+                for id in (100..356).rev() {
+                    let mut parent = message(id, "IPM.Note");
+                    parent.attachments.push(CanonicalAttachment {
+                        index: 0,
+                        attachment_type: Some(i32::from(b'i')),
+                        filename: Some("nested.msg".to_owned()),
+                        declared_size: None,
+                        data: None,
+                        data_complete: true,
+                        properties: Vec::new(),
+                        embedded: Some(Box::new(child)),
+                    });
+                    child = parent;
+                }
+                let deep_input = build_part_writer_input(
+                    &job,
+                    &[&child],
+                    &"0".repeat(64),
+                    "balanced",
+                    4_294_967_296,
+                    1,
+                )
+                .map_err(std::io::Error::other)?;
+                assert_eq!(deep_input.item_keys.len(), 257);
+                assert!(deep_input.unsupported_item_keys.is_empty());
+                assert_eq!(deep_input.omitted_attachments, 0);
+                assert!(!deep_input.partial);
+                pstforge_pst::writer::create_mail_store(
+                    directory.path().join("deep-nesting.pst"),
+                    &deep_input.store,
+                )
+                .map_err(std::io::Error::other)?;
+                Ok(())
+            })?
+            .join()
+            .map_err(|_| std::io::Error::other("deep embedded checkpoint terminated"))??;
         Ok(())
     }
 }

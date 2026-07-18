@@ -13,8 +13,11 @@ without modifying it and creates smaller, independently valid Unicode PST
 files for import into Synology MailPlus Server. Outlook compatibility is a
 secondary interoperability check.
 
-Do not add EML, Maildir, PDF, GUI, OST conversion, PST merging, in-place
-repair, password cracking, contacts, calendars, tasks, notes, date-range
+Preserve every readable native PST item and useful property that Outlook,
+MailPlus, or another PST reader could consume. This includes non-mail item
+classes, hidden associated items, folder/store metadata, named properties, and
+recursive embedded attachments. Do not add EML, Maildir, PDF, GUI, OST
+conversion, PST merging, in-place repair, password cracking, date-range
 partitioning, or folder-based partitioning before 1.0 unless the human owner
 changes the product specification.
 
@@ -52,6 +55,9 @@ Implementation starts at `0.1.0` and follows the milestone versions in
   passes.
 - Keep the workspace package version, CLI version, report schema producer
   version, Debian package version, and milestone documentation consistent.
+- Version 0.4.2 uses multiple reviewed checkpoint commits on one milestone
+  branch. Keep every checkpoint at version 0.4.2; do not create progress-only
+  commits or treat a checkpoint commit as a new version marker.
 
 ## Branches And Worktrees
 
@@ -61,7 +67,8 @@ Never implement code directly on `main`.
 2. Create branch `milestone/vX.Y.Z-<slug>`.
 3. Create a sibling worktree at `../pstforge-worktrees/vX.Y.Z-<slug>`.
 4. Make all code, test, manifest, build, and package changes in that worktree.
-5. Keep one milestone version for all pre-commit fixes in the worktree.
+5. Keep one milestone version for all checkpoint work and pre-commit fixes in
+   the worktree.
 6. Remove the worktree only after its branch is approved and integrated.
 
 Documentation-only changes use a `docs/<slug>` branch. The initial

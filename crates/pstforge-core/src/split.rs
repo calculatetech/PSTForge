@@ -26,13 +26,14 @@ use crate::{
     load_canonical_mail_interruptible,
 };
 
-pub const SPLIT_SCHEMA_VERSION: &str = "0.4.1";
+pub const SPLIT_SCHEMA_VERSION: &str = "0.4.2";
 const TOOL_COMPATIBILITY_MAJOR: u64 = 0;
 const PART_SIZE_POLICY: &str = "hard-maximum-v1";
 const WRITER_FORMAT: &str = "unicode-pst-v23";
 const ESTIMATED_STORE_BYTES: u64 = 1024 * 1024;
 const ESTIMATED_MESSAGE_BYTES: u64 = 64 * 1024;
 const ESTIMATED_FOLDER_BYTES: u64 = 16 * 1024;
+const MAX_RECOVERY_LOG_DETAIL_LINES: usize = 10_000;
 
 #[derive(Debug, Error)]
 pub enum SplitError {
@@ -124,7 +125,9 @@ impl SplitError {
             | Self::Canonical(_)
             | Self::Translation(_)
             | Self::Packing(_)
-            | Self::Writer(WriterError::IndependentValidatorIo { .. })
+            | Self::Writer(
+                WriterError::IndependentValidatorIo { .. } | WriterError::ExecutionTerminated,
+            )
             | Self::ZeroMaximumSize
             | Self::UnknownAssignment
             | Self::TooManyParts => SplitFailureKind::Internal,
@@ -252,15 +255,16 @@ pub fn split(
         std::sync::Arc::clone(&interrupt_flag),
     )?;
     if recovery.interrupted {
-        let parts = Vec::new();
-        let written_candidates = 0;
+        let (parts, written_candidates, unsupported_candidates) =
+            durable_output_snapshot(job_directory)?;
+        recovery.unsupported_candidates = unsupported_candidates;
         let metrics = execution_metrics(
             started,
             source.identity().size_bytes,
             &parts,
             recovery.peak_worker_rss_bytes,
         );
-        return Ok(SplitReport {
+        let report = SplitReport {
             schema_version: SPLIT_SCHEMA_VERSION.to_owned(),
             command: "split".to_owned(),
             maximum_pst_bytes,
@@ -272,7 +276,9 @@ pub fn split(
             parts,
             written_candidates,
             partial: true,
-        });
+        };
+        publish_recovery_log(job_directory, &report)?;
+        return Ok(report);
     }
     if source.identity() != &recovery.source {
         return Err(RecoveryError::Source(SourceError::Changed(source_path.to_path_buf())).into());
@@ -288,13 +294,16 @@ pub fn split(
         )?;
     recovery.interrupted |= split_interrupted;
     if split_interrupted {
+        let (parts, written_candidates, unsupported_candidates) =
+            durable_output_snapshot(job_directory)?;
+        recovery.unsupported_candidates = unsupported_candidates;
         let metrics = execution_metrics(
             started,
             source.identity().size_bytes,
             &parts,
             recovery.peak_worker_rss_bytes,
         );
-        return Ok(SplitReport {
+        let report = SplitReport {
             schema_version: SPLIT_SCHEMA_VERSION.to_owned(),
             command: "split".to_owned(),
             maximum_pst_bytes,
@@ -306,7 +315,9 @@ pub fn split(
             parts,
             written_candidates,
             partial: true,
-        });
+        };
+        publish_recovery_log(job_directory, &report)?;
+        return Ok(report);
     }
     recovery.unsupported_candidates = open_job_interruptible(job_directory, &interrupt_flag)?
         .summary()?
@@ -354,7 +365,7 @@ pub fn split(
         interrupted = recovery.interrupted,
         "split invocation complete"
     );
-    Ok(SplitReport {
+    let report = SplitReport {
         schema_version: SPLIT_SCHEMA_VERSION.to_owned(),
         command: "split".to_owned(),
         maximum_pst_bytes,
@@ -366,7 +377,150 @@ pub fn split(
         parts,
         written_candidates,
         partial,
-    })
+    };
+    publish_recovery_log(job_directory, &report)?;
+    Ok(report)
+}
+
+fn publish_recovery_log(job_directory: &Path, report: &SplitReport) -> Result<(), SplitError> {
+    DurableCatalogSink::open(job_directory)?.publish_recovery_log(&render_recovery_log(report))?;
+    Ok(())
+}
+
+fn durable_output_snapshot(
+    job_directory: &Path,
+) -> Result<(Vec<PartReport>, u64, u64), SplitError> {
+    let job = DurableCatalogSink::open(job_directory)?;
+    let records = job.published_parts()?;
+    let parts = records
+        .iter()
+        .map(part_report)
+        .collect::<Result<Vec<_>, _>>()?;
+    let written = records
+        .iter()
+        .map(|record| record.item_count)
+        .fold(0_u64, u64::saturating_add);
+    let unsupported = job.summary()?.unsupported_candidates;
+    Ok((parts, written, unsupported))
+}
+
+fn render_recovery_log(report: &SplitReport) -> String {
+    let omitted_properties = report
+        .parts
+        .iter()
+        .map(|part| part.omitted_properties)
+        .fold(0_u64, u64::saturating_add);
+    let omitted_attachments = report
+        .parts
+        .iter()
+        .map(|part| part.omitted_attachments)
+        .fold(0_u64, u64::saturating_add);
+    let unfinished_items = report
+        .recovery
+        .committed_candidates
+        .saturating_sub(report.written_candidates)
+        .saturating_sub(report.recovery.unsupported_candidates);
+    let clean_data = report.recovery.partial_candidates == 0
+        && report.recovery.unsupported_candidates == 0
+        && report.recovery.issues == 0
+        && report.recovery.issues_dropped == 0
+        && omitted_properties == 0
+        && omitted_attachments == 0
+        && unfinished_items == 0
+        && report.recovery.source_unchanged
+        && !report.recovery.interrupted;
+    let result = if report.recovery.interrupted {
+        "interrupted"
+    } else if report.partial {
+        "partial"
+    } else {
+        "complete"
+    };
+    let mut output = String::new();
+    output.push_str("PSTForge recovery log\n");
+    output.push_str(&format!("Version: {}\n", crate::VERSION));
+    output.push_str(&format!("Result: {result}\n"));
+    output.push_str(&format!(
+        "Source SHA-256: {}\n",
+        report.recovery.source.sha256
+    ));
+    output.push_str(&format!(
+        "Source size: {} bytes\n",
+        report.recovery.source.size_bytes
+    ));
+    output.push_str(&format!(
+        "Source unchanged: {}\n",
+        if report.recovery.source_unchanged {
+            "yes"
+        } else {
+            "no"
+        }
+    ));
+    output.push_str(&format!(
+        "Maximum part size: {} bytes\n\n",
+        report.maximum_pst_bytes
+    ));
+    output.push_str("Recovery summary\n");
+    output.push_str(&format!(
+        "Items found: {}\n",
+        report.recovery.committed_candidates
+    ));
+    output.push_str(&format!("Items written: {}\n", report.written_candidates));
+    output.push_str(&format!(
+        "Items recovered from damaged structures: {}\n",
+        report.recovery.recovered_items
+    ));
+    output.push_str(&format!(
+        "Detached items recovered: {}\n",
+        report.recovery.orphan_items
+    ));
+    output.push_str(&format!(
+        "Fragmentary items found: {}\n",
+        report.recovery.fragment_items
+    ));
+    output.push_str(&format!("Output files: {}\n\n", report.parts.len()));
+
+    output.push_str("Data not copied\n");
+    if clean_data {
+        output.push_str("No readable data was skipped.\n");
+    } else {
+        output.push_str(&format!(
+            "Items only partly readable: {}\n",
+            report.recovery.partial_candidates
+        ));
+        output.push_str(&format!(
+            "Items not copied because their type or contents could not yet be preserved safely: {}\n",
+            report.recovery.unsupported_candidates
+        ));
+        output.push_str(&format!("Attachments not copied: {omitted_attachments}\n"));
+        output.push_str(&format!("Item details not copied: {omitted_properties}\n"));
+        output.push_str(&format!("Items left unfinished: {unfinished_items}\n"));
+        output.push_str(&format!(
+            "Read problems encountered: {}\n",
+            report.recovery.issues
+        ));
+        output.push_str(&format!(
+            "Additional read problems not listed individually: {}\n",
+            report.recovery.issues_dropped
+        ));
+    }
+    output.push_str("\nOutput files\n");
+    for part in report.parts.iter().take(MAX_RECOVERY_LOG_DETAIL_LINES) {
+        output.push_str(&format!(
+            "{}: {} bytes, SHA-256 {}, {} messages, {} folders\n",
+            part.filename, part.byte_len, part.sha256, part.message_count, part.folder_count
+        ));
+    }
+    let unlisted = report
+        .parts
+        .len()
+        .saturating_sub(MAX_RECOVERY_LOG_DETAIL_LINES);
+    if unlisted != 0 {
+        output.push_str(&format!(
+            "Additional output files omitted from detail: {unlisted}\n"
+        ));
+    }
+    output
 }
 
 pub fn split_recovered_job(
@@ -1151,12 +1305,14 @@ mod tests {
     use tempfile::tempdir;
 
     use super::{
-        AdaptiveSizeModel, LayoutEstimator, SplitError, SplitFailureKind, disk_preflight,
-        extend_to_fitting_prefix, hash_file, preflight_filesystem_path, shrink_to_fitting_prefix,
-        take_fitting_prefix,
+        AdaptiveSizeModel, DiskPreflight, ExecutionMetrics, LayoutEstimator,
+        MAX_RECOVERY_LOG_DETAIL_LINES, PartReport, SplitError, SplitFailureKind, SplitReport,
+        disk_preflight, extend_to_fitting_prefix, hash_file, preflight_filesystem_path,
+        render_recovery_log, shrink_to_fitting_prefix, take_fitting_prefix,
     };
     use crate::{
-        ItemKey, PackCandidate, PartSizeEstimator, RecoveryError, RecoveryProvenance, SourceError,
+        ItemKey, PackCandidate, PartSizeEstimator, RecoveryError, RecoveryProvenance,
+        RecoveryReport, SourceError, SourceIdentity,
     };
 
     fn packing_candidate(index: u32, payload_bytes: u64) -> PackCandidate {
@@ -1170,6 +1326,104 @@ mod tests {
             folder_path: vec!["Inbox".to_owned()],
             payload_bytes,
         }
+    }
+
+    fn split_report() -> SplitReport {
+        SplitReport {
+            schema_version: "0.4.2".to_owned(),
+            command: "split".to_owned(),
+            maximum_pst_bytes: 4_294_967_296,
+            resumed: false,
+            keep_work: false,
+            disk_preflight: DiskPreflight {
+                required_bytes: 0,
+                available_bytes: 0,
+                existing_job_bytes: 0,
+            },
+            metrics: ExecutionMetrics {
+                elapsed_millis: 1,
+                source_bytes: 100,
+                output_bytes: 80,
+                average_source_bytes_per_second: 100_000,
+                peak_process_rss_bytes: 1,
+            },
+            recovery: RecoveryReport {
+                schema_version: "0.4.2".to_owned(),
+                command: "recover".to_owned(),
+                mode: "balanced".to_owned(),
+                source: SourceIdentity {
+                    canonical_path: "/private/source.pst".to_owned(),
+                    device: 1,
+                    inode: 2,
+                    size_bytes: 100,
+                    modified_at: "2026-01-01T00:00:00Z".to_owned(),
+                    sha256: "a".repeat(64),
+                },
+                job_directory: "/private/job".to_owned(),
+                normal_items: 1,
+                recovered_items: 0,
+                orphan_items: 0,
+                fragment_items: 0,
+                committed_candidates: 1,
+                complete_candidates: 1,
+                partial_candidates: 0,
+                unsupported_candidates: 0,
+                blob_count: 0,
+                blob_bytes: 0,
+                issues: 0,
+                issues_dropped: 0,
+                worker_attempts: 1,
+                worker_failures: 0,
+                isolated_units: 0,
+                peak_worker_rss_bytes: 1,
+                interrupted: false,
+                source_unchanged: true,
+            },
+            parts: vec![PartReport {
+                index: 1,
+                filename: "part-0001.pst".to_owned(),
+                byte_len: 80,
+                sha256: "b".repeat(64),
+                folder_count: 1,
+                message_count: 1,
+                oversize: false,
+                partial: false,
+                omitted_properties: 0,
+                omitted_attachments: 0,
+            }],
+            written_candidates: 1,
+            partial: false,
+        }
+    }
+
+    #[test]
+    fn recovery_log_is_human_readable_bounded_and_excludes_private_paths() {
+        let mut report = split_report();
+        let clean = render_recovery_log(&report);
+        assert!(clean.contains("Result: complete"));
+        assert!(clean.contains("No readable data was skipped."));
+        assert!(clean.contains("part-0001.pst: 80 bytes"));
+        assert!(!clean.contains("/private/source.pst"));
+        assert!(!clean.contains("/private/job"));
+
+        report.partial = true;
+        report.recovery.unsupported_candidates = 2;
+        report.parts[0].omitted_attachments = 3;
+        let partial = render_recovery_log(&report);
+        assert!(partial.contains("Result: partial"));
+        assert!(partial.contains("Attachments not copied: 3"));
+        assert!(partial.contains("could not yet be preserved safely: 2"));
+        assert!(partial.len() < 4 * 1024 * 1024);
+
+        let part = report.parts[0].clone();
+        report.parts = vec![part; MAX_RECOVERY_LOG_DETAIL_LINES + 1];
+        let bounded = render_recovery_log(&report);
+        assert!(bounded.contains("Additional output files omitted from detail: 1"));
+        assert_eq!(
+            bounded.matches("part-0001.pst: 80 bytes").count(),
+            MAX_RECOVERY_LOG_DETAIL_LINES
+        );
+        assert!(bounded.len() < 4 * 1024 * 1024);
     }
 
     #[test]

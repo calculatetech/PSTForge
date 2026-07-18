@@ -163,6 +163,7 @@ pub trait Attachment {
     fn message(&self) -> Rc<dyn Message>;
     fn properties(&self) -> &AttachmentProperties;
     fn data(&self) -> Option<&AttachmentData>;
+    fn streamed_data_identity(&self) -> Option<(u64, [u8; 32])>;
 }
 
 struct AttachmentInner<Pst>
@@ -503,6 +504,10 @@ impl Attachment for UnicodeAttachment {
     fn data(&self) -> Option<&AttachmentData> {
         self.inner.data.as_ref()
     }
+
+    fn streamed_data_identity(&self) -> Option<(u64, [u8; 32])> {
+        self.inner.streamed_data_identity
+    }
 }
 
 impl AttachmentReadWrite<UnicodePstFile> for UnicodeAttachment {
@@ -551,6 +556,10 @@ impl Attachment for AnsiAttachment {
 
     fn data(&self) -> Option<&AttachmentData> {
         self.inner.data.as_ref()
+    }
+
+    fn streamed_data_identity(&self) -> Option<(u64, [u8; 32])> {
+        self.inner.streamed_data_identity
     }
 }
 

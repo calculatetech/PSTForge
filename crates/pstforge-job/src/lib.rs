@@ -22,11 +22,12 @@ use sha2::{Digest, Sha256};
 use tempfile::NamedTempFile;
 use thiserror::Error;
 
-const JOB_SCHEMA_VERSION: i64 = 5;
+const JOB_SCHEMA_VERSION: i64 = 6;
 const INLINE_BLOB_MAX_BYTES: u64 = 64 * 1024;
 const INLINE_CACHE_DIRECTORY: &str = ".pstforge-inline-cache";
 const PAYLOAD_PACK_FILENAME: &str = "payload.pack";
 const CANDIDATE_CHECKPOINT_BATCH: u32 = 128;
+const MAX_RECOVERY_LOG_BYTES: usize = 4 * 1024 * 1024;
 
 #[derive(Debug, Error)]
 pub enum JobError {
@@ -211,12 +212,14 @@ pub struct DurableCatalogSink {
     _private_directory: File,
     _spool_directory: File,
     _partial_directory: File,
+    _manifests_directory: File,
     _parts_directory: File,
     private_root: PathBuf,
     spool: PathBuf,
     payload_pack_path: PathBuf,
     payload_pack: File,
     partial: PathBuf,
+    manifests: PathBuf,
     parts: PathBuf,
     inline_cache_directory: RefCell<Option<File>>,
     batch_open: Cell<bool>,
@@ -340,7 +343,8 @@ impl DurableCatalogSink {
         let private_root = held_job_path.join(".pstforge");
         let spool = private_root.join("spool");
         let partial = private_root.join("partial");
-        for directory in [&private_root, &spool, &partial] {
+        let manifests = private_root.join("manifests");
+        for directory in [&private_root, &spool, &partial, &manifests] {
             fs::create_dir(directory).map_err(|source| io_error(directory, source))?;
             set_mode(directory, 0o700)?;
         }
@@ -361,6 +365,8 @@ impl DurableCatalogSink {
             .map_err(|source| io_error(&payload_pack_path, source))?;
         let partial_directory = open_directory(&private_root.join("partial"))?;
         let partial = fd_path(partial_directory.as_raw_fd());
+        let manifests_directory = open_directory(&private_root.join("manifests"))?;
+        let manifests = fd_path(manifests_directory.as_raw_fd());
         let parts_directory = open_directory(&parts)?;
         let parts = fd_path(parts_directory.as_raw_fd());
         let database = private_root.join("job.sqlite3");
@@ -385,12 +391,14 @@ impl DurableCatalogSink {
             _private_directory: private_directory,
             _spool_directory: spool_directory,
             _partial_directory: partial_directory,
+            _manifests_directory: manifests_directory,
             _parts_directory: parts_directory,
             private_root,
             spool,
             payload_pack_path,
             payload_pack,
             partial,
+            manifests,
             parts,
             inline_cache_directory: RefCell::new(None),
             batch_open: Cell::new(false),
@@ -463,6 +471,9 @@ impl DurableCatalogSink {
         let partial_directory = open_directory(&private_root.join("partial"))?;
         validate_private_directory(&partial_directory, &private_root.join("partial"))?;
         let partial = fd_path(partial_directory.as_raw_fd());
+        let manifests_directory = open_directory(&private_root.join("manifests"))?;
+        validate_private_directory(&manifests_directory, &private_root.join("manifests"))?;
+        let manifests = fd_path(manifests_directory.as_raw_fd());
         let database = private_root.join("job.sqlite3");
         validate_private_file(&database, true)?;
         validate_private_file(&private_root.join("job.sqlite3-wal"), false)?;
@@ -536,9 +547,10 @@ impl DurableCatalogSink {
             reconcile_publications(
                 connection,
                 &partial_directory,
-                &parts_directory,
+                &manifests_directory,
                 &partial,
                 &parts,
+                &manifests,
                 interrupted,
             )
         })?;
@@ -547,7 +559,7 @@ impl DurableCatalogSink {
             validate_foreign_keys(connection)
         })?;
         validate_blob_store(&connection, &spool, interrupted)?;
-        validate_part_store(&connection, &parts, interrupted)?;
+        validate_part_store(&connection, &parts, &manifests, interrupted)?;
         remove_temporary_blobs(&spool, interrupted)?;
         remove_unreferenced_blobs(&connection, &spool, interrupted)?;
         Ok(Self {
@@ -557,12 +569,14 @@ impl DurableCatalogSink {
             _private_directory: private_directory,
             _spool_directory: spool_directory,
             _partial_directory: partial_directory,
+            _manifests_directory: manifests_directory,
             _parts_directory: parts_directory,
             private_root,
             spool,
             payload_pack_path,
             payload_pack,
             partial,
+            manifests,
             parts,
             inline_cache_directory: RefCell::new(None),
             batch_open: Cell::new(false),
@@ -1588,6 +1602,57 @@ impl DurableCatalogSink {
         Ok(self.partial.join(filename))
     }
 
+    pub fn publish_recovery_log(&self, contents: &str) -> Result<(), JobError> {
+        if contents.len() > MAX_RECOVERY_LOG_BYTES {
+            return Err(JobError::Integrity(
+                "recovery log exceeds the supported size".to_owned(),
+            ));
+        }
+        let staged_name = Path::new("recovery.log.partial");
+        let staged_path = self.partial.join(staged_name);
+        match staged_path.symlink_metadata() {
+            Ok(metadata)
+                if metadata.file_type().is_symlink()
+                    || !private_state_attributes_valid(
+                        metadata.is_file(),
+                        metadata.uid(),
+                        metadata.mode(),
+                        Some(metadata.nlink()),
+                    ) =>
+            {
+                return Err(JobError::UnsafePath(staged_path));
+            }
+            Ok(_) => {
+                fs::remove_file(&staged_path).map_err(|source| io_error(&staged_path, source))?;
+            }
+            Err(error) if error.kind() == ErrorKind::NotFound => {}
+            Err(source) => return Err(io_error(&staged_path, source)),
+        }
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
+            .open(&staged_path)
+            .map_err(|source| io_error(&staged_path, source))?;
+        file.write_all(contents.as_bytes())
+            .map_err(|source| io_error(&staged_path, source))?;
+        file.sync_all()
+            .map_err(|source| io_error(&staged_path, source))?;
+
+        let final_name = Path::new("recovery.log");
+        let final_path = fd_path(self._job_directory.as_raw_fd()).join(final_name);
+        replace_at(
+            &self._partial_directory,
+            staged_name,
+            &self._job_directory,
+            final_name,
+            &final_path,
+        )?;
+        sync_file(&self._job_directory, &final_path)?;
+        verify_recovery_log(&final_path, contents)
+    }
+
     pub fn publish_validated_part(
         &mut self,
         staged_filename: &str,
@@ -1631,7 +1696,7 @@ impl DurableCatalogSink {
         check_interrupted(interrupted)?;
         let final_path = self.parts.join(&part.filename);
         let sidecar_filename = part.filename.trim_end_matches(".pst").to_owned() + ".json";
-        let sidecar_path = self.parts.join(&sidecar_filename);
+        let sidecar_path = self.manifests.join(&sidecar_filename);
         let staged_sidecar_filename = sidecar_filename.clone() + ".partial";
         let staged_sidecar_path = self.partial.join(&staged_sidecar_filename);
         refuse_existing(&final_path)?;
@@ -1656,11 +1721,11 @@ impl DurableCatalogSink {
         rename_noclobber(
             &self._partial_directory,
             Path::new(&staged_sidecar_filename),
-            &self._parts_directory,
+            &self._manifests_directory,
             Path::new(&sidecar_filename),
             &sidecar_path,
         )?;
-        sync_file(&self._parts_directory, &self.parts)?;
+        sync_file(&self._manifests_directory, &self.manifests)?;
         check_interrupted(interrupted)?;
         verify_sidecar_artifact(&sidecar_path, sidecar)?;
         check_interrupted(interrupted)?;
@@ -2639,7 +2704,12 @@ fn allocated_private_bytes(private_root: &Path) -> Result<u64, JobError> {
             .map_err(|_| JobError::UnsafePath(entry.path()))?;
         if !matches!(
             name.as_str(),
-            "job.sqlite3" | "job.sqlite3-wal" | "job.sqlite3-shm" | "spool" | "partial"
+            "job.sqlite3"
+                | "job.sqlite3-wal"
+                | "job.sqlite3-shm"
+                | "spool"
+                | "partial"
+                | "manifests"
         ) {
             return Err(JobError::UnsafePath(entry.path()));
         }
@@ -2685,7 +2755,12 @@ fn validate_private_root_entries(private_root: &Path) -> Result<(), JobError> {
             .map_err(|_| JobError::UnsafePath(entry.path()))?;
         if !matches!(
             name.as_str(),
-            "job.sqlite3" | "job.sqlite3-wal" | "job.sqlite3-shm" | "spool" | "partial"
+            "job.sqlite3"
+                | "job.sqlite3-wal"
+                | "job.sqlite3-shm"
+                | "spool"
+                | "partial"
+                | "manifests"
         ) {
             return Err(JobError::UnsafePath(entry.path()));
         }
@@ -3035,9 +3110,10 @@ fn commit_published_part_transaction(
 fn reconcile_publications(
     connection: &mut Connection,
     partial_directory: &File,
-    parts_directory: &File,
+    manifests_directory: &File,
     partial: &Path,
     parts: &Path,
+    manifests: &Path,
     interrupted: Option<&AtomicBool>,
 ) -> Result<(), JobError> {
     let intents = {
@@ -3069,7 +3145,7 @@ fn reconcile_publications(
         }
         let final_path = parts.join(&part.filename);
         let sidecar_filename = part.filename.trim_end_matches(".pst").to_owned() + ".json";
-        let sidecar_path = parts.join(&sidecar_filename);
+        let sidecar_path = manifests.join(&sidecar_filename);
         let staged_sidecar_filename = sidecar_filename.clone() + ".partial";
         let staged_sidecar_path = partial.join(&staged_sidecar_filename);
         let final_exists = final_path
@@ -3106,11 +3182,11 @@ fn reconcile_publications(
             rename_noclobber(
                 partial_directory,
                 Path::new(&staged_sidecar_filename),
-                parts_directory,
+                manifests_directory,
                 Path::new(&sidecar_filename),
                 &sidecar_path,
             )?;
-            sync_file(parts_directory, parts)?;
+            sync_file(manifests_directory, manifests)?;
             verify_sidecar_artifact(&sidecar_path, &sidecar)?;
         }
         commit_published_part_transaction(connection, &part, &sidecar, &item_keys, true)?;
@@ -3272,6 +3348,50 @@ fn rename_noclobber(
         )),
         Err(source) => Err(io_error(destination, source.into())),
     }
+}
+
+fn replace_at(
+    source_directory: &File,
+    source_name: &Path,
+    destination_directory: &File,
+    destination_name: &Path,
+    destination: &Path,
+) -> Result<(), JobError> {
+    rustix::fs::renameat(
+        source_directory,
+        source_name,
+        destination_directory,
+        destination_name,
+    )
+    .map_err(|source| io_error(destination, source.into()))
+}
+
+fn verify_recovery_log(path: &Path, expected: &str) -> Result<(), JobError> {
+    let metadata = path
+        .symlink_metadata()
+        .map_err(|source| io_error(path, source))?;
+    if metadata.file_type().is_symlink()
+        || !private_state_attributes_valid(
+            metadata.is_file(),
+            metadata.uid(),
+            metadata.mode(),
+            Some(metadata.nlink()),
+        )
+        || metadata.len()
+            != u64::try_from(expected.len())
+                .map_err(|_| JobError::Integrity("recovery log length overflow".to_owned()))?
+    {
+        return Err(JobError::Integrity(
+            "published recovery log has unsafe attributes".to_owned(),
+        ));
+    }
+    let actual = fs::read_to_string(path).map_err(|source| io_error(path, source))?;
+    if actual != expected {
+        return Err(JobError::Integrity(
+            "published recovery log content mismatch".to_owned(),
+        ));
+    }
+    Ok(())
 }
 
 fn require_message(active: Option<&ActiveCandidate>, message_id: u32) -> Result<(), JobError> {
@@ -3634,6 +3754,7 @@ fn verify_pack_range(
 fn validate_part_store(
     connection: &Connection,
     parts: &Path,
+    manifests: &Path,
     interrupted: Option<&AtomicBool>,
 ) -> Result<(), JobError> {
     let mut statement = connection.prepare(
@@ -3662,7 +3783,7 @@ fn validate_part_store(
         let sidecar_filename = part.filename.trim_end_matches(".pst").to_owned() + ".json";
         let expected_sidecar: PartSidecar = serde_json::from_str(&sidecar_json)?;
         validate_sidecar(&part, &expected_sidecar)?;
-        verify_sidecar_artifact(&parts.join(&sidecar_filename), &expected_sidecar)?;
+        verify_sidecar_artifact(&manifests.join(&sidecar_filename), &expected_sidecar)?;
         accounted_sidecars.insert(sidecar_filename);
         accounted.insert(part.filename);
     }
@@ -3674,14 +3795,23 @@ fn validate_part_store(
             return Err(JobError::Integrity(format!(
                 "finalized PST {name:?} has no ledger record"
             )));
-        } else if name.ends_with(".json") && !accounted_sidecars.contains(name.as_ref()) {
+        } else if !accounted.contains(name.as_ref()) {
+            return Err(JobError::Integrity(format!(
+                "unrecognized finalized-part entry {name:?}"
+            )));
+        }
+    }
+    for entry in fs::read_dir(manifests).map_err(|source| io_error(manifests, source))? {
+        let entry = entry.map_err(|source| io_error(manifests, source))?;
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if name.ends_with(".json") && !accounted_sidecars.contains(name.as_ref()) {
             return Err(JobError::Integrity(format!(
                 "finalized sidecar {name:?} has no ledger record"
             )));
-        } else if !accounted.contains(name.as_ref()) && !accounted_sidecars.contains(name.as_ref())
-        {
+        } else if !accounted_sidecars.contains(name.as_ref()) {
             return Err(JobError::Integrity(format!(
-                "unrecognized finalized-part entry {name:?}"
+                "unrecognized private manifest entry {name:?}"
             )));
         }
     }
@@ -4179,7 +4309,7 @@ mod tests {
         };
         let configuration = JobConfiguration {
             tool_compatibility_major: 0,
-            split_schema_version: "0.4.1".to_owned(),
+            split_schema_version: "0.4.2".to_owned(),
             recovery_mode: "balanced".to_owned(),
             maximum_pst_bytes: 4_294_967_296,
             part_size_policy: "hard-maximum-v1".to_owned(),
@@ -4589,6 +4719,29 @@ mod tests {
     }
 
     #[test]
+    fn recovery_log_is_private_atomic_and_replaces_a_symlink_without_following_it()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempdir()?;
+        let job = directory.path().join("job");
+        let sink = DurableCatalogSink::create(&job)?;
+        sink.publish_recovery_log("first\n")?;
+        let log = job.join("recovery.log");
+        assert_eq!(std::fs::read_to_string(&log)?, "first\n");
+        assert_eq!(log.metadata()?.permissions().mode() & 0o777, 0o600);
+
+        let external = directory.path().join("external");
+        std::fs::write(&external, "untouched\n")?;
+        std::fs::remove_file(&log)?;
+        symlink(&external, &log)?;
+        sink.publish_recovery_log("second\n")?;
+        assert_eq!(std::fs::read_to_string(&external)?, "untouched\n");
+        assert_eq!(std::fs::read_to_string(&log)?, "second\n");
+        assert!(!log.symlink_metadata()?.file_type().is_symlink());
+        assert_eq!(log.metadata()?.permissions().mode() & 0o777, 0o600);
+        Ok(())
+    }
+
+    #[test]
     fn spool_read_model_and_part_assignment_are_transactional()
     -> Result<(), Box<dyn std::error::Error>> {
         let directory = tempdir()?;
@@ -4692,7 +4845,7 @@ mod tests {
         );
         assert_eq!(sink.spooled_candidates()?.len(), 1);
         sink.commit_published_part(&part, &sidecar, &[item_key])?;
-        let sidecar_path = job.join("parts/part-0001.json");
+        let sidecar_path = job.join(".pstforge/manifests/part-0001.json");
         std::fs::write(&sidecar_path, serde_json::to_vec(&sidecar)?)?;
         std::fs::set_permissions(&sidecar_path, std::fs::Permissions::from_mode(0o600))?;
         assert!(sink.spooled_candidates()?.is_empty());
@@ -4974,7 +5127,7 @@ mod tests {
             if publication_step >= 2 {
                 std::fs::rename(
                     job.join(".pstforge/partial/part-0001.json.partial"),
-                    job.join("parts/part-0001.json"),
+                    job.join(".pstforge/manifests/part-0001.json"),
                 )?;
             }
             drop(sink);
@@ -4996,7 +5149,7 @@ mod tests {
             } else {
                 assert!(reopened.spooled_candidates()?.is_empty());
                 assert!(job.join("parts/part-0001.pst").is_file());
-                assert!(job.join("parts/part-0001.json").is_file());
+                assert!(job.join(".pstforge/manifests/part-0001.json").is_file());
             }
         }
         Ok(())

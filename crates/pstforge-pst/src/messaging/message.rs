@@ -138,6 +138,13 @@ pub trait Message {
     fn recipient_table(&self) -> Option<&Rc<dyn TableContext>>;
     fn attachment_table(&self) -> Option<&Rc<dyn TableContext>>;
     fn streamed_property_identity(&self, id: u16) -> Option<(u16, u64, [u8; 32])>;
+    fn read_attachment(
+        self: Rc<Self>,
+        node: NodeId,
+        property_ids: Option<&[u16]>,
+        embedded_streamed_ids: &[u16],
+        materialize: bool,
+    ) -> io::Result<Rc<dyn attachment::Attachment>>;
 }
 
 struct MessageInner<Pst>
@@ -438,6 +445,27 @@ impl Message for UnicodeMessage {
     fn streamed_property_identity(&self, id: u16) -> Option<(u16, u64, [u8; 32])> {
         self.inner.streamed_property_identities.get(&id).copied()
     }
+
+    fn read_attachment(
+        self: Rc<Self>,
+        node: NodeId,
+        property_ids: Option<&[u16]>,
+        embedded_streamed_ids: &[u16],
+        materialize: bool,
+    ) -> io::Result<Rc<dyn attachment::Attachment>> {
+        if materialize {
+            attachment::UnicodeAttachment::read_with_streamed_embedded_properties(
+                self,
+                node,
+                property_ids,
+                embedded_streamed_ids,
+            )
+            .map(|attachment| attachment as Rc<dyn attachment::Attachment>)
+        } else {
+            attachment::UnicodeAttachment::read_metadata(self, node)
+                .map(|attachment| attachment as Rc<dyn attachment::Attachment>)
+        }
+    }
 }
 
 impl MessageReadWrite<UnicodePstFile> for UnicodeMessage {
@@ -545,6 +573,22 @@ impl Message for AnsiMessage {
 
     fn streamed_property_identity(&self, id: u16) -> Option<(u16, u64, [u8; 32])> {
         self.inner.streamed_property_identities.get(&id).copied()
+    }
+
+    fn read_attachment(
+        self: Rc<Self>,
+        node: NodeId,
+        property_ids: Option<&[u16]>,
+        _embedded_streamed_ids: &[u16],
+        materialize: bool,
+    ) -> io::Result<Rc<dyn attachment::Attachment>> {
+        if materialize {
+            attachment::AnsiAttachment::read(self, node, property_ids)
+                .map(|attachment| attachment as Rc<dyn attachment::Attachment>)
+        } else {
+            attachment::AnsiAttachment::read_metadata(self, node)
+                .map(|attachment| attachment as Rc<dyn attachment::Attachment>)
+        }
     }
 }
 
