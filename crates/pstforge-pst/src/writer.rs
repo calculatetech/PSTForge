@@ -199,6 +199,7 @@ pub enum RawPropertyValue {
     MultipleInteger32(Vec<i32>),
     MultipleInteger64(Vec<i64>),
     MultipleGuid(Vec<[u8; 16]>),
+    MultipleBinary(Vec<Vec<u8>>),
 }
 
 /// A raw property retained when its type has an unambiguous PST encoding.
@@ -603,6 +604,7 @@ enum PropertyValue {
     MultipleInteger32(Vec<i32>),
     MultipleInteger64(Vec<i64>),
     MultipleGuid(Vec<[u8; 16]>),
+    MultipleBinary(Vec<Vec<u8>>),
     Object(NodeId, u32),
     External(PropertyType, NodeId),
 }
@@ -627,6 +629,7 @@ impl PropertyValue {
             Self::MultipleInteger32(_) => PropertyType::MultipleInteger32,
             Self::MultipleInteger64(_) => PropertyType::MultipleInteger64,
             Self::MultipleGuid(_) => PropertyType::MultipleGuid,
+            Self::MultipleBinary(_) => PropertyType::MultipleBinary,
             Self::Object(_, _) => PropertyType::Object,
             Self::External(kind, _) => *kind,
         }
@@ -672,6 +675,7 @@ impl PropertyValue {
                 bytes.extend(values.iter().flatten().copied());
                 bytes
             }
+            Self::MultipleBinary(values) => multiple_binary_bytes(values)?,
             Self::Object(node, size) => {
                 let mut bytes = Vec::with_capacity(8);
                 bytes.extend_from_slice(&u32::from(*node).to_le_bytes());
@@ -770,6 +774,10 @@ const MAX_SUBNODE_TREE_ENTRIES: usize = SUBNODE_LEAF_CAPACITY * SUBNODE_INTERMED
 const MAX_FIDELITY_PROPERTY_BYTES: usize = 16 * 1024;
 const MAX_FIDELITY_COLLECTION_ITEMS: usize = MAX_FIDELITY_PROPERTY_BYTES / 8;
 const MAX_FIDELITY_CUSTOM_PROPERTY_BYTES: usize = 64 * 1024;
+const MAX_DISTRIBUTION_LIST_PROPERTY_BYTES: usize = 15_000;
+const PSETID_ADDRESS: [u8; 16] = [
+    0x04, 0x20, 0x06, 0x00, 0x00, 0x00, 0x00, 0x00, 0xC0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x46,
+];
 static NEVER_INTERRUPTED: AtomicBool = AtomicBool::new(false);
 
 fn check_interrupted(interrupted: &AtomicBool) -> Result<(), WriterError> {
@@ -3915,6 +3923,7 @@ fn validate_message(message: &MessageSpec, depth: usize) -> Result<(), WriterErr
         }
         validate_raw_value(&property.value)?;
     }
+    validate_distribution_list_properties(message)?;
     if depth == 0 {
         validate_contents_raw_property_types(message)?;
     }
@@ -3935,6 +3944,68 @@ fn validate_contents_raw_property_types(message: &MessageSpec) -> Result<(), Wri
                 raw.id,
                 column.prop_type()
             )));
+        }
+    }
+    Ok(())
+}
+
+fn validate_distribution_list_properties(message: &MessageSpec) -> Result<(), WriterError> {
+    if !class_is_or_descends_from(&message.message_class, "IPM.DistList") {
+        return Ok(());
+    }
+    let named = |lid| {
+        message.named_properties.iter().find(|property| {
+            property.set == NamedPropertySet::Guid(PSETID_ADDRESS)
+                && property.name == NamedPropertyName::Numeric(lid)
+        })
+    };
+    let members = named(0x8055);
+    let one_off_members = named(0x8054);
+    let checksum = named(0x804C);
+
+    if one_off_members.is_some() && members.is_none() {
+        return Err(WriterError::InvalidStructure(
+            "distribution-list one-off members require primary members".to_owned(),
+        ));
+    }
+    let member_count = match members.map(|property| &property.value) {
+        Some(RawPropertyValue::MultipleBinary(values)) => {
+            if multiple_binary_payload_len(values)? >= MAX_DISTRIBUTION_LIST_PROPERTY_BYTES {
+                return Err(WriterError::ValueTooLarge(
+                    "distribution-list members property",
+                ));
+            }
+            Some(values.len())
+        }
+        Some(_) => {
+            return Err(WriterError::InvalidStructure(
+                "distribution-list members have the wrong property type".to_owned(),
+            ));
+        }
+        None => None,
+    };
+    if let Some(property) = one_off_members {
+        let RawPropertyValue::MultipleBinary(values) = &property.value else {
+            return Err(WriterError::InvalidStructure(
+                "distribution-list one-off members have the wrong property type".to_owned(),
+            ));
+        };
+        if multiple_binary_payload_len(values)? >= MAX_DISTRIBUTION_LIST_PROPERTY_BYTES {
+            return Err(WriterError::ValueTooLarge(
+                "distribution-list one-off members property",
+            ));
+        }
+        if member_count != Some(values.len()) {
+            return Err(WriterError::InvalidStructure(
+                "distribution-list member arrays are not synchronized".to_owned(),
+            ));
+        }
+    }
+    if let Some(property) = checksum {
+        if members.is_none() || !matches!(property.value, RawPropertyValue::Integer32(_)) {
+            return Err(WriterError::InvalidStructure(
+                "distribution-list checksum is inconsistent with the members property".to_owned(),
+            ));
         }
     }
     Ok(())
@@ -4014,8 +4085,67 @@ fn raw_value_payload_len(value: &RawPropertyValue) -> Result<usize, WriterError>
             .len()
             .checked_mul(16)
             .ok_or(WriterError::ValueTooLarge("multi-valued property"))?,
+        RawPropertyValue::MultipleBinary(values) => multiple_binary_payload_len(values)?,
     };
     Ok(encoded_len)
+}
+
+fn multiple_binary_payload_len(values: &[Vec<u8>]) -> Result<usize, WriterError> {
+    values
+        .len()
+        .checked_add(1)
+        .and_then(|count| count.checked_mul(4))
+        .and_then(|header| {
+            values
+                .iter()
+                .try_fold(header, |total, value| total.checked_add(value.len()))
+        })
+        .ok_or(WriterError::ValueTooLarge("multi-valued binary property"))
+}
+
+fn multiple_binary_bytes(values: &[Vec<u8>]) -> io::Result<Vec<u8>> {
+    let encoded_len = multiple_binary_payload_len(values)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
+    let count = u32::try_from(values.len()).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "multi-valued binary property has too many values",
+        )
+    })?;
+    let mut bytes = Vec::with_capacity(encoded_len);
+    bytes.extend_from_slice(&count.to_le_bytes());
+    let mut offset = values
+        .len()
+        .checked_add(1)
+        .and_then(|count| count.checked_mul(4))
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "multi-valued binary property offset overflow",
+            )
+        })?;
+    for value in values {
+        bytes.extend_from_slice(
+            &u32::try_from(offset)
+                .map_err(|_| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "multi-valued binary property offset is too large",
+                    )
+                })?
+                .to_le_bytes(),
+        );
+        offset = offset.checked_add(value.len()).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "multi-valued binary property offset overflow",
+            )
+        })?;
+    }
+    for value in values {
+        bytes.extend_from_slice(value);
+    }
+    Ok(bytes)
 }
 
 fn unicode_payload_len(value: &str) -> Result<usize, WriterError> {
@@ -4880,12 +5010,20 @@ fn raw_value_matches(
                     .zip(right)
                     .all(|(left, right)| *left == right.to_le_bytes())
         }
+        (RawPropertyValue::MultipleBinary(left), ReadValue::MultipleBinary(right)) => {
+            left.len() == right.len()
+                && left
+                    .iter()
+                    .zip(right)
+                    .all(|(left, right)| left.as_slice() == right.buffer())
+        }
         (RawPropertyValue::Unicode(value), ReadValue::Null) => value.is_empty(),
         (RawPropertyValue::Binary(value), ReadValue::Null) => value.is_empty(),
         (RawPropertyValue::MultipleInteger16(value), ReadValue::Null) => value.is_empty(),
         (RawPropertyValue::MultipleInteger32(value), ReadValue::Null) => value.is_empty(),
         (RawPropertyValue::MultipleInteger64(value), ReadValue::Null) => value.is_empty(),
         (RawPropertyValue::MultipleGuid(value), ReadValue::Null) => value.is_empty(),
+        (RawPropertyValue::MultipleBinary(value), ReadValue::Null) => value.is_empty(),
         _ => false,
     }
 }
@@ -5892,6 +6030,7 @@ fn raw_property_value(value: &RawPropertyValue) -> PropertyValue {
             PropertyValue::MultipleInteger64(value.clone())
         }
         RawPropertyValue::MultipleGuid(value) => PropertyValue::MultipleGuid(value.clone()),
+        RawPropertyValue::MultipleBinary(value) => PropertyValue::MultipleBinary(value.clone()),
     }
 }
 
@@ -7097,6 +7236,7 @@ fn write_external_table_value(
         | PropertyValue::MultipleInteger32(_)
         | PropertyValue::MultipleInteger64(_)
         | PropertyValue::MultipleGuid(_)
+        | PropertyValue::MultipleBinary(_)
         | PropertyValue::Object(_, _) => {
             let data = table_variable_bytes(value)?.ok_or_else(|| {
                 WriterError::InvalidStructure("table variable value is missing".to_owned())
@@ -7154,6 +7294,7 @@ fn write_table_value(
         | PropertyValue::MultipleInteger32(_)
         | PropertyValue::MultipleInteger64(_)
         | PropertyValue::MultipleGuid(_)
+        | PropertyValue::MultipleBinary(_)
         | PropertyValue::Object(_, _) => {
             let data = table_variable_bytes(value)?.ok_or_else(|| {
                 WriterError::InvalidStructure("table variable value is missing".to_owned())
@@ -11060,9 +11201,89 @@ mod tests {
                 id: 0x1111,
                 value: RawPropertyValue::MultipleGuid(Vec::new()),
             },
+            RawProperty {
+                id: 0x1112,
+                value: RawPropertyValue::MultipleBinary(vec![
+                    vec![0, 1, 2],
+                    Vec::new(),
+                    vec![3, 4, 5, 6],
+                ]),
+            },
         ];
         let directory = tempfile::tempdir()?;
         create_fidelity_store(directory.path().join("raw-values.pst"), &spec)?;
+        Ok(())
+    }
+
+    #[test]
+    fn distribution_list_member_properties_round_trip_and_require_synchronization()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut message = FidelityStore::default().message;
+        message.message_class = "IPM.DistList".to_owned();
+        message.subject = "Distribution list fidelity checkpoint".to_owned();
+        message.sender_name.clear();
+        message.sender_email.clear();
+        message.recipients.clear();
+        let member = vec![1, 2, 3, 4, 5];
+        message.named_properties = vec![
+            NamedProperty {
+                set: NamedPropertySet::Guid(PSETID_ADDRESS),
+                name: NamedPropertyName::Numeric(0x8055),
+                value: RawPropertyValue::MultipleBinary(vec![member.clone()]),
+            },
+            NamedProperty {
+                set: NamedPropertySet::Guid(PSETID_ADDRESS),
+                name: NamedPropertyName::Numeric(0x8054),
+                value: RawPropertyValue::MultipleBinary(vec![member]),
+            },
+            NamedProperty {
+                set: NamedPropertySet::Guid(PSETID_ADDRESS),
+                name: NamedPropertyName::Numeric(0x804C),
+                value: RawPropertyValue::Integer32(0),
+            },
+        ];
+        let spec = MailStoreSpec {
+            store_name: "PSTForge distribution list".to_owned(),
+            record_key: *b"PSTForgeDistList",
+            folders: vec![MailFolderSpec {
+                path: vec!["Contacts".to_owned()],
+                location: MailFolderLocation::IpmSubtree,
+                role: MailFolderRole::Ordinary,
+                container_class: "IPF.Contact".to_owned(),
+                messages: vec![message.clone()],
+                associated_messages: Vec::new(),
+            }],
+        };
+        let directory = tempfile::tempdir()?;
+        create_mail_store(directory.path().join("distribution-list.pst"), &spec)?;
+
+        let mut mismatched = message;
+        let one_off = mismatched
+            .named_properties
+            .iter_mut()
+            .find(|property| property.name == NamedPropertyName::Numeric(0x8054))
+            .ok_or("missing one-off member property")?;
+        one_off.value = RawPropertyValue::MultipleBinary(Vec::new());
+        assert!(matches!(
+            validate_message(&mismatched, 0),
+            Err(WriterError::InvalidStructure(detail))
+                if detail.contains("not synchronized")
+        ));
+        let members = mismatched
+            .named_properties
+            .iter_mut()
+            .find(|property| property.name == NamedPropertyName::Numeric(0x8055))
+            .ok_or("missing primary member property")?;
+        members.value = RawPropertyValue::MultipleBinary(vec![vec![0; 14_992]]);
+        mismatched
+            .named_properties
+            .retain(|property| property.name != NamedPropertyName::Numeric(0x8054));
+        assert!(matches!(
+            validate_message(&mismatched, 0),
+            Err(WriterError::ValueTooLarge(
+                "distribution-list members property"
+            ))
+        ));
         Ok(())
     }
 

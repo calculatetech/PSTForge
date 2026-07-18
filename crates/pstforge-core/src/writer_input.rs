@@ -20,6 +20,11 @@ use crate::{
     attachment_mime::{self, BlobRange},
 };
 
+const PSETID_ADDRESS: [u8; 16] = [
+    0x04, 0x20, 0x06, 0x00, 0x00, 0x00, 0x00, 0x00, 0xC0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x46,
+];
+const MAX_DISTRIBUTION_LIST_PROPERTY_BYTES: u64 = 15_000;
+
 #[derive(Debug, Error)]
 pub enum CanonicalWriteError {
     #[error(transparent)]
@@ -393,20 +398,59 @@ fn translate_message(
                 omitted_properties = omitted_properties.saturating_add(1);
                 continue;
             }
-            let value = match property_type {
-                0x001F => read_unicode(job, mail, property)?
-                    .map(RawPropertyValue::Unicode)
-                    .or_else(|| Some(RawPropertyValue::Unicode(String::new()))),
-                0x0102 if property.blob.byte_len <= 1_048_576 => Some(RawPropertyValue::Binary(
-                    read_blob(job, mail, property, 1_048_576)?,
-                )),
-                _ => scalar_property(job, mail, property, transient_id, property_type)?,
+            let distribution_list_lid = match (&set, &name) {
+                (NamedPropertySet::Guid(guid), NamedPropertyName::Numeric(lid))
+                    if *guid == PSETID_ADDRESS =>
+                {
+                    Some(*lid)
+                }
+                _ => None,
+            };
+            let is_distribution_list_members =
+                matches!(distribution_list_lid, Some(0x8054 | 0x8055));
+            let is_distribution_list_checksum = distribution_list_lid == Some(0x804C);
+            let omissions_before_value = omitted_properties;
+            let value = if (is_distribution_list_members && property_type != 0x1102)
+                || (is_distribution_list_checksum && property_type != 0x0003)
+            {
+                None
+            } else {
+                match property_type {
+                    0x001F => read_unicode(job, mail, property)?
+                        .map(RawPropertyValue::Unicode)
+                        .or_else(|| Some(RawPropertyValue::Unicode(String::new()))),
+                    0x0102 if property.blob.byte_len <= 1_048_576 => Some(
+                        RawPropertyValue::Binary(read_blob(job, mail, property, 1_048_576)?),
+                    ),
+                    0x1102 => omit_malformed(
+                        multiple_binary_property(
+                            job,
+                            mail,
+                            property,
+                            transient_id,
+                            if is_distribution_list_members {
+                                MAX_DISTRIBUTION_LIST_PROPERTY_BYTES - 1
+                            } else {
+                                16 * 1024
+                            },
+                        ),
+                        &mut omitted_properties,
+                    )?,
+                    0x0003 if is_distribution_list_checksum => omit_malformed(
+                        scalar_property(job, mail, property, transient_id, property_type),
+                        &mut omitted_properties,
+                    )?
+                    .flatten(),
+                    _ => scalar_property(job, mail, property, transient_id, property_type)?,
+                }
             };
             if let Some(value) = value {
                 named_properties.push(NamedProperty { set, name, value });
             } else {
                 partial = true;
-                omitted_properties = omitted_properties.saturating_add(1);
+                if omitted_properties == omissions_before_value {
+                    omitted_properties = omitted_properties.saturating_add(1);
+                }
                 unsupported_properties.push(UnsupportedProperty {
                     id: transient_id,
                     property_type,
@@ -612,6 +656,17 @@ fn translate_message(
             }
             None => partial = true,
         }
+    }
+    if mail
+        .message_class
+        .as_deref()
+        .is_some_and(distribution_list_message_class)
+    {
+        contain_distribution_list_properties(
+            &mut named_properties,
+            &mut partial,
+            &mut omitted_properties,
+        );
     }
 
     let source_internet_codepage = internet_codepage;
@@ -1199,6 +1254,143 @@ fn scalar_property(
     Ok(Some(value))
 }
 
+fn multiple_binary_property(
+    job: &TranslationSource<'_>,
+    mail: &CanonicalMail,
+    property: &CanonicalProperty,
+    id: u16,
+    maximum_bytes: u64,
+) -> Result<RawPropertyValue, CanonicalWriteError> {
+    if property.blob.byte_len > maximum_bytes {
+        return Err(CanonicalWriteError::InvalidProperty {
+            item_key: mail.durable_item_key.clone(),
+            property_id: u32::from(id),
+            detail: format!(
+                "PtypMultipleBinary has {} bytes, limit is {maximum_bytes}",
+                property.blob.byte_len
+            ),
+        });
+    }
+    let bytes = read_blob(job, mail, property, maximum_bytes)?;
+    decode_multiple_binary(&bytes)
+        .map(RawPropertyValue::MultipleBinary)
+        .map_err(|detail| CanonicalWriteError::InvalidProperty {
+            item_key: mail.durable_item_key.clone(),
+            property_id: u32::from(id),
+            detail: detail.to_owned(),
+        })
+}
+
+fn decode_multiple_binary(bytes: &[u8]) -> Result<Vec<Vec<u8>>, &'static str> {
+    let count_bytes = bytes
+        .get(..4)
+        .ok_or("PtypMultipleBinary count is truncated")?;
+    let count = usize::try_from(u32::from_le_bytes([
+        count_bytes[0],
+        count_bytes[1],
+        count_bytes[2],
+        count_bytes[3],
+    ]))
+    .map_err(|_| "PtypMultipleBinary count is out of range")?;
+    let header_len = count
+        .checked_add(1)
+        .and_then(|value| value.checked_mul(4))
+        .ok_or("PtypMultipleBinary header length overflows")?;
+    if header_len > bytes.len() {
+        return Err("PtypMultipleBinary offset table is truncated");
+    }
+    if count == 0 {
+        if bytes.len() != 4 {
+            return Err("empty PtypMultipleBinary has trailing bytes");
+        }
+        return Ok(Vec::new());
+    }
+
+    let mut offsets = Vec::with_capacity(count);
+    for index in 0..count {
+        let start = 4_usize
+            .checked_add(
+                index
+                    .checked_mul(4)
+                    .ok_or("PtypMultipleBinary offset index overflows")?,
+            )
+            .ok_or("PtypMultipleBinary offset index overflows")?;
+        let encoded = bytes
+            .get(start..start + 4)
+            .ok_or("PtypMultipleBinary offset is truncated")?;
+        offsets.push(
+            usize::try_from(u32::from_le_bytes([
+                encoded[0], encoded[1], encoded[2], encoded[3],
+            ]))
+            .map_err(|_| "PtypMultipleBinary offset is out of range")?,
+        );
+    }
+    if offsets.first().copied() != Some(header_len)
+        || offsets
+            .windows(2)
+            .any(|pair| pair[0] > pair[1] || pair[1] > bytes.len())
+        || offsets.last().is_some_and(|offset| *offset > bytes.len())
+    {
+        return Err("PtypMultipleBinary offsets are not ordered within the property");
+    }
+    offsets
+        .iter()
+        .enumerate()
+        .map(|(index, start)| {
+            let end = offsets.get(index + 1).copied().unwrap_or(bytes.len());
+            bytes
+                .get(*start..end)
+                .map(ToOwned::to_owned)
+                .ok_or("PtypMultipleBinary value range is invalid")
+        })
+        .collect()
+}
+
+fn contain_distribution_list_properties(
+    properties: &mut Vec<NamedProperty>,
+    partial: &mut bool,
+    omitted_properties: &mut u64,
+) {
+    let key_matches = |property: &NamedProperty, lid| {
+        property.set == NamedPropertySet::Guid(PSETID_ADDRESS)
+            && property.name == NamedPropertyName::Numeric(lid)
+    };
+    let members = properties
+        .iter()
+        .find(|property| key_matches(property, 0x8055))
+        .map(|property| match &property.value {
+            RawPropertyValue::MultipleBinary(values) => Ok(values.len()),
+            _ => Err(()),
+        });
+    let one_off_members = properties
+        .iter()
+        .find(|property| key_matches(property, 0x8054))
+        .map(|property| match &property.value {
+            RawPropertyValue::MultipleBinary(values) => Ok(values.len()),
+            _ => Err(()),
+        });
+    let primary_is_invalid = matches!(members, Some(Err(())));
+    let member_count = members.and_then(Result::ok);
+    let remove_one_off = one_off_members.is_some()
+        && (primary_is_invalid || one_off_members.and_then(Result::ok) != member_count);
+    let remove_checksum = member_count.is_none()
+        || properties
+            .iter()
+            .find(|property| key_matches(property, 0x804C))
+            .is_some_and(|property| !matches!(property.value, RawPropertyValue::Integer32(_)));
+
+    properties.retain(|property| {
+        let remove = (primary_is_invalid && key_matches(property, 0x8055))
+            || ((primary_is_invalid || remove_one_off) && key_matches(property, 0x8054))
+            || (remove_checksum && key_matches(property, 0x804C));
+        if remove {
+            *omitted_properties = omitted_properties.saturating_add(1);
+            *partial = true;
+        }
+        !remove
+    });
+}
+
 fn read_boolean(
     job: &TranslationSource<'_>,
     mail: &CanonicalMail,
@@ -1470,6 +1662,10 @@ fn contact_message_class(value: &str) -> bool {
     class_is_or_descends_from(value, "IPM.Contact")
 }
 
+fn distribution_list_message_class(value: &str) -> bool {
+    class_is_or_descends_from(value, "IPM.DistList")
+}
+
 fn appointment_message_class(value: &str) -> bool {
     class_is_or_descends_from(value, "IPM.Appointment")
 }
@@ -1501,7 +1697,7 @@ fn sender_optional_message_class(value: &str) -> bool {
 }
 
 fn default_container_class(value: &str) -> &'static str {
-    if contact_message_class(value) {
+    if contact_message_class(value) || distribution_list_message_class(value) {
         "IPF.Contact"
     } else if appointment_message_class(value) {
         "IPF.Appointment"
@@ -1969,7 +2165,8 @@ mod tests {
     use std::io::Cursor;
 
     use libpff_sys::{
-        CatalogEvent, CatalogProvenance, CatalogSink, PropertyDescriptor, PropertyOwner,
+        CatalogEvent, CatalogProvenance, CatalogSink, NamedPropertyIdentity,
+        NamedPropertyName as LibpffNamedPropertyName, PropertyDescriptor, PropertyOwner,
         RecoveryUnit,
     };
     use pstforge_job::{DurableCatalogSink, ReconstructedField, ReconstructionCounts, SpooledBlob};
@@ -1978,7 +2175,8 @@ mod tests {
     use super::{
         CanonicalWriteError, PartBuildOptions, attachment_property_type_is_preservable,
         build_part_writer_input, build_part_writer_input_with_folders_interruptible,
-        contain_body_metadata, extension_for_mime, named_property_set,
+        contain_body_metadata, contain_distribution_list_properties, decode_multiple_binary,
+        default_container_class, extension_for_mime, named_property_set,
         normalize_associated_display_name, recipient_property_value_matches,
         record_internet_codepage_provenance, supported_message_class,
         valid_compressed_rtf_container, valid_utf8_stream, valid_utf16_stream,
@@ -1991,12 +2189,264 @@ mod tests {
         attachment_mime::flat_signature as mime_from_signature,
     };
     use pstforge_pst::writer::{
-        AttachmentContent, MailFolderRole, NamedPropertySet, NativeBody, validate_mail_store_input,
+        AttachmentContent, MailFolderRole, NamedProperty, NamedPropertyName, NamedPropertySet,
+        NativeBody, RawPropertyValue, validate_mail_store_input,
     };
 
     #[test]
     fn libpff_reserved_mapi_guid_is_normalized() {
         assert_eq!(named_property_set([0; 16]), NamedPropertySet::Mapi);
+    }
+
+    #[test]
+    fn multiple_binary_offsets_are_bounded_and_exact() {
+        let bytes = [3, 0, 0, 0, 16, 0, 0, 0, 18, 0, 0, 0, 18, 0, 0, 0, 1, 2, 3];
+        assert_eq!(
+            decode_multiple_binary(&bytes),
+            Ok(vec![vec![1, 2], Vec::new(), vec![3]])
+        );
+        assert_eq!(decode_multiple_binary(&[0, 0, 0, 0]), Ok(Vec::new()));
+        assert!(decode_multiple_binary(&[]).is_err());
+        assert!(decode_multiple_binary(&[0, 0, 0, 0, 1]).is_err());
+        assert!(decode_multiple_binary(&[1, 0, 0, 0, 7, 0, 0, 0]).is_err());
+        assert!(decode_multiple_binary(&[2, 0, 0, 0, 12, 0, 0, 0, 11, 0, 0, 0,]).is_err());
+    }
+
+    #[test]
+    fn distribution_list_containment_keeps_primary_members() {
+        let property = |lid, value| NamedProperty {
+            set: NamedPropertySet::Guid(super::PSETID_ADDRESS),
+            name: NamedPropertyName::Numeric(lid),
+            value,
+        };
+        let mut properties = vec![
+            property(
+                0x8055,
+                RawPropertyValue::MultipleBinary(vec![vec![1], vec![2]]),
+            ),
+            property(0x8054, RawPropertyValue::MultipleBinary(vec![vec![1]])),
+            property(0x804C, RawPropertyValue::Integer32(7)),
+        ];
+        let mut partial = false;
+        let mut omitted = 0;
+        contain_distribution_list_properties(&mut properties, &mut partial, &mut omitted);
+        assert!(partial);
+        assert_eq!(omitted, 1);
+        assert!(
+            properties
+                .iter()
+                .any(|property| property.name == NamedPropertyName::Numeric(0x8055))
+        );
+        assert!(
+            !properties
+                .iter()
+                .any(|property| property.name == NamedPropertyName::Numeric(0x8054))
+        );
+        assert!(
+            properties
+                .iter()
+                .any(|property| property.name == NamedPropertyName::Numeric(0x804C))
+        );
+
+        let mut orphaned = vec![
+            property(0x8054, RawPropertyValue::MultipleBinary(vec![vec![1]])),
+            property(0x804C, RawPropertyValue::Integer32(7)),
+        ];
+        partial = false;
+        omitted = 0;
+        contain_distribution_list_properties(&mut orphaned, &mut partial, &mut omitted);
+        assert!(partial);
+        assert_eq!(omitted, 2);
+        assert!(orphaned.is_empty());
+
+        let mut malformed = vec![
+            property(0x8055, RawPropertyValue::Binary(vec![1])),
+            property(0x8054, RawPropertyValue::MultipleBinary(vec![vec![1]])),
+            property(0x804C, RawPropertyValue::Unicode("wrong".to_owned())),
+        ];
+        partial = false;
+        omitted = 0;
+        contain_distribution_list_properties(&mut malformed, &mut partial, &mut omitted);
+        assert!(partial);
+        assert_eq!(omitted, 3);
+        assert!(malformed.is_empty());
+
+        assert_eq!(default_container_class("IPM.DistList"), "IPF.Contact");
+        assert_eq!(
+            default_container_class("ipm.distlist.recovered"),
+            "IPF.Contact"
+        );
+    }
+
+    #[test]
+    fn distribution_list_translation_contains_bad_arrays_once_and_keeps_valid_boundary()
+    -> Result<(), Box<dyn std::error::Error>> {
+        fn send(
+            sink: &mut DurableCatalogSink,
+            event: CatalogEvent<'_>,
+        ) -> Result<(), std::io::Error> {
+            CatalogSink::event(sink, event).map_err(std::io::Error::other)
+        }
+
+        fn encoded_single_value(total_bytes: usize) -> Vec<u8> {
+            let mut encoded = Vec::with_capacity(total_bytes);
+            encoded.extend_from_slice(&1_u32.to_le_bytes());
+            encoded.extend_from_slice(&8_u32.to_le_bytes());
+            encoded.resize(total_bytes, 0xA5);
+            encoded
+        }
+
+        fn mail(blob: SpooledBlob, value_type: u32, key: &str) -> CanonicalMail {
+            let spooled_bytes = blob.byte_len;
+            CanonicalMail {
+                durable_item_key: key.to_owned(),
+                key: ItemKey {
+                    provenance: RecoveryProvenance::Recovered,
+                    source_node_id: None,
+                    recovery_index: Some(0),
+                    occurrence: 0,
+                },
+                folder_path: vec!["Contacts".to_owned()],
+                folder_location: CanonicalFolderLocation::IpmSubtree,
+                folder_role: CanonicalFolderRole::Ordinary,
+                placement: CanonicalMessagePlacement::Normal,
+                message_class: Some("IPM.DistList".to_owned()),
+                subject: Some("Distribution-list containment checkpoint".to_owned()),
+                sender_name: None,
+                sender_email: None,
+                submit_filetime: None,
+                delivery_filetime: None,
+                recipients: Vec::new(),
+                attachments: Vec::new(),
+                properties: vec![CanonicalProperty {
+                    owner: "message".to_owned(),
+                    owner_index: None,
+                    record_set_index: 0,
+                    entry_index: 0,
+                    property_id: Some(0x8000),
+                    value_type: Some(value_type),
+                    named_property: Some(NamedPropertyIdentity {
+                        guid: super::PSETID_ADDRESS,
+                        name: LibpffNamedPropertyName::Numeric(0x8055),
+                    }),
+                    blob,
+                }],
+                completeness: ContentCompleteness::Complete,
+                spooled_bytes,
+            }
+        }
+
+        let malformed = vec![1, 0, 0, 0, 7, 0, 0, 0];
+        let oversized = encoded_single_value(15_000);
+        let wrong_type = vec![0x3D, 0xD8];
+        let maximum_valid = encoded_single_value(14_999);
+        let payloads = [&malformed, &oversized, &wrong_type, &maximum_valid];
+        let directory = tempdir()?;
+        let mut job = DurableCatalogSink::create(&directory.path().join("job"))?;
+        let unit = RecoveryUnit::Recovered { index: 0 };
+        send(&mut job, CatalogEvent::UnitStart(unit))?;
+        send(
+            &mut job,
+            CatalogEvent::MessageStart {
+                id: 9,
+                provenance: CatalogProvenance::Recovered,
+                recovery_index: Some(0),
+                folder_id: None,
+                parent_message_id: None,
+                parent_attachment_index: None,
+                embedded_path: Vec::new(),
+                associated: false,
+                item_type: None,
+                message_class: Some("IPM.DistList".to_owned()),
+                subject: None,
+                sender_name: None,
+                sender_email: None,
+                submit_filetime: None,
+                delivery_filetime: None,
+                supported: true,
+            },
+        )?;
+        for (index, payload) in payloads.into_iter().enumerate() {
+            let descriptor = PropertyDescriptor {
+                owner: PropertyOwner::Message(9),
+                record_set_index: 0,
+                entry_index: u32::try_from(index)?,
+                entry_type: Some(0x7000 + u32::try_from(index)?),
+                value_type: Some(0x0102),
+                data_size: u64::try_from(payload.len())?,
+            };
+            send(&mut job, CatalogEvent::PropertyStart(descriptor))?;
+            send(
+                &mut job,
+                CatalogEvent::PropertyData {
+                    descriptor,
+                    bytes: payload,
+                },
+            )?;
+            send(&mut job, CatalogEvent::PropertyEnd(descriptor))?;
+        }
+        send(
+            &mut job,
+            CatalogEvent::MessageEnd {
+                id: 9,
+                complete: true,
+            },
+        )?;
+        send(&mut job, CatalogEvent::UnitEnd(unit))?;
+        let blobs = job
+            .spooled_candidates()?
+            .into_iter()
+            .flat_map(|candidate| candidate.events)
+            .filter(|event| event.kind == "property")
+            .filter_map(|event| event.blob)
+            .collect::<Vec<_>>();
+        assert_eq!(blobs.len(), 4);
+
+        for (index, value_type) in [0x1102, 0x1102, 0x001F].into_iter().enumerate() {
+            let candidate = mail(
+                blobs[index].clone(),
+                value_type,
+                &format!("recovered:-:0:{index}"),
+            );
+            let input = build_part_writer_input(
+                &job,
+                &[&candidate],
+                &"0".repeat(64),
+                "balanced",
+                4_294_967_296,
+                1,
+            )?;
+            assert!(input.partial);
+            assert_eq!(input.omitted_properties, 1);
+            assert!(
+                input.store.folders[0].messages[0]
+                    .named_properties
+                    .is_empty()
+            );
+        }
+
+        let candidate = mail(blobs[3].clone(), 0x1102, "recovered:-:0:3");
+        let input = build_part_writer_input(
+            &job,
+            &[&candidate],
+            &"0".repeat(64),
+            "balanced",
+            4_294_967_296,
+            1,
+        )?;
+        assert!(!input.partial);
+        assert_eq!(input.omitted_properties, 0);
+        assert_eq!(input.store.folders[0].container_class, "IPF.Contact");
+        assert_eq!(
+            input.store.folders[0].messages[0].named_properties,
+            vec![NamedProperty {
+                set: NamedPropertySet::Guid(super::PSETID_ADDRESS),
+                name: NamedPropertyName::Numeric(0x8055),
+                value: RawPropertyValue::MultipleBinary(vec![vec![0xA5; 14_991]]),
+            }]
+        );
+        validate_mail_store_input(&input.store)?;
+        Ok(())
     }
 
     #[test]

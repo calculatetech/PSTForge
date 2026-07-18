@@ -257,11 +257,12 @@ fn run() -> Result<(), String> {
             Some("appointments") => qualify_appointments(&root, Path::new(&output)),
             Some("meetings") => qualify_meetings(&root, Path::new(&output)),
             Some("pim-items") => qualify_pim_items(&root, Path::new(&output)),
+            Some("distribution-list") => qualify_distribution_list(&root, Path::new(&output)),
             Some("calendar-exceptions") => {
                 qualify_calendar_exceptions(&root, Path::new(&output))
             }
             Some("associated-data") => qualify_associated_data(&root, Path::new(&output)),
-            _ => Err("unknown qualification checkpoint; expected embedded-attachments, named-properties, empty-folders, contacts, appointments, meetings, pim-items, or calendar-exceptions".to_owned()),
+            _ => Err("unknown qualification checkpoint; expected embedded-attachments, named-properties, empty-folders, contacts, appointments, meetings, pim-items, distribution-list, calendar-exceptions, or associated-data".to_owned()),
         };
     }
     if command != std::ffi::OsStr::new("gate") {
@@ -293,7 +294,7 @@ fn run() -> Result<(), String> {
 }
 
 fn usage() -> String {
-    "usage: cargo xtask gate <fast|full|release> | qualify <embedded-attachments|named-properties|empty-folders|contacts|appointments|meetings|pim-items|calendar-exceptions|associated-data> <output>"
+    "usage: cargo xtask gate <fast|full|release> | qualify <embedded-attachments|named-properties|empty-folders|contacts|appointments|meetings|pim-items|distribution-list|calendar-exceptions|associated-data> <output>"
         .to_owned()
 }
 
@@ -925,6 +926,91 @@ fn qualify_pim_items(root: &Path, output: &Path) -> Result<(), String> {
         ],
     };
     publish_qualification(root, output, 3, |part| {
+        pstforge_pst::writer::create_mail_store(part, &spec)
+    })
+}
+
+fn qualify_distribution_list(root: &Path, output: &Path) -> Result<(), String> {
+    use pstforge_pst::writer::{
+        FidelityStore, MailFolderRole, MailFolderSpec, MailStoreSpec, NamedProperty,
+        NamedPropertyName, NamedPropertySet, RawProperty, RawPropertyValue,
+    };
+
+    const PSETID_ADDRESS: [u8; 16] = [
+        0x04, 0x20, 0x06, 0x00, 0x00, 0x00, 0x00, 0x00, 0xC0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x46,
+    ];
+    const ONE_OFF_PROVIDER: [u8; 16] = [
+        0x81, 0x2B, 0x1F, 0xA4, 0xBE, 0xA3, 0x10, 0x19, 0x9D, 0x6E, 0x00, 0xDD, 0x01, 0x0F, 0x54,
+        0x02,
+    ];
+    let one_off = |display_name: &str, address: &str| {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&[0; 4]);
+        bytes.extend_from_slice(&ONE_OFF_PROVIDER);
+        bytes.extend_from_slice(&[0; 4]);
+        bytes.extend_from_slice(display_name.as_bytes());
+        bytes.push(0);
+        bytes.extend_from_slice(b"SMTP\0");
+        bytes.extend_from_slice(address.as_bytes());
+        bytes.push(0);
+        bytes
+    };
+
+    let list_name = "PSTForge distribution list checkpoint";
+    let members = vec![
+        one_off("Ada Example", "ada@example.com"),
+        one_off("Grace Example", "grace@example.com"),
+    ];
+    let mut fixture = FidelityStore {
+        store_name: "PSTForge distribution list source".to_owned(),
+        record_key: *b"PSTForgeDLSource",
+        ..FidelityStore::default()
+    };
+    fixture.message.message_class = "IPM.DistList".to_owned();
+    fixture.message.subject = list_name.to_owned();
+    fixture.message.sender_name.clear();
+    fixture.message.sender_email.clear();
+    fixture.message.recipients.clear();
+    fixture.message.body_text = None;
+    fixture.message.body_html = None;
+    fixture.message.body_rtf = None;
+    fixture.message.native_body = None;
+    fixture.message.attachments.clear();
+    fixture.message.raw_properties = vec![RawProperty {
+        id: 0x3001,
+        value: RawPropertyValue::Unicode(list_name.to_owned()),
+    }];
+    fixture.message.named_properties = vec![
+        NamedProperty {
+            set: NamedPropertySet::Guid(PSETID_ADDRESS),
+            name: NamedPropertyName::Numeric(0x8053),
+            value: RawPropertyValue::Unicode(list_name.to_owned()),
+        },
+        NamedProperty {
+            set: NamedPropertySet::Guid(PSETID_ADDRESS),
+            name: NamedPropertyName::Numeric(0x8055),
+            value: RawPropertyValue::MultipleBinary(members.clone()),
+        },
+        NamedProperty {
+            set: NamedPropertySet::Guid(PSETID_ADDRESS),
+            name: NamedPropertyName::Numeric(0x8054),
+            value: RawPropertyValue::MultipleBinary(members),
+        },
+    ];
+    let spec = MailStoreSpec {
+        store_name: fixture.store_name,
+        record_key: fixture.record_key,
+        folders: vec![MailFolderSpec {
+            path: vec!["Contacts".to_owned()],
+            location: pstforge_pst::writer::MailFolderLocation::IpmSubtree,
+            role: MailFolderRole::Ordinary,
+            container_class: "IPF.Contact".to_owned(),
+            messages: vec![fixture.message],
+            associated_messages: Vec::new(),
+        }],
+    };
+    publish_qualification(root, output, 1, |part| {
         pstforge_pst::writer::create_mail_store(part, &spec)
     })
 }

@@ -2148,6 +2148,116 @@ fn milestone_0_4_2_pim_items_roundtrip_through_libpff() -> Result<(), Box<dyn st
 }
 
 #[test]
+#[ignore = "requires the external v042-distribution-list-source corpus case"]
+fn milestone_0_4_2_distribution_list_roundtrip_through_libpff()
+-> Result<(), Box<dyn std::error::Error>> {
+    let manifest_path = std::env::var_os("PSTFORGE_CORPUS_MANIFEST")
+        .ok_or("PSTFORGE_CORPUS_MANIFEST is required")?;
+    let manifest: Manifest = toml::from_str(&fs::read_to_string(&manifest_path)?)?;
+    let case = manifest
+        .cases
+        .iter()
+        .find(|case| case.name == "v042-distribution-list-source")
+        .ok_or("manifest has no v042-distribution-list-source case")?;
+    let identity = pstforge_core::SourceFile::open(&case.path)?
+        .identity()
+        .clone();
+    if identity.sha256 != case.sha256 {
+        return Err("distribution-list source SHA-256 does not match its manifest".into());
+    }
+
+    let source_messages = independent_messages(&case.path)?;
+    if source_messages.len() != 1
+        || source_messages[0].folder_path != ["Contacts"]
+        || source_messages[0].content.message_class.as_deref() != Some("IPM.DistList")
+        || source_messages[0].content.subject.as_deref()
+            != Some("PSTForge distribution list checkpoint")
+        || source_messages[0].content.sender_name.is_some()
+        || source_messages[0].content.sender_email.is_some()
+        || !source_messages[0].content.recipients.is_empty()
+        || !source_messages[0].complete
+    {
+        return Err("distribution-list source does not match the item contract".into());
+    }
+    let source_named = independent_named_properties(&case.path)?;
+    let expected = [(0x8053, 0x001F), (0x8054, 0x1102), (0x8055, 0x1102)];
+    if source_named.len() != expected.len()
+        || !expected.iter().all(|(lid, property_type)| {
+            source_named.iter().any(|property| {
+                property.owner.message_class.as_deref() == Some("IPM.DistList")
+                    && property.owner.subject.as_deref()
+                        == Some("PSTForge distribution list checkpoint")
+                    && property.identity.guid
+                        == [
+                            0x04, 0x20, 0x06, 0x00, 0x00, 0x00, 0x00, 0x00, 0xC0, 0x00, 0x00, 0x00,
+                            0x00, 0x00, 0x00, 0x46,
+                        ]
+                    && property.identity.name == NamedPropertyName::Numeric(*lid)
+                    && property.value_type == Some(*property_type)
+            })
+        })
+    {
+        return Err(
+            format!("distribution-list named-property contract changed: {source_named:?}").into(),
+        );
+    }
+    if independent_folder_classes(&case.path)?
+        .get(&vec!["Contacts".to_owned()])
+        .map(String::as_str)
+        != Some("IPF.Contact")
+    {
+        return Err("distribution-list source folder is not IPF.Contact".into());
+    }
+
+    let directory = tempfile::tempdir()?;
+    let job = directory.path().join("job");
+    let output = Command::new(env!("CARGO_BIN_EXE_pstforge"))
+        .arg("split")
+        .arg(&case.path)
+        .arg("--output")
+        .arg(&job)
+        .arg("--max-pst-size")
+        .arg("4GiB")
+        .arg("--json")
+        .arg("--color")
+        .arg("never")
+        .output()?;
+    if !output.status.success() {
+        return Err(format!(
+            "distribution-list split failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        )
+        .into());
+    }
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+    if report["partial"].as_bool() != Some(false)
+        || report["written_candidates"].as_u64() != Some(1)
+        || report["parts"].as_array().map(Vec::len) != Some(1)
+        || report["parts"][0]["omitted_folders"].as_u64() != Some(0)
+        || report["parts"][0]["omitted_properties"].as_u64() != Some(0)
+        || report["parts"][0]["omitted_attachments"].as_u64() != Some(0)
+    {
+        return Err("distribution-list split did not report complete preservation".into());
+    }
+    let generated = job.join("parts/part-0001.pst");
+    verify_exact_message_fidelity(source_messages, independent_messages(&generated)?)?;
+    if independent_named_properties(&generated)? != source_named {
+        return Err("distribution-list named-property identity or payload changed".into());
+    }
+    if independent_folder_classes(&generated)?
+        .get(&vec!["Contacts".to_owned()])
+        .map(String::as_str)
+        != Some("IPF.Contact")
+    {
+        return Err("generated distribution-list folder is not IPF.Contact".into());
+    }
+    if pstforge_core::SourceFile::open(&case.path)?.identity() != &identity {
+        return Err("distribution-list source identity changed during the split".into());
+    }
+    Ok(())
+}
+
+#[test]
 #[ignore = "requires the external v042-calendar-exception-source corpus case"]
 fn milestone_0_4_2_calendar_exceptions_roundtrip_through_libpff()
 -> Result<(), Box<dyn std::error::Error>> {

@@ -1835,6 +1835,40 @@ work. Hash and identity evidence show that the source was not modified.
   - [ ] Checkpoints 10 onward: distribution lists; documents and reference
     attachments; task communications; journal/activity objects; and remaining
     generic classes, each proven separately where feasible.
+    - [x] (2026-07-18) Checkpoint 10: Personal Distribution Lists. Admit
+      `IPM.DistList` descendants only after implementing the MS-PST
+      variable-width multivalue envelope and the MS-OXOCNTC synchronized
+      member-property contract. Preserve structurally readable PSETID_Address
+      LID `0x8055` and optional `0x8054` values byte-for-byte, require each
+      encoded property to remain below 15,000 bytes, and never synthesize,
+      reorder, reinterpret, or checksum-rewrite recovered members. A missing
+      one-off mirror remains absent as permitted by documented Exchange 2003
+      behavior. A malformed, oversized, or count-mismatched mirror is omitted
+      alone and reported partial; an unusable primary list omits the
+      member properties while retaining recoverable message metadata.
+      Job-schema compatibility must advance because schema 15 durable
+      catalogs can already contain these properties classified as omitted.
+      Prove the exact source/output property fingerprints with one bounded
+      external fixture, then stop after the first generated part for ScanPST
+      and Outlook verification before commit.
+      Implementation now preserves the exact bounded multivalue-binary
+      envelopes, contains each malformed or inconsistent source property
+      without aborting the message, derives `IPF.Contact` only when the source
+      folder class is absent, and refuses resume from job schema 15. Focused
+      tests cover the 14,999-byte accepted boundary, the 15,000-byte rejected
+      boundary, malformed offsets, wrong source types, synchronized arrays,
+      and exact omission counts. The automated external fixture proves exact
+      source/output named-property fingerprints through libpff. The
+      combined-manifest full gate passed at
+      `.agent/test-results/1784413306-full`, and a fresh final-state
+      adversarial review returned `CLEAN`. Candidate
+      `qualification-v042-distribution-list-r3/parts/part-0001.pst` is 271,360
+      bytes with SHA-256
+      `48b2bbde100abeae2051e5dc542cb19479c23c8d0f6880712f01d3d84d5c6d40`;
+      `pffinfo` accepts it and `readpst` completes while intentionally skipping
+      the non-mail Contact object. The owner reports ScanPST and Outlook
+      acceptance fully green, including the Contacts-folder list name and both
+      members.
   - [ ] Run the complete 19 GB split once after all focused checkpoints pass
     and reconcile discovered unique items against written plus explicitly
     unwritten items across every part.
@@ -3037,6 +3071,21 @@ work. Hash and identity evidence show that the source was not modified.
   associated collections and cannot safely resume as complete.
   Date/Author: 2026-07-18 / Codex from read-only source-ledger and installed
   libpff API evidence.
+
+- Decision: Job schema 16 admits `IPM.DistList` descendants and preserves
+  structurally readable PSETID_Address member arrays without interpreting
+  their EntryID payloads. A readable primary member array is authoritative;
+  an absent optional one-off mirror stays absent, an inconsistent mirror is
+  omitted alone, and an unusable primary also removes its dependent mirror and
+  checksum. The source checksum is retained only when the source member bytes
+  are retained unchanged and is never recomputed.
+  Rationale: MS-OXOCNTC defines primary and optional synchronized
+  `PtypMultipleBinary` properties below 15,000 bytes. Schema 15 catalogs can
+  already contain these values classified as omitted, so resume must fail
+  closed. Byte preservation maximizes recovery without claiming that damaged
+  One-Off or Wrapped EntryIDs can be safely reconstructed.
+  Date/Author: 2026-07-18 / Codex from checkpoint-10 Microsoft conformance and
+  bounded source/output fingerprint evidence.
 
 - Decision: No further PST writer feature may be implemented until every
   existing writer invariant is indexed in `docs/WRITER_CONFORMANCE.md` against

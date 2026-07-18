@@ -63,6 +63,11 @@ date or protocol revision here.
 - **Section:** 2.3.3.4.1
 - **Page date:** 2024-04-16
 
+### PST-MV-VARIABLE
+- **Source:** MS-PST MV Properties with Variable-size Base Type
+- **Section:** 2.3.3.4.2
+- **Page date:** 2024-04-16 protocol revision
+
 ### PST-MSG
 - **Source:** [MS-PST Messaging Layer](https://learn.microsoft.com/en-us/openspecs/office_file_formats/ms-pst/e2e7a5aa-c89f-4fb8-b044-15ac76e5207e)
 - **Section:** 2.4
@@ -265,7 +270,7 @@ date or protocol revision here.
 
 ### OXOCNTC
 - **Source:** [MS-OXOCNTC Contact Object Protocol](https://learn.microsoft.com/en-us/openspecs/exchange_server_protocols/ms-oxocntc/9b636532-9150-4836-9635-9c9b756c9ccf)
-- **Section:** published revision 21.0; [contacts-related folders 2.2.3](https://learn.microsoft.com/en-us/openspecs/exchange_server_protocols/ms-oxocntc/45951a5e-82b4-4d83-83e6-24abbac67947)
+- **Section:** published revision 21.0; [personal distribution-list members 2.2.2.2.1](https://learn.microsoft.com/en-us/openspecs/exchange_server_protocols/ms-oxocntc/9604efce-a4d9-4d6c-9541-e16dc3598dc2); [one-off members 2.2.2.2.2](https://learn.microsoft.com/en-us/openspecs/exchange_server_protocols/ms-oxocntc/48d63d90-48e1-4edf-a84b-8ccbcd3afdde); [checksum 3.1.5.11](https://learn.microsoft.com/en-us/openspecs/exchange_server_protocols/ms-oxocntc/51b77be4-66d3-40a7-ae95-a56982af2d68); [WrappedEntryId 2.2.2.2.4.1.1](https://learn.microsoft.com/en-us/openspecs/exchange_server_protocols/ms-oxocntc/02656215-1cb0-4b06-a077-b07e756216be); [contacts-related folders 2.2.3](https://learn.microsoft.com/en-us/openspecs/exchange_server_protocols/ms-oxocntc/45951a5e-82b4-4d83-83e6-24abbac67947)
 - **Page date:** 2025-05-20
 
 ### OXOCAL
@@ -483,7 +488,7 @@ PSTForge to invent class semantics that were absent from the source.
 - **Behavior and evidence:** Ordinary mail routing, body, attachment, raw, and named properties use the generic message model; exact external fingerprints and MailPlus/Outlook acceptance cover the implemented subset
 
 ### CLS-02
-- **Status:** Verified for Contact objects; Personal Distribution Lists remain a later checkpoint
+- **Status:** Verified for Contact objects; Personal Distribution Lists are specified by CLS-09
 - **Class family:** `IPM.Contact` and descendants
 - **Sources:** OXOCNTC; MAPI-CONTAINER
 - **Behavior and evidence:** Sender is optional, source `IPF.Contact` is retained, and contact raw/named properties remain on their owning message; exact libpff source/output fingerprint, ScanPST, and Outlook pass
@@ -523,6 +528,16 @@ PSTForge to invent class semantics that were absent from the source.
 - **Class family:** folder-associated configuration messages
 - **Sources:** OXOCFG section 1.4; MAPI-FAI; MSG-08
 - **Behavior and evidence:** Source traversal, not class-name inference, places the item in the owning folder's FAI table; class and representable raw/named properties remain exact
+
+### CLS-09
+- **Status:** Verified
+- **Class family:** `IPM.DistList` and descendants
+- **Sources:** OXOCNTC sections 2.2.2.2.1, 2.2.2.2.2, 2.2.2.2.3, 2.2.2.2.4.1.1, 2.2.2.4.2, and 2.2.3; MS-OXPROPS 2.95, 2.96, and 2.98; PST-MV-VARIABLE; OXCDATA-TYPES
+- **Required properties:** PSETID_Address `{00062004-0000-0000-C000-000000000046}` LID `0x8055` is `PtypMultipleBinary` and contains One-Off EntryIDs or WrappedEntryIds. Optional LID `0x8054` is `PtypMultipleBinary`, contains the corresponding One-Off EntryIDs, and when present has the same element count and ordering. Each property is less than 15,000 bytes. Optional LID `0x804C` is the source checksum over the member-value bytes.
+- **Recovery behavior:** Preserve each structurally readable member value byte-for-byte. Do not invent members, reinterpret EntryIDs, reorder arrays, or recompute a source checksum when the member bytes are unchanged. Retain a readable source folder class; derive `IPF.Contact` only when it is absent. A missing one-off mirror is valid and remains absent. If the one-off mirror is malformed, oversized, or count-mismatched, retain the readable primary member list, omit only the mirror, and report the readable omission as partial. If the primary member list is malformed or oversized, preserve the distribution-list message metadata but omit the unusable member properties and report partial recovery.
+- **Implementation:** `multiple_binary_property`, `contain_distribution_list_properties`, `validate_distribution_list_properties`, `RawPropertyValue::MultipleBinary`, `PropertyValue::variable_bytes`
+- **Focused tests:** bounded offset/count parser; exact variable-MV encoding and roundtrip; missing, synchronized, mismatched, malformed, and oversized distribution-list property cases
+- **Independent evidence:** Exact source/output libpff property fingerprints, `pffinfo`, and `readpst` pass; ScanPST reports clean and Outlook displays the Contacts-folder list name and both members correctly.
 
 ## Template And Outlook-Maintained Output
 
