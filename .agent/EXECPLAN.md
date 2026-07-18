@@ -1462,7 +1462,192 @@ work. Hash and identity evidence show that the source was not modified.
       objects are intentionally not visible as ordinary messages; clean
       ScanPST and stable Outlook attachment close the human acceptance gate.
   - [ ] Checkpoint 9: writer-wide Microsoft specification conformance audit.
-    - [ ] Create `docs/WRITER_CONFORMANCE.md` with one traceable row for every
+    - [x] (2026-07-18) Created `docs/WRITER_CONFORMANCE.md` as the
+      non-destructive audit ledger, with source baselines, status semantics,
+      subsystem coverage, code/test/evidence mappings, and an explicit exit
+      gate. The initial inventory isolates the fixed HMP hierarchy map, the
+      persisted-view/index templates, and the empty NAMEID sentinel as
+      empirical or partially documented output. All remain unchanged pending
+      exact source comparison and, where documentation remains absent, human
+      disposition.
+    - [x] (2026-07-18) Completed the first exact Messaging-layer pass over
+      mandatory nodes, fixed folders, six required table templates, store,
+      folder, message, recipient, and attachment minimum schemas. The core
+      required graph and ordinary object schemas match. The audit found
+      Microsoft-source contradictions for replication/container-class template
+      types and fixed-folder content counts, plus undocumented ScanPST-derived
+      output (`0xEC1`, store property `0x6633`, provider/index table schemas,
+      and replication-instance values). The conformance index preserves and
+      isolates all of them for control comparison and human disposition; no
+      writer bytes changed.
+    - [x] (2026-07-18) Completed the exact Unicode HEADER and ROOT comparison.
+      The documented field layout, constants, reserved bytes, free-map fields,
+      root references, counters, and CRC ranges match MS-PST 2.2.2.5-2.2.2.6.
+      The Outlook-control-derived `bidUnused` and `dwUnique` creation seed is
+      not prescribed by Microsoft, so it is now isolated as EMP-10 and retained
+      unchanged for human disposition. No writer bytes changed.
+    - [x] (2026-07-18) Completed the exact NDB page, block, data-tree,
+      subnode-tree, BBT/NBT, and allocation-map comparison. Physical
+      alignment, trailers, checksums, signatures, block types, ordinary tree
+      levels, B-tree capacities, and DList-based allocation match. Two bounded
+      implementation gaps are isolated for focused correction: a zero-byte
+      spooled value currently reaches a rejected zero-length data block, and a
+      local subnode set above the single documented SIBLOCK level (roughly
+      173,000 entries) would attempt an invalid level 2 rather than refusing
+      cleanly. No writer bytes changed.
+    - [x] (2026-07-18) Completed the exact LTP heap, BTH, PC, TC, column,
+      row-matrix, and existence-bitmap comparison. The structural encodings
+      match MS-PST. Two already accepted value encodings are not fully
+      reconciled with generic MS-OXCDATA wording: PSTForge omits the Unicode
+      terminator because terminated controls caused visible MailPlus suffix
+      corruption, and fixed-width multivalues use packed elements with count
+      inferred from allocation length. Both are isolated as EMP-11/EMP-12 and
+      retained unchanged pending control comparison and human disposition. No
+      writer bytes changed.
+    - [x] (2026-07-18) Completed the populated NAMEID map comparison. Store-wide
+      identity collection, property-index assignment, reserved/custom GUID
+      selectors, entry/string/GUID streams, 251-bucket hashing, and embedded
+      message lookup match MS-PST 2.4.7. The fixed empty-map mapping and the
+      physical MAPI GUID used when no custom GUID exists remain EMP-03 because
+      Microsoft does not require those sentinels; both remain unchanged. No
+      writer bytes changed.
+    - [x] (2026-07-18) Verified embedded-message serialization against MS-PST
+      2.3.3.5, 2.4.5, and 2.4.6.3. Method 5, the attachment-owned object
+      subnode, NID/size pair, child property context, recipient and attachment
+      tables, and recursive child subnodes agree. The accepted 256-level
+      traversal bound is a product containment policy rather than a PST
+      boundary. No writer bytes changed.
+    - [x] (2026-07-18) Verified body serialization against MS-OXCMSG and
+      MS-OXRTFCP. Plain text, binary HTML, compressed RTF, RTF synchronization,
+      native-body enumeration, and Internet code page use the documented
+      property IDs and types; the literal-only LZFu stream has the required
+      header, termination reference, and CRC. PSTForge does not fabricate an
+      absent body representation. No writer bytes changed.
+    - [x] (2026-07-18) The exact MS-OXOCAL comparison found a conflict in the
+      already accepted calendar-exception fixture. Microsoft defines exception
+      replacement time as `0x7FF9/PtypTime`; the source and current exact
+      output instead contain `0x7FFA/PtypInteger32`, also retain
+      `0x7FFF/PtypBoolean` (canonically the attachment-contact-photo flag), and
+      require `0x7FFA..=0x7FFE` for admission. The documented start, end,
+      flags, hidden state, method, embedded class, and object relationship
+      agree. The conflicting source fields are isolated as EMP-13 and remain
+      byte-exact; no property was stripped, remapped, synthesized, or changed
+      pending owner disposition. No writer bytes changed.
+    - [x] (2026-07-18) Split generic property fidelity from class semantics.
+      MS-OXOMSG, MS-OXOCNTC, MS-OXOCAL, MS-OXOTASK, MS-OXONOTE, MS-OXOPOST,
+      and MS-OXOCFG now index the completed mail, contact, calendar/meeting,
+      standalone task, sticky-note, post, and associated-configuration
+      checkpoints. Exact source/output fingerprints prove that supported raw
+      and named values remain on the correct source class and owner. Later
+      distribution-list, task-communication, document, and journal families
+      remain pending their own protocol pass.
+    - [x] (2026-07-18) The generated-metadata audit found mixed fallback
+      behavior when source values are absent: `(no subject)`, `Unknown Sender`,
+      copied sender halves, `MSGFLAG_READ`, UTF-8 Internet codepage,
+      received-time creation/modification substitutes, standard folder/message
+      class fallbacks, and subject fallback for absent FAI display names.
+      Structural PST requirements, standard container classes, and the existing
+      product codepage contract justify part of that set, but no located
+      Microsoft source requires the user-visible subject/sender substitutions
+      or content-derived classification when source class is absent. EMP-14
+      retains all current behavior until the owner decides how structurally
+      required fields, provenance, and partial accounting should replace or
+      preserve those values. No writer bytes changed.
+    - [x] (2026-07-18) Recipient and attachment fallbacks are now isolated as
+      EMP-15. The pipeline can copy a missing recipient display name/address
+      from its counterpart; generate recovery filenames; label embedded
+      messages `message/rfc822`; and default rendering position/flags. Required
+      table shape and `-1` rendering semantics are documented, while generated
+      display/MIME values are recovery policy. All remain unchanged pending
+      owner disposition; usable payloads must not be stripped merely because
+      optional display metadata is absent.
+    - [x] (2026-07-18) Closed the publication/integrity pass. PSTForge builds a
+      private new file rather than modifying a published PST, synchronizes it,
+      completes and resynchronizes any allocation-map rebuild, validates its
+      owned object graph, requires independent `pffinfo` and `readpst`
+      acceptance, atomically renames without replacement, synchronizes the
+      held destination directory, and verifies the published device/inode.
+      Existing failure, timeout, moved-directory, no-clobber, retained-evidence,
+      and scratch-containment tests cover the publication states. No writer
+      bytes changed.
+    - [x] (2026-07-18) Resolved the two normative NDB gaps without removing or
+      changing empirical output. Empty binary/Unicode values continue through
+      the inline empty-value representation; zero-byte spool descriptors are
+      now rejected during writer preflight and cannot emit a prohibited
+      zero-length data block. Subnode trees now enforce the exact 340-leaf by
+      510-intermediate capacity before appending blocks, so a 173,401st local
+      subnode cannot create the MS-PST-prohibited second SIBLOCK level. Both
+      focused regressions pass.
+    - [x] (2026-07-18) The complete fast gate passes at
+      `.agent/test-results/1784387912-fast`. A fresh clean-context adversarial
+      review scoped to valid-input preservation, integer bounds,
+      mutation-before-error, and PST validity reports CLEAN with no blocker,
+      high, or medium finding. The zero-spool guard changes no valid output
+      bytes, and the subnode limit is unreachable under the writer's existing
+      per-message collection bounds; no ScanPST candidate is needed for these
+      preflight-only corrections.
+    - [x] (2026-07-18) The initial pre-commit full gate passed format, check, clippy,
+      workspace tests, documentation, artifact checks, licenses, advisories,
+      independent `pffinfo`, independent `readpst`, and writer acceptance. The
+      first run stopped because `PSTFORGE_CORPUS_MANIFEST` was unset. Re-running
+      with the ExecPlan-documented external manifest at
+      `$XDG_DATA_HOME/pstforge-test-corpus/manifest.toml` reached the corpus
+      phase and stopped because that focused manifest has no `healthy_ansi`
+      case classified `milestone_0_1_1`. Evidence is retained at
+      `.agent/test-results/1784388172-full`. Do not commit until the required
+      external case is available or the owner explicitly approves a recorded
+      gate exception. The combined manifest below resolved the blocker; no
+      exception was taken.
+    - [x] (2026-07-18) Replaced the incomplete focused/full manifest choice
+      with an external mode-0600 combined manifest containing the legacy
+      ANSI/Unicode/split cases and every focused 0.4.2 case. The combined run
+      passed all six prior 0.4.2 source/output comparisons and the calendar
+      exception comparison. Its legacy GroupDocs split case then exposed one
+      known bounded `libpff_message_get_recipients` failure in addition to the
+      already permitted attachment-count failures. The source verification
+      reports that message incomplete, and the split regression already
+      requires incomplete source messages to produce partial accounting. The
+      independent fingerprint helper now permits only those two exact libpff
+      operations/messages and continues to reject every other issue, dropped
+      issue, or unfinished stream.
+    - [x] (2026-07-18) The legacy full-corpus split then exposed two stale test
+      assumptions and one applicable reporting defect. Private part sidecars
+      moved from `parts/` to `.pstforge/manifests/` in checkpoint 1, and parts
+      now preserve empty source folders rather than equating folder count with
+      message-bearing leaves. The regression now validates the private path,
+      requires all message paths to be represented, and accounts for mandatory
+      writer folders separately. More importantly, part `message_count`
+      included normal and recursively embedded messages but omitted associated
+      messages. Counting both top-level collections corrects the private
+      manifest and human/JSON report without changing PST bytes.
+    - [x] (2026-07-18) Accepted exact-length UTF-16LE property and table
+      allocations as the permanent EMP-11 interoperability exception. The
+      focused writer roundtrip freezes the absence of a trailing NUL; the
+      earlier strict-NUL output produced visible folder/subject corruption,
+      while the retained form passed ScanPST, Outlook, and MailPlus. No writer
+      bytes changed in this checkpoint.
+    - [x] (2026-07-18) Implemented permanent typed reconstruction accounting
+      for EMP-14 and EMP-15 without changing any fallback value. Each part
+      records bounded grouped counts for metadata derived from other readable
+      source values and metadata generated because the source field was absent
+      or unusable.
+      `recovery.log` renders the aggregate without subjects, addresses, paths,
+      attachment names, or item identifiers. Associated and recursively
+      embedded messages contribute to the aggregate. Reconstruction remains
+      separate from `partial`, which still means readable source data was not
+      preserved. Private sidecar schema 1.1.0 and job schema 15 prevent an old
+      resume from silently losing the new accounting.
+    - [x] (2026-07-18) Completed the consolidated no-PST-byte recovery point.
+      The combined-manifest full gate passed formatting, check, Clippy,
+      workspace tests, documentation/artifact policy, licenses, advisories,
+      writer acceptance, every focused 0.4.2 comparison, the legacy damaged
+      split control, and independent `pffinfo`/`readpst` checks. Evidence:
+      `.agent/test-results/1784392888-full`. One fresh clean-context
+      adversarial review focused on accounting completeness, privacy, resume
+      compatibility, partial status, source-loss masking, the NDB guards, and
+      the unchanged valid-PST serialization boundary returned `CLEAN`. Human
+      approval remains required before the focused 0.4.2 commit and push.
+    - [x] Create `docs/WRITER_CONFORMANCE.md` with one traceable row for every
       existing store, NDB, LTP, folder, message, recipient, attachment,
       embedded-message, associated-content, named-property, and publication
       invariant. Each row names the authoritative Microsoft document,
@@ -2711,6 +2896,27 @@ work. Hash and identity evidence show that the source was not modified.
   the milestone's data-preservation and trust goals.
   Date/Author: 2026-07-18 / human owner clarification before checkpoint-9
   conformance audit.
+
+- Decision: Derived/generated recovery counts are a permanent part of the
+  bounded human `recovery.log`. They use typed field categories rather than
+  source values or per-item records, aggregate across every message placement,
+  and survive resume. Reconstructing a structurally required field does not by
+  itself make an otherwise preserved candidate partial.
+  Rationale: Operators need to know where output contains recovered facts
+  versus policy-generated metadata without creating a private-data log or
+  conflating reconstruction with source data loss. The underlying fallback
+  values remain separate human decisions supported by later comparative
+  evidence.
+  Date/Author: 2026-07-18 / human owner decisions for EMP-14 and EMP-15
+  remediation.
+
+- Decision: Store PtypString allocations as exact UTF-16LE bytes without a
+  trailing NUL despite the generic MS-OXCDATA wording.
+  Rationale: The strict-NUL implementation produced visible `_` and `€`
+  suffix corruption. The exact-length representation is frozen by a focused
+  regression and passed ScanPST, Outlook, and MailPlus, making the proven
+  interoperable behavior the most correct result for this conflict.
+  Date/Author: 2026-07-18 / human owner acceptance of the proven behavior.
 
 ## Outcomes & Retrospective
 

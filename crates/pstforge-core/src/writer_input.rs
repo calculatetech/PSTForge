@@ -2,7 +2,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::io::Read;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use pstforge_job::{DurableCatalogSink, JobError, SpooledBlob};
+use pstforge_job::{
+    DurableCatalogSink, JobError, ReconstructedField, ReconstructionCounts, SpooledBlob,
+};
 use pstforge_pst::writer::{
     AttachmentContent, AttachmentSpec, FileBlobSpec, MailFolderLocation, MailFolderRole,
     MailFolderSpec, MailStoreSpec, MessageSpec, NamedProperty, NamedPropertyName, NamedPropertySet,
@@ -46,6 +48,7 @@ pub struct PartWriterInput {
     pub omitted_folders: u64,
     pub omitted_properties: u64,
     pub omitted_attachments: u64,
+    pub reconstructions: ReconstructionCounts,
 }
 
 pub(crate) struct PartBuildOptions<'a> {
@@ -135,21 +138,21 @@ fn build_part_writer_input_expected(
             detail: "part has no messages".to_owned(),
         });
     }
+    let mut reconstructions = ReconstructionCounts::default();
     let mut folders = source_folders
         .iter()
         .map(|folder| {
+            let container_class = folder
+                .container_class
+                .clone()
+                .filter(|value| !value.is_empty())
+                .unwrap_or_else(|| {
+                    reconstructions.record_generated(ReconstructedField::FolderClass);
+                    "IPF.Note".to_owned()
+                });
             (
                 (folder.location, folder.path.clone()),
-                (
-                    folder.role,
-                    folder
-                        .container_class
-                        .clone()
-                        .filter(|value| !value.is_empty())
-                        .unwrap_or_else(|| "IPF.Note".to_owned()),
-                    Vec::new(),
-                    Vec::new(),
-                ),
+                (folder.role, container_class, Vec::new(), Vec::new()),
             )
         })
         .collect::<BTreeMap<
@@ -172,6 +175,28 @@ fn build_part_writer_input_expected(
         partial |= translated.partial;
         omitted_properties = omitted_properties.saturating_add(translated.omitted_properties);
         omitted_attachments = omitted_attachments.saturating_add(translated.omitted_attachments);
+        if mail.placement == CanonicalMessagePlacement::Associated
+            && !translated.message.raw_properties.iter().any(|property| {
+                matches!(
+                    property,
+                    RawProperty {
+                        id: 0x3001,
+                        value: RawPropertyValue::Unicode(_),
+                    }
+                )
+            })
+        {
+            if mail
+                .subject
+                .as_deref()
+                .is_some_and(|value| !value.is_empty())
+            {
+                reconstructions.record_derived(ReconstructedField::AssociatedDisplayName);
+            } else {
+                reconstructions.record_generated(ReconstructedField::AssociatedDisplayName);
+            }
+        }
+        reconstructions.merge(translated.reconstructions);
         match folders.entry((mail.folder_location, mail.folder_path.clone())) {
             std::collections::btree_map::Entry::Vacant(entry) => {
                 let mut normal = Vec::new();
@@ -180,13 +205,19 @@ fn build_part_writer_input_expected(
                     CanonicalMessagePlacement::Normal => normal.push(translated.message),
                     CanonicalMessagePlacement::Associated => associated.push(translated.message),
                 }
-                entry.insert((
-                    mail.folder_role,
+                let container_class =
                     default_container_class(mail.message_class.as_deref().unwrap_or("IPM.Note"))
-                        .to_owned(),
-                    normal,
-                    associated,
-                ));
+                        .to_owned();
+                if mail
+                    .message_class
+                    .as_deref()
+                    .is_some_and(|value| !value.is_empty())
+                {
+                    reconstructions.record_derived(ReconstructedField::FolderClass);
+                } else {
+                    reconstructions.record_generated(ReconstructedField::FolderClass);
+                }
+                entry.insert((mail.folder_role, container_class, normal, associated));
             }
             std::collections::btree_map::Entry::Occupied(mut entry) => {
                 let (role, _, messages, associated_messages) = entry.get_mut();
@@ -244,6 +275,7 @@ fn build_part_writer_input_expected(
         omitted_folders,
         omitted_properties,
         omitted_attachments,
+        reconstructions,
     })
 }
 
@@ -286,6 +318,7 @@ struct TranslatedMessage {
     partial: bool,
     omitted_properties: u64,
     omitted_attachments: u64,
+    reconstructions: ReconstructionCounts,
 }
 
 fn translate_message(
@@ -312,6 +345,7 @@ fn translate_message(
     let mut serialized_named = BTreeSet::new();
     let mut item_keys = vec![mail.durable_item_key.clone()];
     let mut unsupported_item_keys = Vec::new();
+    let mut reconstructions = ReconstructionCounts::default();
 
     for property in &mail.properties {
         let Some(property_type) = property
@@ -560,7 +594,10 @@ fn translate_message(
         }
     }
 
-    let internet_codepage = internet_codepage.unwrap_or(65001);
+    let internet_codepage = internet_codepage.unwrap_or_else(|| {
+        reconstructions.record_generated(ReconstructedField::InternetCodepage);
+        65001
+    });
     if internet_codepage == 65001 {
         if let Some(property) = html_property {
             if !valid_utf8_property(job, mail, property)? {
@@ -627,6 +664,26 @@ fn translate_message(
         omitted_properties = omitted_properties.saturating_add(recipient_property_count);
     }
 
+    for recipient in &mail.recipients {
+        match (
+            recipient
+                .display_name
+                .as_deref()
+                .filter(|value| !value.is_empty()),
+            recipient
+                .email_address
+                .as_deref()
+                .filter(|value| !value.is_empty()),
+        ) {
+            (None, Some(_)) => {
+                reconstructions.record_derived(ReconstructedField::RecipientDisplayName);
+            }
+            (Some(_), None) => {
+                reconstructions.record_derived(ReconstructedField::RecipientAddress);
+            }
+            _ => {}
+        }
+    }
     let recipients = mail
         .recipients
         .iter()
@@ -674,6 +731,7 @@ fn translate_message(
                     omitted_properties.saturating_add(translated.omitted_properties);
                 omitted_attachments =
                     omitted_attachments.saturating_add(translated.omitted_attachments);
+                reconstructions.merge(translated.reconstructions);
                 item_keys.extend(translated.item_keys);
                 unsupported_item_keys.extend(translated.unsupported_item_keys);
                 if let Some(attachment) = translated.attachment {
@@ -687,10 +745,10 @@ fn translate_message(
         }
     }
 
-    let message_class = mail
-        .message_class
-        .clone()
-        .unwrap_or_else(|| "IPM.Note".to_owned());
+    let message_class = mail.message_class.clone().unwrap_or_else(|| {
+        reconstructions.record_generated(ReconstructedField::MessageClass);
+        "IPM.Note".to_owned()
+    });
     if !supported_message_class(&message_class)
         || (calendar_exception_message_class(&message_class) && !allow_calendar_exception)
     {
@@ -700,7 +758,10 @@ fn translate_message(
         .subject
         .clone()
         .filter(|value| !value.is_empty())
-        .unwrap_or_else(|| "(no subject)".to_owned());
+        .unwrap_or_else(|| {
+            reconstructions.record_generated(ReconstructedField::Subject);
+            "(no subject)".to_owned()
+        });
     let sender_optional = sender_optional_message_class(&message_class);
     let source_sender_name = mail.sender_name.clone().filter(|value| !value.is_empty());
     let source_sender_email = mail.sender_email.clone().filter(|value| !value.is_empty());
@@ -715,22 +776,58 @@ fn translate_message(
             }
         }
     } else {
-        let sender_name = source_sender_name
-            .or_else(|| source_sender_email.clone())
-            .unwrap_or_else(|| "Unknown Sender".to_owned());
-        let sender_email = source_sender_email.unwrap_or_else(|| sender_name.clone());
+        let sender_name = source_sender_name.or_else(|| {
+            if source_sender_email.is_some() {
+                reconstructions.record_derived(ReconstructedField::SenderName);
+                source_sender_email.clone()
+            } else {
+                reconstructions.record_generated(ReconstructedField::SenderName);
+                Some("Unknown Sender".to_owned())
+            }
+        });
+        let sender_name = sender_name.unwrap_or_else(|| "Unknown Sender".to_owned());
+        let sender_email = source_sender_email.unwrap_or_else(|| {
+            if mail
+                .sender_name
+                .as_deref()
+                .is_some_and(|value| !value.is_empty())
+            {
+                reconstructions.record_derived(ReconstructedField::SenderAddress);
+            } else {
+                reconstructions.record_generated(ReconstructedField::SenderAddress);
+            }
+            sender_name.clone()
+        });
         (sender_name, sender_email)
     };
-    if mail.subject.as_deref().is_none_or(str::is_empty)
-        || (!sender_optional
-            && (mail.sender_name.as_deref().is_none_or(str::is_empty)
-                || mail.sender_email.as_deref().is_none_or(str::is_empty)))
-    {
-        partial = true;
-    }
-
     let (sent_filetime, invalid_sent_filetime) = contained_filetime(mail.submit_filetime);
     let (received_filetime, invalid_received_filetime) = contained_filetime(mail.delivery_filetime);
+    if mail.submit_filetime.is_none() || invalid_sent_filetime {
+        reconstructions.record_generated(ReconstructedField::SubmitTime);
+    }
+    if mail.delivery_filetime.is_none() || invalid_received_filetime {
+        reconstructions.record_generated(ReconstructedField::DeliveryTime);
+    }
+    let creation_filetime = creation_filetime.unwrap_or_else(|| {
+        if mail.delivery_filetime.is_some() && !invalid_received_filetime {
+            reconstructions.record_derived(ReconstructedField::CreationTime);
+        } else {
+            reconstructions.record_generated(ReconstructedField::CreationTime);
+        }
+        received_filetime
+    });
+    let modification_filetime = modification_filetime.unwrap_or_else(|| {
+        if mail.delivery_filetime.is_some() && !invalid_received_filetime {
+            reconstructions.record_derived(ReconstructedField::ModificationTime);
+        } else {
+            reconstructions.record_generated(ReconstructedField::ModificationTime);
+        }
+        received_filetime
+    });
+    let message_flags = message_flags.unwrap_or_else(|| {
+        reconstructions.record_generated(ReconstructedField::MessageFlags);
+        1
+    });
     partial |= invalid_sent_filetime || invalid_received_filetime;
     omitted_properties = omitted_properties
         .saturating_add(u64::from(invalid_sent_filetime))
@@ -738,7 +835,7 @@ fn translate_message(
     Ok(TranslatedMessage {
         message: MessageSpec {
             message_class,
-            message_flags: message_flags.unwrap_or(1),
+            message_flags,
             internet_codepage,
             subject,
             sender_name,
@@ -746,8 +843,8 @@ fn translate_message(
             recipients,
             sent_filetime,
             received_filetime,
-            creation_filetime: creation_filetime.unwrap_or(received_filetime),
-            modification_filetime: modification_filetime.unwrap_or(received_filetime),
+            creation_filetime,
+            modification_filetime,
             body_text: None,
             body_html: None,
             body_rtf: None,
@@ -765,6 +862,7 @@ fn translate_message(
         partial,
         omitted_properties,
         omitted_attachments,
+        reconstructions,
     })
 }
 
@@ -806,6 +904,7 @@ struct TranslatedAttachment {
     partial: bool,
     omitted_properties: u64,
     omitted_attachments: u64,
+    reconstructions: ReconstructionCounts,
 }
 
 fn translate_attachment(
@@ -818,9 +917,11 @@ fn translate_attachment(
     let mut content_location = None;
     let mut rendering_position = None;
     let mut flags = 0;
+    let mut flags_observed = false;
     let mut raw_properties = Vec::new();
     let mut omitted_properties = 0_u64;
     let mut mapped_property_ids = BTreeSet::new();
+    let mut reconstructions = ReconstructionCounts::default();
     let parent_class = mail.message_class.as_deref().unwrap_or("IPM.Note");
     let preserves_calendar_exception = appointment_message_class(parent_class)
         && attachment
@@ -863,6 +964,7 @@ fn translate_attachment(
                     omit_malformed(read_i32(job, mail, property), &mut omitted_properties)?
                 {
                     flags = value;
+                    flags_observed = true;
                 }
             }
             id if attachment_property_is_mapped(id) => {}
@@ -940,9 +1042,11 @@ fn translate_attachment(
                 partial: true,
                 omitted_properties,
                 omitted_attachments: 1,
+                reconstructions,
             }));
         }
         let translated = translate_message(job, embedded, calendar_exception)?;
+        reconstructions.merge(translated.reconstructions);
         (
             AttachmentContent::Embedded(Box::new(translated.message)),
             translated.item_keys,
@@ -966,25 +1070,34 @@ fn translate_attachment(
     } else {
         return Ok(None);
     };
+    let filename = attachment
+        .filename
+        .clone()
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| {
+            reconstructions.record_generated(ReconstructedField::AttachmentFilename);
+            if attachment.embedded.is_some() {
+                format!("Embedded message {}.msg", attachment.index)
+            } else {
+                format!("Recovered attachment {}", attachment.index)
+            }
+        });
+    let mime_type = mime_type.or_else(|| {
+        attachment.embedded.is_some().then(|| {
+            reconstructions.record_generated(ReconstructedField::AttachmentMimeType);
+            "message/rfc822".to_owned()
+        })
+    });
+    if rendering_position.is_none() {
+        reconstructions.record_generated(ReconstructedField::AttachmentRenderingPosition);
+    }
+    if !flags_observed {
+        reconstructions.record_generated(ReconstructedField::AttachmentFlags);
+    }
     Ok(Some(TranslatedAttachment {
         attachment: Some(AttachmentSpec {
-            filename: attachment
-                .filename
-                .clone()
-                .filter(|value| !value.is_empty())
-                .unwrap_or_else(|| {
-                    if attachment.embedded.is_some() {
-                        format!("Embedded message {}.msg", attachment.index)
-                    } else {
-                        format!("Recovered attachment {}", attachment.index)
-                    }
-                }),
-            mime_type: mime_type.or_else(|| {
-                attachment
-                    .embedded
-                    .is_some()
-                    .then(|| "message/rfc822".to_owned())
-            }),
+            filename,
+            mime_type,
             content_id,
             content_location,
             rendering_position,
@@ -1001,6 +1114,7 @@ fn translate_attachment(
             || child_omitted_attachments != 0,
         omitted_properties: omitted_properties.saturating_add(child_omitted_properties),
         omitted_attachments: child_omitted_attachments,
+        reconstructions,
     }))
 }
 
@@ -1754,7 +1868,7 @@ mod tests {
 
     use std::io::Cursor;
 
-    use pstforge_job::{DurableCatalogSink, SpooledBlob};
+    use pstforge_job::{DurableCatalogSink, ReconstructedField, SpooledBlob};
     use tempfile::tempdir;
 
     use super::{
@@ -1948,7 +2062,87 @@ mod tests {
         assert_eq!(input.store.folders[0].messages[0].sender_email, "");
         assert_eq!(input.omitted_properties, 0);
         assert!(!input.partial);
+        assert!(input.reconstructions.derived.is_empty());
+        for field in [
+            ReconstructedField::MessageFlags,
+            ReconstructedField::InternetCodepage,
+            ReconstructedField::SubmitTime,
+            ReconstructedField::DeliveryTime,
+            ReconstructedField::CreationTime,
+            ReconstructedField::ModificationTime,
+        ] {
+            assert_eq!(input.reconstructions.generated.get(&field), Some(&1));
+        }
+        assert_eq!(input.reconstructions.generated.len(), 6);
         validate_mail_store_input(&input.store)?;
+        Ok(())
+    }
+
+    #[test]
+    fn generated_mail_metadata_is_accounted_without_marking_source_loss()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempdir()?;
+        let job = DurableCatalogSink::create(&directory.path().join("job"))?;
+        let mail = CanonicalMail {
+            durable_item_key: "normal:4:-:0".to_owned(),
+            key: ItemKey {
+                provenance: RecoveryProvenance::Normal,
+                source_node_id: Some(4),
+                recovery_index: None,
+                occurrence: 0,
+            },
+            folder_path: vec!["Inbox".to_owned()],
+            folder_location: CanonicalFolderLocation::IpmSubtree,
+            folder_role: CanonicalFolderRole::Ordinary,
+            placement: CanonicalMessagePlacement::Normal,
+            message_class: Some("IPM.Note".to_owned()),
+            subject: None,
+            sender_name: None,
+            sender_email: None,
+            submit_filetime: None,
+            delivery_filetime: None,
+            recipients: Vec::new(),
+            attachments: Vec::new(),
+            properties: Vec::new(),
+            completeness: ContentCompleteness::Complete,
+            spooled_bytes: 0,
+        };
+        let input = build_part_writer_input(
+            &job,
+            &[&mail],
+            &"0".repeat(64),
+            "balanced",
+            4_294_967_296,
+            1,
+        )?;
+
+        let output = &input.store.folders[0].messages[0];
+        assert_eq!(output.subject, "(no subject)");
+        assert_eq!(output.sender_name, "Unknown Sender");
+        assert_eq!(output.sender_email, "Unknown Sender");
+        assert!(!input.partial);
+        assert_eq!(
+            input
+                .reconstructions
+                .derived
+                .get(&ReconstructedField::FolderClass),
+            Some(&1)
+        );
+        assert_eq!(input.reconstructions.derived.len(), 1);
+        for field in [
+            ReconstructedField::Subject,
+            ReconstructedField::SenderName,
+            ReconstructedField::SenderAddress,
+            ReconstructedField::MessageFlags,
+            ReconstructedField::InternetCodepage,
+            ReconstructedField::SubmitTime,
+            ReconstructedField::DeliveryTime,
+            ReconstructedField::CreationTime,
+            ReconstructedField::ModificationTime,
+        ] {
+            assert_eq!(input.reconstructions.generated.get(&field), Some(&1));
+        }
+        assert_eq!(input.reconstructions.generated.len(), 9);
         Ok(())
     }
 

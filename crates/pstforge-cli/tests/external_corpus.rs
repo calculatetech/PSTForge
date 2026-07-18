@@ -908,10 +908,15 @@ fn independent_messages(
     let mut sink = IndependentMessageSink::default();
     let catalog = native.catalog(&mut sink)?;
     if catalog.issues.iter().any(|issue| {
-        issue.operation != "count attachments"
-            || !issue
-                .message
-                .contains("libpff_message_get_number_of_attachments")
+        !matches!(
+            (issue.operation, issue.message.as_str()),
+            ("count attachments", message)
+                if message.contains("libpff_message_get_number_of_attachments")
+        ) && !matches!(
+            (issue.operation, issue.message.as_str()),
+            ("stream recipients", message)
+                if message.contains("libpff_message_get_recipients")
+        )
     }) || catalog.issues_dropped != 0
         || !sink.active.is_empty()
         || !sink.attachments.is_empty()
@@ -1222,10 +1227,9 @@ fn match_source_messages(
     let mut unmatched = expected.iter().collect::<Vec<_>>();
     let mut source_paths = Vec::with_capacity(actual.len());
     for generated in actual {
-        if !unmatched
-            .iter()
-            .any(|source| source.content == generated.content)
-        {
+        if !unmatched.iter().any(|source| {
+            content_matches_current_recovery_policy(&source.content, &generated.content)
+        }) {
             let categories = unmatched
                 .iter()
                 .find(|source| generated.folder_path == source.folder_path)
@@ -1264,11 +1268,14 @@ fn match_source_messages(
             .into());
         }
         let Some(position) = unmatched.iter().position(|source| {
-            source.content == generated.content && generated.folder_path == source.folder_path
+            content_matches_current_recovery_policy(&source.content, &generated.content)
+                && generated.folder_path == source.folder_path
         }) else {
             let source_depth = unmatched
                 .iter()
-                .find(|source| source.content == generated.content)
+                .find(|source| {
+                    content_matches_current_recovery_policy(&source.content, &generated.content)
+                })
                 .map(|source| source.folder_path.len())
                 .unwrap_or_default();
             return Err(format!(
@@ -1281,6 +1288,96 @@ fn match_source_messages(
         source_paths.push(unmatched.swap_remove(position).folder_path.clone());
     }
     Ok((source_paths, unmatched.len()))
+}
+
+fn content_matches_current_recovery_policy(
+    source: &MessageContentFingerprint,
+    generated: &MessageContentFingerprint,
+) -> bool {
+    let mut expected = source.clone();
+    normalize_current_recovery_policy(&mut expected);
+    expected == *generated
+}
+
+fn normalize_current_recovery_policy(expected: &mut MessageContentFingerprint) {
+    if expected.message_class.is_none() {
+        expected.message_class = Some("IPM.Note".to_owned());
+    }
+    if expected.subject.as_deref().is_none_or(str::is_empty) {
+        expected.subject = Some("(no subject)".to_owned());
+    }
+    if !sender_optional_class(expected.message_class.as_deref().unwrap_or("IPM.Note")) {
+        match (&expected.sender_name, &expected.sender_email) {
+            (None, None) => {
+                expected.sender_name = Some("Unknown Sender".to_owned());
+                expected.sender_email = Some("Unknown Sender".to_owned());
+            }
+            (None, Some(address)) => expected.sender_name = Some(address.clone()),
+            (Some(name), None) => expected.sender_email = Some(name.clone()),
+            (Some(_), Some(_)) => {}
+        }
+    }
+    let source_delivery = expected.delivery_filetime;
+    if expected.submit_filetime.is_none() {
+        expected.submit_filetime = Some(0);
+    }
+    if expected.delivery_filetime.is_none() {
+        expected.delivery_filetime = Some(0);
+    }
+    add_i32_fallback(&mut expected.body_properties, 0x0E07, 1);
+    add_i32_fallback(&mut expected.body_properties, 0x3FDE, 65_001);
+    add_i64_fallback(
+        &mut expected.body_properties,
+        0x3007,
+        source_delivery.unwrap_or_default(),
+    );
+    add_i64_fallback(
+        &mut expected.body_properties,
+        0x3008,
+        source_delivery.unwrap_or_default(),
+    );
+    expected.body_properties.sort();
+}
+
+fn sender_optional_class(value: &str) -> bool {
+    !(class_is_or_descends_from(value, "IPM.Note")
+        || class_descends_from(value, "REPORT.IPM.Note")
+        || class_descends_from(value, "IPM.Schedule.Meeting"))
+}
+
+fn class_is_or_descends_from(value: &str, root: &str) -> bool {
+    value.eq_ignore_ascii_case(root) || class_descends_from(value, root)
+}
+
+fn class_descends_from(value: &str, root: &str) -> bool {
+    value
+        .get(..root.len())
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case(root))
+        && value.as_bytes().get(root.len()) == Some(&b'.')
+        && value.len() > root.len() + 1
+}
+
+fn add_i32_fallback(properties: &mut Vec<PropertyFingerprint>, id: u32, value: i32) {
+    if properties.iter().any(|property| property.id == id) {
+        return;
+    }
+    properties.push(property_fingerprint(id, 0x0003, &value.to_le_bytes()));
+}
+
+fn add_i64_fallback(properties: &mut Vec<PropertyFingerprint>, id: u32, value: u64) {
+    if properties.iter().any(|property| property.id == id) {
+        return;
+    }
+    properties.push(property_fingerprint(id, 0x0040, &value.to_le_bytes()));
+}
+
+fn property_fingerprint(id: u32, value_type: u32, bytes: &[u8]) -> PropertyFingerprint {
+    PropertyFingerprint {
+        id,
+        value_type: Some(value_type),
+        byte_len: u64::try_from(bytes.len()).unwrap_or_default(),
+        sha256: Sha256::digest(bytes).into(),
+    }
 }
 
 fn fingerprint_difference(
@@ -2218,6 +2315,7 @@ fn milestone_0_4_real_pst_splits_deterministically_without_mutation()
             let mut identities = Vec::new();
             let mut output_messages = 0_u64;
             let mut output_fingerprints = Vec::new();
+            let mut reconstructions = pstforge_job::ReconstructionCounts::default();
             for part in parts {
                 let filename = part["filename"].as_str().ok_or("part filename is absent")?;
                 let byte_len = part["byte_len"].as_u64().ok_or("part length is absent")?;
@@ -2239,30 +2337,32 @@ fn milestone_0_4_real_pst_splits_deterministically_without_mutation()
                 let inventory = pstforge_core::verify(&path)?;
                 output_messages = output_messages.saturating_add(inventory.inventory.normal_items);
                 let part_fingerprints = independent_messages(&path)?;
-                let (replicated_leaf_folders, replicated_all_folders) =
+                let (_, replicated_all_folders) =
                     replicated_source_folder_counts(&source_messages, &part_fingerprints)?;
                 output_fingerprints.extend(part_fingerprints);
                 let store = pstforge_pst::open_store(&path)?;
                 let record_key = lower_hex(store.properties().record_key()?.record_key());
                 let sidecar_name = format!("{}.json", filename.trim_end_matches(".pst"));
-                let sidecar_bytes = fs::read(job.join("parts").join(sidecar_name))?;
+                let sidecar_bytes = fs::read(job.join(".pstforge/manifests").join(sidecar_name))?;
                 let sidecar: pstforge_job::PartSidecar = serde_json::from_slice(&sidecar_bytes)?;
-                let expected_inventory_folders =
-                    replicated_all_folders.saturating_add(WRITER_MANDATORY_FOLDER_COUNT);
-                if sidecar.folder_count != replicated_leaf_folders
+                reconstructions.merge(sidecar.reconstructions.clone());
+                let expected_inventory_folders = sidecar
+                    .folder_count
+                    .saturating_add(WRITER_MANDATORY_FOLDER_COUNT);
+                if sidecar.folder_count < replicated_all_folders
                     || inventory.inventory.folders != expected_inventory_folders
                 {
                     return Err(format!(
-                        "{} folder accounting mismatch: sidecar={}, source leaves={}, inventory={}, expected inventory={}",
+                        "{} folder accounting mismatch: sidecar={}, required message paths={}, inventory={}, expected inventory={}",
                         case.name,
                         sidecar.folder_count,
-                        replicated_leaf_folders,
+                        replicated_all_folders,
                         inventory.inventory.folders,
                         expected_inventory_folders
                     )
                     .into());
                 }
-                if sidecar.schema_version != "1.0.0"
+                if sidecar.schema_version != "1.1.0"
                     || sidecar.producer_version != env!("CARGO_PKG_VERSION")
                     || u64::from(sidecar.index) != part["index"].as_u64().unwrap_or_default()
                     || sidecar.filename != filename
@@ -2285,6 +2385,13 @@ fn milestone_0_4_real_pst_splits_deterministically_without_mutation()
                     byte_len,
                     sidecar_bytes,
                 ));
+            }
+            if reconstructions.is_empty() {
+                return Err(format!(
+                    "{} normalized missing metadata without reconstruction accounting",
+                    case.name
+                )
+                .into());
             }
             if output_messages != written {
                 return Err(format!("{} generated message count mismatch", case.name).into());

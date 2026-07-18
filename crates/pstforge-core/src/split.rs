@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 use libpff_sys::RecoveryMode;
 use pstforge_job::{
     DurableCatalogSink, JobConfiguration, JobError, JobSourceIdentity, PartSidecar, PublishedPart,
-    PublishedPartRecord,
+    PublishedPartRecord, ReconstructedField, ReconstructionCounts,
 };
 use pstforge_pst::writer::{
     AttachmentContent, MessageSpec, WriterError, create_mail_store_interruptible,
@@ -165,6 +165,8 @@ pub struct PartReport {
     pub omitted_folders: u64,
     pub omitted_properties: u64,
     pub omitted_attachments: u64,
+    #[serde(skip_serializing)]
+    pub reconstructions: ReconstructionCounts,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -427,6 +429,10 @@ fn render_recovery_log(report: &SplitReport) -> String {
         .committed_candidates
         .saturating_sub(report.written_candidates)
         .saturating_sub(report.recovery.unsupported_candidates);
+    let mut reconstructions = ReconstructionCounts::default();
+    for part in &report.parts {
+        reconstructions.merge(part.reconstructions.clone());
+    }
     let clean_data = report.recovery.partial_candidates == 0
         && report.recovery.unsupported_candidates == 0
         && report.recovery.issues == 0
@@ -513,6 +519,21 @@ fn render_recovery_log(report: &SplitReport) -> String {
             report.recovery.issues_dropped
         ));
     }
+    output.push_str("\nData reconstructed\n");
+    if reconstructions.is_empty() {
+        output.push_str("No source metadata required reconstruction.\n");
+    } else {
+        append_reconstruction_group(
+            &mut output,
+            "Derived from other readable source values",
+            &reconstructions.derived,
+        );
+        append_reconstruction_group(
+            &mut output,
+            "Generated because source metadata was absent or unusable",
+            &reconstructions.generated,
+        );
+    }
     output.push_str("\nOutput files\n");
     for part in report.parts.iter().take(MAX_RECOVERY_LOG_DETAIL_LINES) {
         output.push_str(&format!(
@@ -530,6 +551,47 @@ fn render_recovery_log(report: &SplitReport) -> String {
         ));
     }
     output
+}
+
+fn append_reconstruction_group(
+    output: &mut String,
+    heading: &str,
+    counts: &BTreeMap<ReconstructedField, u64>,
+) {
+    if counts.is_empty() {
+        return;
+    }
+    output.push_str(heading);
+    output.push_str(":\n");
+    for (field, count) in counts {
+        output.push_str(&format!(
+            "  {}: {count}\n",
+            reconstructed_field_label(*field)
+        ));
+    }
+}
+
+fn reconstructed_field_label(field: ReconstructedField) -> &'static str {
+    match field {
+        ReconstructedField::FolderClass => "Folder class",
+        ReconstructedField::MessageClass => "Message class",
+        ReconstructedField::Subject => "Subject",
+        ReconstructedField::SenderName => "Sender name",
+        ReconstructedField::SenderAddress => "Sender address",
+        ReconstructedField::MessageFlags => "Message flags",
+        ReconstructedField::InternetCodepage => "Internet code page",
+        ReconstructedField::SubmitTime => "Submit time",
+        ReconstructedField::DeliveryTime => "Delivery time",
+        ReconstructedField::CreationTime => "Creation time",
+        ReconstructedField::ModificationTime => "Modification time",
+        ReconstructedField::AssociatedDisplayName => "Associated-item display name",
+        ReconstructedField::RecipientDisplayName => "Recipient display name",
+        ReconstructedField::RecipientAddress => "Recipient address",
+        ReconstructedField::AttachmentFilename => "Attachment filename",
+        ReconstructedField::AttachmentMimeType => "Attachment MIME type",
+        ReconstructedField::AttachmentRenderingPosition => "Attachment rendering position",
+        ReconstructedField::AttachmentFlags => "Attachment flags",
+    }
 }
 
 pub fn split_recovered_job(
@@ -930,7 +992,12 @@ fn split_recovered_job_with_interrupt(
             .store
             .folders
             .iter()
-            .flat_map(|folder| &folder.messages)
+            .flat_map(|folder| {
+                folder
+                    .messages
+                    .iter()
+                    .chain(folder.associated_messages.iter())
+            })
             .map(count_messages)
             .fold(0_u64, u64::saturating_add);
         // Translator omissions already include every diagnostic record returned
@@ -941,7 +1008,7 @@ fn split_recovered_job_with_interrupt(
             || omitted_properties != 0
             || input.omitted_attachments != 0;
         let sidecar = PartSidecar {
-            schema_version: "1.0.0".to_owned(),
+            schema_version: "1.1.0".to_owned(),
             producer_version: crate::VERSION.to_owned(),
             index: part_index,
             filename: filename.clone(),
@@ -955,6 +1022,7 @@ fn split_recovered_job_with_interrupt(
             omitted_folders: input.omitted_folders,
             omitted_properties,
             omitted_attachments: input.omitted_attachments,
+            reconstructions: input.reconstructions.clone(),
         };
         match job.publish_validated_part_interruptible(
             &staged_filename,
@@ -991,6 +1059,7 @@ fn split_recovered_job_with_interrupt(
             omitted_folders: input.omitted_folders,
             omitted_properties,
             omitted_attachments: input.omitted_attachments,
+            reconstructions: input.reconstructions,
         });
         written_candidates =
             written_candidates.saturating_add(saturating_len(input.item_keys.len()));
@@ -1110,6 +1179,7 @@ fn part_report(record: &PublishedPartRecord) -> Result<PartReport, SplitError> {
         omitted_folders: record.sidecar.omitted_folders,
         omitted_properties: record.sidecar.omitted_properties,
         omitted_attachments: record.sidecar.omitted_attachments,
+        reconstructions: record.sidecar.reconstructions.clone(),
     })
 }
 
@@ -1481,7 +1551,7 @@ mod tests {
     use std::path::PathBuf;
     use std::sync::atomic::AtomicBool;
 
-    use pstforge_job::JobError;
+    use pstforge_job::{JobError, ReconstructedField};
     use pstforge_pst::writer::WriterError;
 
     use tempfile::tempdir;
@@ -1630,6 +1700,7 @@ mod tests {
                 omitted_folders: 0,
                 omitted_properties: 0,
                 omitted_attachments: 0,
+                reconstructions: Default::default(),
             }],
             written_candidates: 1,
             partial: false,
@@ -1642,9 +1713,25 @@ mod tests {
         let clean = render_recovery_log(&report);
         assert!(clean.contains("Result: complete"));
         assert!(clean.contains("No readable data was skipped."));
+        assert!(clean.contains("No source metadata required reconstruction."));
         assert!(clean.contains("part-0001.pst: 80 bytes"));
         assert!(!clean.contains("/private/source.pst"));
         assert!(!clean.contains("/private/job"));
+
+        report.parts[0]
+            .reconstructions
+            .record_derived(ReconstructedField::RecipientDisplayName);
+        report.parts[0]
+            .reconstructions
+            .record_generated(ReconstructedField::AttachmentFilename);
+        let reconstructed = render_recovery_log(&report);
+        assert!(reconstructed.contains("Result: complete"));
+        assert!(reconstructed.contains("Derived from other readable source values:"));
+        assert!(reconstructed.contains("Recipient display name: 1"));
+        assert!(
+            reconstructed.contains("Generated because source metadata was absent or unusable:")
+        );
+        assert!(reconstructed.contains("Attachment filename: 1"));
 
         report.partial = true;
         report.recovery.unsupported_candidates = 2;

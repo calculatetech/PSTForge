@@ -1,7 +1,7 @@
 #![deny(unsafe_code)]
 
 use std::cell::{Cell, RefCell};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt::Write as _;
 use std::fs::{self, File, OpenOptions};
 use std::io::{ErrorKind, Read, Seek as _, Write as _};
@@ -23,7 +23,7 @@ use sha2::{Digest, Sha256};
 use tempfile::NamedTempFile;
 use thiserror::Error;
 
-const JOB_SCHEMA_VERSION: i64 = 14;
+const JOB_SCHEMA_VERSION: i64 = 15;
 const INLINE_BLOB_MAX_BYTES: u64 = 64 * 1024;
 const INLINE_CACHE_DIRECTORY: &str = ".pstforge-inline-cache";
 const PAYLOAD_PACK_FILENAME: &str = "payload.pack";
@@ -141,6 +141,75 @@ pub struct PublishedPart {
     pub oversize: bool,
 }
 
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum ReconstructedField {
+    FolderClass,
+    MessageClass,
+    Subject,
+    SenderName,
+    SenderAddress,
+    MessageFlags,
+    InternetCodepage,
+    SubmitTime,
+    DeliveryTime,
+    CreationTime,
+    ModificationTime,
+    AssociatedDisplayName,
+    RecipientDisplayName,
+    RecipientAddress,
+    AttachmentFilename,
+    AttachmentMimeType,
+    AttachmentRenderingPosition,
+    AttachmentFlags,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReconstructionCounts {
+    pub derived: BTreeMap<ReconstructedField, u64>,
+    pub generated: BTreeMap<ReconstructedField, u64>,
+}
+
+impl ReconstructionCounts {
+    pub fn record_derived(&mut self, field: ReconstructedField) {
+        increment_reconstruction(&mut self.derived, field);
+    }
+
+    pub fn record_generated(&mut self, field: ReconstructedField) {
+        increment_reconstruction(&mut self.generated, field);
+    }
+
+    pub fn merge(&mut self, other: Self) {
+        merge_reconstructions(&mut self.derived, other.derived);
+        merge_reconstructions(&mut self.generated, other.generated);
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.derived.is_empty() && self.generated.is_empty()
+    }
+}
+
+fn increment_reconstruction(
+    counts: &mut BTreeMap<ReconstructedField, u64>,
+    field: ReconstructedField,
+) {
+    let count = counts.entry(field).or_default();
+    *count = count.saturating_add(1);
+}
+
+fn merge_reconstructions(
+    counts: &mut BTreeMap<ReconstructedField, u64>,
+    additions: BTreeMap<ReconstructedField, u64>,
+) {
+    for (field, addition) in additions {
+        let count = counts.entry(field).or_default();
+        *count = count.saturating_add(addition);
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PartSidecar {
@@ -158,6 +227,7 @@ pub struct PartSidecar {
     pub omitted_folders: u64,
     pub omitted_properties: u64,
     pub omitted_attachments: u64,
+    pub reconstructions: ReconstructionCounts,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -3287,7 +3357,7 @@ fn validate_part_record(part: &PublishedPart) -> Result<(), JobError> {
 }
 
 fn validate_sidecar(part: &PublishedPart, sidecar: &PartSidecar) -> Result<(), JobError> {
-    if sidecar.schema_version != "1.0.0"
+    if sidecar.schema_version != "1.1.0"
         || sidecar.producer_version.is_empty()
         || sidecar.index != part.index
         || sidecar.filename != part.filename
@@ -4465,6 +4535,52 @@ mod tests {
     }
 
     #[test]
+    fn resume_rejects_schema_fourteen_without_reconstruction_accounting()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempdir()?;
+        let job = directory.path().join("job");
+        let sink = DurableCatalogSink::create(&job)?;
+        let source = JobSourceIdentity {
+            canonical_path: "/external/mail.pst".to_owned(),
+            device: 1,
+            inode: 2,
+            size_bytes: 3,
+            modified_at: "2026-07-16T00:00:00Z".to_owned(),
+            sha256: "a".repeat(64),
+        };
+        let configuration = JobConfiguration {
+            tool_compatibility_major: 0,
+            split_schema_version: "0.4.2".to_owned(),
+            recovery_mode: "balanced".to_owned(),
+            maximum_pst_bytes: 4_294_967_296,
+            part_size_policy: "hard-maximum-v1".to_owned(),
+            writer_format: "unicode-pst-v23".to_owned(),
+        };
+        sink.bind_source(&source)?;
+        sink.bind_recovery_mode("balanced")?;
+        sink.bind_configuration(&configuration)?;
+        sink.checkpoint()?;
+        drop(sink);
+
+        let database = job.join(".pstforge/job.sqlite3");
+        let connection = Connection::open(&database)?;
+        connection.execute(
+            "UPDATE job_metadata SET value = '14' WHERE key = 'schema_version'",
+            [],
+        )?;
+        drop(connection);
+        assert!(matches!(
+            DurableCatalogSink::validate_resume(&job, &source, &configuration),
+            Err(JobError::ResumeMismatch("job schema version"))
+        ));
+        assert!(matches!(
+            DurableCatalogSink::open_resume(&job, &source, &configuration),
+            Err(JobError::ResumeMismatch("job schema version"))
+        ));
+        Ok(())
+    }
+
+    #[test]
     fn resume_rejects_untracked_part_storage_before_capacity_credit()
     -> Result<(), Box<dyn std::error::Error>> {
         let directory = tempdir()?;
@@ -4934,7 +5050,7 @@ mod tests {
             Err(JobError::Interrupted)
         ));
         let sidecar = PartSidecar {
-            schema_version: "1.0.0".to_owned(),
+            schema_version: "1.1.0".to_owned(),
             producer_version: "0.4.0".to_owned(),
             index: part.index,
             filename: part.filename.clone(),
@@ -4948,6 +5064,7 @@ mod tests {
             omitted_folders: 0,
             omitted_properties: 0,
             omitted_attachments: 0,
+            reconstructions: Default::default(),
         };
         let item_key = candidates[0].item_key.clone();
         let oversize = PublishedPart {
@@ -5227,7 +5344,7 @@ mod tests {
                 oversize: false,
             };
             let sidecar = PartSidecar {
-                schema_version: "1.0.0".to_owned(),
+                schema_version: "1.1.0".to_owned(),
                 producer_version: "0.4.0".to_owned(),
                 index: 1,
                 filename: part.filename.clone(),
@@ -5241,6 +5358,7 @@ mod tests {
                 omitted_folders: 0,
                 omitted_properties: 0,
                 omitted_attachments: 0,
+                reconstructions: Default::default(),
             };
             write_sidecar_partial(
                 &job.join(".pstforge/partial/part-0001.json.partial"),

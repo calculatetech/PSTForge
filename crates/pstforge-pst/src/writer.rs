@@ -764,6 +764,9 @@ struct ExternalTableBuild {
 const MAX_DATA_BLOCK_PAYLOAD: usize = 8176;
 const MAX_HEAP_ALLOCATION: usize = 3580;
 const MAX_DATA_TREE_ENTRIES: usize = 1021;
+const SUBNODE_LEAF_CAPACITY: usize = (MAX_DATA_BLOCK_PAYLOAD - 8) / 24;
+const SUBNODE_INTERMEDIATE_CAPACITY: usize = (MAX_DATA_BLOCK_PAYLOAD - 8) / 16;
+const MAX_SUBNODE_TREE_ENTRIES: usize = SUBNODE_LEAF_CAPACITY * SUBNODE_INTERMEDIATE_CAPACITY;
 const MAX_FIDELITY_PROPERTY_BYTES: usize = 16 * 1024;
 const MAX_FIDELITY_COLLECTION_ITEMS: usize = MAX_FIDELITY_PROPERTY_BYTES / 8;
 const MAX_FIDELITY_CUSTOM_PROPERTY_BYTES: usize = 64 * 1024;
@@ -1155,17 +1158,17 @@ fn append_subnode_tree(
     next_block_index: &mut u64,
     blocks: &mut Vec<BlockSpec>,
 ) -> Result<UnicodeBlockId, WriterError> {
-    const LEAF_CAPACITY: usize = (MAX_DATA_BLOCK_PAYLOAD - 8) / 24;
-    const INTERMEDIATE_CAPACITY: usize = (MAX_DATA_BLOCK_PAYLOAD - 8) / 16;
-
     if entries.is_empty() {
         return Err(WriterError::InvalidStructure(
             "subnode tree must contain entries".to_owned(),
         ));
     }
+    if entries.len() > MAX_SUBNODE_TREE_ENTRIES {
+        return Err(WriterError::ValueTooLarge("subnode tree entry count"));
+    }
     entries.sort_by_key(|entry| u32::from(entry.node()));
-    let mut roots = Vec::with_capacity(entries.len().div_ceil(LEAF_CAPACITY));
-    for group in entries.chunks(LEAF_CAPACITY) {
+    let mut roots = Vec::with_capacity(entries.len().div_ceil(SUBNODE_LEAF_CAPACITY));
+    for group in entries.chunks(SUBNODE_LEAF_CAPACITY) {
         let id = take_block_id(next_block_index, true)?;
         blocks.push(BlockSpec {
             id,
@@ -1180,8 +1183,8 @@ fn append_subnode_tree(
 
     let mut level = 1_u8;
     while roots.len() > 1 {
-        let mut parents = Vec::with_capacity(roots.len().div_ceil(INTERMEDIATE_CAPACITY));
-        for group in roots.chunks(INTERMEDIATE_CAPACITY) {
+        let mut parents = Vec::with_capacity(roots.len().div_ceil(SUBNODE_INTERMEDIATE_CAPACITY));
+        for group in roots.chunks(SUBNODE_INTERMEDIATE_CAPACITY) {
             let id = take_block_id(next_block_index, true)?;
             blocks.push(BlockSpec {
                 id,
@@ -3707,10 +3710,13 @@ fn validate_message(message: &MessageSpec, depth: usize) -> Result<(), WriterErr
                 "streamed property collides with a writer-managed property".to_owned(),
             ));
         }
-        if property.blob.path.as_os_str().is_empty() || property.blob.byte_len > i32::MAX as u64 {
+        if property.blob.path.as_os_str().is_empty() || property.blob.byte_len == 0 {
             return Err(WriterError::InvalidStructure(
-                "streamed property blob is invalid or too large".to_owned(),
+                "streamed property blob must be non-empty".to_owned(),
             ));
+        }
+        if property.blob.byte_len > i32::MAX as u64 {
+            return Err(WriterError::ValueTooLarge("streamed property blob"));
         }
     }
     for attachment in &message.attachments {
@@ -3817,7 +3823,12 @@ fn validate_message(message: &MessageSpec, depth: usize) -> Result<(), WriterErr
             validate_payload_len("attachment payload", data.len())?;
         }
         if let AttachmentContent::Spooled(blob) = &attachment.content {
-            if blob.path.as_os_str().is_empty() || blob.byte_len > i32::MAX as u64 {
+            if blob.path.as_os_str().is_empty() || blob.byte_len == 0 {
+                return Err(WriterError::InvalidStructure(
+                    "spooled attachment payload must be non-empty".to_owned(),
+                ));
+            }
+            if blob.byte_len > i32::MAX as u64 {
                 return Err(WriterError::ValueTooLarge("spooled attachment payload"));
             }
         }
@@ -8947,6 +8958,27 @@ mod tests {
     }
 
     #[test]
+    fn subnode_tree_rejects_a_second_intermediate_level_before_writing_blocks()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let entry = UnicodeLeafSubNodeTreeEntry::new(
+            node(NodeIdType::ListsTablesProperties, 1)?,
+            leaf_bid(1)?,
+            None,
+        );
+        let entries = vec![entry; MAX_SUBNODE_TREE_ENTRIES + 1];
+        let mut next_block_index = 2;
+        let mut blocks = Vec::new();
+
+        assert!(matches!(
+            append_subnode_tree(entries, &mut next_block_index, &mut blocks),
+            Err(WriterError::ValueTooLarge("subnode tree entry count"))
+        ));
+        assert!(blocks.is_empty());
+        assert_eq!(next_block_index, 2);
+        Ok(())
+    }
+
+    #[test]
     fn mail_store_preflight_contains_hierarchy_and_huge_attachment_shapes() {
         let base = FidelityStore::default();
         let many_folders = MailStoreSpec {
@@ -10209,6 +10241,40 @@ mod tests {
             value: RawPropertyValue::Unicode(String::new()),
         });
         validate_spec(&empty_raw)?;
+
+        let mut empty_spooled_property = FidelityStore::default();
+        empty_spooled_property
+            .message
+            .spooled_properties
+            .push(SpooledPropertySpec {
+                id: 0x1103,
+                property_type: 0x0102,
+                blob: FileBlobSpec {
+                    path: PathBuf::from("/dev/null"),
+                    offset: 0,
+                    byte_len: 0,
+                    sha256: Sha256::digest([]).into(),
+                },
+            });
+        assert!(matches!(
+            validate_spec(&empty_spooled_property),
+            Err(WriterError::InvalidStructure(detail))
+                if detail.contains("streamed property blob must be non-empty")
+        ));
+
+        let mut empty_spooled_attachment = FidelityStore::default();
+        empty_spooled_attachment.message.attachments[0].content =
+            AttachmentContent::Spooled(FileBlobSpec {
+                path: PathBuf::from("/dev/null"),
+                offset: 0,
+                byte_len: 0,
+                sha256: Sha256::digest([]).into(),
+            });
+        assert!(matches!(
+            validate_spec(&empty_spooled_attachment),
+            Err(WriterError::InvalidStructure(detail))
+                if detail.contains("spooled attachment payload must be non-empty")
+        ));
 
         let mut invalid_html = FidelityStore::default();
         invalid_html.message.body_html = Some(vec![0xFF]);
