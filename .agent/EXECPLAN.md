@@ -1122,9 +1122,54 @@ work. Hash and identity evidence show that the source was not modified.
     - [x] (2026-07-17) The owner reports all-green ScanPST and Outlook
       acceptance for the original, unrepaired contact candidate. This closes
       checkpoint 3 for commit and push.
-  - [ ] Checkpoints 4 onward: appointments, meetings, distribution lists,
-    tasks, notes/posts, OLE/documents, associated/configuration data, and
-    remaining generic classes, each proven separately where feasible.
+  - [x] Checkpoint 4: appointments.
+    - [x] (2026-07-17) Admit only `IPM.Appointment` and descendants as the next
+      item family. Sender fields are optional and remain absent rather than
+      receiving fabricated mail identities. Recovered appointments without a
+      retained source folder default to `IPF.Appointment`; retained folder
+      classes remain source-driven.
+    - [x] (2026-07-17) The bounded non-recurring fixture follows the Microsoft
+      MS-OXPROPS/MS-OXOCAL property contract: PSETID_Appointment contains busy
+      status, location, UTC start/end, duration, all-day, state, and recurring
+      fields; PSETID_Common contains reminder delta/time/enabled and common
+      UTC start/end. Recurrence blobs and meeting semantics remain separate
+      checkpoints.
+    - [x] (2026-07-17) Job schema 10 refuses schema-9 resumes because an older
+      durable catalog may already have classified readable appointments as
+      unsupported. The focused regression proves the refusal.
+    - [x] (2026-07-17) Added external case `v042-appointment-source`, 271,360
+      bytes, SHA-256
+      `dafa90a3840d1ac85bb0d9d72400114eaf7ec675094d1457beb1898e1fc4b20d`.
+      Independent libpff intake confirms one senderless `IPM.Appointment` in
+      an `IPF.Appointment` Calendar folder and exact named-property GUID, LID,
+      type, length, and payload hashes.
+    - [x] (2026-07-17) Measured source intake showed libpff exposes compact
+      table-cell PT_BOOLEAN values as one byte, while property streams can use
+      the two-byte MAPI form. The bounded scalar translator now accepts both
+      encodings; the focused source/output regression passes with one complete
+      item and zero folder, property, or attachment omissions.
+    - [x] (2026-07-17) Complete fast automation passes at
+      `.agent/test-results/1784346211-fast`; the ignored external appointment
+      comparison passes again after the gate.
+    - [x] (2026-07-17) The focused clean-context review found no blocker,
+      high, or medium issue in the appointment class boundary, schema refusal,
+      sender containment, bounded Boolean intake, exact named-property
+      preservation, folder class, or writer validation.
+    - [x] (2026-07-17) Generated the single bounded human candidate at
+      `qualification-v042-appointment-r1/parts/part-0001.pst`: 271,360 bytes,
+      SHA-256
+      `85efb62e2b1430e38d1e4a9d2d0cae1c8a4ce384125fad4081a93ca8eba1ee64`.
+      PSTForge full verification reports Unicode64, no observed corruption,
+      one complete item, zero unsupported items, and zero issues; `pffinfo`
+      opens it successfully. The recovery log reports no readable data
+      skipped, and transient schema-10 job/spool state was removed after
+      verification.
+    - [x] (2026-07-17) The owner reports all-green ScanPST and Outlook
+      acceptance for the original, unrepaired appointment candidate. This
+      closes checkpoint 4 for commit and push.
+  - [ ] Checkpoints 5 onward: meetings, distribution lists, tasks,
+    notes/posts, OLE/documents, associated/configuration data, and remaining
+    generic classes, each proven separately where feasible.
   - [ ] Run the complete 19 GB split once after all focused checkpoints pass
     and reconcile discovered unique items against written plus explicitly
     unwritten items across every part.
@@ -2214,6 +2259,25 @@ work. Hash and identity evidence show that the source was not modified.
   therefore cannot safely resume under the new placement contract.
   Date/Author: 2026-07-17 / Codex from checkpoint-2b adversarial review.
 
+- Decision: Job schema 9 is the first resume-compatible schema for contacts,
+  and schema 10 is the first for appointments.
+  Rationale: Each older durable catalog can contain a readable item from the
+  newly admitted class already marked unsupported. Reusing that classification
+  would silently omit the item, so each class-admission checkpoint fails
+  closed on the immediately preceding schema.
+  Date/Author: 2026-07-17 / Codex from checkpoint-3 and checkpoint-4
+  implementation evidence.
+
+- Decision: The appointment checkpoint proves a standalone, non-recurring
+  `IPM.Appointment` before meeting and recurrence families. Preserve the exact
+  PSETID_Appointment and PSETID_Common named-property identities and values;
+  do not derive calendar fields from subject, body, or display timestamps.
+  Rationale: Meetings and recurrence add distinct required state and binary
+  recurrence structures. Combining them would enlarge the review and human
+  failure surface without improving proof for ordinary appointments.
+  Date/Author: 2026-07-17 / Codex from Microsoft MS-OXPROPS/MS-OXOCAL and the
+  external libpff roundtrip.
+
 - Decision: Prove the oversize-message exception with an exact serialization
   that excludes catalog-only folders whenever enriched part 0001 has one
   message and exceeds the configured maximum. Refuse conformance if the
@@ -2753,6 +2817,15 @@ view and opens one `Ada Lovelace` contact with the expected name, company,
 title, business phone, mobile phone, birthday, email address, File As value,
 and notes. The independent libpff comparison remains the exact property
 fidelity evidence.
+
+For checkpoint 4, select external case `v042-appointment-source`, run ignored
+test `milestone_0_4_2_appointments_roundtrip_through_libpff`, and scan only
+`qualification-v042-appointment-r1/parts/part-0001.pst`. Then open the
+original, unrepaired candidate in Outlook. Confirm `Calendar` uses the calendar
+view and contains one `Appointment fidelity checkpoint` appointment on
+January 15, 2025 from 10:00 AM to 11:00 AM America/Detroit (15:00-16:00 UTC),
+located in `Conference Room 42`, shown as Busy, with a 15-minute reminder,
+non-recurring status, and the expected notes.
 
 After every available focused checkpoint succeeds, run the complete 19 GB
 split once. Unique source items assigned across all output parts must equal the

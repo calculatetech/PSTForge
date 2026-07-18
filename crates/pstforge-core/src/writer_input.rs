@@ -165,11 +165,7 @@ fn build_part_writer_input_expected(
             std::collections::btree_map::Entry::Vacant(entry) => {
                 entry.insert((
                     mail.folder_role,
-                    if contact_message_class(&translated.message.message_class) {
-                        "IPF.Contact".to_owned()
-                    } else {
-                        "IPF.Note".to_owned()
-                    },
+                    default_container_class(&translated.message.message_class).to_owned(),
                     vec![translated.message],
                 ));
             }
@@ -648,10 +644,10 @@ fn translate_message(
         .clone()
         .filter(|value| !value.is_empty())
         .unwrap_or_else(|| "(no subject)".to_owned());
-    let contact = contact_message_class(&message_class);
+    let sender_optional = sender_optional_message_class(&message_class);
     let source_sender_name = mail.sender_name.clone().filter(|value| !value.is_empty());
     let source_sender_email = mail.sender_email.clone().filter(|value| !value.is_empty());
-    let (sender_name, sender_email) = if contact {
+    let (sender_name, sender_email) = if sender_optional {
         match (source_sender_name, source_sender_email) {
             (Some(name), Some(email)) => (name, email),
             (None, None) => (String::new(), String::new()),
@@ -669,7 +665,7 @@ fn translate_message(
         (sender_name, sender_email)
     };
     if mail.subject.as_deref().is_none_or(str::is_empty)
-        || (!contact
+        || (!sender_optional
             && (mail.sender_name.as_deref().is_none_or(str::is_empty)
                 || mail.sender_email.as_deref().is_none_or(str::is_empty)))
     {
@@ -925,6 +921,10 @@ fn scalar_property(
         (0x0006, bytes) if bytes.len() == 8 => RawPropertyValue::Currency(i64_le(bytes)),
         (0x0007, bytes) if bytes.len() == 8 => RawPropertyValue::FloatingTime(u64_le(bytes)),
         (0x000A, [a, b, c, d]) => RawPropertyValue::ErrorCode(u32::from_le_bytes([*a, *b, *c, *d])),
+        // libpff exposes PT_BOOLEAN as one byte for PST values written in the
+        // compact table representation, while property streams can contain
+        // the two-byte MAPI representation.
+        (0x000B, [value]) => RawPropertyValue::Boolean(*value != 0),
         (0x000B, [a, b]) => RawPropertyValue::Boolean(u16::from_le_bytes([*a, *b]) != 0),
         (0x0014, bytes) if bytes.len() == 8 => RawPropertyValue::Integer64(i64_le(bytes)),
         (0x0040, bytes) if bytes.len() == 8 => RawPropertyValue::Time(i64_le(bytes)),
@@ -1133,10 +1133,29 @@ fn supported_message_class(value: &str) -> bool {
     class_is_or_descends_from(value, "IPM.Note")
         || class_descends_from(value, "REPORT.IPM.Note")
         || contact_message_class(value)
+        || appointment_message_class(value)
 }
 
 fn contact_message_class(value: &str) -> bool {
     class_is_or_descends_from(value, "IPM.Contact")
+}
+
+fn appointment_message_class(value: &str) -> bool {
+    class_is_or_descends_from(value, "IPM.Appointment")
+}
+
+fn sender_optional_message_class(value: &str) -> bool {
+    contact_message_class(value) || appointment_message_class(value)
+}
+
+fn default_container_class(value: &str) -> &'static str {
+    if contact_message_class(value) {
+        "IPF.Contact"
+    } else if appointment_message_class(value) {
+        "IPF.Appointment"
+    } else {
+        "IPF.Note"
+    }
 }
 
 fn class_is_or_descends_from(value: &str, root: &str) -> bool {
@@ -1628,6 +1647,61 @@ mod tests {
     }
 
     #[test]
+    fn preserves_senderless_appointment_in_source_calendar()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempdir()?;
+        let job = DurableCatalogSink::create(&directory.path().join("job"))?;
+        let mail = CanonicalMail {
+            durable_item_key: "normal:3:-:0".to_owned(),
+            key: ItemKey {
+                provenance: RecoveryProvenance::Normal,
+                source_node_id: Some(3),
+                recovery_index: None,
+                occurrence: 0,
+            },
+            folder_path: vec!["Calendar".to_owned()],
+            folder_role: CanonicalFolderRole::Ordinary,
+            message_class: Some("IPM.Appointment".to_owned()),
+            subject: Some("Appointment fidelity checkpoint".to_owned()),
+            sender_name: None,
+            sender_email: None,
+            submit_filetime: None,
+            delivery_filetime: None,
+            recipients: Vec::new(),
+            attachments: Vec::new(),
+            properties: Vec::new(),
+            completeness: ContentCompleteness::Complete,
+            spooled_bytes: 0,
+        };
+        let retained = [CanonicalFolder {
+            path: vec!["Calendar".to_owned()],
+            role: CanonicalFolderRole::Ordinary,
+            container_class: Some("IPF.Appointment".to_owned()),
+        }];
+        let input = build_part_writer_input_with_folders_interruptible(
+            &job,
+            &[&mail],
+            &retained,
+            PartBuildOptions {
+                source_sha256: &"0".repeat(64),
+                recovery_mode: "balanced",
+                maximum_pst_bytes: 4_294_967_296,
+                part_index: 1,
+                omitted_folders: 0,
+            },
+            &AtomicBool::new(false),
+        )?;
+
+        assert_eq!(input.store.folders[0].container_class, "IPF.Appointment");
+        assert_eq!(input.store.folders[0].messages[0].sender_name, "");
+        assert_eq!(input.store.folders[0].messages[0].sender_email, "");
+        assert_eq!(input.omitted_properties, 0);
+        assert!(!input.partial);
+        validate_mail_store_input(&input.store)?;
+        Ok(())
+    }
+
+    #[test]
     fn attachment_larger_than_writer_field_is_omitted_without_losing_parent()
     -> Result<(), Box<dyn std::error::Error>> {
         let directory = tempdir()?;
@@ -1911,8 +1985,11 @@ mod tests {
         assert!(supported_message_class("Report.IPM.Note.DR"));
         assert!(supported_message_class("IPM.Contact"));
         assert!(supported_message_class("ipm.contact.custom"));
+        assert!(supported_message_class("IPM.Appointment"));
+        assert!(supported_message_class("ipm.appointment.custom"));
         assert!(!supported_message_class("IPM.NoteCustom"));
         assert!(!supported_message_class("IPM.ContactCustom"));
+        assert!(!supported_message_class("IPM.AppointmentCustom"));
         assert!(!supported_message_class("REPORT.IPM.NoteDR"));
 
         let directory = tempdir()?;

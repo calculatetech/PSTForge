@@ -644,6 +644,7 @@ fn split_recovered_job_with_interrupt(
             }
             Ok(input) => input,
             Err(error) if candidate_local_translation_error(&error) => {
+                tracing::debug!(error = %error, "candidate translation rejected during prefilter");
                 let mut item_keys = Vec::new();
                 collect_item_keys(message, &mut item_keys);
                 job.mark_candidates_unsupported(&item_keys)?;
@@ -654,7 +655,8 @@ fn split_recovered_job_with_interrupt(
         };
         match validate_mail_store_input(&input.store) {
             Ok(()) => writable_mail.push(message),
-            Err(WriterError::InputRejected(_)) => {
+            Err(WriterError::InputRejected(detail)) => {
+                tracing::debug!(%detail, "writer input rejected candidate during prefilter");
                 let mut item_keys = Vec::new();
                 collect_item_keys(message, &mut item_keys);
                 job.mark_candidates_unsupported(&item_keys)?;

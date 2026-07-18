@@ -3417,7 +3417,7 @@ fn validate_message(message: &MessageSpec, depth: usize) -> Result<(), WriterErr
         ("sender name", &message.sender_name),
         ("sender email", &message.sender_email),
     ] {
-        if value.is_empty() && !contact_message_class(&message.message_class) {
+        if value.is_empty() && !sender_optional_message_class(&message.message_class) {
             return Err(WriterError::InvalidStructure(format!(
                 "{name} must be non-empty"
             )));
@@ -3694,10 +3694,19 @@ fn supported_message_class(value: &str) -> bool {
     class_is_or_descends_from(value, "IPM.Note")
         || class_descends_from(value, "REPORT.IPM.Note")
         || contact_message_class(value)
+        || appointment_message_class(value)
 }
 
 fn contact_message_class(value: &str) -> bool {
     class_is_or_descends_from(value, "IPM.Contact")
+}
+
+fn appointment_message_class(value: &str) -> bool {
+    class_is_or_descends_from(value, "IPM.Appointment")
+}
+
+fn sender_optional_message_class(value: &str) -> bool {
+    contact_message_class(value) || appointment_message_class(value)
 }
 
 fn class_is_or_descends_from(value: &str, root: &str) -> bool {
@@ -8156,6 +8165,69 @@ mod tests {
             Some(crate::ltp::prop_context::PropertyValue::Unicode(value))
                 if value.to_string() == "Ada"
         ));
+        Ok(())
+    }
+
+    #[test]
+    fn appointment_message_round_trips_in_calendar_folder() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("appointment.pst");
+        let mut message = FidelityStore::default().message;
+        message.message_class = "IPM.Appointment".to_owned();
+        message.subject = "Appointment fidelity checkpoint".to_owned();
+        message.sender_name.clear();
+        message.sender_email.clear();
+        message.recipients.clear();
+        message.named_properties = vec![
+            NamedProperty {
+                set: NamedPropertySet::Guid([
+                    0x02, 0x20, 0x06, 0x00, 0x00, 0x00, 0x00, 0x00, 0xC0, 0x00, 0x00, 0x00, 0x00,
+                    0x00, 0x00, 0x46,
+                ]),
+                name: NamedPropertyName::Numeric(0x820D),
+                value: RawPropertyValue::Time(133_814_268_000_000_000),
+            },
+            NamedProperty {
+                set: NamedPropertySet::Guid([
+                    0x02, 0x20, 0x06, 0x00, 0x00, 0x00, 0x00, 0x00, 0xC0, 0x00, 0x00, 0x00, 0x00,
+                    0x00, 0x00, 0x46,
+                ]),
+                name: NamedPropertyName::Numeric(0x820E),
+                value: RawPropertyValue::Time(133_814_304_000_000_000),
+            },
+        ];
+        let spec = MailStoreSpec {
+            store_name: "PSTForge appointment".to_owned(),
+            record_key: *b"PSTForgeAppt0001",
+            folders: vec![MailFolderSpec {
+                path: vec!["Calendar".to_owned()],
+                role: MailFolderRole::Ordinary,
+                container_class: "IPF.Appointment".to_owned(),
+                messages: vec![message],
+            }],
+        };
+        create_mail_store(&path, &spec)?;
+
+        let store = open_store(&path)?;
+        let folder = store.open_folder(
+            &store
+                .properties()
+                .make_entry_id(node(NodeIdType::NormalFolder, MAIL_FOLDER_INDEX)?)?,
+        )?;
+        assert!(matches!(
+            folder.properties().get(0x3613),
+            Some(crate::ltp::prop_context::PropertyValue::Unicode(value))
+                if value.to_string() == "IPF.Appointment"
+        ));
+        let appointment = store.open_message(
+            &EntryId::new(
+                crate::messaging::store::StoreRecordKey::new(spec.record_key),
+                node(NodeIdType::NormalMessage, MESSAGE_INDEX)?,
+            ),
+            None,
+        )?;
+        assert_eq!(appointment.properties().message_class()?, "IPM.Appointment");
         Ok(())
     }
 

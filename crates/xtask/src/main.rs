@@ -254,7 +254,8 @@ fn run() -> Result<(), String> {
             Some("named-properties") => qualify_named_properties(&root, Path::new(&output)),
             Some("empty-folders") => qualify_empty_folders(&root, Path::new(&output)),
             Some("contacts") => qualify_contacts(&root, Path::new(&output)),
-            _ => Err("unknown qualification checkpoint; expected embedded-attachments, named-properties, empty-folders, or contacts".to_owned()),
+            Some("appointments") => qualify_appointments(&root, Path::new(&output)),
+            _ => Err("unknown qualification checkpoint; expected embedded-attachments, named-properties, empty-folders, contacts, or appointments".to_owned()),
         };
     }
     if command != std::ffi::OsStr::new("gate") {
@@ -286,7 +287,7 @@ fn run() -> Result<(), String> {
 }
 
 fn usage() -> String {
-    "usage: cargo xtask gate <fast|full|release> | qualify <embedded-attachments|named-properties|empty-folders|contacts> <output>"
+    "usage: cargo xtask gate <fast|full|release> | qualify <embedded-attachments|named-properties|empty-folders|contacts|appointments> <output>"
         .to_owned()
 }
 
@@ -491,6 +492,120 @@ fn qualify_contacts(root: &Path, output: &Path) -> Result<(), String> {
             path: vec!["Contacts".to_owned()],
             role: MailFolderRole::Ordinary,
             container_class: "IPF.Contact".to_owned(),
+            messages: vec![fixture.message],
+        }],
+    };
+    publish_qualification(root, output, 1, |part| {
+        pstforge_pst::writer::create_mail_store(part, &spec)
+    })
+}
+
+fn qualify_appointments(root: &Path, output: &Path) -> Result<(), String> {
+    use pstforge_pst::writer::{
+        FidelityStore, MailFolderRole, MailFolderSpec, MailStoreSpec, MinimalStore, NamedProperty,
+        NamedPropertyName, NamedPropertySet, NativeBody, RawPropertyValue,
+    };
+
+    const PSETID_APPOINTMENT: [u8; 16] = [
+        0x02, 0x20, 0x06, 0x00, 0x00, 0x00, 0x00, 0x00, 0xC0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x46,
+    ];
+    const PSETID_COMMON: [u8; 16] = [
+        0x08, 0x20, 0x06, 0x00, 0x00, 0x00, 0x00, 0x00, 0xC0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x46,
+    ];
+    const START: i64 = 133_814_268_000_000_000;
+    const END: i64 = 133_814_304_000_000_000;
+
+    let mut fixture = FidelityStore::from(&MinimalStore {
+        store_name: "PSTForge appointment source".to_owned(),
+        folder_name: "Calendar".to_owned(),
+        subject: "Appointment fidelity checkpoint".to_owned(),
+        body: "Appointment notes checkpoint.".to_owned(),
+        sender_name: "unused".to_owned(),
+        sender_email: "unused@example.com".to_owned(),
+        recipient: "unused@example.com".to_owned(),
+        record_key: *b"PSTForgeAppt0001",
+    });
+    fixture.message.message_class = "IPM.Appointment".to_owned();
+    fixture.message.sender_name.clear();
+    fixture.message.sender_email.clear();
+    fixture.message.recipients.clear();
+    fixture.message.native_body = Some(NativeBody::PlainText);
+    fixture.message.named_properties = vec![
+        NamedProperty {
+            set: NamedPropertySet::Guid(PSETID_APPOINTMENT),
+            name: NamedPropertyName::Numeric(0x8205),
+            value: RawPropertyValue::Integer32(2),
+        },
+        NamedProperty {
+            set: NamedPropertySet::Guid(PSETID_APPOINTMENT),
+            name: NamedPropertyName::Numeric(0x8208),
+            value: RawPropertyValue::Unicode("Conference Room 42".to_owned()),
+        },
+        NamedProperty {
+            set: NamedPropertySet::Guid(PSETID_APPOINTMENT),
+            name: NamedPropertyName::Numeric(0x820D),
+            value: RawPropertyValue::Time(START),
+        },
+        NamedProperty {
+            set: NamedPropertySet::Guid(PSETID_APPOINTMENT),
+            name: NamedPropertyName::Numeric(0x820E),
+            value: RawPropertyValue::Time(END),
+        },
+        NamedProperty {
+            set: NamedPropertySet::Guid(PSETID_APPOINTMENT),
+            name: NamedPropertyName::Numeric(0x8213),
+            value: RawPropertyValue::Integer32(60),
+        },
+        NamedProperty {
+            set: NamedPropertySet::Guid(PSETID_APPOINTMENT),
+            name: NamedPropertyName::Numeric(0x8215),
+            value: RawPropertyValue::Boolean(false),
+        },
+        NamedProperty {
+            set: NamedPropertySet::Guid(PSETID_APPOINTMENT),
+            name: NamedPropertyName::Numeric(0x8217),
+            value: RawPropertyValue::Integer32(0),
+        },
+        NamedProperty {
+            set: NamedPropertySet::Guid(PSETID_APPOINTMENT),
+            name: NamedPropertyName::Numeric(0x8223),
+            value: RawPropertyValue::Boolean(false),
+        },
+        NamedProperty {
+            set: NamedPropertySet::Guid(PSETID_COMMON),
+            name: NamedPropertyName::Numeric(0x8501),
+            value: RawPropertyValue::Integer32(15),
+        },
+        NamedProperty {
+            set: NamedPropertySet::Guid(PSETID_COMMON),
+            name: NamedPropertyName::Numeric(0x8502),
+            value: RawPropertyValue::Time(START),
+        },
+        NamedProperty {
+            set: NamedPropertySet::Guid(PSETID_COMMON),
+            name: NamedPropertyName::Numeric(0x8503),
+            value: RawPropertyValue::Boolean(true),
+        },
+        NamedProperty {
+            set: NamedPropertySet::Guid(PSETID_COMMON),
+            name: NamedPropertyName::Numeric(0x8516),
+            value: RawPropertyValue::Time(START),
+        },
+        NamedProperty {
+            set: NamedPropertySet::Guid(PSETID_COMMON),
+            name: NamedPropertyName::Numeric(0x8517),
+            value: RawPropertyValue::Time(END),
+        },
+    ];
+    let spec = MailStoreSpec {
+        store_name: fixture.store_name,
+        record_key: fixture.record_key,
+        folders: vec![MailFolderSpec {
+            path: vec!["Calendar".to_owned()],
+            role: MailFolderRole::Ordinary,
+            container_class: "IPF.Appointment".to_owned(),
             messages: vec![fixture.message],
         }],
     };
