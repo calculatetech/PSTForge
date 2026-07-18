@@ -11,8 +11,9 @@ mod worker;
 mod writer_input;
 
 pub use canonical::{
-    CanonicalAttachment, CanonicalError, CanonicalFolderRole, CanonicalMail, CanonicalProperty,
-    CanonicalRecipient, load_canonical_mail, load_canonical_mail_interruptible,
+    CanonicalAttachment, CanonicalError, CanonicalFolder, CanonicalFolderRole, CanonicalFolderSet,
+    CanonicalMail, CanonicalProperty, CanonicalRecipient, load_canonical_folders,
+    load_canonical_folders_interruptible, load_canonical_mail, load_canonical_mail_interruptible,
 };
 pub use inspection::{
     EncryptionMode, FileFormat, InfoReport, InspectionBackend, InspectionError, InventoryReport,

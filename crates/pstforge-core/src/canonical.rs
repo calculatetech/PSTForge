@@ -65,6 +65,18 @@ pub struct CanonicalMail {
     pub spooled_bytes: u64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CanonicalFolder {
+    pub path: Vec<String>,
+    pub role: CanonicalFolderRole,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CanonicalFolderSet {
+    pub folders: Vec<CanonicalFolder>,
+    pub omitted_folders: u64,
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
 pub enum CanonicalFolderRole {
     #[default]
@@ -101,6 +113,124 @@ pub enum CanonicalError {
 
 pub fn load_canonical_mail(job: &DurableCatalogSink) -> Result<Vec<CanonicalMail>, CanonicalError> {
     load_canonical_mail_expected(job, None)
+}
+
+pub fn load_canonical_folders(
+    job: &DurableCatalogSink,
+) -> Result<CanonicalFolderSet, CanonicalError> {
+    load_canonical_folders_expected(job, None)
+}
+
+pub fn load_canonical_folders_interruptible(
+    job: &DurableCatalogSink,
+    interrupted: &AtomicBool,
+) -> Result<CanonicalFolderSet, CanonicalError> {
+    load_canonical_folders_expected(job, Some(interrupted))
+}
+
+fn load_canonical_folders_expected(
+    job: &DurableCatalogSink,
+    interrupted: Option<&AtomicBool>,
+) -> Result<CanonicalFolderSet, CanonicalError> {
+    const NID_IPM_SUBTREE: u32 = 0x8022;
+    const NID_DELETED_ITEMS: u32 = 0x8062;
+
+    let folders = job.spooled_folders()?;
+    let mut by_address = BTreeMap::<FolderAddress, &SpooledFolder>::new();
+    for folder in &folders {
+        if let Some(address) = folder.address {
+            by_address.insert(address, folder);
+        }
+    }
+    let ipm_addresses = folders
+        .iter()
+        .filter(|folder| {
+            folder.source_id == NID_IPM_SUBTREE
+                && folder
+                    .address
+                    .and_then(FolderAddress::parent)
+                    .is_some_and(|parent| parent == FolderAddress::root())
+        })
+        .filter_map(|folder| folder.address)
+        .collect::<BTreeSet<_>>();
+    if ipm_addresses.is_empty() {
+        return Ok(CanonicalFolderSet {
+            folders: Vec::new(),
+            omitted_folders: 0,
+        });
+    }
+    let deleted_items_address = folders
+        .iter()
+        .filter(|folder| folder.source_id == NID_DELETED_ITEMS)
+        .filter_map(|folder| folder.address)
+        .filter(|address| {
+            address
+                .parent()
+                .is_some_and(|parent| ipm_addresses.contains(&parent))
+        })
+        .min();
+    let mut by_path = BTreeMap::<Vec<String>, CanonicalFolder>::new();
+    let mut omitted_folders = 0_u64;
+    for folder in folders.iter().filter(|folder| {
+        folder
+            .address
+            .is_some_and(|address| !ipm_addresses.contains(&address))
+    }) {
+        if interrupted.is_some_and(|flag| flag.load(Ordering::Relaxed)) {
+            return Err(JobError::Interrupted.into());
+        }
+        let mut path = Vec::new();
+        let mut current = folder.address;
+        let mut seen = BTreeSet::new();
+        let mut belongs_to_ipm = false;
+        while let Some(address) = current {
+            if ipm_addresses.contains(&address) {
+                belongs_to_ipm = true;
+                break;
+            }
+            if path.len() == 64 || !seen.insert(address) {
+                return Err(CanonicalError::InvalidFolderHierarchy(folder.source_id));
+            }
+            let Some(current_folder) = by_address.get(&address) else {
+                return Err(CanonicalError::InvalidFolderHierarchy(folder.source_id));
+            };
+            path.push(
+                current_folder
+                    .name
+                    .clone()
+                    .filter(|name| !name.is_empty())
+                    .unwrap_or_else(|| format!("Recovered Folder {}", current_folder.source_id)),
+            );
+            current = address.parent();
+        }
+        if !belongs_to_ipm {
+            continue;
+        }
+        path.reverse();
+        let candidate = CanonicalFolder {
+            path,
+            role: if folder.address == deleted_items_address {
+                CanonicalFolderRole::DeletedItems
+            } else {
+                CanonicalFolderRole::Ordinary
+            },
+        };
+        match by_path.entry(candidate.path.clone()) {
+            std::collections::btree_map::Entry::Vacant(entry) => {
+                entry.insert(candidate);
+            }
+            std::collections::btree_map::Entry::Occupied(mut entry) => {
+                omitted_folders = omitted_folders.saturating_add(1);
+                if candidate.role == CanonicalFolderRole::DeletedItems {
+                    entry.insert(candidate);
+                }
+            }
+        }
+    }
+    Ok(CanonicalFolderSet {
+        folders: by_path.into_values().collect(),
+        omitted_folders,
+    })
 }
 
 pub fn load_canonical_mail_interruptible(
@@ -617,23 +747,40 @@ fn candidate_folder_role(
     folders_by_address: &BTreeMap<FolderAddress, &SpooledFolder>,
     folders_by_id: &BTreeMap<u32, Option<&SpooledFolder>>,
 ) -> CanonicalFolderRole {
-    const NID_DELETED_ITEMS: u32 = 0x8062;
-
-    let source_id = match candidate.unit {
-        Some(RecoveryUnit::Normal { folder, .. }) => {
-            folders_by_address.get(&folder).map(|value| value.source_id)
-        }
+    let address = match candidate.unit {
+        Some(RecoveryUnit::Normal { folder, .. }) => Some(folder),
         _ => metadata_u32(candidate, "folder_id")
             .ok()
             .flatten()
             .and_then(|id| folders_by_id.get(&id).and_then(|value| *value))
-            .map(|value| value.source_id),
+            .and_then(|value| value.address),
     };
-    if source_id == Some(NID_DELETED_ITEMS) {
+    if address == well_known_deleted_items_address(folders_by_address) {
         CanonicalFolderRole::DeletedItems
     } else {
         CanonicalFolderRole::Ordinary
     }
+}
+
+fn well_known_deleted_items_address(
+    folders_by_address: &BTreeMap<FolderAddress, &SpooledFolder>,
+) -> Option<FolderAddress> {
+    const NID_IPM_SUBTREE: u32 = 0x8022;
+    const NID_DELETED_ITEMS: u32 = 0x8062;
+
+    folders_by_address
+        .iter()
+        .filter(|(_, folder)| folder.source_id == NID_DELETED_ITEMS)
+        .filter_map(|(address, _)| {
+            let parent = address.parent()?;
+            let ipm = folders_by_address.get(&parent)?;
+            (ipm.source_id == NID_IPM_SUBTREE
+                && parent
+                    .parent()
+                    .is_some_and(|root| root == FolderAddress::root()))
+            .then_some(*address)
+        })
+        .min()
 }
 
 fn candidate_folder_path(
@@ -711,7 +858,11 @@ fn candidate_folder_path(
 fn is_visible_mail_folder(address: FolderAddress, source_id: u32) -> bool {
     const NID_IPM_SUBTREE: u32 = 0x8022;
 
-    address != FolderAddress::root() && source_id != NID_IPM_SUBTREE
+    address != FolderAddress::root()
+        && !(source_id == NID_IPM_SUBTREE
+            && address
+                .parent()
+                .is_some_and(|parent| parent == FolderAddress::root()))
 }
 
 fn nonempty_folder_path(path: Vec<String>, provenance: CatalogProvenance) -> Vec<String> {
@@ -951,7 +1102,9 @@ mod tests {
     use rusqlite::{Connection, params};
     use tempfile::tempdir;
 
-    use super::{CanonicalFolderRole, load_canonical_mail};
+    use super::{
+        CanonicalFolder, CanonicalFolderRole, load_canonical_folders, load_canonical_mail,
+    };
     use crate::{build_part_writer_input, split_recovered_job};
 
     fn message_start(
@@ -1372,6 +1525,186 @@ mod tests {
         assert_eq!(mail.len(), 1);
         assert_eq!(mail[0].folder_path, ["Inbox"]);
         assert_eq!(mail[0].folder_role, CanonicalFolderRole::Ordinary);
+        Ok(())
+    }
+
+    #[test]
+    fn reconstructs_empty_ipm_folders_by_catalog_address_despite_duplicate_source_ids()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempdir()?;
+        let mut sink = DurableCatalogSink::create(&directory.path().join("job"))?;
+        let root = FolderAddress::root();
+        let ipm = root.child(0).ok_or("IPM address")?;
+        let inbox = ipm.child(0).ok_or("Inbox address")?;
+        let deleted = ipm.child(1).ok_or("Deleted Items address")?;
+        let user_deleted = ipm.child(2).ok_or("user folder address")?;
+        let duplicate_deleted = ipm.child(3).ok_or("duplicate Deleted Items address")?;
+        let empty_child = user_deleted.child(0).ok_or("empty child address")?;
+        let search_root = root.child(1).ok_or("search root address")?;
+        for (address, id, parent_id, name) in [
+            (root, 0x122, None, None),
+            (ipm, 0x8022, Some(0x122), Some("Top of Outlook data file")),
+            (inbox, 0x8082, Some(0x8022), Some("Inbox")),
+            (deleted, 0x8062, Some(0x8022), Some("Deleted Items")),
+            (user_deleted, 0x8022, Some(0x8022), Some("Deleted items")),
+            (
+                duplicate_deleted,
+                0x8062,
+                Some(0x8022),
+                Some("Other Deleted"),
+            ),
+            (empty_child, 0x9003, Some(0x8022), Some("Empty Child")),
+            (search_root, 0x8023, Some(0x122), Some("Search Root")),
+        ] {
+            sink.event(CatalogEvent::UnitStart(RecoveryUnit::Folder { address }))?;
+            sink.event(CatalogEvent::Folder {
+                id,
+                parent_id,
+                name: name.map(str::to_owned),
+            })?;
+            sink.event(CatalogEvent::UnitEnd(RecoveryUnit::Folder { address }))?;
+        }
+
+        let folder_set = load_canonical_folders(&sink)?;
+        assert_eq!(folder_set.omitted_folders, 0);
+        assert_eq!(
+            folder_set.folders,
+            [
+                CanonicalFolder {
+                    path: vec!["Deleted Items".to_owned()],
+                    role: CanonicalFolderRole::DeletedItems,
+                },
+                CanonicalFolder {
+                    path: vec!["Deleted items".to_owned()],
+                    role: CanonicalFolderRole::Ordinary,
+                },
+                CanonicalFolder {
+                    path: vec!["Deleted items".to_owned(), "Empty Child".to_owned()],
+                    role: CanonicalFolderRole::Ordinary,
+                },
+                CanonicalFolder {
+                    path: vec!["Inbox".to_owned()],
+                    role: CanonicalFolderRole::Ordinary,
+                },
+                CanonicalFolder {
+                    path: vec!["Other Deleted".to_owned()],
+                    role: CanonicalFolderRole::Ordinary,
+                },
+            ]
+        );
+        let message_unit = RecoveryUnit::Normal {
+            folder: inbox,
+            folder_id: 0x8082,
+            message_index: 0,
+        };
+        sink.event(CatalogEvent::UnitStart(message_unit))?;
+        message_start(&mut sink, 0x9104, Some(0x8082), None)?;
+        sink.event(CatalogEvent::MessageEnd {
+            id: 0x9104,
+            complete: true,
+        })?;
+        sink.event(CatalogEvent::UnitEnd(message_unit))?;
+        sink.checkpoint()?;
+        let (parts, written, _partial) = split_recovered_job(
+            &directory.path().join("job"),
+            &"1".repeat(64),
+            RecoveryMode::Balanced,
+            4_294_967_296,
+        )?;
+        assert_eq!(parts.len(), 1);
+        assert_eq!(written, 1);
+        let output = directory.path().join("job/parts/part-0001.pst");
+        let verified = crate::verify(&output)?;
+        assert_eq!(verified.inventory.folders, 9);
+        assert_eq!(verified.inventory.normal_items, 1);
+        Ok(())
+    }
+
+    #[test]
+    fn reports_duplicate_visible_folder_paths_instead_of_hiding_loss()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempdir()?;
+        let mut sink = DurableCatalogSink::create(&directory.path().join("job"))?;
+        let root = FolderAddress::root();
+        let ipm = root.child(0).ok_or("IPM address")?;
+        let first = ipm.child(0).ok_or("first folder address")?;
+        let duplicate = ipm.child(1).ok_or("duplicate folder address")?;
+        for (address, id, parent_id, name) in [
+            (root, 0x122, None, None),
+            (ipm, 0x8022, Some(0x122), Some("Top of Outlook data file")),
+            (first, 0x9001, Some(0x8022), Some("Duplicate")),
+            (duplicate, 0x9002, Some(0x8022), Some("Duplicate")),
+        ] {
+            sink.event(CatalogEvent::UnitStart(RecoveryUnit::Folder { address }))?;
+            sink.event(CatalogEvent::Folder {
+                id,
+                parent_id,
+                name: name.map(str::to_owned),
+            })?;
+            sink.event(CatalogEvent::UnitEnd(RecoveryUnit::Folder { address }))?;
+        }
+
+        let folder_set = load_canonical_folders(&sink)?;
+        assert_eq!(folder_set.omitted_folders, 1);
+        assert_eq!(
+            folder_set.folders,
+            [CanonicalFolder {
+                path: vec!["Duplicate".to_owned()],
+                role: CanonicalFolderRole::Ordinary,
+            }]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn omits_invalid_source_only_folder_without_suppressing_valid_mail()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempdir()?;
+        let mut sink = DurableCatalogSink::create(&directory.path().join("job"))?;
+        let root = FolderAddress::root();
+        let ipm = root.child(0).ok_or("IPM address")?;
+        let inbox = ipm.child(0).ok_or("Inbox address")?;
+        let invalid = ipm.child(1).ok_or("invalid folder address")?;
+        let invalid_name = "x".repeat(2049);
+        for (address, id, parent_id, name) in [
+            (root, 0x122, None, None),
+            (ipm, 0x8022, Some(0x122), Some("Top of Outlook data file")),
+            (inbox, 0x8082, Some(0x8022), Some("Inbox")),
+            (invalid, 0x9001, Some(0x8022), Some(invalid_name.as_str())),
+        ] {
+            sink.event(CatalogEvent::UnitStart(RecoveryUnit::Folder { address }))?;
+            sink.event(CatalogEvent::Folder {
+                id,
+                parent_id,
+                name: name.map(str::to_owned),
+            })?;
+            sink.event(CatalogEvent::UnitEnd(RecoveryUnit::Folder { address }))?;
+        }
+        let message_unit = RecoveryUnit::Normal {
+            folder: inbox,
+            folder_id: 0x8082,
+            message_index: 0,
+        };
+        sink.event(CatalogEvent::UnitStart(message_unit))?;
+        message_start(&mut sink, 0x9104, Some(0x8082), None)?;
+        sink.event(CatalogEvent::MessageEnd {
+            id: 0x9104,
+            complete: true,
+        })?;
+        sink.event(CatalogEvent::UnitEnd(message_unit))?;
+        sink.checkpoint()?;
+
+        let (parts, written, partial) = split_recovered_job(
+            &directory.path().join("job"),
+            &"1".repeat(64),
+            RecoveryMode::Balanced,
+            4_294_967_296,
+        )?;
+        assert_eq!(parts.len(), 1);
+        assert_eq!(written, 1);
+        assert!(partial);
+        assert_eq!(parts[0].message_count, 1);
+        assert_eq!(parts[0].omitted_folders, 1);
         Ok(())
     }
 

@@ -252,10 +252,8 @@ fn run() -> Result<(), String> {
         return match checkpoint.to_str() {
             Some("embedded-attachments") => qualify_embedded_attachments(&root, Path::new(&output)),
             Some("named-properties") => qualify_named_properties(&root, Path::new(&output)),
-            _ => Err(
-                "unknown qualification checkpoint; expected embedded-attachments or named-properties"
-                    .to_owned(),
-            ),
+            Some("empty-folders") => qualify_empty_folders(&root, Path::new(&output)),
+            _ => Err("unknown qualification checkpoint; expected embedded-attachments, named-properties, or empty-folders".to_owned()),
         };
     }
     if command != std::ffi::OsStr::new("gate") {
@@ -356,11 +354,79 @@ fn qualify_named_properties(root: &Path, output: &Path) -> Result<(), String> {
     publish_fidelity_qualification(root, output, &fixture, 1)
 }
 
+fn qualify_empty_folders(root: &Path, output: &Path) -> Result<(), String> {
+    use pstforge_pst::writer::{
+        FidelityStore, MailFolderRole, MailFolderSpec, MailStoreSpec, MinimalStore,
+    };
+
+    let mut fixture = FidelityStore::from(&MinimalStore {
+        store_name: "PSTForge empty folder source".to_owned(),
+        folder_name: "Inbox".to_owned(),
+        subject: "Empty folder fidelity checkpoint".to_owned(),
+        body: "Empty folder hierarchy checkpoint.".to_owned(),
+        sender_name: "PSTForge Sender".to_owned(),
+        sender_email: "sender@example.com".to_owned(),
+        recipient: "recipient@example.com".to_owned(),
+        record_key: *b"PSTForgeEmptyFld",
+    });
+    fixture.message.recipients.clear();
+    let spec = MailStoreSpec {
+        store_name: fixture.store_name,
+        record_key: fixture.record_key,
+        folders: vec![
+            MailFolderSpec {
+                path: vec!["Deleted Items".to_owned()],
+                role: MailFolderRole::DeletedItems,
+                messages: Vec::new(),
+            },
+            MailFolderSpec {
+                path: vec!["Deleted items".to_owned()],
+                role: MailFolderRole::Ordinary,
+                messages: Vec::new(),
+            },
+            MailFolderSpec {
+                path: vec!["Empty Parent".to_owned()],
+                role: MailFolderRole::Ordinary,
+                messages: Vec::new(),
+            },
+            MailFolderSpec {
+                path: vec!["Empty Parent".to_owned(), "Empty Child".to_owned()],
+                role: MailFolderRole::Ordinary,
+                messages: Vec::new(),
+            },
+            MailFolderSpec {
+                path: vec!["Inbox".to_owned()],
+                role: MailFolderRole::Ordinary,
+                messages: vec![fixture.message],
+            },
+        ],
+    };
+    publish_qualification(root, output, 1, |part| {
+        pstforge_pst::writer::create_mail_store(part, &spec)
+    })
+}
+
 fn publish_fidelity_qualification(
     root: &Path,
     output: &Path,
     fixture: &pstforge_pst::writer::FidelityStore,
     item_count: u64,
+) -> Result<(), String> {
+    publish_qualification(root, output, item_count, |part| {
+        pstforge_pst::writer::create_fidelity_store(part, fixture)
+    })
+}
+
+fn publish_qualification(
+    root: &Path,
+    output: &Path,
+    item_count: u64,
+    create: impl FnOnce(
+        &Path,
+    ) -> Result<
+        pstforge_pst::writer::FidelityWriteReport,
+        pstforge_pst::writer::WriterError,
+    >,
 ) -> Result<(), String> {
     if !output.is_absolute() || output.starts_with(root) || output.exists() {
         return Err(
@@ -382,8 +448,8 @@ fn publish_fidelity_qualification(
     fs::set_permissions(&parts, fs::Permissions::from_mode(0o700))
         .map_err(|error| format!("cannot secure qualification parts directory: {error}"))?;
     let part = parts.join("part-0001.pst");
-    let report = pstforge_pst::writer::create_fidelity_store(&part, fixture)
-        .map_err(|error| format!("cannot create qualification PST: {error}"))?;
+    let report =
+        create(&part).map_err(|error| format!("cannot create qualification PST: {error}"))?;
     if !report.unsupported_properties.is_empty() {
         return Err("qualification PST omitted writer properties".to_owned());
     }

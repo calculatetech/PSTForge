@@ -70,6 +70,32 @@ struct NamedPropertySink {
     completed: Vec<NamedPropertyFingerprint>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct FolderFingerprint {
+    path: Vec<String>,
+    deleted_items: bool,
+}
+
+#[derive(Default)]
+struct IndependentFolderSink {
+    folders: BTreeMap<u32, (Option<u32>, Option<String>)>,
+}
+
+impl CatalogSink for IndependentFolderSink {
+    fn event(&mut self, event: CatalogEvent<'_>) -> Result<(), String> {
+        if let CatalogEvent::Folder {
+            id,
+            parent_id,
+            name,
+        } = event
+            && self.folders.insert(id, (parent_id, name)).is_some()
+        {
+            return Err("duplicate folder identifier".to_owned());
+        }
+        Ok(())
+    }
+}
+
 impl CatalogSink for NamedPropertySink {
     fn event(&mut self, event: CatalogEvent<'_>) -> Result<(), String> {
         match event {
@@ -618,6 +644,63 @@ fn independent_named_properties(
     Ok(sink.completed)
 }
 
+fn independent_visible_folders(
+    path: &std::path::Path,
+) -> Result<Vec<FolderFingerprint>, Box<dyn std::error::Error>> {
+    const NID_IPM_SUBTREE: u32 = 0x8022;
+    const NID_DELETED_ITEMS: u32 = 0x8062;
+
+    let file = fs::File::open(path)?;
+    let native = libpff_sys::PffFile::open_fd(file.as_fd())?;
+    let mut sink = IndependentFolderSink::default();
+    let catalog = native.catalog(&mut sink)?;
+    if !catalog.issues.is_empty() || catalog.issues_dropped != 0 {
+        return Err("folder catalog reported read issues".into());
+    }
+    let mut output = Vec::new();
+    for id in sink
+        .folders
+        .keys()
+        .copied()
+        .filter(|id| *id != NID_IPM_SUBTREE)
+    {
+        let mut current = Some(id);
+        let mut chain = Vec::new();
+        let mut seen = BTreeSet::new();
+        let mut belongs_to_ipm = false;
+        while let Some(folder_id) = current {
+            if folder_id == NID_IPM_SUBTREE {
+                belongs_to_ipm = true;
+                break;
+            }
+            if !seen.insert(folder_id) || seen.len() > 64 {
+                return Err("folder hierarchy is cyclic or too deep".into());
+            }
+            let Some((parent_id, name)) = sink.folders.get(&folder_id) else {
+                return Err("folder hierarchy references a missing parent".into());
+            };
+            chain.push(name.clone());
+            current = *parent_id;
+        }
+        if belongs_to_ipm {
+            chain.reverse();
+            let path = chain
+                .into_iter()
+                .map(|name| {
+                    name.filter(|value| !value.is_empty())
+                        .ok_or("visible folder name is absent")
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            output.push(FolderFingerprint {
+                path,
+                deleted_items: id == NID_DELETED_ITEMS,
+            });
+        }
+    }
+    output.sort();
+    Ok(output)
+}
+
 fn verify_exact_message_fidelity(
     expected: Vec<MessageFingerprint>,
     actual: Vec<MessageFingerprint>,
@@ -829,6 +912,86 @@ fn milestone_0_4_2_named_properties_roundtrip_through_libpff()
     let generated = independent_named_properties(&job.join("parts/part-0001.pst"))?;
     if generated != source {
         return Err("named-property identity or value changed during the split".into());
+    }
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires the external v042-empty-folders-source corpus case"]
+fn milestone_0_4_2_empty_folders_roundtrip_through_libpff() -> Result<(), Box<dyn std::error::Error>>
+{
+    let manifest_path = std::env::var_os("PSTFORGE_CORPUS_MANIFEST")
+        .ok_or("PSTFORGE_CORPUS_MANIFEST is required")?;
+    let manifest: Manifest = toml::from_str(&fs::read_to_string(&manifest_path)?)?;
+    let case = manifest
+        .cases
+        .iter()
+        .find(|case| case.name == "v042-empty-folders-source")
+        .ok_or("manifest has no v042-empty-folders-source case")?;
+    let identity = pstforge_core::SourceFile::open(&case.path)?
+        .identity()
+        .clone();
+    if identity.sha256 != case.sha256 {
+        return Err("empty-folder source SHA-256 does not match its manifest".into());
+    }
+
+    let source = independent_visible_folders(&case.path)?;
+    let mut expected = vec![
+        FolderFingerprint {
+            path: vec!["Deleted Items".to_owned()],
+            deleted_items: true,
+        },
+        FolderFingerprint {
+            path: vec!["Deleted items".to_owned()],
+            deleted_items: false,
+        },
+        FolderFingerprint {
+            path: vec!["Empty Parent".to_owned()],
+            deleted_items: false,
+        },
+        FolderFingerprint {
+            path: vec!["Empty Parent".to_owned(), "Empty Child".to_owned()],
+            deleted_items: false,
+        },
+        FolderFingerprint {
+            path: vec!["Inbox".to_owned()],
+            deleted_items: false,
+        },
+    ];
+    expected.sort();
+    if source != expected {
+        return Err("empty-folder source does not match the qualification contract".into());
+    }
+
+    let directory = tempfile::tempdir()?;
+    let job = directory.path().join("job");
+    let output = Command::new(env!("CARGO_BIN_EXE_pstforge"))
+        .arg("split")
+        .arg(&case.path)
+        .arg("--output")
+        .arg(&job)
+        .arg("--max-pst-size")
+        .arg("4GiB")
+        .arg("--json")
+        .arg("--color")
+        .arg("never")
+        .output()?;
+    if !output.status.success() {
+        return Err(format!(
+            "empty-folder split failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        )
+        .into());
+    }
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+    if report["partial"].as_bool() != Some(false)
+        || report["parts"].as_array().map(Vec::len) != Some(1)
+    {
+        return Err("empty-folder split was not a complete one-part result".into());
+    }
+    let generated = independent_visible_folders(&job.join("parts/part-0001.pst"))?;
+    if generated != source {
+        return Err("visible empty-folder path or role changed during the split".into());
     }
     Ok(())
 }

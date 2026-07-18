@@ -23,7 +23,7 @@ use sha2::{Digest, Sha256};
 use tempfile::NamedTempFile;
 use thiserror::Error;
 
-const JOB_SCHEMA_VERSION: i64 = 7;
+const JOB_SCHEMA_VERSION: i64 = 8;
 const INLINE_BLOB_MAX_BYTES: u64 = 64 * 1024;
 const INLINE_CACHE_DIRECTORY: &str = ".pstforge-inline-cache";
 const PAYLOAD_PACK_FILENAME: &str = "payload.pack";
@@ -154,6 +154,7 @@ pub struct PartSidecar {
     pub message_count: u64,
     pub oversize: bool,
     pub partial: bool,
+    pub omitted_folders: u64,
     pub omitted_properties: u64,
     pub omitted_attachments: u64,
 }
@@ -4408,7 +4409,7 @@ mod tests {
     }
 
     #[test]
-    fn resume_rejects_schema_six_without_named_property_identity()
+    fn resume_rejects_schema_seven_without_empty_folder_placement()
     -> Result<(), Box<dyn std::error::Error>> {
         let directory = tempdir()?;
         let job = directory.path().join("job");
@@ -4438,7 +4439,7 @@ mod tests {
         let database = job.join(".pstforge/job.sqlite3");
         let connection = Connection::open(&database)?;
         connection.execute(
-            "UPDATE job_metadata SET value = '6' WHERE key = 'schema_version'",
+            "UPDATE job_metadata SET value = '7' WHERE key = 'schema_version'",
             [],
         )?;
         drop(connection);
@@ -4924,6 +4925,7 @@ mod tests {
             message_count: 1,
             oversize: part.oversize,
             partial: false,
+            omitted_folders: 0,
             omitted_properties: 0,
             omitted_attachments: 0,
         };
@@ -5216,6 +5218,7 @@ mod tests {
                 message_count: 1,
                 oversize: false,
                 partial: false,
+                omitted_folders: 0,
                 omitted_properties: 0,
                 omitted_attachments: 0,
             };

@@ -977,6 +977,83 @@ work. Hash and identity evidence show that the source was not modified.
       identity and payload fidelity remain proven by the independent libpff
       source/output comparison because Outlook does not expose these properties
       in its ordinary message UI.
+    - [x] (2026-07-17) Checkpoint 2b reconstructs every catalogued visible
+      folder beneath the source IPM subtree independently of message placement
+      and includes the complete visible hierarchy in part 0001. Empty parents
+      and leaves are retained; system/search trees outside the IPM subtree
+      remain excluded. Deleted Items is identified only by well-known source
+      NID `0x8062`, so an ordinary user folder named `Deleted items` remains
+      ordinary and distinct.
+    - [x] (2026-07-17) Added the private `empty-folders` qualification source
+      and a manifest-selected external-corpus regression. It compares every
+      visible source/output path, including multiplicity, and Deleted Items
+      role through independent libpff reads. The initial pre-review native
+      split completed with zero omissions and produced one 271,360-byte
+      candidate at
+      `qualification-v042-empty-folders-r1/parts/part-0001.pst`, SHA-256
+      `79cea37390706e25a8cbf0d28b56c9599be7c01e28253d0f2ff5003293173b22`;
+      both source and output contain nine total folders and one message. This
+      candidate is superseded by the schema-8 review remediations and must be
+      regenerated before human acceptance.
+    - [x] (2026-07-17) Checkpoint-2b adversarial review replaced source-NID
+      ancestry with durable catalog-address ancestry, preserved duplicate
+      native NIDs in tests, made duplicate visible paths an explicit counted
+      folder omission, and changed the independent oracle from a set to a
+      multiplicity-preserving sorted list. Job schema 8 refuses schema-7
+      resumes because already-published part 0001 cannot be retrofitted with
+      its empty hierarchy.
+    - [x] (2026-07-17) A one-message part exceeding the hard maximum because of
+      catalog-only folder overhead is no longer reported as an indivisible
+      oversize message. PSTForge writes an exact message-only baseline; if that
+      baseline fits, the enriched output is rejected as a conformance failure.
+    - [x] (2026-07-17) A second focused adversarial review found two corrupt-ID
+      collisions. IPM subtree recognition now requires both well-known NID
+      `0x8022` and the direct-child catalog position, so a descendant reusing
+      that NID remains visible without flattening. Message placement now
+      normalizes a colliding display path to the retained folder role; writable
+      mail is preserved while the unrepresentable duplicate folder remains a
+      counted omission.
+    - [x] (2026-07-17) Final focused review separated folder-set containment
+      from message prefiltering. Each catalog-only folder is validated against
+      a known-writable message and an invalid folder is counted and omitted
+      without marking that message unsupported. Well-known Deleted Items
+      selection is limited to one deterministic direct child of the actual IPM
+      root; additional damaged folders reusing NID `0x8062` remain ordinary.
+      A regression proves a source-only folder name beyond the writer's
+      2,048-UTF-16-unit bound does not suppress valid mail.
+    - [x] (2026-07-17) The focused remediation review is clean. Fast gate
+      evidence is `.agent/test-results/1784341338-fast`; the independent
+      external source/output folder comparison passes. The schema-8
+      qualification candidate is
+      `qualification-v042-empty-folders-r2/parts/part-0001.pst`, 271,360 bytes,
+      SHA-256
+      `79cea37390706e25a8cbf0d28b56c9599be7c01e28253d0f2ff5003293173b22`.
+      Its bounded recovery log reports complete output and no skipped readable
+      data; its part manifest reports zero folder, property, and attachment
+      omissions; full verification reports nine reachable folders, one
+      message, and no observed corruption. The source remains 271,360 bytes
+      with SHA-256
+      `a2739cdf474e3f94703a55173cf22605a230f637311806d20805332d909c3ef8`.
+    - [x] (2026-07-17) Human acceptance passed for the checkpoint-2b schema-8
+      r2 candidate: ScanPST reported clean output, Outlook opened the original
+      unrepaired PST, the Inbox checkpoint message and every expected empty
+      folder were present, the case-distinct ordinary `Deleted items` folder
+      remained separate from well-known `Deleted Items`, and no artificial
+      wrapper folder appeared.
+    - [x] (2026-07-17) Pre-commit automation passed formatting, workspace
+      checks, clippy, ordinary tests, documentation, artifacts, diff checks,
+      licenses, advisories, writer acceptance, independent `pffinfo`, and
+      independent `readpst`. The generic full gate could not enter its legacy
+      corpus phase because the configured private manifest intentionally
+      contains only the two focused 0.4.2 qualification cases and therefore
+      has no `healthy_ansi` milestone-0.1.1 case. The applicable checkpoint-2b
+      external libpff source/output comparison, full PSTForge verification,
+      ScanPST, and Outlook acceptance all pass; the owner approved the
+      checkpoint commit with this bounded corpus limitation.
+    - [ ] Replace the native catalog's fixed 64-component `FolderAddress` with
+      a resource-proportional durable address and measured deep-folder tests
+      before claiming preservation beyond its current boundary. This is a
+      worker/job compatibility change and is not hidden inside checkpoint 2b.
   - [ ] Checkpoints 3 onward: contacts, appointments, meetings, distribution
     lists, tasks, notes/posts, OLE/documents, associated/configuration data,
     and remaining generic classes, each proven separately where feasible.
@@ -2046,6 +2123,37 @@ work. Hash and identity evidence show that the source was not modified.
   silently downgrade data correctness.
   Date/Author: 2026-07-17 / Codex from checkpoint-2a adversarial review.
 
+- Decision: Put the complete visible source folder hierarchy in part 0001;
+  later parts continue to include only paths required by their assigned mail.
+  Rationale: Empty folders have no message candidate that can assign them to a
+  part. Writing them once preserves source structure without multiplying empty
+  objects across every import checkpoint. Part 0001 already participates in
+  procedural size calibration, so folder overhead remains inside the requested
+  hard part-size target. A source containing no writable item at all still
+  requires a separate empty-store writer checkpoint and is not claimed here.
+  Date/Author: 2026-07-17 / Codex from checkpoint-2b implementation evidence.
+
+- Decision: Job schema 8 is the first resume-compatible schema for empty
+  visible-folder placement. Reconstruct ancestry from durable `FolderAddress`
+  values rather than source NIDs. When damaged input exposes multiple sibling
+  folders with the exact same display path, preserve one deterministically,
+  prefer the well-known Deleted Items role when applicable, count every
+  collapsed folder as not copied, and report partial success.
+  Rationale: Source NIDs are untrusted and may collide. A valid PST cannot
+  represent multiple same-name siblings through the target folder APIs, so
+  silently deduplicating them would falsely report complete preservation.
+  Schema-7 output may already contain a part 0001 without empty folders and
+  therefore cannot safely resume under the new placement contract.
+  Date/Author: 2026-07-17 / Codex from checkpoint-2b adversarial review.
+
+- Decision: Prove the oversize-message exception with an exact serialization
+  that excludes catalog-only folders whenever enriched part 0001 has one
+  message and exceeds the configured maximum. Refuse conformance if the
+  baseline fits.
+  Rationale: Folder hierarchy overhead is divisible metadata and cannot justify
+  the product's exception for an indivisible message.
+  Date/Author: 2026-07-17 / Codex from checkpoint-2b adversarial review.
+
 ## Outcomes & Retrospective
 
 Version 0.1.0 now lets an operator inspect a healthy PST in human or JSON form
@@ -2559,6 +2667,15 @@ After ScanPST, open the unrepaired original candidate in Outlook and confirm the
 single `Named property fidelity checkpoint` message opens normally. Named
 properties are not asserted through Outlook's visible UI; the exact independent
 libpff comparison is the semantic acceptance evidence.
+
+For checkpoint 2b, run the ignored
+`milestone_0_4_2_empty_folders_roundtrip_through_libpff` external-corpus test,
+then scan only
+`qualification-v042-empty-folders-r1/parts/part-0001.pst`. After ScanPST, open
+the unrepaired candidate in Outlook. Confirm `Inbox` contains the single
+`Empty folder fidelity checkpoint` message; `Deleted Items`, the ordinary
+case-distinct `Deleted items`, `Empty Parent`, and its nested `Empty Child` are
+all visible; and no artificial recovery or source-store wrapper folder exists.
 
 After every available focused checkpoint succeeds, run the complete 19 GB
 split once. Unique source items assigned across all output parts must equal the

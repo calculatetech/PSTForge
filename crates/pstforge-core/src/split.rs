@@ -20,9 +20,10 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 use crate::recovery::{InterruptHandler, recover_for_split};
+use crate::writer_input::{PartBuildOptions, build_part_writer_input_with_folders_interruptible};
 use crate::{
     CanonicalError, CanonicalWriteError, PackCandidate, PackingError, PartSizeEstimator,
-    RecoveryError, RecoveryReport, SourceError, SourceFile, build_part_writer_input_interruptible,
+    RecoveryError, RecoveryReport, SourceError, SourceFile, load_canonical_folders_interruptible,
     load_canonical_mail_interruptible,
 };
 
@@ -161,6 +162,7 @@ pub struct PartReport {
     pub message_count: u64,
     pub oversize: bool,
     pub partial: bool,
+    pub omitted_folders: u64,
     pub omitted_properties: u64,
     pub omitted_attachments: u64,
 }
@@ -405,6 +407,11 @@ fn durable_output_snapshot(
 }
 
 fn render_recovery_log(report: &SplitReport) -> String {
+    let omitted_folders = report
+        .parts
+        .iter()
+        .map(|part| part.omitted_folders)
+        .fold(0_u64, u64::saturating_add);
     let omitted_properties = report
         .parts
         .iter()
@@ -424,6 +431,7 @@ fn render_recovery_log(report: &SplitReport) -> String {
         && report.recovery.unsupported_candidates == 0
         && report.recovery.issues == 0
         && report.recovery.issues_dropped == 0
+        && omitted_folders == 0
         && omitted_properties == 0
         && omitted_attachments == 0
         && unfinished_items == 0
@@ -493,6 +501,7 @@ fn render_recovery_log(report: &SplitReport) -> String {
             report.recovery.unsupported_candidates
         ));
         output.push_str(&format!("Attachments not copied: {omitted_attachments}\n"));
+        output.push_str(&format!("Folders not copied: {omitted_folders}\n"));
         output.push_str(&format!("Item details not copied: {omitted_properties}\n"));
         output.push_str(&format!("Items left unfinished: {unfinished_items}\n"));
         output.push_str(&format!(
@@ -585,6 +594,15 @@ fn split_recovered_job_with_interrupt(
         }
         Err(error) => return Err(error.into()),
     };
+    let source_folders = match load_canonical_folders_interruptible(&job, interrupted) {
+        Ok(folders) => folders,
+        Err(CanonicalError::Job(JobError::Interrupted)) => {
+            job.record_interrupted()?;
+            job.checkpoint()?;
+            return Ok((reports, written_candidates, true, true));
+        }
+        Err(error) => return Err(error.into()),
+    };
     if mail.is_empty() {
         job.checkpoint()?;
         return Ok((reports, written_candidates, any_partial, false));
@@ -606,13 +624,17 @@ fn split_recovered_job_with_interrupt(
             return Ok((reports, written_candidates, true, true));
         }
         let messages = [message];
-        let input = match build_part_writer_input_interruptible(
+        let input = match build_part_writer_input_with_folders_interruptible(
             &job,
             &messages,
-            source_sha256,
-            mode_name,
-            maximum_pst_bytes,
-            part_index,
+            &[],
+            PartBuildOptions {
+                source_sha256,
+                recovery_mode: mode_name,
+                maximum_pst_bytes,
+                part_index,
+                omitted_folders: 0,
+            },
             interrupted,
         ) {
             Err(CanonicalWriteError::Job(JobError::Interrupted)) => {
@@ -645,6 +667,52 @@ fn split_recovered_job_with_interrupt(
         job.checkpoint()?;
         return Ok((reports, written_candidates, true, false));
     }
+    let source_folders = if part_index == 1 {
+        let mut accepted = Vec::with_capacity(source_folders.folders.len());
+        let mut omitted_folders = source_folders.omitted_folders;
+        let probe = [writable_mail[0]];
+        for folder in source_folders.folders {
+            let trial = [folder.clone()];
+            let input = match build_part_writer_input_with_folders_interruptible(
+                &job,
+                &probe,
+                &trial,
+                PartBuildOptions {
+                    source_sha256,
+                    recovery_mode: mode_name,
+                    maximum_pst_bytes,
+                    part_index,
+                    omitted_folders: 0,
+                },
+                interrupted,
+            ) {
+                Ok(input) => input,
+                Err(CanonicalWriteError::Job(JobError::Interrupted)) => {
+                    job.record_interrupted()?;
+                    job.checkpoint()?;
+                    return Ok((reports, written_candidates, true, true));
+                }
+                Err(error) => return Err(error.into()),
+            };
+            match validate_mail_store_input(&input.store) {
+                Ok(()) => accepted.push(folder),
+                Err(WriterError::InputRejected(_)) => {
+                    omitted_folders = omitted_folders.saturating_add(1);
+                    any_partial = true;
+                }
+                Err(error) => return Err(error.into()),
+            }
+        }
+        crate::CanonicalFolderSet {
+            folders: accepted,
+            omitted_folders,
+        }
+    } else {
+        crate::CanonicalFolderSet {
+            folders: Vec::new(),
+            omitted_folders: 0,
+        }
+    };
     let by_key = writable_mail
         .iter()
         .map(|message| (message.key, *message))
@@ -682,13 +750,25 @@ fn split_recovered_job_with_interrupt(
                         .ok_or(SplitError::UnknownAssignment)
                 })
                 .collect::<Result<Vec<_>, _>>()?;
-            let input = match build_part_writer_input_interruptible(
+            let input = match build_part_writer_input_with_folders_interruptible(
                 &job,
                 &messages,
-                source_sha256,
-                mode_name,
-                maximum_pst_bytes,
-                part_index,
+                if part_index == 1 {
+                    &source_folders.folders
+                } else {
+                    &[]
+                },
+                PartBuildOptions {
+                    source_sha256,
+                    recovery_mode: mode_name,
+                    maximum_pst_bytes,
+                    part_index,
+                    omitted_folders: if part_index == 1 {
+                        source_folders.omitted_folders
+                    } else {
+                        0
+                    },
+                },
                 interrupted,
             ) {
                 Err(CanonicalWriteError::Job(JobError::Interrupted)) => {
@@ -708,15 +788,12 @@ fn split_recovered_job_with_interrupt(
                 }
                 Err(error) => return Err(error.into()),
             }
-            let write_result = match validator_supervisor {
-                Some(supervisor) => create_mail_store_supervised(
-                    &staged_path,
-                    &input.store,
-                    interrupted,
-                    supervisor,
-                ),
-                None => create_mail_store_interruptible(&staged_path, &input.store, interrupted),
-            };
+            let write_result = write_staged_part(
+                &staged_path,
+                &input.store,
+                interrupted,
+                validator_supervisor,
+            );
             match write_result {
                 Ok(_) => {}
                 Err(WriterError::Interrupted) => {
@@ -736,6 +813,60 @@ fn split_recovered_job_with_interrupt(
                 .metadata()
                 .map_err(|source| staged_io(&staged_path, source))?
                 .len();
+            if byte_len > maximum_pst_bytes
+                && candidate_group.len() == 1
+                && part_index == 1
+                && !source_folders.folders.is_empty()
+            {
+                let baseline_input = build_part_writer_input_with_folders_interruptible(
+                    &job,
+                    &messages,
+                    &[],
+                    PartBuildOptions {
+                        source_sha256,
+                        recovery_mode: mode_name,
+                        maximum_pst_bytes,
+                        part_index,
+                        omitted_folders: 0,
+                    },
+                    interrupted,
+                )?;
+                validate_mail_store_input(&baseline_input.store)?;
+                let baseline_filename =
+                    format!("part-{part_index:04}-attempt-{attempt}-baseline.pst.partial");
+                let baseline_path = job.staged_part_path(&baseline_filename)?;
+                match write_staged_part(
+                    &baseline_path,
+                    &baseline_input.store,
+                    interrupted,
+                    validator_supervisor,
+                ) {
+                    Ok(()) => {}
+                    Err(WriterError::Interrupted) => {
+                        remove_staged_if_present(&staged_path)?;
+                        job.record_interrupted()?;
+                        job.checkpoint()?;
+                        return Ok((reports, written_candidates, true, true));
+                    }
+                    Err(error) => {
+                        remove_staged_if_present(&staged_path)?;
+                        return Err(error.into());
+                    }
+                }
+                let baseline_len = baseline_path
+                    .metadata()
+                    .map_err(|source| staged_io(&baseline_path, source))?
+                    .len();
+                remove_staged_if_present(&baseline_path)?;
+                if baseline_len <= maximum_pst_bytes {
+                    remove_staged_if_present(&staged_path)?;
+                    return Err(SplitError::PartExceedsMaximum {
+                        part_index,
+                        byte_len,
+                        maximum_bytes: maximum_pst_bytes,
+                    });
+                }
+            }
             let estimated_bytes = LayoutEstimator.estimate_part_bytes(&candidate_group)?;
             size_model.observe(estimated_bytes, byte_len)?;
             if byte_len > maximum_pst_bytes && candidate_group.len() > 1 {
@@ -803,7 +934,10 @@ fn split_recovered_job_with_interrupt(
         // Translator omissions already include every diagnostic record returned
         // by the writer; the report list must not increment the same occurrence.
         let omitted_properties = input.omitted_properties;
-        let partial = input.partial || omitted_properties != 0 || input.omitted_attachments != 0;
+        let partial = input.partial
+            || input.omitted_folders != 0
+            || omitted_properties != 0
+            || input.omitted_attachments != 0;
         let sidecar = PartSidecar {
             schema_version: "1.0.0".to_owned(),
             producer_version: crate::VERSION.to_owned(),
@@ -816,6 +950,7 @@ fn split_recovered_job_with_interrupt(
             message_count,
             oversize,
             partial,
+            omitted_folders: input.omitted_folders,
             omitted_properties,
             omitted_attachments: input.omitted_attachments,
         };
@@ -851,6 +986,7 @@ fn split_recovered_job_with_interrupt(
             message_count,
             oversize,
             partial,
+            omitted_folders: input.omitted_folders,
             omitted_properties,
             omitted_attachments: input.omitted_attachments,
         });
@@ -875,6 +1011,28 @@ fn split_recovered_job_with_interrupt(
     job.clear_interrupted()?;
     job.checkpoint()?;
     Ok((reports, written_candidates, any_partial, false))
+}
+
+fn write_staged_part(
+    staged_path: &Path,
+    store: &pstforge_pst::writer::MailStoreSpec,
+    interrupted: &AtomicBool,
+    validator_supervisor: Option<&Path>,
+) -> Result<(), WriterError> {
+    match validator_supervisor {
+        Some(supervisor) => {
+            create_mail_store_supervised(staged_path, store, interrupted, supervisor).map(|_| ())
+        }
+        None => create_mail_store_interruptible(staged_path, store, interrupted).map(|_| ()),
+    }
+}
+
+fn remove_staged_if_present(path: &Path) -> Result<(), SplitError> {
+    match fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(source) => Err(staged_io(path, source)),
+    }
 }
 
 fn test_pause_after_part() -> Option<u64> {
@@ -927,6 +1085,7 @@ fn part_report(record: &PublishedPartRecord) -> Result<PartReport, SplitError> {
         message_count: record.sidecar.message_count,
         oversize: record.part.oversize,
         partial: record.sidecar.partial,
+        omitted_folders: record.sidecar.omitted_folders,
         omitted_properties: record.sidecar.omitted_properties,
         omitted_attachments: record.sidecar.omitted_attachments,
     })
@@ -1388,6 +1547,7 @@ mod tests {
                 message_count: 1,
                 oversize: false,
                 partial: false,
+                omitted_folders: 0,
                 omitted_properties: 0,
                 omitted_attachments: 0,
             }],

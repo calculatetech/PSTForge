@@ -11,7 +11,9 @@ use pstforge_pst::writer::{
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
-use crate::{CanonicalAttachment, CanonicalFolderRole, CanonicalMail, CanonicalProperty};
+use crate::{
+    CanonicalAttachment, CanonicalFolder, CanonicalFolderRole, CanonicalMail, CanonicalProperty,
+};
 
 #[derive(Debug, Error)]
 pub enum CanonicalWriteError {
@@ -39,8 +41,17 @@ pub struct PartWriterInput {
     pub item_keys: Vec<String>,
     pub unsupported_item_keys: Vec<String>,
     pub partial: bool,
+    pub omitted_folders: u64,
     pub omitted_properties: u64,
     pub omitted_attachments: u64,
+}
+
+pub(crate) struct PartBuildOptions<'a> {
+    pub source_sha256: &'a str,
+    pub recovery_mode: &'a str,
+    pub maximum_pst_bytes: u64,
+    pub part_index: u32,
+    pub omitted_folders: u64,
 }
 
 pub fn build_part_writer_input(
@@ -54,10 +65,14 @@ pub fn build_part_writer_input(
     build_part_writer_input_expected(
         job,
         messages,
-        source_sha256,
-        recovery_mode,
-        maximum_pst_bytes,
-        part_index,
+        &[],
+        PartBuildOptions {
+            source_sha256,
+            recovery_mode,
+            maximum_pst_bytes,
+            part_index,
+            omitted_folders: 0,
+        },
         None,
     )
 }
@@ -74,23 +89,42 @@ pub fn build_part_writer_input_interruptible(
     build_part_writer_input_expected(
         job,
         messages,
-        source_sha256,
-        recovery_mode,
-        maximum_pst_bytes,
-        part_index,
+        &[],
+        PartBuildOptions {
+            source_sha256,
+            recovery_mode,
+            maximum_pst_bytes,
+            part_index,
+            omitted_folders: 0,
+        },
         Some(interrupted),
     )
+}
+
+pub(crate) fn build_part_writer_input_with_folders_interruptible(
+    job: &DurableCatalogSink,
+    messages: &[&CanonicalMail],
+    source_folders: &[CanonicalFolder],
+    options: PartBuildOptions<'_>,
+    interrupted: &AtomicBool,
+) -> Result<PartWriterInput, CanonicalWriteError> {
+    build_part_writer_input_expected(job, messages, source_folders, options, Some(interrupted))
 }
 
 fn build_part_writer_input_expected(
     job: &DurableCatalogSink,
     messages: &[&CanonicalMail],
-    source_sha256: &str,
-    recovery_mode: &str,
-    maximum_pst_bytes: u64,
-    part_index: u32,
+    source_folders: &[CanonicalFolder],
+    options: PartBuildOptions<'_>,
     interrupted: Option<&AtomicBool>,
 ) -> Result<PartWriterInput, CanonicalWriteError> {
+    let PartBuildOptions {
+        source_sha256,
+        recovery_mode,
+        maximum_pst_bytes,
+        part_index,
+        omitted_folders,
+    } = options;
     let source = TranslationSource { job, interrupted };
     source.check_interrupted()?;
     if messages.is_empty() {
@@ -99,7 +133,10 @@ fn build_part_writer_input_expected(
             detail: "part has no messages".to_owned(),
         });
     }
-    let mut folders = BTreeMap::<(Vec<String>, CanonicalFolderRole), Vec<MessageSpec>>::new();
+    let mut folders = source_folders
+        .iter()
+        .map(|folder| (folder.path.clone(), (folder.role, Vec::new())))
+        .collect::<BTreeMap<Vec<String>, (CanonicalFolderRole, Vec<MessageSpec>)>>();
     let mut item_keys = Vec::with_capacity(messages.len());
     let mut unsupported_item_keys = Vec::new();
     let mut partial = false;
@@ -111,16 +148,24 @@ fn build_part_writer_input_expected(
         partial |= translated.partial;
         omitted_properties = omitted_properties.saturating_add(translated.omitted_properties);
         omitted_attachments = omitted_attachments.saturating_add(translated.omitted_attachments);
-        folders
-            .entry((mail.folder_path.clone(), mail.folder_role))
-            .or_default()
-            .push(translated.message);
+        match folders.entry(mail.folder_path.clone()) {
+            std::collections::btree_map::Entry::Vacant(entry) => {
+                entry.insert((mail.folder_role, vec![translated.message]));
+            }
+            std::collections::btree_map::Entry::Occupied(mut entry) => {
+                let (role, messages) = entry.get_mut();
+                if mail.folder_role == CanonicalFolderRole::DeletedItems {
+                    *role = CanonicalFolderRole::DeletedItems;
+                }
+                messages.push(translated.message);
+            }
+        }
         item_keys.extend(translated.item_keys);
         unsupported_item_keys.extend(translated.unsupported_item_keys);
     }
     let folders = folders
         .into_iter()
-        .map(|((path, role), messages)| MailFolderSpec {
+        .map(|(path, (role, messages))| MailFolderSpec {
             path,
             role: match role {
                 CanonicalFolderRole::Ordinary => MailFolderRole::Ordinary,
@@ -144,7 +189,8 @@ fn build_part_writer_input_expected(
         },
         item_keys,
         unsupported_item_keys,
-        partial,
+        partial: partial || omitted_folders != 0,
+        omitted_folders,
         omitted_properties,
         omitted_attachments,
     })
@@ -1407,25 +1453,82 @@ fn invalid<T>(mail: &CanonicalMail, detail: impl Into<String>) -> Result<T, Cano
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::AtomicBool;
+
     use std::io::Cursor;
 
     use pstforge_job::{DurableCatalogSink, SpooledBlob};
     use tempfile::tempdir;
 
     use super::{
-        build_part_writer_input, contain_body_metadata, named_property_set,
-        supported_message_class, valid_compressed_rtf_container, valid_utf8_stream,
-        valid_utf16_stream, writer_stream_type_is_supported,
+        PartBuildOptions, build_part_writer_input,
+        build_part_writer_input_with_folders_interruptible, contain_body_metadata,
+        named_property_set, supported_message_class, valid_compressed_rtf_container,
+        valid_utf8_stream, valid_utf16_stream, writer_stream_type_is_supported,
     };
     use crate::{
-        CanonicalAttachment, CanonicalFolderRole, CanonicalMail, CanonicalProperty,
-        ContentCompleteness, ItemKey, RecoveryProvenance,
+        CanonicalAttachment, CanonicalFolder, CanonicalFolderRole, CanonicalMail,
+        CanonicalProperty, ContentCompleteness, ItemKey, RecoveryProvenance,
     };
-    use pstforge_pst::writer::{AttachmentContent, NamedPropertySet, NativeBody};
+    use pstforge_pst::writer::{AttachmentContent, MailFolderRole, NamedPropertySet, NativeBody};
 
     #[test]
     fn libpff_reserved_mapi_guid_is_normalized() {
         assert_eq!(named_property_set([0; 16]), NamedPropertySet::Mapi);
+    }
+
+    #[test]
+    fn normalizes_message_role_to_retained_same_path_folder()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempdir()?;
+        let job = DurableCatalogSink::create(&directory.path().join("job"))?;
+        let mail = CanonicalMail {
+            durable_item_key: "normal:1:-:0".to_owned(),
+            key: ItemKey {
+                provenance: RecoveryProvenance::Normal,
+                source_node_id: Some(1),
+                recovery_index: None,
+                occurrence: 0,
+            },
+            folder_path: vec!["Deleted Items".to_owned()],
+            folder_role: CanonicalFolderRole::Ordinary,
+            message_class: Some("IPM.Note".to_owned()),
+            subject: Some("colliding folder message".to_owned()),
+            sender_name: None,
+            sender_email: None,
+            submit_filetime: None,
+            delivery_filetime: None,
+            recipients: Vec::new(),
+            attachments: Vec::new(),
+            properties: Vec::new(),
+            completeness: ContentCompleteness::Complete,
+            spooled_bytes: 0,
+        };
+        let retained = [CanonicalFolder {
+            path: vec!["Deleted Items".to_owned()],
+            role: CanonicalFolderRole::DeletedItems,
+        }];
+        let interrupted = AtomicBool::new(false);
+        let input = build_part_writer_input_with_folders_interruptible(
+            &job,
+            &[&mail],
+            &retained,
+            PartBuildOptions {
+                source_sha256: &"0".repeat(64),
+                recovery_mode: "balanced",
+                maximum_pst_bytes: 4_294_967_296,
+                part_index: 1,
+                omitted_folders: 1,
+            },
+            &interrupted,
+        )?;
+
+        assert_eq!(input.store.folders.len(), 1);
+        assert_eq!(input.store.folders[0].role, MailFolderRole::DeletedItems);
+        assert_eq!(input.store.folders[0].messages.len(), 1);
+        assert!(input.partial);
+        assert_eq!(input.omitted_folders, 1);
+        Ok(())
     }
 
     #[test]
