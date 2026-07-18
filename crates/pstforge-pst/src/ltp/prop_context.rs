@@ -399,43 +399,34 @@ pub enum PropertyValue {
     Boolean(bool),
     /// `PtypInteger64`: 8 bytes; a 64-bit integer
     Integer64(i64),
-    /// `PtypString8`: Variable size; a string of multibyte characters in externally specified
-    /// encoding with terminating null character (single 0 byte).
+    /// `PtypString8`: Variable-size string bytes in an externally specified encoding.
     String8(String8Value),
-    /// `PtypString`: Variable size; a string of Unicode characters in UTF-16LE format encoding
-    /// with terminating null character (0x0000).
+    /// `PtypString`: Variable-size UTF-16LE string bytes.
     Unicode(UnicodeValue),
     /// `PtypTime`: 8 bytes; a 64-bit integer representing the number of 100-nanosecond intervals
     /// since January 1, 1601
     Time(i64),
     /// `PtypGuid`: 16 bytes; a GUID with Data1, Data2, and Data3 fields in little-endian format
     Guid(GuidValue),
-    /// `PtypBinary`: Variable size; a COUNT field followed by that many bytes.
+    /// `PtypBinary`: Variable-size opaque bytes.
     Binary(BinaryValue),
     /// `PtypObject`: The property value is a Component Object Model (COM) object, as specified in
     /// section [2.11.1.5](https://learn.microsoft.com/en-us/openspecs/exchange_server_protocols/ms-oxcdata/5a024c95-2264-4832-9840-d6260c9c2cdb).
     Object(ObjectValue),
 
-    /// `PtypMultipleInteger16`: Variable size; a COUNT field followed by that many
-    /// [PropertyValue::Integer16] values.
+    /// `PtypMultipleInteger16`: Tightly packed [PropertyValue::Integer16] values.
     MultipleInteger16(Vec<i16>),
-    /// `PtypMultipleInteger32`: Variable size; a COUNT field followed by that many
-    /// [PropertyValue::Integer32] values.
+    /// `PtypMultipleInteger32`: Tightly packed [PropertyValue::Integer32] values.
     MultipleInteger32(Vec<i32>),
-    /// `PtypMultipleFloating32`: Variable size; a COUNT field followed by that many
-    /// [PropertyValue::Floating32] values.
+    /// `PtypMultipleFloating32`: Tightly packed [PropertyValue::Floating32] values.
     MultipleFloating32(Vec<f32>),
-    /// `PtypFloating64`: Variable size; a COUNT field followed by that many
-    /// [PropertyValue::Floating64] values.
+    /// `PtypMultipleFloating64`: Tightly packed [PropertyValue::Floating64] values.
     MultipleFloating64(Vec<f64>),
-    /// `PtypMultipleCurrency`: Variable size; a COUNT field followed by that many
-    /// [PropertyValue::Currency] values.
+    /// `PtypMultipleCurrency`: Tightly packed [PropertyValue::Currency] values.
     MultipleCurrency(Vec<i64>),
-    /// `PtypMultipleFloatingTime`: Variable size; a COUNT field followed by that many
-    /// [PropertyValue::FloatingTime] values.
+    /// `PtypMultipleFloatingTime`: Tightly packed [PropertyValue::FloatingTime] values.
     MultipleFloatingTime(Vec<f64>),
-    /// `PtypMultipleInteger64`: Variable size; a COUNT field followed by that many
-    /// [PropertyValue::Integer64] values.
+    /// `PtypMultipleInteger64`: Tightly packed [PropertyValue::Integer64] values.
     MultipleInteger64(Vec<i64>),
     /// `PtypMultipleString8`: Variable size; a COUNT field followed by that many
     /// [PropertyValue::String8] values.
@@ -443,10 +434,9 @@ pub enum PropertyValue {
     /// `PtypMultipleString`: Variable size; a COUNT field followed by that many
     /// [PropertyValue::Unicode] values.
     MultipleUnicode(Vec<UnicodeValue>),
-    /// `PtypMultipleTime`: Variable size; a COUNT field followed by that many
-    /// [PropertyValue::Time] values.
+    /// `PtypMultipleTime`: Tightly packed [PropertyValue::Time] values.
     MultipleTime(Vec<i64>),
-    /// `PtypMultipleGuid`: packed fixed-width [PropertyValue::Guid] values.
+    /// `PtypMultipleGuid`: Tightly packed [PropertyValue::Guid] values.
     MultipleGuid(Vec<GuidValue>),
     /// `PtypMultipleBinary`: Variable size; a COUNT field followed by that many
     /// [PropertyValue::Binary] values.
@@ -1565,19 +1555,74 @@ mod tests {
     }
 
     #[test]
-    fn multiple_guid_uses_packed_fixed_width_storage() -> io::Result<()> {
+    fn fixed_multivalues_use_packed_pst_storage_without_a_count() -> io::Result<()> {
+        fn assert_packed(value: PropertyValue, expected: Vec<u8>) -> io::Result<()> {
+            let mut encoded = Vec::new();
+            value.write(&mut encoded)?;
+            assert_eq!(encoded, expected);
+            Ok(())
+        }
+
+        assert_packed(
+            PropertyValue::MultipleInteger16(vec![-1, 2]),
+            [(-1_i16).to_le_bytes(), 2_i16.to_le_bytes()].concat(),
+        )?;
+        assert_packed(
+            PropertyValue::MultipleInteger32(vec![-3, 4]),
+            [(-3_i32).to_le_bytes(), 4_i32.to_le_bytes()].concat(),
+        )?;
+        assert_packed(
+            PropertyValue::MultipleFloating32(vec![1.5, -2.25]),
+            [1.5_f32.to_le_bytes(), (-2.25_f32).to_le_bytes()].concat(),
+        )?;
+        assert_packed(
+            PropertyValue::MultipleFloating64(vec![3.5, -4.75]),
+            [3.5_f64.to_le_bytes(), (-4.75_f64).to_le_bytes()].concat(),
+        )?;
+        assert_packed(
+            PropertyValue::MultipleCurrency(vec![-5, 6]),
+            [(-5_i64).to_le_bytes(), 6_i64.to_le_bytes()].concat(),
+        )?;
+        assert_packed(
+            PropertyValue::MultipleFloatingTime(vec![7.5, -8.25]),
+            [7.5_f64.to_le_bytes(), (-8.25_f64).to_le_bytes()].concat(),
+        )?;
+        assert_packed(
+            PropertyValue::MultipleInteger64(vec![-9, 10]),
+            [(-9_i64).to_le_bytes(), 10_i64.to_le_bytes()].concat(),
+        )?;
+        assert_packed(
+            PropertyValue::MultipleTime(vec![11, 12]),
+            [11_i64.to_le_bytes(), 12_i64.to_le_bytes()].concat(),
+        )?;
+
         let values = PropertyValue::MultipleGuid(vec![
             GuidValue::new(1, 2, 3, [4; 8]),
             GuidValue::new(5, 6, 7, [8; 8]),
         ]);
         let mut encoded = Vec::new();
         values.write(&mut encoded)?;
-        assert_eq!(encoded.len(), 32);
-        assert_eq!(&encoded[..4], &1_u32.to_le_bytes());
-        assert!(matches!(
-            PropertyValue::read(&mut Cursor::new(encoded), PropertyType::MultipleGuid)?,
-            PropertyValue::MultipleGuid(decoded) if decoded.len() == 2
-        ));
+        assert_eq!(
+            encoded,
+            vec![
+                1, 0, 0, 0, 2, 0, 3, 0, 4, 4, 4, 4, 4, 4, 4, 4, 5, 0, 0, 0, 6, 0, 7, 0, 8, 8, 8, 8,
+                8, 8, 8, 8,
+            ]
+        );
+        let PropertyValue::MultipleGuid(decoded) =
+            PropertyValue::read(&mut Cursor::new(encoded), PropertyType::MultipleGuid)?
+        else {
+            panic!("packed GUID values decoded as the wrong property type");
+        };
+        assert_eq!(decoded.len(), 2);
+        assert_eq!(decoded[0].data1, 1);
+        assert_eq!(decoded[0].data2, 2);
+        assert_eq!(decoded[0].data3, 3);
+        assert_eq!(decoded[0].data4, [4; 8]);
+        assert_eq!(decoded[1].data1, 5);
+        assert_eq!(decoded[1].data2, 6);
+        assert_eq!(decoded[1].data3, 7);
+        assert_eq!(decoded[1].data4, [8; 8]);
         Ok(())
     }
 }

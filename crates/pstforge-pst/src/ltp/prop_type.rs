@@ -33,43 +33,34 @@ pub enum PropertyType {
     Boolean = 0x000B,
     /// `PtypInteger64`: 8 bytes; a 64-bit integer
     Integer64 = 0x0014,
-    /// `PtypString8`: Variable size; a string of multibyte characters in externally specified
-    /// encoding with terminating null character (single 0 byte).
+    /// `PtypString8`: Variable-size string bytes in an externally specified encoding.
     String8 = 0x001E,
-    /// `PtypString`: Variable size; a string of Unicode characters in UTF-16LE format encoding
-    /// with terminating null character (0x0000).
+    /// `PtypString`: Variable-size UTF-16LE string bytes.
     Unicode = 0x001F,
     /// `PtypTime`: 8 bytes; a 64-bit integer representing the number of 100-nanosecond intervals
     /// since January 1, 1601
     Time = 0x0040,
     /// `PtypGuid`: 16 bytes; a GUID with Data1, Data2, and Data3 fields in little-endian format
     Guid = 0x0048,
-    /// `PtypBinary`: Variable size; a COUNT field followed by that many bytes.
+    /// `PtypBinary`: Variable-size opaque bytes.
     Binary = 0x0102,
     /// `PtypObject`: The property value is a Component Object Model (COM) object, as specified in
     /// section [2.11.1.5](https://learn.microsoft.com/en-us/openspecs/exchange_server_protocols/ms-oxcdata/5a024c95-2264-4832-9840-d6260c9c2cdb).
     Object = 0x000D,
 
-    /// `PtypMultipleInteger16`: Variable size; a COUNT field followed by that many
-    /// [PropertyType::Integer16] values.
+    /// `PtypMultipleInteger16`: Tightly packed [PropertyType::Integer16] values.
     MultipleInteger16 = 0x1002,
-    /// `PtypMultipleInteger32`: Variable size; a COUNT field followed by that many
-    /// [PropertyType::Integer32] values.
+    /// `PtypMultipleInteger32`: Tightly packed [PropertyType::Integer32] values.
     MultipleInteger32 = 0x1003,
-    /// `PtypMultipleFloating32`: Variable size; a COUNT field followed by that many
-    /// [PropertyType::Floating32] values.
+    /// `PtypMultipleFloating32`: Tightly packed [PropertyType::Floating32] values.
     MultipleFloating32 = 0x1004,
-    /// `PtypMultipleFloating64`: Variable size; a COUNT field followed by that many
-    /// [PropertyType::Floating64] values.
+    /// `PtypMultipleFloating64`: Tightly packed [PropertyType::Floating64] values.
     MultipleFloating64 = 0x1005,
-    /// `PtypMultipleCurrency`: Variable size; a COUNT field followed by that many
-    /// [PropertyType::Currency] values.
+    /// `PtypMultipleCurrency`: Tightly packed [PropertyType::Currency] values.
     MultipleCurrency = 0x1006,
-    /// `PtypMultipleFloatingTime`: Variable size; a COUNT field followed by that many
-    /// [PropertyType::FloatingTime] values.
+    /// `PtypMultipleFloatingTime`: Tightly packed [PropertyType::FloatingTime] values.
     MultipleFloatingTime = 0x1007,
-    /// `PtypMultipleInteger64`: Variable size; a COUNT field followed by that many
-    /// [PropertyType::Integer64] values.
+    /// `PtypMultipleInteger64`: Tightly packed [PropertyType::Integer64] values.
     MultipleInteger64 = 0x1014,
     /// `PtypMultipleString8`: Variable size; a COUNT field followed by that many
     /// [PropertyType::String8] values.
@@ -77,11 +68,9 @@ pub enum PropertyType {
     /// `PtypMultipleString`: Variable size; a COUNT field followed by that many
     /// [PropertyType::Unicode] values.
     MultipleUnicode = 0x101F,
-    /// `PtypMultipleTime`: Variable size; a COUNT field followed by that many [PropertyType::Time]
-    /// values.
+    /// `PtypMultipleTime`: Tightly packed [PropertyType::Time] values.
     MultipleTime = 0x1040,
-    /// `PtypMultipleGuid`: Variable size; a COUNT field followed by that many [PropertyType::Guid]
-    /// values.
+    /// `PtypMultipleGuid`: Tightly packed [PropertyType::Guid] values.
     MultipleGuid = 0x1048,
     /// `PtypMultipleBinary`: Variable size; a COUNT field followed by that many
     /// [PropertyType::Binary] values.

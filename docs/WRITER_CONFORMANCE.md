@@ -55,6 +55,11 @@ date or protocol revision here.
 - **Section:** 2.3
 - **Page date:** 2019-02-14
 
+### PST-MV-FIXED
+- **Source:** [MS-PST MV Properties with Fixed-size Base Type](https://learn.microsoft.com/en-us/openspecs/office_file_formats/ms-pst/73b910ea-09c0-4512-8cd2-e98d06497d51)
+- **Section:** 2.3.3.4.1
+- **Page date:** 2024-04-16
+
 ### PST-MSG
 - **Source:** [MS-PST Messaging Layer](https://learn.microsoft.com/en-us/openspecs/office_file_formats/ms-pst/e2e7a5aa-c89f-4fb8-b044-15ac76e5207e)
 - **Section:** 2.4
@@ -346,7 +351,7 @@ overview reference is replaced by a section-specific reference.
 - **Evidence:** property-context and rich-mail roundtrips; `pffinfo`
 
 ### LTP-03
-- **Status:** Partial: property tags, <=4-byte inline values, heap HIDs, >2,048-byte PSTForge subnodes, object NID/size pairs, and supported scalar byte order agree. Exact-length Unicode and packed fixed-width multivalues are isolated in EMP-11 and EMP-12 because generic MS-OXCDATA wording conflicts with accepted PST evidence.
+- **Status:** Verified: property tags, <=4-byte inline values, heap HIDs, >2,048-byte PSTForge subnodes, object NID/size pairs, supported scalar byte order, and packed fixed-width multivalues agree. Exact-length Unicode remains the accepted EMP-11 interoperability exception.
 - **Requirement:** Property contexts encode each supported property type using the documented inline, heap, or subnode representation
 - **Sources:** [MS-PST 2.3.3 PC](https://learn.microsoft.com/en-us/openspecs/office_file_formats/ms-pst/294c83c6-ff92-42f5-b6b6-876c29fa9737), [2.3.3.3 PC BTH record](https://learn.microsoft.com/en-us/openspecs/office_file_formats/ms-pst/7daab6f5-ce65-437e-80d5-1b1be4088bd3), [2.3.3.5 PtypObject](https://learn.microsoft.com/en-us/openspecs/office_file_formats/ms-pst/49457d57-820e-453d-bbc0-1d192a999814), PST-PROPS, and OXCDATA-TYPES
 - **Implementation:** `property_context`, `externalize_large_properties`, `raw_property_value`
@@ -583,11 +588,12 @@ establish their format. No entry authorizes removing the existing output.
 - **Evidence:** Byte comparison with Outlook-compatible controls; the earlier strict-NUL candidate displayed `_` folder and `€` subject suffixes in MailPlus, while exact-length output is clean in ScanPST, Outlook, and MailPlus. The owner accepted the proven behavior for the specification-conflict case.
 
 ### EMP-12
-- **Status:** Partial/Empirical. Retain packed output unchanged pending byte comparison with Outlook-created multivalue controls and human disposition.
+- **Status:** Verified. The current packed representation is the explicit PST requirement, not an empirical exception.
 - **Requirement:** Fixed-width multivalue properties are stored as tightly packed elements whose count is inferred from allocation length
-- **Sources:** OXCDATA-TYPES describes PtypMultiple values as a COUNT followed by elements; MS-PST PC/TC sections define the HNID location but do not explicitly state whether the generic COUNT is retained in PST heap storage
+- **Sources:** MS-PST 2.3.3.4 and 2.3.3.4.1 explicitly define packed MV storage and require fixed-width element count to be derived by dividing the heap or node allocation length by the element width. Generic MS-OXCDATA describes the logical property type and does not override the PST physical encoding.
 - **Implementation:** `PropertyValue::variable_bytes`, adapted `PropertyValue::read`/`write`
-- **Evidence:** focused packed-width roundtrips, raw-property recovery tests, and ScanPST-accepted associated/PIM candidates
+- **Focused tests:** `fixed_multivalues_use_packed_pst_storage_without_a_count`; `fixed_multivalue_rejects_partial_trailing_elements`
+- **Evidence:** raw-property recovery tests and ScanPST-accepted associated/PIM candidates
 
 ### EMP-13
 - **Status:** Source/specification conflict. Retain the exact source values and current gate unchanged. Do not remap, discard, synthesize `0x7FF9`, or reinterpret either property until the owner chooses a disposition after source-library and Outlook-created-control comparison.

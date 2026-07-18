@@ -1647,6 +1647,19 @@ work. Hash and identity evidence show that the source was not modified.
       compatibility, partial status, source-loss masking, the NDB guards, and
       the unchanged valid-PST serialization boundary returned `CLEAN`. Human
       approval remains required before the focused 0.4.2 commit and push.
+    - [x] (2026-07-18) Resolved EMP-12 as a documentation/test recovery point.
+      MS-PST 2.3.3.4.1 explicitly requires fixed-width multivalue PST
+      allocations to contain a tightly packed array with count derived from
+      allocation length. The current reader/writer already implements that
+      representation. Correct inherited generic wire-format comments, freeze
+      every supported fixed-width type with focused encoding tests, and
+      classify LTP-03/EMP-12 as verified. The combined-manifest full gate
+      passed at `.agent/test-results/1784393719-full`. An initial focused
+      review found that the GUID test did not prove all encoded fields; the
+      complete 32-byte representation and every decoded field are now asserted,
+      and a fresh final-state review returned `CLEAN`. Production code and PST
+      bytes are unchanged, so no human ScanPST candidate is required. Human
+      approval remains required before commit and push.
     - [x] Create `docs/WRITER_CONFORMANCE.md` with one traceable row for every
       existing store, NDB, LTP, folder, message, recipient, attachment,
       embedded-message, associated-content, named-property, and publication
