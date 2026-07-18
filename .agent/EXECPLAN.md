@@ -1708,6 +1708,26 @@ work. Hash and identity evidence show that the source was not modified.
       `.agent/test-results/1784396492-full`; its independent writer-acceptance
       log is byte-for-byte identical to the preceding approved checkpoint at
       `.agent/test-results/1784395507-full`.
+    - [x] (2026-07-18) Implemented the owner-directed bounded MIME-signature
+      checkpoint for missing by-value attachment MIME. A valid source value
+      still wins. Complete payloads can derive only PDF, PNG, JPEG, GIF, or
+      classic TIFF from exact format-defined leading signatures after at most
+      eleven verified bytes; ZIP, OLE, text, short prefixes, and unknown data
+      remain unlabeled. The combined-manifest full gate passed at
+      `.agent/test-results/1784397423-full`. The first review correctly rejected
+      a three-byte JPEG marker as insufficient; the final implementation
+      requires the complete JFIF APP0 identifier and its actual packed-blob
+      negative test. A fresh final-state adversarial review reports CLEAN.
+      The human candidate is
+      `qualification-v042-mime-r1/part-0001.pst`, 271,360 bytes, SHA-256
+      `0f856d1a59bb1d56c56cb77b6608e0bc6edaa2fdeb6f12c5c6e62af198e4095c`.
+      `pffinfo` accepts it, and `readpst` exports `application/pdf` with the
+      exact source payload SHA-256
+      `99b86ad90b88183998f68fb68bac449b56be3a6a5ba8cd5aba299288bb4eb480`.
+      The final combined-manifest full gate passed at
+      `.agent/test-results/1784398030-full`. The owner reports ScanPST and
+      Outlook acceptance clean, approving this output-changing checkpoint for
+      commit and push.
     - [x] Create `docs/WRITER_CONFORMANCE.md` with one traceable row for every
       existing store, NDB, LTP, folder, message, recipient, attachment,
       embedded-message, associated-content, named-property, and publication
@@ -3029,6 +3049,17 @@ work. Hash and identity evidence show that the source was not modified.
   generated or absent.
   Date/Author: 2026-07-18 / human owner direction to prefer tested decoding
   evidence and the most modern compatible encoding.
+
+- Decision: Infer a missing by-value attachment MIME type only from an exact,
+  format-defined leading signature whose media type is unambiguous.
+  Rationale: PDF, PNG, JPEG JFIF, GIF, and classic TIFF are distinguishable
+  within eleven bytes and do not require filename trust or payload
+  materialization. ZIP and OLE identify containers rather than their contained
+  document type, while arbitrary text and legacy code pages admit multiple
+  interpretations. Those cases remain unlabeled rather than receiving a
+  plausible but unproven value.
+  Date/Author: 2026-07-18 / human owner direction to use data decoding when
+  tests establish a clear winner.
 
 ## Outcomes & Retrospective
 

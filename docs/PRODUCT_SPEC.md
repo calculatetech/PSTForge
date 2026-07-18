@@ -212,6 +212,13 @@ properties are preserved when their MAPI type and value can be serialized
 without ambiguity. An unsupported property is recorded on its item and does
 not discard otherwise usable mail. An attachment failure leaves the parent
 mail partial rather than failed when the remaining message can be written.
+PSTForge preserves a nonempty source attachment MIME type. When that property
+is absent on a complete by-value attachment, PSTForge may derive
+`application/pdf`, `image/png`, `image/jpeg`, `image/gif`, or `image/tiff` from
+the format's exact leading signature after reading at most eleven verified
+payload bytes. It does not infer text types, use filenames, or label container
+formats such as ZIP or OLE when the contained media subtype remains ambiguous.
+An unrecognized attachment remains unlabeled rather than receiving a guess.
 
 Writer inputs use typed recipient roles, body formats, attachment content,
 named-property identities, and raw-property values. Named-property identifiers

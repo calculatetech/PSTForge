@@ -1087,12 +1087,19 @@ fn translate_attachment(
                 format!("Recovered attachment {}", attachment.index)
             }
         });
-    let mime_type = mime_type.or_else(|| {
-        attachment.embedded.is_some().then(|| {
+    let mime_type = if let Some(source) = mime_type {
+        Some(source)
+    } else if attachment.embedded.is_some() {
+        reconstructions.record_derived(ReconstructedField::AttachmentMimeType);
+        Some("message/rfc822".to_owned())
+    } else if let Some(data) = &attachment.data {
+        infer_attachment_mime(job, mail, data)?.map(|value| {
             reconstructions.record_derived(ReconstructedField::AttachmentMimeType);
-            "message/rfc822".to_owned()
+            value.to_owned()
         })
-    });
+    } else {
+        None
+    };
     if rendering_position.is_none() {
         reconstructions.record_generated(ReconstructedField::AttachmentRenderingPosition);
     }
@@ -1367,6 +1374,48 @@ fn record_internet_codepage_provenance(
         reconstructions.record_derived(ReconstructedField::InternetCodepage);
     } else {
         reconstructions.record_generated(ReconstructedField::InternetCodepage);
+    }
+}
+
+fn infer_attachment_mime(
+    job: &TranslationSource<'_>,
+    mail: &CanonicalMail,
+    blob: &SpooledBlob,
+) -> Result<Option<&'static str>, CanonicalWriteError> {
+    const MAX_SIGNATURE_BYTES: u64 = 11;
+    let expected = usize::try_from(blob.byte_len.min(MAX_SIGNATURE_BYTES)).map_err(|_| {
+        CanonicalWriteError::InvalidCandidate {
+            item_key: mail.durable_item_key.clone(),
+            detail: "attachment signature length does not fit memory index".to_owned(),
+        }
+    })?;
+    let file = job.open_blob(blob)?;
+    let mut bytes = Vec::with_capacity(expected);
+    file.take(blob.byte_len.min(MAX_SIGNATURE_BYTES))
+        .read_to_end(&mut bytes)
+        .map_err(|source| CanonicalWriteError::BlobRead {
+            item_key: mail.durable_item_key.clone(),
+            source,
+        })?;
+    if bytes.len() != expected {
+        return invalid(mail, "attachment length changed while reading signature");
+    }
+    Ok(mime_from_signature(&bytes))
+}
+
+fn mime_from_signature(bytes: &[u8]) -> Option<&'static str> {
+    if bytes.starts_with(b"%PDF-") {
+        Some("application/pdf")
+    } else if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+        Some("image/png")
+    } else if bytes.starts_with(&[0xFF, 0xD8, 0xFF, 0xE0]) && bytes.get(6..11) == Some(b"JFIF\0") {
+        Some("image/jpeg")
+    } else if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
+        Some("image/gif")
+    } else if bytes.starts_with(b"II*\0") || bytes.starts_with(b"MM\0*") {
+        Some("image/tiff")
+    } else {
+        None
     }
 }
 
@@ -1888,16 +1937,20 @@ mod tests {
 
     use std::io::Cursor;
 
+    use libpff_sys::{
+        CatalogEvent, CatalogProvenance, CatalogSink, PropertyDescriptor, PropertyOwner,
+        RecoveryUnit,
+    };
     use pstforge_job::{DurableCatalogSink, ReconstructedField, SpooledBlob};
     use tempfile::tempdir;
 
     use super::{
         CanonicalWriteError, PartBuildOptions, attachment_property_type_is_preservable,
         build_part_writer_input, build_part_writer_input_with_folders_interruptible,
-        contain_body_metadata, named_property_set, recipient_property_value_matches,
-        record_internet_codepage_provenance, supported_message_class,
-        valid_compressed_rtf_container, valid_utf8_stream, valid_utf16_stream,
-        writer_stream_type_is_supported,
+        contain_body_metadata, mime_from_signature, named_property_set,
+        recipient_property_value_matches, record_internet_codepage_provenance,
+        supported_message_class, valid_compressed_rtf_container, valid_utf8_stream,
+        valid_utf16_stream, writer_stream_type_is_supported,
     };
     use crate::{
         CanonicalAttachment, CanonicalFolder, CanonicalFolderLocation, CanonicalFolderRole,
@@ -1938,6 +1991,272 @@ mod tests {
         let mut source_value = Default::default();
         record_internet_codepage_provenance(Some(1252), false, &mut source_value);
         assert!(source_value.is_empty());
+    }
+
+    #[test]
+    fn attachment_mime_signatures_are_narrow_and_unambiguous() {
+        for (bytes, expected) in [
+            (&b"%PDF-1.7"[..], "application/pdf"),
+            (&b"\x89PNG\r\n\x1a\nrest"[..], "image/png"),
+            (&b"\xFF\xD8\xFF\xE0\x00\x10JFIF\0"[..], "image/jpeg"),
+            (&b"GIF87arest"[..], "image/gif"),
+            (&b"GIF89arest"[..], "image/gif"),
+            (&b"II*\0rest"[..], "image/tiff"),
+            (&b"MM\0*rest"[..], "image/tiff"),
+        ] {
+            assert_eq!(mime_from_signature(bytes), Some(expected));
+        }
+        for ambiguous in [
+            &b""[..],
+            &b"%PDF"[..],
+            &b"\xFF\xD8\xFF"[..],
+            &b"\xFF\xD8\xFF\xE1invalid"[..],
+            &b"PK\x03\x04"[..],
+            &b"\xD0\xCF\x11\xE0\xA1\xB1\x1A\xE1"[..],
+            &b"plain text"[..],
+        ] {
+            assert_eq!(mime_from_signature(ambiguous), None);
+        }
+    }
+
+    #[test]
+    fn missing_attachment_mime_is_derived_from_verified_payload_prefix()
+    -> Result<(), Box<dyn std::error::Error>> {
+        fn send(
+            sink: &mut DurableCatalogSink,
+            event: CatalogEvent<'_>,
+        ) -> Result<(), std::io::Error> {
+            CatalogSink::event(sink, event).map_err(std::io::Error::other)
+        }
+
+        let directory = tempdir()?;
+        let mut job = DurableCatalogSink::create(&directory.path().join("job"))?;
+        let unit = RecoveryUnit::Recovered { index: 0 };
+        let payload = b"%PDF-1.7\ncheckpoint";
+        let truncated_jpeg = b"\xFF\xD8\xFF";
+        let source_mime = "application/x-owner\0"
+            .encode_utf16()
+            .flat_map(u16::to_le_bytes)
+            .collect::<Vec<_>>();
+        send(&mut job, CatalogEvent::UnitStart(unit))?;
+        send(
+            &mut job,
+            CatalogEvent::MessageStart {
+                id: 7,
+                provenance: CatalogProvenance::Recovered,
+                recovery_index: Some(0),
+                folder_id: None,
+                parent_message_id: None,
+                parent_attachment_index: None,
+                embedded_path: Vec::new(),
+                associated: false,
+                item_type: None,
+                message_class: Some("IPM.Note".to_owned()),
+                subject: Some("MIME signature checkpoint".to_owned()),
+                sender_name: Some("PSTForge".to_owned()),
+                sender_email: Some("sender@example.com".to_owned()),
+                submit_filetime: Some(1),
+                delivery_filetime: Some(1),
+                supported: true,
+            },
+        )?;
+        send(
+            &mut job,
+            CatalogEvent::AttachmentStart {
+                message_id: 7,
+                index: 0,
+                attachment_type: Some(i32::from(b'd')),
+                data_size: Some(u64::try_from(payload.len())?),
+                filename: Some("checkpoint.pdf".to_owned()),
+            },
+        )?;
+        let mime_descriptor = PropertyDescriptor {
+            owner: PropertyOwner::Attachment {
+                message_id: 7,
+                index: 0,
+            },
+            record_set_index: 0,
+            entry_index: 0,
+            entry_type: Some(0x370E),
+            value_type: Some(0x001F),
+            data_size: u64::try_from(source_mime.len())?,
+        };
+        send(&mut job, CatalogEvent::PropertyStart(mime_descriptor))?;
+        send(
+            &mut job,
+            CatalogEvent::PropertyData {
+                descriptor: mime_descriptor,
+                bytes: &source_mime,
+            },
+        )?;
+        send(&mut job, CatalogEvent::PropertyEnd(mime_descriptor))?;
+        send(
+            &mut job,
+            CatalogEvent::AttachmentData {
+                message_id: 7,
+                index: 0,
+                bytes: payload,
+            },
+        )?;
+        send(
+            &mut job,
+            CatalogEvent::AttachmentEnd {
+                message_id: 7,
+                index: 0,
+            },
+        )?;
+        send(
+            &mut job,
+            CatalogEvent::AttachmentStart {
+                message_id: 7,
+                index: 1,
+                attachment_type: Some(i32::from(b'd')),
+                data_size: Some(u64::try_from(truncated_jpeg.len())?),
+                filename: Some("truncated.jpg".to_owned()),
+            },
+        )?;
+        send(
+            &mut job,
+            CatalogEvent::AttachmentData {
+                message_id: 7,
+                index: 1,
+                bytes: truncated_jpeg,
+            },
+        )?;
+        send(
+            &mut job,
+            CatalogEvent::AttachmentEnd {
+                message_id: 7,
+                index: 1,
+            },
+        )?;
+        send(
+            &mut job,
+            CatalogEvent::MessageEnd {
+                id: 7,
+                complete: true,
+            },
+        )?;
+        send(&mut job, CatalogEvent::UnitEnd(unit))?;
+        let events = job
+            .spooled_candidates()?
+            .into_iter()
+            .flat_map(|candidate| candidate.events)
+            .collect::<Vec<_>>();
+        let mut attachment_blobs = events
+            .iter()
+            .filter(|event| event.kind == "attachment_data")
+            .filter_map(|event| event.blob.clone());
+        let blob = attachment_blobs
+            .next()
+            .ok_or("missing attachment payload blob")?;
+        let truncated_blob = attachment_blobs
+            .next()
+            .ok_or("missing truncated attachment payload blob")?;
+        let mime_blob = events
+            .iter()
+            .find(|event| event.kind == "property")
+            .and_then(|event| event.blob.clone())
+            .ok_or("missing attachment MIME blob")?;
+        let mail = CanonicalMail {
+            durable_item_key: "recovered:-:0:0".to_owned(),
+            key: ItemKey {
+                provenance: RecoveryProvenance::Recovered,
+                source_node_id: None,
+                recovery_index: Some(0),
+                occurrence: 0,
+            },
+            folder_path: vec!["Recovered".to_owned()],
+            folder_location: CanonicalFolderLocation::IpmSubtree,
+            folder_role: CanonicalFolderRole::Ordinary,
+            placement: CanonicalMessagePlacement::Normal,
+            message_class: Some("IPM.Note".to_owned()),
+            subject: Some("MIME signature checkpoint".to_owned()),
+            sender_name: Some("PSTForge".to_owned()),
+            sender_email: Some("sender@example.com".to_owned()),
+            submit_filetime: Some(1),
+            delivery_filetime: Some(1),
+            recipients: Vec::new(),
+            attachments: vec![
+                CanonicalAttachment {
+                    index: 0,
+                    attachment_type: Some(i32::from(b'd')),
+                    filename: Some("checkpoint.pdf".to_owned()),
+                    declared_size: Some(u64::try_from(payload.len())?),
+                    data: Some(blob),
+                    data_complete: true,
+                    properties: Vec::new(),
+                    embedded: None,
+                },
+                CanonicalAttachment {
+                    index: 1,
+                    attachment_type: Some(i32::from(b'd')),
+                    filename: Some("truncated.jpg".to_owned()),
+                    declared_size: Some(u64::try_from(truncated_jpeg.len())?),
+                    data: Some(truncated_blob),
+                    data_complete: true,
+                    properties: Vec::new(),
+                    embedded: None,
+                },
+            ],
+            properties: Vec::new(),
+            completeness: ContentCompleteness::Complete,
+            spooled_bytes: u64::try_from(payload.len())?,
+        };
+
+        let input = build_part_writer_input(
+            &job,
+            &[&mail],
+            &"0".repeat(64),
+            "balanced",
+            4_294_967_296,
+            1,
+        )?;
+        let attachment = &input.store.folders[0].messages[0].attachments[0];
+        assert_eq!(attachment.mime_type.as_deref(), Some("application/pdf"));
+        assert_eq!(
+            input.store.folders[0].messages[0].attachments[1].mime_type,
+            None
+        );
+        assert_eq!(
+            input
+                .reconstructions
+                .derived
+                .get(&ReconstructedField::AttachmentMimeType),
+            Some(&1)
+        );
+        assert!(!input.partial);
+
+        let mut source_wins = mail;
+        source_wins.attachments[0]
+            .properties
+            .push(CanonicalProperty {
+                owner: "attachment".to_owned(),
+                owner_index: Some(0),
+                record_set_index: 0,
+                entry_index: 0,
+                property_id: Some(0x370E),
+                value_type: Some(0x001F),
+                named_property: None,
+                blob: mime_blob,
+            });
+        let source_input = build_part_writer_input(
+            &job,
+            &[&source_wins],
+            &"0".repeat(64),
+            "balanced",
+            4_294_967_296,
+            1,
+        )?;
+        let attachment = &source_input.store.folders[0].messages[0].attachments[0];
+        assert_eq!(attachment.mime_type.as_deref(), Some("application/x-owner"));
+        assert!(
+            !source_input
+                .reconstructions
+                .derived
+                .contains_key(&ReconstructedField::AttachmentMimeType)
+        );
+        Ok(())
     }
 
     #[test]
