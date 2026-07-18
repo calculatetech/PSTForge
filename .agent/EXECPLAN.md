@@ -1660,6 +1660,21 @@ work. Hash and identity evidence show that the source was not modified.
       and a fresh final-state review returned `CLEAN`. Production code and PST
       bytes are unchanged, so no human ScanPST candidate is required. Human
       approval remains required before commit and push.
+    - [x] (2026-07-18) Separated the mixed EMP-02 classification without
+      changing output. MS-PST 2.7.3.3 explicitly mandates six empty
+      table-template objects at their section-specific NIDs; record their
+      presence and emptiness as verified MSG-13 behavior, four exact schemas,
+      and the existing EMP-06 hierarchy/contents exceptions. Narrow EMP-02 to
+      the three additional
+      ScanPST-derived index nodes whose fixed NIDs, schemas, and reserved type
+      bits remain undocumented. The first review rejected an overbroad schema
+      claim because hierarchy/contents types remain EMP-06; the final wording
+      preserves those exceptions and verifies only the supported scope. One
+      full-gate run hit the unchanged SIGKILL timing test before SQLite schema
+      initialization; its focused rerun passed, and the repeated complete gate
+      passed at `.agent/test-results/1784394282-full`. A fresh final-state
+      review returned `CLEAN`. No production code, PST bytes, or human
+      acceptance behavior changed.
     - [x] Create `docs/WRITER_CONFORMANCE.md` with one traceable row for every
       existing store, NDB, LTP, folder, message, recipient, attachment,
       embedded-message, associated-content, named-property, and publication
@@ -2930,6 +2945,17 @@ work. Hash and identity evidence show that the source was not modified.
   regression and passed ScanPST, Outlook, and MailPlus, making the proven
   interoperable behavior the most correct result for this conflict.
   Date/Author: 2026-07-18 / human owner acceptance of the proven behavior.
+
+- Decision: A fully automated conformance recovery point may be committed and
+  pushed without a separate approval message after its required gate and fresh
+  final-state review pass, provided it changes no accepted PST bytes, requires
+  no empirical product choice, and needs no ScanPST, Outlook, or MailPlus
+  evidence. Any writer-byte change, unresolved empirical disposition, or
+  human interoperability step still pauses before commit.
+  Rationale: Small normative documentation and regression checkpoints provide
+  clean recovery points but do not benefit from an idle approval round trip
+  when all acceptance evidence is machine-verifiable.
+  Date/Author: 2026-07-18 / human owner direction.
 
 ## Outcomes & Retrospective
 

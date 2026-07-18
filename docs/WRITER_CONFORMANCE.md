@@ -450,6 +450,13 @@ overview reference is replaced by a section-specific reference.
 - **Implementation:** `calendar_exception_attachment_*`, `validate_attachment_fidelity`
 - **Evidence:** `calendar_exception_attachment_properties_round_trip`; exact libpff source/output fingerprint; ScanPST/Outlook accepted checkpoint
 
+### MSG-13
+- **Status:** Verified for the presence, emptiness, and specified NIDs of all six required table-template objects. Associated-contents, search-contents, recipient, and attachment schemas agree exactly; the hierarchy/contents type conflicts remain isolated in EMP-06. Outlook-maintained index nodes remain separately isolated in EMP-02.
+- **Requirement:** Every PST contains empty hierarchy, contents, associated-contents, search-contents, recipient, and attachment table templates at their specified NIDs; each template's schema is tracked by its section-specific entry or explicit exception
+- **Sources:** MS-PST 2.7.3.3; PST-HIERARCHY; PST-CONTENTS; PST-FAI; PST-SEARCH-TC; PST-RECIP-TC; PST-ATTACH-TC
+- **Implementation:** `NID_*_TABLE_TEMPLATE`, `hierarchy_columns`, `contents_columns`, `associated_columns`, `search_contents_columns`, `recipient_columns`, `attachment_columns`, fixed template blocks and `node_entries`
+- **Evidence:** `scanpst_required_metadata_is_serialized`; `new_store_round_trips_through_upstream_reader`; ScanPST-clean candidates
+
 ## Completed Message-Class Preservation
 
 These entries verify that completed 0.4.2 checkpoints preserve the source class,
@@ -517,9 +524,9 @@ establish their format. No entry authorizes removing the existing output.
 - **Evidence:** ScanPST accepts current candidates; historical omission caused HMP repair findings
 
 ### EMP-02
-- **Status:** Partial/Empirical. Retain unchanged while separating documented mandatory-node requirements from undocumented template bytes.
-- **Requirement:** Contents/search/attachment index template nodes use fixed IDs, schemas, and a persisted-view template node whose NID has reserved type bits
-- **Sources:** MS-PST 2.7.1 and table-template sections document mandatory nodes; exact `0x6B6` persisted-view payload/type origin not yet located
+- **Status:** Empirical Outlook-maintained output. Retain unchanged pending control comparison and human disposition.
+- **Requirement:** Contents, search, and attachment index nodes use fixed NIDs `0x6B6`, `0x6D7`, and `0x6F8`, ScanPST-derived empty schemas, and reserved NID type bits that do not advance a creation counter
+- **Sources:** MS-PST mandates the six table templates in MSG-13 but does not define these three additional index nodes, their schemas, or their reserved NID type
 - **Implementation:** `NID_*_INDEX_TEMPLATE`, `contents_index_columns`, `search_index_columns`, `attachment_index_columns`, `update_nid_counter`
 - **Evidence:** `scanpst_required_metadata_is_serialized`; ScanPST accepts current candidates
 
