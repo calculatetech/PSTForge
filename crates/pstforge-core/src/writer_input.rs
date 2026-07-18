@@ -594,13 +594,13 @@ fn translate_message(
         }
     }
 
-    let internet_codepage = internet_codepage.unwrap_or_else(|| {
-        reconstructions.record_generated(ReconstructedField::InternetCodepage);
-        65001
-    });
+    let source_internet_codepage = internet_codepage;
+    let internet_codepage = source_internet_codepage.unwrap_or(65001);
+    let mut html_has_utf8_evidence = false;
     if internet_codepage == 65001 {
         if let Some(property) = html_property {
-            if !valid_utf8_property(job, mail, property)? {
+            html_has_utf8_evidence = valid_utf8_property(job, mail, property)?;
+            if !html_has_utf8_evidence {
                 spooled_properties.retain(|property| property.id != 0x1013);
                 partial = true;
                 omitted_properties = omitted_properties.saturating_add(1);
@@ -613,6 +613,11 @@ fn translate_message(
             }
         }
     }
+    record_internet_codepage_provenance(
+        source_internet_codepage,
+        html_has_utf8_evidence,
+        &mut reconstructions,
+    );
 
     let mut recipient_property_count = 0_u64;
     for recipient in &mail.recipients {
@@ -1084,7 +1089,7 @@ fn translate_attachment(
         });
     let mime_type = mime_type.or_else(|| {
         attachment.embedded.is_some().then(|| {
-            reconstructions.record_generated(ReconstructedField::AttachmentMimeType);
+            reconstructions.record_derived(ReconstructedField::AttachmentMimeType);
             "message/rfc822".to_owned()
         })
     });
@@ -1347,6 +1352,21 @@ fn contained_filetime(value: Option<u64>) -> (i64, bool) {
             Err(_) => (0, true),
         },
         None => (0, false),
+    }
+}
+
+fn record_internet_codepage_provenance(
+    source: Option<i32>,
+    html_has_utf8_evidence: bool,
+    reconstructions: &mut ReconstructionCounts,
+) {
+    if source.is_some() {
+        return;
+    }
+    if html_has_utf8_evidence {
+        reconstructions.record_derived(ReconstructedField::InternetCodepage);
+    } else {
+        reconstructions.record_generated(ReconstructedField::InternetCodepage);
     }
 }
 
@@ -1875,8 +1895,9 @@ mod tests {
         CanonicalWriteError, PartBuildOptions, attachment_property_type_is_preservable,
         build_part_writer_input, build_part_writer_input_with_folders_interruptible,
         contain_body_metadata, named_property_set, recipient_property_value_matches,
-        supported_message_class, valid_compressed_rtf_container, valid_utf8_stream,
-        valid_utf16_stream, writer_stream_type_is_supported,
+        record_internet_codepage_provenance, supported_message_class,
+        valid_compressed_rtf_container, valid_utf8_stream, valid_utf16_stream,
+        writer_stream_type_is_supported,
     };
     use crate::{
         CanonicalAttachment, CanonicalFolder, CanonicalFolderLocation, CanonicalFolderRole,
@@ -1890,6 +1911,33 @@ mod tests {
     #[test]
     fn libpff_reserved_mapi_guid_is_normalized() {
         assert_eq!(named_property_set([0; 16]), NamedPropertySet::Mapi);
+    }
+
+    #[test]
+    fn missing_internet_codepage_is_derived_only_from_valid_utf8_html() {
+        let mut valid_html = Default::default();
+        record_internet_codepage_provenance(None, true, &mut valid_html);
+        assert_eq!(
+            valid_html
+                .derived
+                .get(&ReconstructedField::InternetCodepage),
+            Some(&1)
+        );
+        assert!(valid_html.generated.is_empty());
+
+        let mut ambiguous = Default::default();
+        record_internet_codepage_provenance(None, false, &mut ambiguous);
+        assert_eq!(
+            ambiguous
+                .generated
+                .get(&ReconstructedField::InternetCodepage),
+            Some(&1)
+        );
+        assert!(ambiguous.derived.is_empty());
+
+        let mut source_value = Default::default();
+        record_internet_codepage_provenance(Some(1252), false, &mut source_value);
+        assert!(source_value.is_empty());
     }
 
     #[test]
@@ -2103,7 +2151,20 @@ mod tests {
             delivery_filetime: None,
             recipients: Vec::new(),
             attachments: Vec::new(),
-            properties: Vec::new(),
+            properties: vec![CanonicalProperty {
+                owner: "message".to_owned(),
+                owner_index: None,
+                record_set_index: 0,
+                entry_index: 0,
+                property_id: Some(0x1013),
+                value_type: Some(0x0102),
+                named_property: None,
+                blob: SpooledBlob {
+                    sha256: "0".repeat(64),
+                    byte_len: 0,
+                    pack_offset: None,
+                },
+            }],
             completeness: ContentCompleteness::Complete,
             spooled_bytes: 0,
         };
@@ -2534,6 +2595,19 @@ mod tests {
         )?;
         assert!(!clean.partial);
         assert_eq!(clean.item_keys, ["normal:2:-:0", "normal:3:-:0"]);
+        assert_eq!(
+            clean
+                .reconstructions
+                .derived
+                .get(&ReconstructedField::AttachmentMimeType),
+            Some(&1)
+        );
+        assert!(
+            !clean
+                .reconstructions
+                .generated
+                .contains_key(&ReconstructedField::AttachmentMimeType)
+        );
         pstforge_pst::writer::create_mail_store(
             directory.path().join("report-message.pst"),
             &clean.store,
