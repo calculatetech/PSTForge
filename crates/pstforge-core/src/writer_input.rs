@@ -1076,33 +1076,44 @@ fn translate_attachment(
     } else {
         return Ok(None);
     };
-    let mime_type = if let Some(source) = mime_type.filter(|value| !value.is_empty()) {
+    let source_mime = mime_type.filter(|value| !value.is_empty());
+    let source_filename = attachment
+        .filename
+        .clone()
+        .filter(|value| !value.is_empty());
+    let detected_mime =
+        if attachment.embedded.is_none() && (source_mime.is_none() || source_filename.is_none()) {
+            if let Some(data) = &attachment.data {
+                infer_attachment_mime(job, mail, data, attachment.filename.as_deref())?
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+    let mime_type = if let Some(source) = source_mime {
         Some(source)
     } else if attachment.embedded.is_some() {
         reconstructions.record_derived(ReconstructedField::AttachmentMimeType);
         Some("message/rfc822".to_owned())
-    } else if let Some(data) = &attachment.data {
-        infer_attachment_mime(job, mail, data, attachment.filename.as_deref())?.map(|value| {
+    } else {
+        detected_mime.map(|value| {
             reconstructions.record_derived(ReconstructedField::AttachmentMimeType);
             value.to_owned()
         })
-    } else {
-        None
     };
-    let filename = attachment
-        .filename
-        .clone()
-        .filter(|value| !value.is_empty())
-        .unwrap_or_else(|| {
-            reconstructions.record_generated(ReconstructedField::AttachmentFilename);
-            if attachment.embedded.is_some() {
-                format!("Embedded message {}.msg", attachment.index)
-            } else if mime_type.is_none() {
-                format!("Recovered attachment {}.bin", attachment.index)
-            } else {
-                format!("Recovered attachment {}", attachment.index)
-            }
-        });
+    let filename = source_filename.unwrap_or_else(|| {
+        reconstructions.record_generated(ReconstructedField::AttachmentFilename);
+        if attachment.embedded.is_some() {
+            format!("Embedded message {}.msg", attachment.index)
+        } else {
+            let extension = detected_mime
+                .and_then(extension_for_mime)
+                .or_else(|| mime_type.as_deref().and_then(extension_for_mime))
+                .unwrap_or("bin");
+            format!("Recovered attachment {}.{extension}", attachment.index)
+        }
+    });
     if rendering_position.is_none() {
         reconstructions.record_generated(ReconstructedField::AttachmentRenderingPosition);
     }
@@ -1398,6 +1409,43 @@ fn infer_attachment_mime(
             source,
         }
     })
+}
+
+fn extension_for_mime(value: &str) -> Option<&'static str> {
+    let media_type = value.split(';').next()?.trim();
+    if media_type.eq_ignore_ascii_case("application/pdf") {
+        Some("pdf")
+    } else if media_type.eq_ignore_ascii_case("image/png") {
+        Some("png")
+    } else if media_type.eq_ignore_ascii_case("image/jpeg") {
+        Some("jpg")
+    } else if media_type.eq_ignore_ascii_case("image/gif") {
+        Some("gif")
+    } else if media_type.eq_ignore_ascii_case("image/tiff") {
+        Some("tif")
+    } else if media_type.eq_ignore_ascii_case("application/zip") {
+        Some("zip")
+    } else if media_type.eq_ignore_ascii_case(
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    ) {
+        Some("docx")
+    } else if media_type
+        .eq_ignore_ascii_case("application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+    {
+        Some("xlsx")
+    } else if media_type.eq_ignore_ascii_case(
+        "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+    ) {
+        Some("pptx")
+    } else if media_type.eq_ignore_ascii_case("application/msword") {
+        Some("doc")
+    } else if media_type.eq_ignore_ascii_case("application/vnd.ms-excel") {
+        Some("xls")
+    } else if media_type.eq_ignore_ascii_case("application/vnd.ms-powerpoint") {
+        Some("ppt")
+    } else {
+        None
+    }
 }
 
 fn body_type_is_valid(id: u16, property_type: u16) -> bool {
@@ -1928,10 +1976,10 @@ mod tests {
     use super::{
         CanonicalWriteError, PartBuildOptions, attachment_property_type_is_preservable,
         build_part_writer_input, build_part_writer_input_with_folders_interruptible,
-        contain_body_metadata, named_property_set, recipient_property_value_matches,
-        record_internet_codepage_provenance, supported_message_class,
-        valid_compressed_rtf_container, valid_utf8_stream, valid_utf16_stream,
-        writer_stream_type_is_supported,
+        contain_body_metadata, extension_for_mime, named_property_set,
+        recipient_property_value_matches, record_internet_codepage_provenance,
+        supported_message_class, valid_compressed_rtf_container, valid_utf8_stream,
+        valid_utf16_stream, writer_stream_type_is_supported,
     };
     use crate::{
         CanonicalAttachment, CanonicalFolder, CanonicalFolderLocation, CanonicalFolderRole,
@@ -2002,6 +2050,30 @@ mod tests {
     }
 
     #[test]
+    fn generated_attachment_extensions_require_recognized_mime() {
+        for (mime, expected) in [
+            ("application/pdf", "pdf"),
+            ("IMAGE/JPEG; name=checkpoint", "jpg"),
+            ("application/zip", "zip"),
+            (
+                "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                "docx",
+            ),
+            ("application/vnd.ms-excel", "xls"),
+        ] {
+            assert_eq!(extension_for_mime(mime), Some(expected));
+        }
+        for ambiguous in [
+            "",
+            "application/octet-stream",
+            "text/plain",
+            "application/x-owner",
+        ] {
+            assert_eq!(extension_for_mime(ambiguous), None);
+        }
+    }
+
+    #[test]
     fn missing_attachment_mime_is_derived_from_verified_payload_prefix()
     -> Result<(), Box<dyn std::error::Error>> {
         fn send(
@@ -2017,6 +2089,10 @@ mod tests {
         let payload = b"%PDF-1.7\ncheckpoint";
         let truncated_jpeg = b"\xFF\xD8\xFF";
         let source_mime = "application/x-owner\0"
+            .encode_utf16()
+            .flat_map(u16::to_le_bytes)
+            .collect::<Vec<_>>();
+        let docx_mime = "application/vnd.openxmlformats-officedocument.wordprocessingml.document\0"
             .encode_utf16()
             .flat_map(u16::to_le_bytes)
             .collect::<Vec<_>>();
@@ -2114,6 +2190,51 @@ mod tests {
         )?;
         send(
             &mut job,
+            CatalogEvent::AttachmentStart {
+                message_id: 7,
+                index: 2,
+                attachment_type: Some(i32::from(b'd')),
+                data_size: Some(u64::try_from(truncated_jpeg.len())?),
+                filename: None,
+            },
+        )?;
+        let docx_mime_descriptor = PropertyDescriptor {
+            owner: PropertyOwner::Attachment {
+                message_id: 7,
+                index: 2,
+            },
+            record_set_index: 0,
+            entry_index: 0,
+            entry_type: Some(0x370E),
+            value_type: Some(0x001F),
+            data_size: u64::try_from(docx_mime.len())?,
+        };
+        send(&mut job, CatalogEvent::PropertyStart(docx_mime_descriptor))?;
+        send(
+            &mut job,
+            CatalogEvent::PropertyData {
+                descriptor: docx_mime_descriptor,
+                bytes: &docx_mime,
+            },
+        )?;
+        send(&mut job, CatalogEvent::PropertyEnd(docx_mime_descriptor))?;
+        send(
+            &mut job,
+            CatalogEvent::AttachmentData {
+                message_id: 7,
+                index: 2,
+                bytes: truncated_jpeg,
+            },
+        )?;
+        send(
+            &mut job,
+            CatalogEvent::AttachmentEnd {
+                message_id: 7,
+                index: 2,
+            },
+        )?;
+        send(
+            &mut job,
             CatalogEvent::MessageEnd {
                 id: 7,
                 complete: true,
@@ -2135,11 +2256,21 @@ mod tests {
         let truncated_blob = attachment_blobs
             .next()
             .ok_or("missing truncated attachment payload blob")?;
-        let mime_blob = events
+        let source_mime_blob = events
             .iter()
-            .find(|event| event.kind == "property")
-            .and_then(|event| event.blob.clone())
-            .ok_or("missing attachment MIME blob")?;
+            .filter(|event| event.kind == "property")
+            .filter_map(|event| event.blob.clone())
+            .next()
+            .ok_or("missing source attachment MIME blob")?;
+        let docx_mime_blob = events
+            .iter()
+            .filter(|event| event.kind == "property")
+            .filter_map(|event| event.blob.clone())
+            .nth(1)
+            .ok_or("missing DOCX attachment MIME blob")?;
+        let docx_payload_blob = attachment_blobs
+            .next()
+            .ok_or("missing DOCX attachment payload blob")?;
         let mail = CanonicalMail {
             durable_item_key: "recovered:-:0:0".to_owned(),
             key: ItemKey {
@@ -2163,7 +2294,7 @@ mod tests {
                 CanonicalAttachment {
                     index: 0,
                     attachment_type: Some(i32::from(b'd')),
-                    filename: Some("checkpoint.pdf".to_owned()),
+                    filename: None,
                     declared_size: Some(u64::try_from(payload.len())?),
                     data: Some(blob),
                     data_complete: true,
@@ -2178,6 +2309,25 @@ mod tests {
                     data: Some(truncated_blob),
                     data_complete: true,
                     properties: Vec::new(),
+                    embedded: None,
+                },
+                CanonicalAttachment {
+                    index: 2,
+                    attachment_type: Some(i32::from(b'd')),
+                    filename: None,
+                    declared_size: Some(u64::try_from(truncated_jpeg.len())?),
+                    data: Some(docx_payload_blob),
+                    data_complete: true,
+                    properties: vec![CanonicalProperty {
+                        owner: "attachment".to_owned(),
+                        owner_index: Some(2),
+                        record_set_index: 0,
+                        entry_index: 0,
+                        property_id: Some(0x370E),
+                        value_type: Some(0x001F),
+                        named_property: None,
+                        blob: docx_mime_blob,
+                    }],
                     embedded: None,
                 },
             ],
@@ -2196,6 +2346,7 @@ mod tests {
         )?;
         let attachment = &input.store.folders[0].messages[0].attachments[0];
         assert_eq!(attachment.mime_type.as_deref(), Some("application/pdf"));
+        assert_eq!(attachment.filename, "Recovered attachment 0.pdf");
         assert_eq!(attachment.rendering_position, None);
         assert_eq!(attachment.flags, 0);
         assert_eq!(
@@ -2205,6 +2356,16 @@ mod tests {
         assert_eq!(
             input.store.folders[0].messages[0].attachments[1].filename,
             "Recovered attachment 1.bin"
+        );
+        assert_eq!(
+            input.store.folders[0].messages[0].attachments[2]
+                .mime_type
+                .as_deref(),
+            Some("application/vnd.openxmlformats-officedocument.wordprocessingml.document")
+        );
+        assert_eq!(
+            input.store.folders[0].messages[0].attachments[2].filename,
+            "Recovered attachment 2.docx"
         );
         assert_eq!(
             input
@@ -2218,14 +2379,21 @@ mod tests {
                 .reconstructions
                 .generated
                 .get(&ReconstructedField::AttachmentRenderingPosition),
-            Some(&2)
+            Some(&3)
         );
         assert_eq!(
             input
                 .reconstructions
                 .generated
                 .get(&ReconstructedField::AttachmentFlags),
-            Some(&2)
+            Some(&3)
+        );
+        assert_eq!(
+            input
+                .reconstructions
+                .generated
+                .get(&ReconstructedField::AttachmentFilename),
+            Some(&3)
         );
         assert!(!input.partial);
         let neutral_defaults_pst = directory.path().join("neutral-attachment-defaults.pst");
@@ -2243,7 +2411,7 @@ mod tests {
                 property_id: Some(0x370E),
                 value_type: Some(0x001F),
                 named_property: None,
-                blob: mime_blob,
+                blob: source_mime_blob,
             });
         let source_input = build_part_writer_input(
             &job,
@@ -2255,6 +2423,7 @@ mod tests {
         )?;
         let attachment = &source_input.store.folders[0].messages[0].attachments[0];
         assert_eq!(attachment.mime_type.as_deref(), Some("application/x-owner"));
+        assert_eq!(attachment.filename, "Recovered attachment 0.pdf");
         assert!(
             !source_input
                 .reconstructions

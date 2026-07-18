@@ -1771,6 +1771,26 @@ work. Hash and identity evidence show that the source was not modified.
       focused review corrected overbroad rendering terminology, required
       completed-PST validation, and corrected the source page date. A fresh
       final-state review returned `CLEAN`.
+    - [x] (2026-07-18) Generate a correct deterministic extension when a
+      readable attachment has no nonempty source filename. Preserve every
+      source filename unchanged. For a generated name, payload-proven type
+      evidence outranks conflicting source MIME metadata, a recognized
+      preserved source MIME supplies the extension when content is
+      inconclusive, and all remaining by-value data uses `.bin`. Embedded
+      Message objects retain `.msg`. Supported mappings are bounded to the
+      already documented PDF, image, ZIP, and Office formats; filename
+      generation does not change payload or MIME bytes. Focused tests cover
+      mapping, MIME parameters/case, ambiguity, provenance counts, conflict
+      precedence, and completed PST validation. The combined-manifest full gate
+      passed at `.agent/test-results/1784402171-full`. The first focused review
+      required end-to-end coverage of the recognized-source-MIME fallback; the
+      remediated test publishes and validates that case, and a fresh final-state
+      review returned `CLEAN`. The focused candidate
+      `qualification-v042-generated-extensions-r1/parts/part-0001.pst` is
+      271,360 bytes with SHA-256
+      `544b37b9e862aa92442298c874f3afab05a99a4a9e6bd0b9d8f3117fabcab0f5`;
+      `pffinfo` and `readpst` accept it with `.pdf`, `.bin`, and `.docx`
+      generated names. The owner reports ScanPST and Outlook acceptance clean.
     - [x] Create `docs/WRITER_CONFORMANCE.md` with one traceable row for every
       existing store, NDB, LTP, folder, message, recipient, attachment,
       embedded-message, associated-content, named-property, and publication
@@ -3124,6 +3144,20 @@ work. Hash and identity evidence show that the source was not modified.
   entry limits further bound corrupt-container work.
   Date/Author: 2026-07-18 / human owner direction to cover common Office/ZIP
   documents and retain unknown data for later recovery analysis.
+
+- Decision: When an attachment has no nonempty source filename, generate a
+  deterministic extension from the strongest supported type evidence. A
+  payload-proven type controls the generated extension even when preserved
+  source MIME metadata conflicts; otherwise a recognized source MIME supplies
+  the extension. Use `.bin` when neither proves a supported type and `.msg` for
+  an embedded Message object. Never alter a nonempty source filename.
+  Rationale: A usable extension improves recovered-file handling without
+  modifying payload bytes or presenting an arbitrary guess. Content evidence
+  is stronger than potentially damaged metadata for a newly generated display
+  value, while preserving the original MIME property keeps the source fact
+  available for later analysis.
+  Date/Author: 2026-07-18 / human owner approval to use the correct extension
+  when possible.
 
 ## Outcomes & Retrospective
 

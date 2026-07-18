@@ -26,6 +26,16 @@ converts, repairs, or discards the original bytes.
    `Recovered attachment {index}.bin` name so the exact bytes remain available
    to later recovery and forensic tools.
 
+When the source filename is absent, PSTForge generates
+`Recovered attachment {index}.{extension}` from the strongest available type
+evidence. A payload-proven type takes precedence over a conflicting source MIME
+value for this generated display name, while the original MIME property itself
+remains unchanged. A recognized source MIME value supplies the extension when
+payload detection is inconclusive. Supported generated extensions are `.pdf`,
+`.png`, `.jpg`, `.gif`, `.tif`, `.zip`, `.docx`, `.xlsx`, `.pptx`, `.doc`,
+`.xls`, and `.ppt`. Other by-value payloads receive `.bin`; embedded Message
+objects receive `.msg`. PSTForge never changes a nonempty source filename.
+
 The filename and MIME type are separate MAPI properties:
 [PidTagAttachFilename](https://learn.microsoft.com/en-us/office/client-developer/outlook/mapi/pidtagattachfilename-canonical-property),
 [PidTagAttachLongFilename](https://learn.microsoft.com/en-us/office/client-developer/outlook/mapi/pidtagattachlongfilename-canonical-property),

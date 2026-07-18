@@ -224,8 +224,11 @@ source filename extension can serve as corroborating recovery evidence only
 when the payload is independently identified as the matching ZIP or CFB
 container and no stronger structural evidence conflicts. Unrecognized data
 remains unlabeled. When its source filename is also absent, the generated
-recovery filename ends in `.bin` so the byte-exact payload is available to
-later analysis.
+recovery filename uses the extension of a payload-proven supported type, then
+the extension of a recognized preserved source MIME type, and otherwise
+`.bin`. Embedded Message objects use `.msg`. Generated filename evidence never
+changes a nonempty source filename or replaces the preserved source MIME
+property.
 
 Writer inputs use typed recipient roles, body formats, attachment content,
 named-property identities, and raw-property values. Named-property identifiers
