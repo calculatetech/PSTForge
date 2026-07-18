@@ -293,6 +293,8 @@ pub struct MailFolderSpec {
     /// Non-empty path below the PST's mandatory IPM root.
     pub path: Vec<String>,
     pub role: MailFolderRole,
+    /// Source PR_CONTAINER_CLASS, or `IPF.Note` when the property was absent.
+    pub container_class: String,
     pub messages: Vec<MessageSpec>,
 }
 
@@ -1282,6 +1284,7 @@ struct FolderPlan<'a> {
     node: NodeId,
     parent: Option<usize>,
     children: Vec<usize>,
+    container_class: String,
 }
 
 fn plan_folders<'a>(
@@ -1291,6 +1294,7 @@ fn plan_folders<'a>(
 ) -> Result<Vec<FolderPlan<'a>>, WriterError> {
     let mut paths = BTreeMap::<Vec<String>, Vec<&MessageSpec>>::new();
     let mut roles = BTreeMap::<Vec<String>, MailFolderRole>::new();
+    let mut container_classes = BTreeMap::<Vec<String>, String>::new();
     if let Some(folders) = folders {
         let mut explicit_paths = BTreeSet::new();
         for folder in folders {
@@ -1309,10 +1313,17 @@ fn plan_folders<'a>(
                     "the Deleted Items role must identify a top-level folder".to_owned(),
                 ));
             }
+            validate_unicode("folder container class", &folder.container_class)?;
+            if folder.container_class.is_empty() {
+                return Err(WriterError::InvalidStructure(
+                    "folder container class must be non-empty".to_owned(),
+                ));
+            }
             for depth in 1..=folder.path.len() {
                 paths.entry(folder.path[..depth].to_vec()).or_default();
             }
             roles.insert(folder.path.clone(), folder.role);
+            container_classes.insert(folder.path.clone(), folder.container_class.clone());
             let messages = paths.get_mut(&folder.path).ok_or_else(|| {
                 WriterError::InvalidStructure("mail folder path was not planned".to_owned())
             })?;
@@ -1352,6 +1363,10 @@ fn plan_folders<'a>(
                 .then(|| path_indexes.get(&path[..path.len() - 1]).copied())
                 .flatten();
             let role = roles.get(&path).copied().unwrap_or_default();
+            let container_class = container_classes
+                .get(&path)
+                .cloned()
+                .unwrap_or_else(|| "IPF.Note".to_owned());
             let node = if role == MailFolderRole::DeletedItems {
                 node(NodeIdType::NormalFolder, DELETED_FOLDER_INDEX)?
             } else {
@@ -1368,6 +1383,7 @@ fn plan_folders<'a>(
                 node,
                 parent,
                 children: Vec::new(),
+                container_class,
             })
         })
         .collect::<Result<Vec<_>, WriterError>>()?;
@@ -1765,6 +1781,7 @@ fn validate_folder_hierarchy_shapes(folders: &[FolderPlan<'_>]) -> Result<(), Wr
                         .map_err(|_| WriterError::ValueTooLarge("folder message count"))?,
                     folder_unread_count(&child.messages)?,
                     !child.children.is_empty(),
+                    &child.container_class,
                 ))
             })
             .collect::<Result<Vec<_>, WriterError>>()?;
@@ -1783,6 +1800,7 @@ fn validate_folder_hierarchy_shapes(folders: &[FolderPlan<'_>]) -> Result<(), Wr
                 .map_err(|_| WriterError::ValueTooLarge("folder message count"))?,
             folder_unread_count(&folder.messages)?,
             !folder.children.is_empty(),
+            &folder.container_class,
         )],
         None => vec![folder_table_row(deleted, "Deleted Items", 0, false)],
     };
@@ -1800,6 +1818,7 @@ fn validate_folder_hierarchy_shapes(folders: &[FolderPlan<'_>]) -> Result<(), Wr
                 .map_err(|_| WriterError::ValueTooLarge("folder message count"))?,
             folder_unread_count(&folder.messages)?,
             !folder.children.is_empty(),
+            &folder.container_class,
         ));
     }
     table_context(&columns, &rows)?;
@@ -2069,6 +2088,7 @@ fn create_flat_store(
                         .map_err(|_| WriterError::ValueTooLarge("folder message count"))?,
                     unread_count,
                     !folder.children.is_empty(),
+                    &folder.container_class,
                 ))?),
                 ref_count: 2,
             });
@@ -2092,6 +2112,7 @@ fn create_flat_store(
                             .map_err(|_| WriterError::ValueTooLarge("folder message count"))?,
                         folder_unread_count(&child.messages)?,
                         !child.children.is_empty(),
+                        &child.container_class,
                     ))
                 })
                 .collect::<Result<Vec<_>, WriterError>>()?;
@@ -2155,6 +2176,7 @@ fn create_flat_store(
                 .map_err(|_| WriterError::ValueTooLarge("folder message count"))?,
             folder_unread_count(&folder.messages)?,
             !folder.children.is_empty(),
+            &folder.container_class,
         )],
         None => vec![folder_table_row(deleted_folder, "Deleted Items", 0, false)],
     };
@@ -2172,6 +2194,7 @@ fn create_flat_store(
                 .map_err(|_| WriterError::ValueTooLarge("folder message count"))?,
             folder_unread_count(&folder.messages)?,
             !folder.children.is_empty(),
+            &folder.container_class,
         ));
     }
     let empty_contents = folder_plans
@@ -2256,6 +2279,7 @@ fn create_flat_store(
                         .map_err(|_| WriterError::ValueTooLarge("folder message count"))?,
                     folder_unread_count(&folder.messages)?,
                     !folder.children.is_empty(),
+                    &folder.container_class,
                 ),
                 None => folder_properties("Deleted Items", 0, false),
             })?),
@@ -3276,22 +3300,27 @@ fn validate_property_context_shape(
 }
 
 fn validate_message_property_context_shape(message: &MessageSpec) -> Result<(), WriterError> {
-    let mut property_count = 18_usize;
+    let has_sender = !message.sender_name.is_empty() && !message.sender_email.is_empty();
+    let mut property_count = if has_sender { 18_usize } else { 12_usize };
     let mut lengths = vec![
         unicode_payload_len(&message.message_class)?,
         unicode_payload_len(&message.subject)?,
-        unicode_payload_len(&message.sender_name)?,
-        8,
-        unicode_payload_len(&message.sender_email)?,
-        unicode_payload_len(&message.sender_name)?,
-        8,
-        unicode_payload_len(&message.sender_email)?,
         16,
         8,
         8,
         8,
         8,
     ];
+    if has_sender {
+        lengths.extend([
+            unicode_payload_len(&message.sender_name)?,
+            8,
+            unicode_payload_len(&message.sender_email)?,
+            unicode_payload_len(&message.sender_name)?,
+            8,
+            unicode_payload_len(&message.sender_email)?,
+        ]);
+    }
     if let Some(body) = &message.body_text {
         property_count += 1;
         lengths.push(unicode_payload_len(body)?);
@@ -3376,10 +3405,19 @@ fn validate_message(message: &MessageSpec, depth: usize) -> Result<(), WriterErr
     for (name, value) in [
         ("message class", &message.message_class),
         ("subject", &message.subject),
+    ] {
+        if value.is_empty() {
+            return Err(WriterError::InvalidStructure(format!(
+                "{name} must be non-empty"
+            )));
+        }
+        validate_unicode(name, value)?;
+    }
+    for (name, value) in [
         ("sender name", &message.sender_name),
         ("sender email", &message.sender_email),
     ] {
-        if value.is_empty() {
+        if value.is_empty() && !contact_message_class(&message.message_class) {
             return Err(WriterError::InvalidStructure(format!(
                 "{name} must be non-empty"
             )));
@@ -3653,7 +3691,13 @@ fn validate_contents_raw_property_types(message: &MessageSpec) -> Result<(), Wri
 }
 
 fn supported_message_class(value: &str) -> bool {
-    class_is_or_descends_from(value, "IPM.Note") || class_descends_from(value, "REPORT.IPM.Note")
+    class_is_or_descends_from(value, "IPM.Note")
+        || class_descends_from(value, "REPORT.IPM.Note")
+        || contact_message_class(value)
+}
+
+fn contact_message_class(value: &str) -> bool {
+    class_is_or_descends_from(value, "IPM.Contact")
 }
 
 fn class_is_or_descends_from(value: &str, root: &str) -> bool {
@@ -3874,8 +3918,13 @@ fn validate_completed_store(
             "completed store delivery-time row value is invalid",
         ));
     }
+    let sender_row_matches = if spec.message.sender_name.is_empty() {
+        table_value(0x0042)?.is_none()
+    } else {
+        matches!(table_value(0x0042)?, Some(ReadValue::Unicode(value)) if value.to_string() == spec.message.sender_name)
+    };
     if !matches!(table_value(0x0039)?, Some(ReadValue::Time(value)) if value == spec.message.sent_filetime)
-        || !matches!(table_value(0x0042)?, Some(ReadValue::Unicode(value)) if value.to_string() == spec.message.sender_name)
+        || !sender_row_matches
         || !matches!(table_value(0x0E17)?, Some(ReadValue::Integer32(0)))
     {
         return Err(invalid("completed store copied contents value mismatch"));
@@ -3912,21 +3961,29 @@ fn validate_completed_store(
             _ => return Err(invalid(&format!("completed store {name} mismatch"))),
         }
     }
-    for (property, expected, name) in [
-        (0x0042, &spec.message.sender_name, "sender name"),
-        (0x0065, &spec.message.sender_email, "sender email"),
-        (0x0C1A, &spec.message.sender_name, "sender duplicate name"),
-        (0x0C1F, &spec.message.sender_email, "sender duplicate email"),
-    ] {
-        match message.properties().get(property) {
-            Some(ReadValue::Unicode(value)) if value.to_string() == *expected => {}
-            _ => return Err(invalid(&format!("completed store {name} mismatch"))),
+    if spec.message.sender_name.is_empty() && spec.message.sender_email.is_empty() {
+        for property in [0x0042, 0x0064, 0x0065, 0x0C1A, 0x0C1E, 0x0C1F] {
+            if message.properties().get(property).is_some() {
+                return Err(invalid("completed store unexpected sender property"));
+            }
         }
-    }
-    for property in [0x0064, 0x0C1E] {
-        if !matches!(message.properties().get(property), Some(ReadValue::Unicode(value)) if value.to_string() == "SMTP")
-        {
-            return Err(invalid("completed store sender address type mismatch"));
+    } else {
+        for (property, expected, name) in [
+            (0x0042, &spec.message.sender_name, "sender name"),
+            (0x0065, &spec.message.sender_email, "sender email"),
+            (0x0C1A, &spec.message.sender_name, "sender duplicate name"),
+            (0x0C1F, &spec.message.sender_email, "sender duplicate email"),
+        ] {
+            match message.properties().get(property) {
+                Some(ReadValue::Unicode(value)) if value.to_string() == *expected => {}
+                _ => return Err(invalid(&format!("completed store {name} mismatch"))),
+            }
+        }
+        for property in [0x0064, 0x0C1E] {
+            if !matches!(message.properties().get(property), Some(ReadValue::Unicode(value)) if value.to_string() == "SMTP")
+            {
+                return Err(invalid("completed store sender address type mismatch"));
+            }
         }
     }
     let expected_flags = output_message_flags(spec.message);
@@ -4162,6 +4219,11 @@ fn validate_completed_folder_store(
                     .map_err(|_| WriterError::ValueTooLarge("folder message count"))?
             || folder.properties().unread_count()? != folder_unread_count(&folder_plan.messages)?
             || folder.properties().has_sub_folders()? == folder_plan.children.is_empty()
+            || !matches!(
+                folder.properties().get(0x3613),
+                Some(crate::ltp::prop_context::PropertyValue::Unicode(value))
+                    if value.to_string() == folder_plan.container_class
+            )
         {
             return Err(invalid("completed folder properties mismatch"));
         }
@@ -4695,14 +4757,21 @@ fn validate_embedded_message(
     let invalid = |message: &str| WriterError::InvalidStructure(message.to_owned());
     let properties = actual.properties();
     let unicode_matches = |id, expected: &str| matches!(properties.get(id), Some(ReadValue::Unicode(value)) if value.to_string() == expected);
+    let sender_matches = if expected.sender_name.is_empty() && expected.sender_email.is_empty() {
+        [0x0042, 0x0064, 0x0065, 0x0C1A, 0x0C1E, 0x0C1F]
+            .into_iter()
+            .all(|id| properties.get(id).is_none())
+    } else {
+        unicode_matches(0x0042, &expected.sender_name)
+            && unicode_matches(0x0065, &expected.sender_email)
+            && unicode_matches(0x0C1A, &expected.sender_name)
+            && unicode_matches(0x0C1F, &expected.sender_email)
+            && unicode_matches(0x0064, "SMTP")
+            && unicode_matches(0x0C1E, "SMTP")
+    };
     if properties.message_class()? != expected.message_class
         || !unicode_matches(0x0037, &expected.subject)
-        || !unicode_matches(0x0042, &expected.sender_name)
-        || !unicode_matches(0x0065, &expected.sender_email)
-        || !unicode_matches(0x0C1A, &expected.sender_name)
-        || !unicode_matches(0x0C1F, &expected.sender_email)
-        || !unicode_matches(0x0064, "SMTP")
-        || !unicode_matches(0x0C1E, "SMTP")
+        || !sender_matches
         || !matches!(properties.get(0x0039), Some(ReadValue::Time(value)) if *value == expected.sent_filetime)
         || !matches!(properties.get(0x0E06), Some(ReadValue::Time(value)) if *value == expected.received_filetime)
         || !matches!(properties.get(0x3007), Some(ReadValue::Time(value)) if *value == expected.creation_filetime)
@@ -5086,7 +5155,7 @@ fn folder_properties(
     content_count: i32,
     has_children: bool,
 ) -> Vec<(u16, PropertyValue)> {
-    folder_properties_with_unread(name, content_count, 0, has_children)
+    folder_properties_with_unread(name, content_count, 0, has_children, "IPF.Note")
 }
 
 fn folder_properties_with_unread(
@@ -5094,6 +5163,7 @@ fn folder_properties_with_unread(
     content_count: i32,
     unread_count: i32,
     has_children: bool,
+    container_class: &str,
 ) -> Vec<(u16, PropertyValue)> {
     vec![
         (0x3001, PropertyValue::Unicode(name.to_owned())),
@@ -5101,7 +5171,7 @@ fn folder_properties_with_unread(
         (0x3602, PropertyValue::Integer32(content_count)),
         (0x3603, PropertyValue::Integer32(unread_count)),
         (0x360A, PropertyValue::Boolean(has_children)),
-        (0x3613, PropertyValue::Unicode("IPF.Note".to_owned())),
+        (0x3613, PropertyValue::Unicode(container_class.to_owned())),
     ]
 }
 
@@ -5257,12 +5327,6 @@ fn message_properties(
             PropertyValue::Unicode(message.message_class.clone()),
         ),
         (0x0037, PropertyValue::Unicode(message.subject.clone())),
-        (0x0042, PropertyValue::Unicode(message.sender_name.clone())),
-        (0x0064, PropertyValue::Unicode("SMTP".to_owned())),
-        (0x0065, PropertyValue::Unicode(message.sender_email.clone())),
-        (0x0C1A, PropertyValue::Unicode(message.sender_name.clone())),
-        (0x0C1E, PropertyValue::Unicode("SMTP".to_owned())),
-        (0x0C1F, PropertyValue::Unicode(message.sender_email.clone())),
         (0x0E06, PropertyValue::Time(message.received_filetime)),
         (
             0x0E07,
@@ -5279,6 +5343,16 @@ fn message_properties(
         (0x300B, PropertyValue::Binary(record_key.to_vec())),
         (0x3FDE, PropertyValue::Integer32(message.internet_codepage)),
     ];
+    if !message.sender_name.is_empty() && !message.sender_email.is_empty() {
+        properties.extend([
+            (0x0042, PropertyValue::Unicode(message.sender_name.clone())),
+            (0x0064, PropertyValue::Unicode("SMTP".to_owned())),
+            (0x0065, PropertyValue::Unicode(message.sender_email.clone())),
+            (0x0C1A, PropertyValue::Unicode(message.sender_name.clone())),
+            (0x0C1E, PropertyValue::Unicode("SMTP".to_owned())),
+            (0x0C1F, PropertyValue::Unicode(message.sender_email.clone())),
+        ]);
+    }
     if let Some(body) = &message.body_text {
         properties.push((0x1000, PropertyValue::Unicode(body.clone())));
     }
@@ -5914,7 +5988,7 @@ fn column(
 }
 
 fn folder_table_row(id: NodeId, name: &str, count: i32, children: bool) -> TableRowSpec {
-    folder_table_row_with_unread(id, name, count, 0, children)
+    folder_table_row_with_unread(id, name, count, 0, children, "IPF.Note")
 }
 
 fn folder_table_row_with_unread(
@@ -5923,6 +5997,7 @@ fn folder_table_row_with_unread(
     count: i32,
     unread_count: i32,
     children: bool,
+    container_class: &str,
 ) -> TableRowSpec {
     TableRowSpec {
         id,
@@ -5931,7 +6006,7 @@ fn folder_table_row_with_unread(
             (0x3602, PropertyValue::Integer32(count)),
             (0x3603, PropertyValue::Integer32(unread_count)),
             (0x360A, PropertyValue::Boolean(children)),
-            (0x3613, PropertyValue::Unicode("IPF.Note".to_owned())),
+            (0x3613, PropertyValue::Unicode(container_class.to_owned())),
         ],
     }
 }
@@ -5951,7 +6026,6 @@ fn message_table_row(
         ),
         (0x0037, PropertyValue::Unicode(message.subject.clone())),
         (0x0039, PropertyValue::Time(message.sent_filetime)),
-        (0x0042, PropertyValue::Unicode(message.sender_name.clone())),
         (0x0E06, PropertyValue::Time(message.received_filetime)),
         (
             0x0E07,
@@ -5967,6 +6041,9 @@ fn message_table_row(
         ),
         (0x3008, PropertyValue::Time(message.modification_filetime)),
     ];
+    if !message.sender_name.is_empty() {
+        values.push((0x0042, PropertyValue::Unicode(message.sender_name.clone())));
+    }
     values.extend(
         display_recipient_properties(&message.recipients)
             .into_iter()
@@ -7974,6 +8051,7 @@ mod tests {
             folders: vec![MailFolderSpec {
                 path: vec![base.folder_name.clone()],
                 role: MailFolderRole::Ordinary,
+                container_class: "IPF.Note".to_owned(),
                 messages: vec![base.message.clone(), second],
             }],
         };
@@ -8004,6 +8082,79 @@ mod tests {
             second.properties().get(0x0037),
             Some(crate::ltp::prop_context::PropertyValue::Unicode(value))
                 if value.to_string() == "second"
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn contact_message_round_trips_in_contact_folder() -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("contact.pst");
+        let mut message = FidelityStore::default().message;
+        message.message_class = "IPM.Contact".to_owned();
+        message.subject = "Ada Lovelace".to_owned();
+        message.sender_name.clear();
+        message.sender_email.clear();
+        message.recipients.clear();
+        message.body_text = None;
+        message.native_body = None;
+        message.raw_properties = vec![
+            RawProperty {
+                id: 0x3001,
+                value: RawPropertyValue::Unicode("Ada Lovelace".to_owned()),
+            },
+            RawProperty {
+                id: 0x3A06,
+                value: RawPropertyValue::Unicode("Ada".to_owned()),
+            },
+            RawProperty {
+                id: 0x3A11,
+                value: RawPropertyValue::Unicode("Lovelace".to_owned()),
+            },
+        ];
+        message.named_properties = vec![NamedProperty {
+            set: NamedPropertySet::Guid([
+                0x04, 0x20, 0x06, 0x00, 0x00, 0x00, 0x00, 0x00, 0xC0, 0x00, 0x00, 0x00, 0x00, 0x00,
+                0x00, 0x46,
+            ]),
+            name: NamedPropertyName::Numeric(0x8083),
+            value: RawPropertyValue::Unicode("ada@example.com".to_owned()),
+        }];
+        let spec = MailStoreSpec {
+            store_name: "PSTForge contact".to_owned(),
+            record_key: *b"PSTForgeContact1",
+            folders: vec![MailFolderSpec {
+                path: vec!["Contacts".to_owned()],
+                role: MailFolderRole::Ordinary,
+                container_class: "IPF.Contact".to_owned(),
+                messages: vec![message],
+            }],
+        };
+        create_mail_store(&path, &spec)?;
+
+        let store = open_store(&path)?;
+        let folder = store.open_folder(
+            &store
+                .properties()
+                .make_entry_id(node(NodeIdType::NormalFolder, MAIL_FOLDER_INDEX)?)?,
+        )?;
+        assert!(matches!(
+            folder.properties().get(0x3613),
+            Some(crate::ltp::prop_context::PropertyValue::Unicode(value))
+                if value.to_string() == "IPF.Contact"
+        ));
+        let contact = store.open_message(
+            &EntryId::new(
+                crate::messaging::store::StoreRecordKey::new(spec.record_key),
+                node(NodeIdType::NormalMessage, MESSAGE_INDEX)?,
+            ),
+            None,
+        )?;
+        assert_eq!(contact.properties().message_class()?, "IPM.Contact");
+        assert!(matches!(
+            contact.properties().get(0x3A06),
+            Some(crate::ltp::prop_context::PropertyValue::Unicode(value))
+                if value.to_string() == "Ada"
         ));
         Ok(())
     }
@@ -8043,6 +8194,7 @@ mod tests {
                 .map(|index| MailFolderSpec {
                     path: vec![format!("Folder {index:04}")],
                     role: MailFolderRole::Ordinary,
+                    container_class: "IPF.Note".to_owned(),
                     messages: vec![base.message.clone()],
                 })
                 .collect(),
@@ -8073,6 +8225,7 @@ mod tests {
             folders: vec![MailFolderSpec {
                 path: vec!["Inbox".to_owned()],
                 role: MailFolderRole::Ordinary,
+                container_class: "IPF.Note".to_owned(),
                 messages: vec![huge_message],
             }],
         };
@@ -8262,6 +8415,7 @@ mod tests {
             folders: vec![MailFolderSpec {
                 path: vec![base.folder_name],
                 role: MailFolderRole::Ordinary,
+                container_class: "IPF.Note".to_owned(),
                 messages: vec![first, second],
             }],
         };
@@ -8391,6 +8545,7 @@ mod tests {
             folders: vec![MailFolderSpec {
                 path: vec![base.folder_name.clone()],
                 role: MailFolderRole::Ordinary,
+                container_class: "IPF.Note".to_owned(),
                 messages,
             }],
         };
@@ -8613,26 +8768,31 @@ mod tests {
                 MailFolderSpec {
                     path: vec!["Deleted Items".to_owned()],
                     role: MailFolderRole::DeletedItems,
+                    container_class: "IPF.Note".to_owned(),
                     messages: vec![message("deleted")],
                 },
                 MailFolderSpec {
                     path: vec!["Deleted items".to_owned()],
                     role: MailFolderRole::Ordinary,
+                    container_class: "IPF.Note".to_owned(),
                     messages: vec![message("user-created deleted items")],
                 },
                 MailFolderSpec {
                     path: vec!["Inbox".to_owned(), "Projects".to_owned()],
                     role: MailFolderRole::Ordinary,
+                    container_class: "IPF.Note".to_owned(),
                     messages: vec![message("projects")],
                 },
                 MailFolderSpec {
                     path: vec!["Archive".to_owned()],
                     role: MailFolderRole::Ordinary,
+                    container_class: "IPF.Note".to_owned(),
                     messages: vec![message("archive")],
                 },
                 MailFolderSpec {
                     path: vec!["Inbox".to_owned(), "Personal".to_owned()],
                     role: MailFolderRole::Ordinary,
+                    container_class: "IPF.Note".to_owned(),
                     messages: vec![message("personal")],
                 },
             ],
@@ -8712,16 +8872,19 @@ mod tests {
                 MailFolderSpec {
                     path: vec!["Deleted Items".to_owned()],
                     role: MailFolderRole::DeletedItems,
+                    container_class: "IPF.Note".to_owned(),
                     messages: vec![message("deleted")],
                 },
                 MailFolderSpec {
                     path: vec!["Deleted Items".to_owned(), "Child".to_owned()],
                     role: MailFolderRole::Ordinary,
+                    container_class: "IPF.Note".to_owned(),
                     messages: vec![message("deleted child")],
                 },
                 MailFolderSpec {
                     path: vec!["Inbox".to_owned()],
                     role: MailFolderRole::Ordinary,
+                    container_class: "IPF.Note".to_owned(),
                     messages: vec![message("inbox")],
                 },
             ],
@@ -9226,6 +9389,20 @@ mod tests {
 
     #[test]
     fn fidelity_validation_handles_empty_raw_values_and_rejects_ambiguous_inputs()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let result = std::thread::Builder::new()
+            .name("pstforge-writer-validation-test".to_owned())
+            .stack_size(WRITER_STACK_BYTES)
+            .spawn(|| {
+                fidelity_validation_handles_empty_raw_values_and_rejects_ambiguous_inputs_inner()
+                    .map_err(|error| error.to_string())
+            })?
+            .join()
+            .map_err(|_| "writer validation test thread panicked")?;
+        result.map_err(Into::into)
+    }
+
+    fn fidelity_validation_handles_empty_raw_values_and_rejects_ambiguous_inputs_inner()
     -> Result<(), Box<dyn std::error::Error>> {
         let mut empty_body = FidelityStore::default();
         empty_body.message.body_text = Some(String::new());

@@ -172,6 +172,7 @@ pub enum CatalogEvent<'a> {
         id: u32,
         parent_id: Option<u32>,
         name: Option<String>,
+        container_class: Option<String>,
     },
     MessageStart {
         id: u32,
@@ -404,6 +405,12 @@ impl PffFile {
                     None
                 }
             };
+            let container_class = recover_item_value(
+                &mut catalog,
+                Some(folder_id),
+                "get folder container class",
+                folder.message_string(0x3613),
+            )?;
             emit(
                 sink,
                 "folder metadata",
@@ -411,6 +418,7 @@ impl PffFile {
                     id: folder_id,
                     parent_id,
                     name,
+                    container_class,
                 },
             )?;
             if let Err(error) = stream_item_properties(
@@ -887,7 +895,9 @@ fn process_message(
 }
 
 fn supported_message_class(value: &str) -> bool {
-    class_is_or_descends_from(value, "IPM.Note") || class_descends_from(value, "REPORT.IPM.Note")
+    class_is_or_descends_from(value, "IPM.Note")
+        || class_descends_from(value, "REPORT.IPM.Note")
+        || class_is_or_descends_from(value, "IPM.Contact")
 }
 
 fn class_is_or_descends_from(value: &str, root: &str) -> bool {

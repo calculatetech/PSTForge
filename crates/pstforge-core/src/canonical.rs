@@ -69,6 +69,7 @@ pub struct CanonicalMail {
 pub struct CanonicalFolder {
     pub path: Vec<String>,
     pub role: CanonicalFolderRole,
+    pub container_class: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -214,6 +215,7 @@ fn load_canonical_folders_expected(
             } else {
                 CanonicalFolderRole::Ordinary
             },
+            container_class: folder.container_class.clone(),
         };
         match by_path.entry(candidate.path.clone()) {
             std::collections::btree_map::Entry::Vacant(entry) => {
@@ -1156,6 +1158,7 @@ mod tests {
             id: 0,
             parent_id: None,
             name: Some("Root".to_owned()),
+            container_class: None,
         })?;
         sink.event(CatalogEvent::UnitEnd(RecoveryUnit::Folder {
             address: root,
@@ -1167,6 +1170,7 @@ mod tests {
             id: 0,
             parent_id: Some(0),
             name: Some("Inbox".to_owned()),
+            container_class: Some("IPF.Note".to_owned()),
         })?;
         sink.event(CatalogEvent::UnitEnd(RecoveryUnit::Folder {
             address: inbox,
@@ -1441,7 +1445,7 @@ mod tests {
             parent_attachment_index: None,
             embedded_path: Vec::new(),
             item_type: Some(5),
-            message_class: Some("IPM.Contact".to_owned()),
+            message_class: Some("IPM.Task".to_owned()),
             subject: None,
             sender_name: None,
             sender_email: None,
@@ -1505,6 +1509,7 @@ mod tests {
                 id,
                 parent_id,
                 name: name.map(str::to_owned),
+                container_class: None,
             })?;
             sink.event(CatalogEvent::UnitEnd(RecoveryUnit::Folder { address }))?;
         }
@@ -1561,6 +1566,7 @@ mod tests {
                 id,
                 parent_id,
                 name: name.map(str::to_owned),
+                container_class: (name == Some("Empty Child")).then(|| "IPF.Contact".to_owned()),
             })?;
             sink.event(CatalogEvent::UnitEnd(RecoveryUnit::Folder { address }))?;
         }
@@ -1573,22 +1579,27 @@ mod tests {
                 CanonicalFolder {
                     path: vec!["Deleted Items".to_owned()],
                     role: CanonicalFolderRole::DeletedItems,
+                    container_class: None,
                 },
                 CanonicalFolder {
                     path: vec!["Deleted items".to_owned()],
                     role: CanonicalFolderRole::Ordinary,
+                    container_class: None,
                 },
                 CanonicalFolder {
                     path: vec!["Deleted items".to_owned(), "Empty Child".to_owned()],
                     role: CanonicalFolderRole::Ordinary,
+                    container_class: Some("IPF.Contact".to_owned()),
                 },
                 CanonicalFolder {
                     path: vec!["Inbox".to_owned()],
                     role: CanonicalFolderRole::Ordinary,
+                    container_class: None,
                 },
                 CanonicalFolder {
                     path: vec!["Other Deleted".to_owned()],
                     role: CanonicalFolderRole::Ordinary,
+                    container_class: None,
                 },
             ]
         );
@@ -1640,6 +1651,7 @@ mod tests {
                 id,
                 parent_id,
                 name: name.map(str::to_owned),
+                container_class: None,
             })?;
             sink.event(CatalogEvent::UnitEnd(RecoveryUnit::Folder { address }))?;
         }
@@ -1651,6 +1663,7 @@ mod tests {
             [CanonicalFolder {
                 path: vec!["Duplicate".to_owned()],
                 role: CanonicalFolderRole::Ordinary,
+                container_class: None,
             }]
         );
         Ok(())
@@ -1677,6 +1690,7 @@ mod tests {
                 id,
                 parent_id,
                 name: name.map(str::to_owned),
+                container_class: None,
             })?;
             sink.event(CatalogEvent::UnitEnd(RecoveryUnit::Folder { address }))?;
         }
@@ -1739,8 +1753,8 @@ mod tests {
             parent_attachment_index: Some(2),
             embedded_path: vec![2],
             item_type: Some(5),
-            message_class: Some("IPM.Contact".to_owned()),
-            subject: Some("unsupported embedded contact".to_owned()),
+            message_class: Some("IPM.Task".to_owned()),
+            subject: Some("unsupported embedded task".to_owned()),
             sender_name: None,
             sender_email: None,
             submit_filetime: None,
@@ -2038,7 +2052,7 @@ mod tests {
             parent_attachment_index: None,
             embedded_path: Vec::new(),
             item_type: Some(5),
-            message_class: Some("IPM.Contact".to_owned()),
+            message_class: Some("IPM.Task".to_owned()),
             subject: None,
             sender_name: None,
             sender_email: None,

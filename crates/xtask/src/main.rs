@@ -253,7 +253,8 @@ fn run() -> Result<(), String> {
             Some("embedded-attachments") => qualify_embedded_attachments(&root, Path::new(&output)),
             Some("named-properties") => qualify_named_properties(&root, Path::new(&output)),
             Some("empty-folders") => qualify_empty_folders(&root, Path::new(&output)),
-            _ => Err("unknown qualification checkpoint; expected embedded-attachments, named-properties, or empty-folders".to_owned()),
+            Some("contacts") => qualify_contacts(&root, Path::new(&output)),
+            _ => Err("unknown qualification checkpoint; expected embedded-attachments, named-properties, empty-folders, or contacts".to_owned()),
         };
     }
     if command != std::ffi::OsStr::new("gate") {
@@ -285,7 +286,7 @@ fn run() -> Result<(), String> {
 }
 
 fn usage() -> String {
-    "usage: cargo xtask gate <fast|full|release> | qualify <embedded-attachments|named-properties> <output>"
+    "usage: cargo xtask gate <fast|full|release> | qualify <embedded-attachments|named-properties|empty-folders|contacts> <output>"
         .to_owned()
 }
 
@@ -377,29 +378,121 @@ fn qualify_empty_folders(root: &Path, output: &Path) -> Result<(), String> {
             MailFolderSpec {
                 path: vec!["Deleted Items".to_owned()],
                 role: MailFolderRole::DeletedItems,
+                container_class: "IPF.Note".to_owned(),
                 messages: Vec::new(),
             },
             MailFolderSpec {
                 path: vec!["Deleted items".to_owned()],
                 role: MailFolderRole::Ordinary,
+                container_class: "IPF.Note".to_owned(),
                 messages: Vec::new(),
             },
             MailFolderSpec {
                 path: vec!["Empty Parent".to_owned()],
                 role: MailFolderRole::Ordinary,
+                container_class: "IPF.Note".to_owned(),
                 messages: Vec::new(),
             },
             MailFolderSpec {
                 path: vec!["Empty Parent".to_owned(), "Empty Child".to_owned()],
                 role: MailFolderRole::Ordinary,
+                container_class: "IPF.Note".to_owned(),
                 messages: Vec::new(),
             },
             MailFolderSpec {
                 path: vec!["Inbox".to_owned()],
                 role: MailFolderRole::Ordinary,
+                container_class: "IPF.Note".to_owned(),
                 messages: vec![fixture.message],
             },
         ],
+    };
+    publish_qualification(root, output, 1, |part| {
+        pstforge_pst::writer::create_mail_store(part, &spec)
+    })
+}
+
+fn qualify_contacts(root: &Path, output: &Path) -> Result<(), String> {
+    use pstforge_pst::writer::{
+        FidelityStore, MailFolderRole, MailFolderSpec, MailStoreSpec, MinimalStore, NamedProperty,
+        NamedPropertyName, NamedPropertySet, NativeBody, RawProperty, RawPropertyValue,
+    };
+
+    const PSETID_ADDRESS: [u8; 16] = [
+        0x04, 0x20, 0x06, 0x00, 0x00, 0x00, 0x00, 0x00, 0xC0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x46,
+    ];
+    let mut fixture = FidelityStore::from(&MinimalStore {
+        store_name: "PSTForge contact source".to_owned(),
+        folder_name: "Contacts".to_owned(),
+        subject: "Ada Lovelace".to_owned(),
+        body: "Contact notes checkpoint.".to_owned(),
+        sender_name: "unused".to_owned(),
+        sender_email: "unused@example.com".to_owned(),
+        recipient: "unused@example.com".to_owned(),
+        record_key: *b"PSTForgeContact1",
+    });
+    fixture.message.message_class = "IPM.Contact".to_owned();
+    fixture.message.sender_name.clear();
+    fixture.message.sender_email.clear();
+    fixture.message.recipients.clear();
+    fixture.message.native_body = Some(NativeBody::PlainText);
+    fixture.message.raw_properties = vec![
+        RawProperty {
+            id: 0x3001,
+            value: RawPropertyValue::Unicode("Ada Lovelace".to_owned()),
+        },
+        RawProperty {
+            id: 0x3A06,
+            value: RawPropertyValue::Unicode("Ada".to_owned()),
+        },
+        RawProperty {
+            id: 0x3A11,
+            value: RawPropertyValue::Unicode("Lovelace".to_owned()),
+        },
+        RawProperty {
+            id: 0x3A08,
+            value: RawPropertyValue::Unicode("+1 313 555 0100".to_owned()),
+        },
+        RawProperty {
+            id: 0x3A1C,
+            value: RawPropertyValue::Unicode("+1 313 555 0199".to_owned()),
+        },
+        RawProperty {
+            id: 0x3A16,
+            value: RawPropertyValue::Unicode("Analytical Engines Ltd".to_owned()),
+        },
+        RawProperty {
+            id: 0x3A17,
+            value: RawPropertyValue::Unicode("Programmer".to_owned()),
+        },
+        RawProperty {
+            id: 0x3A42,
+            value: RawPropertyValue::Time(130_000_000_000_000_000),
+        },
+    ];
+    fixture.message.named_properties = [
+        (0x8005, "Lovelace, Ada"),
+        (0x8080, "Ada Lovelace (ada@example.com)"),
+        (0x8082, "SMTP"),
+        (0x8083, "ada@example.com"),
+    ]
+    .into_iter()
+    .map(|(id, value)| NamedProperty {
+        set: NamedPropertySet::Guid(PSETID_ADDRESS),
+        name: NamedPropertyName::Numeric(id),
+        value: RawPropertyValue::Unicode(value.to_owned()),
+    })
+    .collect();
+    let spec = MailStoreSpec {
+        store_name: fixture.store_name,
+        record_key: fixture.record_key,
+        folders: vec![MailFolderSpec {
+            path: vec!["Contacts".to_owned()],
+            role: MailFolderRole::Ordinary,
+            container_class: "IPF.Contact".to_owned(),
+            messages: vec![fixture.message],
+        }],
     };
     publish_qualification(root, output, 1, |part| {
         pstforge_pst::writer::create_mail_store(part, &spec)

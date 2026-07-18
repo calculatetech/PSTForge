@@ -57,6 +57,7 @@ enum ControlFrame {
         id: u32,
         parent_id: Option<u32>,
         name: Option<String>,
+        container_class: Option<String>,
     },
     MessageStart {
         id: u32,
@@ -318,10 +319,12 @@ impl CatalogSink for ProtocolSink<'_> {
                 id,
                 parent_id,
                 name,
+                container_class,
             } => self.send(&ControlFrame::Folder {
                 id,
                 parent_id,
                 name,
+                container_class,
             }),
             CatalogEvent::MessageStart {
                 id,
@@ -822,10 +825,12 @@ fn send_control_to_sink(
             id,
             parent_id,
             name,
+            container_class,
         } => CatalogEvent::Folder {
             id,
             parent_id,
             name,
+            container_class,
         },
         ControlFrame::MessageStart {
             id,

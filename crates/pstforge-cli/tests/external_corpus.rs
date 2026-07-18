@@ -79,18 +79,87 @@ struct FolderFingerprint {
 #[derive(Default)]
 struct IndependentFolderSink {
     folders: BTreeMap<u32, (Option<u32>, Option<String>)>,
+    active_classes: BTreeMap<(u32, u32, u32), Vec<u8>>,
+    container_classes: BTreeMap<u32, String>,
 }
 
 impl CatalogSink for IndependentFolderSink {
     fn event(&mut self, event: CatalogEvent<'_>) -> Result<(), String> {
-        if let CatalogEvent::Folder {
-            id,
-            parent_id,
-            name,
-        } = event
-            && self.folders.insert(id, (parent_id, name)).is_some()
-        {
-            return Err("duplicate folder identifier".to_owned());
+        match event {
+            CatalogEvent::Folder {
+                id,
+                parent_id,
+                name,
+                ..
+            } => {
+                if self.folders.insert(id, (parent_id, name)).is_some() {
+                    return Err("duplicate folder identifier".to_owned());
+                }
+            }
+            CatalogEvent::PropertyStart(descriptor)
+                if descriptor.entry_type == Some(0x3613)
+                    && matches!(descriptor.owner, PropertyOwner::Folder(_)) =>
+            {
+                let PropertyOwner::Folder(folder_id) = descriptor.owner else {
+                    return Err("folder property owner changed".to_owned());
+                };
+                self.active_classes.insert(
+                    (
+                        folder_id,
+                        descriptor.record_set_index,
+                        descriptor.entry_index,
+                    ),
+                    Vec::new(),
+                );
+            }
+            CatalogEvent::PropertyData { descriptor, bytes } => {
+                let PropertyOwner::Folder(folder_id) = descriptor.owner else {
+                    return Ok(());
+                };
+                if let Some(value) = self.active_classes.get_mut(&(
+                    folder_id,
+                    descriptor.record_set_index,
+                    descriptor.entry_index,
+                )) {
+                    value.extend_from_slice(bytes);
+                }
+            }
+            CatalogEvent::PropertyEnd(descriptor) => {
+                let PropertyOwner::Folder(folder_id) = descriptor.owner else {
+                    return Ok(());
+                };
+                if let Some(bytes) = self.active_classes.remove(&(
+                    folder_id,
+                    descriptor.record_set_index,
+                    descriptor.entry_index,
+                )) {
+                    let words = bytes
+                        .chunks_exact(2)
+                        .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
+                        .collect::<Vec<_>>();
+                    if bytes.len() % 2 != 0 {
+                        return Err("folder container class has odd UTF-16 length".to_owned());
+                    }
+                    let value = String::from_utf16(&words)
+                        .map_err(|_| "folder container class is invalid UTF-16")?
+                        .trim_end_matches('\0')
+                        .to_owned();
+                    if self.container_classes.insert(folder_id, value).is_some() {
+                        return Err("duplicate folder container class".to_owned());
+                    }
+                }
+            }
+            CatalogEvent::PropertyAbort { descriptor, .. } => {
+                let PropertyOwner::Folder(folder_id) = descriptor.owner else {
+                    return Ok(());
+                };
+                self.active_classes.remove(&(
+                    folder_id,
+                    descriptor.record_set_index,
+                    descriptor.entry_index,
+                ));
+            }
+            _ => {}
         }
         Ok(())
     }
@@ -241,6 +310,7 @@ impl CatalogSink for IndependentMessageSink {
                 id,
                 parent_id,
                 name,
+                ..
             } => {
                 let mut path = match parent_id {
                     Some(parent) => self
@@ -391,7 +461,22 @@ impl CatalogSink for IndependentMessageSink {
                     && descriptor.entry_type.is_some_and(|id| {
                         matches!(
                             id,
-                            0x007d | 0x0e07 | 0x1000 | 0x1009 | 0x1013 | 0x3007 | 0x3008 | 0x3fde
+                            0x007d
+                                | 0x0e07
+                                | 0x1000
+                                | 0x1009
+                                | 0x1013
+                                | 0x3001
+                                | 0x3007
+                                | 0x3008
+                                | 0x3a06
+                                | 0x3a08
+                                | 0x3a11
+                                | 0x3a16
+                                | 0x3a17
+                                | 0x3a1c
+                                | 0x3a42
+                                | 0x3fde
                         )
                     }) =>
             {
@@ -701,6 +786,51 @@ fn independent_visible_folders(
     Ok(output)
 }
 
+fn independent_folder_classes(
+    path: &std::path::Path,
+) -> Result<BTreeMap<Vec<String>, String>, Box<dyn std::error::Error>> {
+    let file = fs::File::open(path)?;
+    let native = libpff_sys::PffFile::open_fd(file.as_fd())?;
+    let mut sink = IndependentFolderSink::default();
+    let catalog = native.catalog(&mut sink)?;
+    if !catalog.issues.is_empty() || catalog.issues_dropped != 0 || !sink.active_classes.is_empty()
+    {
+        return Err("folder-class catalog was incomplete".into());
+    }
+    let mut output = BTreeMap::new();
+    for (id, container_class) in &sink.container_classes {
+        let mut current = Some(*id);
+        let mut chain = Vec::new();
+        let mut seen = BTreeSet::new();
+        let mut belongs_to_ipm = false;
+        while let Some(folder_id) = current {
+            if folder_id == NID_IPM_SUBTREE {
+                belongs_to_ipm = true;
+                break;
+            }
+            if !seen.insert(folder_id) || seen.len() > 64 {
+                return Err("folder-class hierarchy is cyclic or too deep".into());
+            }
+            let Some((parent_id, name)) = sink.folders.get(&folder_id) else {
+                return Err("folder-class hierarchy references a missing parent".into());
+            };
+            chain.push(name.clone().filter(|value| !value.is_empty()));
+            current = *parent_id;
+        }
+        if belongs_to_ipm {
+            chain.reverse();
+            let chain = chain
+                .into_iter()
+                .map(|name| name.ok_or("visible folder name is absent"))
+                .collect::<Result<Vec<_>, _>>()?;
+            if output.insert(chain, container_class.clone()).is_some() {
+                return Err("duplicate visible folder-class path".into());
+            }
+        }
+    }
+    Ok(output)
+}
+
 fn verify_exact_message_fidelity(
     expected: Vec<MessageFingerprint>,
     actual: Vec<MessageFingerprint>,
@@ -992,6 +1122,120 @@ fn milestone_0_4_2_empty_folders_roundtrip_through_libpff() -> Result<(), Box<dy
     let generated = independent_visible_folders(&job.join("parts/part-0001.pst"))?;
     if generated != source {
         return Err("visible empty-folder path or role changed during the split".into());
+    }
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires the external v042-contact-source corpus case"]
+fn milestone_0_4_2_contacts_roundtrip_through_libpff() -> Result<(), Box<dyn std::error::Error>> {
+    let manifest_path = std::env::var_os("PSTFORGE_CORPUS_MANIFEST")
+        .ok_or("PSTFORGE_CORPUS_MANIFEST is required")?;
+    let manifest: Manifest = toml::from_str(&fs::read_to_string(&manifest_path)?)?;
+    let case = manifest
+        .cases
+        .iter()
+        .find(|case| case.name == "v042-contact-source")
+        .ok_or("manifest has no v042-contact-source case")?;
+    let identity = pstforge_core::SourceFile::open(&case.path)?
+        .identity()
+        .clone();
+    if identity.sha256 != case.sha256 {
+        return Err("contact source SHA-256 does not match its manifest".into());
+    }
+
+    let source_messages = independent_messages(&case.path)?;
+    if source_messages.len() != 1
+        || source_messages[0].folder_path != ["Contacts"]
+        || source_messages[0].content.message_class.as_deref() != Some("IPM.Contact")
+        || source_messages[0].content.subject.as_deref() != Some("Ada Lovelace")
+        || source_messages[0].content.sender_name.is_some()
+        || source_messages[0].content.sender_email.is_some()
+        || !source_messages[0].complete
+    {
+        return Err("contact source does not match the item contract".into());
+    }
+    let expected_property_ids = [
+        0x0E07, 0x1000, 0x3001, 0x3007, 0x3008, 0x3A06, 0x3A08, 0x3A11, 0x3A16, 0x3A17, 0x3A1C,
+        0x3A42, 0x3FDE,
+    ];
+    if source_messages[0]
+        .content
+        .body_properties
+        .iter()
+        .map(|property| property.id)
+        .collect::<Vec<_>>()
+        != expected_property_ids
+    {
+        return Err("contact source ordinary-property set changed".into());
+    }
+    let source_named = independent_named_properties(&case.path)?;
+    let expected_named_ids = [0x8005, 0x8080, 0x8082, 0x8083];
+    if source_named.len() != expected_named_ids.len()
+        || !source_named
+            .iter()
+            .zip(expected_named_ids)
+            .all(|(property, expected)| {
+                property.identity.name == NamedPropertyName::Numeric(expected)
+                    && property.identity.guid
+                        == [
+                            0x04, 0x20, 0x06, 0x00, 0x00, 0x00, 0x00, 0x00, 0xC0, 0x00, 0x00, 0x00,
+                            0x00, 0x00, 0x00, 0x46,
+                        ]
+            })
+    {
+        return Err("contact source named-property identity changed".into());
+    }
+    let source_classes = independent_folder_classes(&case.path)?;
+    if source_classes
+        .get(&vec!["Contacts".to_owned()])
+        .map(String::as_str)
+        != Some("IPF.Contact")
+    {
+        return Err("contact source folder is not IPF.Contact".into());
+    }
+
+    let directory = tempfile::tempdir()?;
+    let job = directory.path().join("job");
+    let output = Command::new(env!("CARGO_BIN_EXE_pstforge"))
+        .arg("split")
+        .arg(&case.path)
+        .arg("--output")
+        .arg(&job)
+        .arg("--max-pst-size")
+        .arg("4GiB")
+        .arg("--json")
+        .arg("--color")
+        .arg("never")
+        .output()?;
+    if !output.status.success() {
+        return Err(format!(
+            "contact split failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        )
+        .into());
+    }
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+    if report["partial"].as_bool() != Some(false)
+        || report["written_candidates"].as_u64() != Some(1)
+        || report["parts"].as_array().map(Vec::len) != Some(1)
+        || report["parts"][0]["omitted_folders"].as_u64() != Some(0)
+        || report["parts"][0]["omitted_properties"].as_u64() != Some(0)
+        || report["parts"][0]["omitted_attachments"].as_u64() != Some(0)
+    {
+        return Err("contact split did not report complete preservation".into());
+    }
+    let generated = job.join("parts/part-0001.pst");
+    verify_exact_message_fidelity(source_messages, independent_messages(&generated)?)?;
+    if independent_named_properties(&generated)? != source_named {
+        return Err("contact named-property identity or payload changed".into());
+    }
+    if independent_folder_classes(&generated)?
+        .get(&vec!["Contacts".to_owned()])
+        .map(String::as_str)
+        != Some("IPF.Contact")
+    {
+        return Err("generated contact folder is not IPF.Contact".into());
     }
     Ok(())
 }

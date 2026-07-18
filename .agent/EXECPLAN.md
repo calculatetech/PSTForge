@@ -1054,9 +1054,77 @@ work. Hash and identity evidence show that the source was not modified.
       a resource-proportional durable address and measured deep-folder tests
       before claiming preservation beyond its current boundary. This is a
       worker/job compatibility change and is not hidden inside checkpoint 2b.
-  - [ ] Checkpoints 3 onward: contacts, appointments, meetings, distribution
-    lists, tasks, notes/posts, OLE/documents, associated/configuration data,
-    and remaining generic classes, each proven separately where feasible.
+  - [x] Checkpoint 3: contacts.
+    - [x] (2026-07-17) Native intake, canonical translation, and the writer now
+      admit only `IPM.Contact` and descendants in addition to the previously
+      supported mail/report classes. Contacts without mail sender fields no
+      longer receive fabricated sender values or invalid empty Unicode
+      streams. `PR_CONTAINER_CLASS` now travels explicitly from the native
+      catalog through the worker protocol, schema-9 ledger, canonical folder,
+      and writer input. The writer preserves `IPF.Contact` from the source
+      instead of guessing from the current part's items; empty contact folders
+      and later parts therefore retain their source class.
+    - [x] (2026-07-17) Job schema 9 refuses schema-8 resumes because an older
+      durable catalog may already have classified readable contacts as
+      unsupported. The regression mutates a bound job to schema 8 and proves
+      resume fails closed.
+    - [x] (2026-07-17) Added external case `v042-contact-source`, 271,360 bytes,
+      SHA-256
+      `b4d6e250b96550d601721918c386dd3847283e248370716e59c132e56fb22ca7`.
+      Its single contact contains display/given/surname, company, title,
+      business and mobile phones, birthday, notes, File As, and Email1 fields.
+      The ignored source/output regression compares message metadata, folder
+      path and `IPF.Contact` class, ordinary property IDs/types/lengths/hashes,
+      and PSETID_Address GUID/LID/types/lengths/hashes through independent
+      libpff reads. The split reports one written contact and zero omissions.
+    - [x] (2026-07-17) The initial complete fast gate passed at
+      `.agent/test-results/1784343620-fast`. One pre-existing aggregate writer
+      validation test exceeded Rust's default test-thread stack after the
+      contact paths expanded validation; it now runs on the same measured
+      32 MiB stack used by production writer validation.
+    - [x] (2026-07-17) The first focused clean-context review found two
+      checkpoint-relevant defects: content-based folder-class inference could
+      misclassify mixed, empty, or later-part folders; and one-sided contact
+      sender metadata could pass translation but fail completed validation.
+      Source folder classes are now durable and later parts receive only the
+      source folder definitions they use. One-sided contact sender pairs are
+      cleared together and counted as one omitted property, keeping the
+      contact writable and explicitly partial.
+    - [x] (2026-07-17) Review remediation passes the focused external libpff
+      source/output comparison and the complete fast gate at
+      `.agent/test-results/1784344330-fast`. Focused regressions also prove an
+      empty source `IPF.Contact` folder remains classified, later parts retain
+      only source folder metadata they use, an ordinary item does not override
+      its folder class, and one-sided contact sender metadata is contained
+      without rejecting the part.
+    - [x] (2026-07-17) The final focused review found one remaining medium
+      later-part defect: exact leaf matching retained the leaf's source class
+      but allowed the writer to synthesize nested ancestors as `IPF.Note`.
+      Later parts now retain every source folder whose path is a prefix of a
+      used message path. The regression uses `Contacts/Child` and proves both
+      source-classified levels remain while an unused empty sibling is not
+      replicated.
+    - [x] (2026-07-17) The nested-ancestor regression, focused external
+      contact roundtrip, and complete fast gate pass after remediation.
+      Evidence: `.agent/test-results/1784344564-fast`.
+    - [x] (2026-07-17) A fresh clean-context remediation review found no
+      blocker, high, or medium findings after tracing source folder class
+      preservation through nested later-part and resume behavior.
+    - [x] (2026-07-17) Generated the single bounded human candidate at
+      `qualification-v042-contact-r1/parts/part-0001.pst`: 271,360 bytes,
+      SHA-256
+      `21b35c20dc72b65e4b1b8bc2fe287d08f03dd988294c5347b96a874122e3f3e3`.
+      PSTForge full verification reports Unicode64, no observed corruption,
+      one complete item, zero unsupported items, and zero issues; `pffinfo`
+      opens it successfully. The recovery log reports no readable data
+      skipped, and transient schema-9 job/spool state was removed after
+      verification.
+    - [x] (2026-07-17) The owner reports all-green ScanPST and Outlook
+      acceptance for the original, unrepaired contact candidate. This closes
+      checkpoint 3 for commit and push.
+  - [ ] Checkpoints 4 onward: appointments, meetings, distribution lists,
+    tasks, notes/posts, OLE/documents, associated/configuration data, and
+    remaining generic classes, each proven separately where feasible.
   - [ ] Run the complete 19 GB split once after all focused checkpoints pass
     and reconcile discovered unique items against written plus explicitly
     unwritten items across every part.
@@ -2676,6 +2744,15 @@ the unrepaired candidate in Outlook. Confirm `Inbox` contains the single
 `Empty folder fidelity checkpoint` message; `Deleted Items`, the ordinary
 case-distinct `Deleted items`, `Empty Parent`, and its nested `Empty Child` are
 all visible; and no artificial recovery or source-store wrapper folder exists.
+
+For checkpoint 3, select external case `v042-contact-source`, run ignored test
+`milestone_0_4_2_contacts_roundtrip_through_libpff`, and scan only
+`qualification-v042-contact-r1/parts/part-0001.pst`. Then open the original,
+unrepaired candidate in Outlook. Confirm the `Contacts` folder uses the contact
+view and opens one `Ada Lovelace` contact with the expected name, company,
+title, business phone, mobile phone, birthday, email address, File As value,
+and notes. The independent libpff comparison remains the exact property
+fidelity evidence.
 
 After every available focused checkpoint succeeds, run the complete 19 GB
 split once. Unique source items assigned across all output parts must equal the

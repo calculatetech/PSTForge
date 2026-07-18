@@ -667,9 +667,13 @@ fn split_recovered_job_with_interrupt(
         job.checkpoint()?;
         return Ok((reports, written_candidates, true, false));
     }
-    let source_folders = if part_index == 1 {
+    let source_folders = {
         let mut accepted = Vec::with_capacity(source_folders.folders.len());
-        let mut omitted_folders = source_folders.omitted_folders;
+        let mut omitted_folders = if part_index == 1 {
+            source_folders.omitted_folders
+        } else {
+            0
+        };
         let probe = [writable_mail[0]];
         for folder in source_folders.folders {
             let trial = [folder.clone()];
@@ -697,7 +701,9 @@ fn split_recovered_job_with_interrupt(
             match validate_mail_store_input(&input.store) {
                 Ok(()) => accepted.push(folder),
                 Err(WriterError::InputRejected(_)) => {
-                    omitted_folders = omitted_folders.saturating_add(1);
+                    if part_index == 1 {
+                        omitted_folders = omitted_folders.saturating_add(1);
+                    }
                     any_partial = true;
                 }
                 Err(error) => return Err(error.into()),
@@ -706,11 +712,6 @@ fn split_recovered_job_with_interrupt(
         crate::CanonicalFolderSet {
             folders: accepted,
             omitted_folders,
-        }
-    } else {
-        crate::CanonicalFolderSet {
-            folders: Vec::new(),
-            omitted_folders: 0,
         }
     };
     let by_key = writable_mail
@@ -750,14 +751,12 @@ fn split_recovered_job_with_interrupt(
                         .ok_or(SplitError::UnknownAssignment)
                 })
                 .collect::<Result<Vec<_>, _>>()?;
+            let part_folders =
+                source_folders_for_part(part_index, &source_folders.folders, &messages);
             let input = match build_part_writer_input_with_folders_interruptible(
                 &job,
                 &messages,
-                if part_index == 1 {
-                    &source_folders.folders
-                } else {
-                    &[]
-                },
+                &part_folders,
                 PartBuildOptions {
                     source_sha256,
                     recovery_mode: mode_name,
@@ -1011,6 +1010,25 @@ fn split_recovered_job_with_interrupt(
     job.clear_interrupted()?;
     job.checkpoint()?;
     Ok((reports, written_candidates, any_partial, false))
+}
+
+fn source_folders_for_part(
+    part_index: u32,
+    source_folders: &[crate::CanonicalFolder],
+    messages: &[&crate::CanonicalMail],
+) -> Vec<crate::CanonicalFolder> {
+    if part_index == 1 {
+        return source_folders.to_vec();
+    }
+    source_folders
+        .iter()
+        .filter(|folder| {
+            messages
+                .iter()
+                .any(|message| message.folder_path.starts_with(&folder.path))
+        })
+        .cloned()
+        .collect()
 }
 
 fn write_staged_part(
@@ -1467,11 +1485,13 @@ mod tests {
         AdaptiveSizeModel, DiskPreflight, ExecutionMetrics, LayoutEstimator,
         MAX_RECOVERY_LOG_DETAIL_LINES, PartReport, SplitError, SplitFailureKind, SplitReport,
         disk_preflight, extend_to_fitting_prefix, hash_file, preflight_filesystem_path,
-        render_recovery_log, shrink_to_fitting_prefix, take_fitting_prefix,
+        render_recovery_log, shrink_to_fitting_prefix, source_folders_for_part,
+        take_fitting_prefix,
     };
     use crate::{
-        ItemKey, PackCandidate, PartSizeEstimator, RecoveryError, RecoveryProvenance,
-        RecoveryReport, SourceError, SourceIdentity,
+        CanonicalFolder, CanonicalFolderRole, CanonicalMail, ContentCompleteness, ItemKey,
+        PackCandidate, PartSizeEstimator, RecoveryError, RecoveryProvenance, RecoveryReport,
+        SourceError, SourceIdentity,
     };
 
     fn packing_candidate(index: u32, payload_bytes: u64) -> PackCandidate {
@@ -1485,6 +1505,55 @@ mod tests {
             folder_path: vec!["Inbox".to_owned()],
             payload_bytes,
         }
+    }
+
+    #[test]
+    fn later_parts_retain_only_used_source_folder_metadata() {
+        let folders = [
+            CanonicalFolder {
+                path: vec!["Contacts".to_owned()],
+                role: CanonicalFolderRole::Ordinary,
+                container_class: Some("IPF.Contact".to_owned()),
+            },
+            CanonicalFolder {
+                path: vec!["Contacts".to_owned(), "Child".to_owned()],
+                role: CanonicalFolderRole::Ordinary,
+                container_class: Some("IPF.Contact".to_owned()),
+            },
+            CanonicalFolder {
+                path: vec!["Contacts".to_owned(), "Empty Child".to_owned()],
+                role: CanonicalFolderRole::Ordinary,
+                container_class: Some("IPF.Contact".to_owned()),
+            },
+        ];
+        let mail = CanonicalMail {
+            durable_item_key: "normal:1:-:0".to_owned(),
+            key: ItemKey {
+                provenance: RecoveryProvenance::Normal,
+                source_node_id: Some(1),
+                recovery_index: None,
+                occurrence: 0,
+            },
+            folder_path: vec!["Contacts".to_owned(), "Child".to_owned()],
+            folder_role: CanonicalFolderRole::Ordinary,
+            message_class: Some("IPM.Note".to_owned()),
+            subject: Some("ordinary item in contacts folder".to_owned()),
+            sender_name: Some("Sender".to_owned()),
+            sender_email: Some("sender@example.com".to_owned()),
+            submit_filetime: None,
+            delivery_filetime: None,
+            recipients: Vec::new(),
+            attachments: Vec::new(),
+            properties: Vec::new(),
+            completeness: ContentCompleteness::Complete,
+            spooled_bytes: 0,
+        };
+
+        assert_eq!(source_folders_for_part(1, &folders, &[&mail]), folders);
+        assert_eq!(
+            source_folders_for_part(2, &folders, &[&mail]),
+            [folders[0].clone(), folders[1].clone()]
+        );
     }
 
     fn split_report() -> SplitReport {

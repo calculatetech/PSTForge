@@ -135,8 +135,21 @@ fn build_part_writer_input_expected(
     }
     let mut folders = source_folders
         .iter()
-        .map(|folder| (folder.path.clone(), (folder.role, Vec::new())))
-        .collect::<BTreeMap<Vec<String>, (CanonicalFolderRole, Vec<MessageSpec>)>>();
+        .map(|folder| {
+            (
+                folder.path.clone(),
+                (
+                    folder.role,
+                    folder
+                        .container_class
+                        .clone()
+                        .filter(|value| !value.is_empty())
+                        .unwrap_or_else(|| "IPF.Note".to_owned()),
+                    Vec::new(),
+                ),
+            )
+        })
+        .collect::<BTreeMap<Vec<String>, (CanonicalFolderRole, String, Vec<MessageSpec>)>>();
     let mut item_keys = Vec::with_capacity(messages.len());
     let mut unsupported_item_keys = Vec::new();
     let mut partial = false;
@@ -150,10 +163,18 @@ fn build_part_writer_input_expected(
         omitted_attachments = omitted_attachments.saturating_add(translated.omitted_attachments);
         match folders.entry(mail.folder_path.clone()) {
             std::collections::btree_map::Entry::Vacant(entry) => {
-                entry.insert((mail.folder_role, vec![translated.message]));
+                entry.insert((
+                    mail.folder_role,
+                    if contact_message_class(&translated.message.message_class) {
+                        "IPF.Contact".to_owned()
+                    } else {
+                        "IPF.Note".to_owned()
+                    },
+                    vec![translated.message],
+                ));
             }
             std::collections::btree_map::Entry::Occupied(mut entry) => {
-                let (role, messages) = entry.get_mut();
+                let (role, _, messages) = entry.get_mut();
                 if mail.folder_role == CanonicalFolderRole::DeletedItems {
                     *role = CanonicalFolderRole::DeletedItems;
                 }
@@ -165,12 +186,13 @@ fn build_part_writer_input_expected(
     }
     let folders = folders
         .into_iter()
-        .map(|(path, (role, messages))| MailFolderSpec {
+        .map(|(path, (role, container_class, messages))| MailFolderSpec {
             path,
             role: match role {
                 CanonicalFolderRole::Ordinary => MailFolderRole::Ordinary,
                 CanonicalFolderRole::DeletedItems => MailFolderRole::DeletedItems,
             },
+            container_class,
             messages,
         })
         .collect();
@@ -626,20 +648,30 @@ fn translate_message(
         .clone()
         .filter(|value| !value.is_empty())
         .unwrap_or_else(|| "(no subject)".to_owned());
-    let sender_name = mail
-        .sender_name
-        .clone()
-        .filter(|value| !value.is_empty())
-        .or_else(|| mail.sender_email.clone())
-        .unwrap_or_else(|| "Unknown Sender".to_owned());
-    let sender_email = mail
-        .sender_email
-        .clone()
-        .filter(|value| !value.is_empty())
-        .unwrap_or_else(|| sender_name.clone());
+    let contact = contact_message_class(&message_class);
+    let source_sender_name = mail.sender_name.clone().filter(|value| !value.is_empty());
+    let source_sender_email = mail.sender_email.clone().filter(|value| !value.is_empty());
+    let (sender_name, sender_email) = if contact {
+        match (source_sender_name, source_sender_email) {
+            (Some(name), Some(email)) => (name, email),
+            (None, None) => (String::new(), String::new()),
+            (Some(_), None) | (None, Some(_)) => {
+                partial = true;
+                omitted_properties = omitted_properties.saturating_add(1);
+                (String::new(), String::new())
+            }
+        }
+    } else {
+        let sender_name = source_sender_name
+            .or_else(|| source_sender_email.clone())
+            .unwrap_or_else(|| "Unknown Sender".to_owned());
+        let sender_email = source_sender_email.unwrap_or_else(|| sender_name.clone());
+        (sender_name, sender_email)
+    };
     if mail.subject.as_deref().is_none_or(str::is_empty)
-        || mail.sender_name.as_deref().is_none_or(str::is_empty)
-        || mail.sender_email.as_deref().is_none_or(str::is_empty)
+        || (!contact
+            && (mail.sender_name.as_deref().is_none_or(str::is_empty)
+                || mail.sender_email.as_deref().is_none_or(str::is_empty)))
     {
         partial = true;
     }
@@ -1098,7 +1130,13 @@ fn writer_stream_type_is_supported(property_type: u16) -> bool {
 }
 
 fn supported_message_class(value: &str) -> bool {
-    class_is_or_descends_from(value, "IPM.Note") || class_descends_from(value, "REPORT.IPM.Note")
+    class_is_or_descends_from(value, "IPM.Note")
+        || class_descends_from(value, "REPORT.IPM.Note")
+        || contact_message_class(value)
+}
+
+fn contact_message_class(value: &str) -> bool {
+    class_is_or_descends_from(value, "IPM.Contact")
 }
 
 fn class_is_or_descends_from(value: &str, root: &str) -> bool {
@@ -1470,7 +1508,9 @@ mod tests {
         CanonicalAttachment, CanonicalFolder, CanonicalFolderRole, CanonicalMail,
         CanonicalProperty, ContentCompleteness, ItemKey, RecoveryProvenance,
     };
-    use pstforge_pst::writer::{AttachmentContent, MailFolderRole, NamedPropertySet, NativeBody};
+    use pstforge_pst::writer::{
+        AttachmentContent, MailFolderRole, NamedPropertySet, NativeBody, validate_mail_store_input,
+    };
 
     #[test]
     fn libpff_reserved_mapi_guid_is_normalized() {
@@ -1507,6 +1547,7 @@ mod tests {
         let retained = [CanonicalFolder {
             path: vec!["Deleted Items".to_owned()],
             role: CanonicalFolderRole::DeletedItems,
+            container_class: Some("IPF.Note".to_owned()),
         }];
         let interrupted = AtomicBool::new(false);
         let input = build_part_writer_input_with_folders_interruptible(
@@ -1528,6 +1569,61 @@ mod tests {
         assert_eq!(input.store.folders[0].messages.len(), 1);
         assert!(input.partial);
         assert_eq!(input.omitted_folders, 1);
+        Ok(())
+    }
+
+    #[test]
+    fn preserves_source_contact_class_and_contains_one_sided_contact_sender()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempdir()?;
+        let job = DurableCatalogSink::create(&directory.path().join("job"))?;
+        let mail = CanonicalMail {
+            durable_item_key: "normal:2:-:0".to_owned(),
+            key: ItemKey {
+                provenance: RecoveryProvenance::Normal,
+                source_node_id: Some(2),
+                recovery_index: None,
+                occurrence: 0,
+            },
+            folder_path: vec!["Contacts".to_owned()],
+            folder_role: CanonicalFolderRole::Ordinary,
+            message_class: Some("IPM.Contact".to_owned()),
+            subject: Some("Ada Lovelace".to_owned()),
+            sender_name: Some("not valid contact sender metadata".to_owned()),
+            sender_email: None,
+            submit_filetime: None,
+            delivery_filetime: None,
+            recipients: Vec::new(),
+            attachments: Vec::new(),
+            properties: Vec::new(),
+            completeness: ContentCompleteness::Complete,
+            spooled_bytes: 0,
+        };
+        let retained = [CanonicalFolder {
+            path: vec!["Contacts".to_owned()],
+            role: CanonicalFolderRole::Ordinary,
+            container_class: Some("IPF.Contact".to_owned()),
+        }];
+        let input = build_part_writer_input_with_folders_interruptible(
+            &job,
+            &[&mail],
+            &retained,
+            PartBuildOptions {
+                source_sha256: &"0".repeat(64),
+                recovery_mode: "balanced",
+                maximum_pst_bytes: 4_294_967_296,
+                part_index: 2,
+                omitted_folders: 0,
+            },
+            &AtomicBool::new(false),
+        )?;
+
+        assert_eq!(input.store.folders[0].container_class, "IPF.Contact");
+        assert_eq!(input.store.folders[0].messages[0].sender_name, "");
+        assert_eq!(input.store.folders[0].messages[0].sender_email, "");
+        assert_eq!(input.omitted_properties, 1);
+        assert!(input.partial);
+        validate_mail_store_input(&input.store)?;
         Ok(())
     }
 
@@ -1813,7 +1909,10 @@ mod tests {
     -> Result<(), Box<dyn std::error::Error>> {
         assert!(supported_message_class("ipm.note.custom"));
         assert!(supported_message_class("Report.IPM.Note.DR"));
+        assert!(supported_message_class("IPM.Contact"));
+        assert!(supported_message_class("ipm.contact.custom"));
         assert!(!supported_message_class("IPM.NoteCustom"));
+        assert!(!supported_message_class("IPM.ContactCustom"));
         assert!(!supported_message_class("REPORT.IPM.NoteDR"));
 
         let directory = tempdir()?;

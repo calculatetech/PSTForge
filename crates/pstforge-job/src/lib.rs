@@ -23,7 +23,7 @@ use sha2::{Digest, Sha256};
 use tempfile::NamedTempFile;
 use thiserror::Error;
 
-const JOB_SCHEMA_VERSION: i64 = 8;
+const JOB_SCHEMA_VERSION: i64 = 9;
 const INLINE_BLOB_MAX_BYTES: u64 = 64 * 1024;
 const INLINE_CACHE_DIRECTORY: &str = ".pstforge-inline-cache";
 const PAYLOAD_PACK_FILENAME: &str = "payload.pack";
@@ -88,6 +88,7 @@ pub struct SpooledFolder {
     pub source_id: u32,
     pub parent_source_id: Option<u32>,
     pub name: Option<String>,
+    pub container_class: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1205,7 +1206,7 @@ impl DurableCatalogSink {
 
     pub fn spooled_folders(&self) -> Result<Vec<SpooledFolder>, JobError> {
         let mut statement = self.connection.prepare(
-            "SELECT source_id, parent_source_id, name, address_json \
+            "SELECT source_id, parent_source_id, name, address_json, container_class \
                  FROM folders ORDER BY folder_key",
         )?;
         let rows = statement
@@ -1215,24 +1216,28 @@ impl DurableCatalogSink {
                     row.get::<_, Option<i64>>(1)?,
                     row.get::<_, Option<String>>(2)?,
                     row.get::<_, Option<String>>(3)?,
+                    row.get::<_, Option<String>>(4)?,
                 ))
             })?
             .collect::<Result<Vec<_>, _>>()?;
         rows.into_iter()
-            .map(|(source_id, parent_source_id, name, address)| {
-                let source_id = checked_u32(source_id, "folder source id")?;
-                let parent_source_id = parent_source_id
-                    .map(|value| checked_u32(value, "folder parent source id"))
-                    .transpose()?;
-                Ok(SpooledFolder {
-                    address: address
-                        .map(|value| serde_json::from_str(&value))
-                        .transpose()?,
-                    source_id,
-                    parent_source_id,
-                    name,
-                })
-            })
+            .map(
+                |(source_id, parent_source_id, name, address, container_class)| {
+                    let source_id = checked_u32(source_id, "folder source id")?;
+                    let parent_source_id = parent_source_id
+                        .map(|value| checked_u32(value, "folder parent source id"))
+                        .transpose()?;
+                    Ok(SpooledFolder {
+                        address: address
+                            .map(|value| serde_json::from_str(&value))
+                            .transpose()?,
+                        source_id,
+                        parent_source_id,
+                        name,
+                        container_class,
+                    })
+                },
+            )
             .collect()
     }
 
@@ -2270,6 +2275,7 @@ impl DurableCatalogSink {
                 id,
                 parent_id,
                 name,
+                container_class,
             } => {
                 if self.active.is_some() || self.pending_named_property.is_some() {
                     return Err(JobError::EventSequence(
@@ -2288,14 +2294,15 @@ impl DurableCatalogSink {
                     .unwrap_or_else(|| format!("legacy:{id}"));
                 self.connection.execute(
                     "INSERT OR REPLACE INTO folders(\
-                        folder_key, source_id, parent_source_id, name, address_json\
-                     ) VALUES (?1, ?2, ?3, ?4, ?5)",
+                        folder_key, source_id, parent_source_id, name, address_json, container_class\
+                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
                     params![
                         folder_key,
                         i64::from(id),
                         parent_id.map(i64::from),
                         name,
-                        address_json
+                        address_json,
+                        container_class
                     ],
                 )?;
             }
@@ -2995,7 +3002,8 @@ fn create_schema(connection: &Connection) -> Result<(), JobError> {
             source_id INTEGER NOT NULL,\
             parent_source_id INTEGER,\
             name TEXT,\
-            address_json TEXT\
+            address_json TEXT,\
+            container_class TEXT\
          ) STRICT;\
          CREATE TABLE candidates(\
             item_key TEXT PRIMARY KEY,\
@@ -4409,7 +4417,7 @@ mod tests {
     }
 
     #[test]
-    fn resume_rejects_schema_seven_without_empty_folder_placement()
+    fn resume_rejects_schema_eight_without_contact_classification()
     -> Result<(), Box<dyn std::error::Error>> {
         let directory = tempdir()?;
         let job = directory.path().join("job");
@@ -4439,7 +4447,7 @@ mod tests {
         let database = job.join(".pstforge/job.sqlite3");
         let connection = Connection::open(&database)?;
         connection.execute(
-            "UPDATE job_metadata SET value = '7' WHERE key = 'schema_version'",
+            "UPDATE job_metadata SET value = '8' WHERE key = 'schema_version'",
             [],
         )?;
         drop(connection);
@@ -4778,6 +4786,7 @@ mod tests {
             id: 1,
             parent_id: None,
             name: Some("private folder".to_owned()),
+            container_class: Some("IPF.Note".to_owned()),
         })?;
         message_start(&mut sink, 10)?;
         sink.event(CatalogEvent::AttachmentStart {
@@ -4857,6 +4866,7 @@ mod tests {
             id: 1,
             parent_id: None,
             name: Some("private folder".to_owned()),
+            container_class: Some("IPF.Note".to_owned()),
         })?;
         message_start(&mut sink, 10)?;
         let descriptor = body_descriptor(10, 4);
@@ -4878,6 +4888,13 @@ mod tests {
                 .find(|folder| folder.source_id == 1)
                 .and_then(|folder| folder.name.as_deref()),
             Some("private folder")
+        );
+        assert_eq!(
+            folders
+                .iter()
+                .find(|folder| folder.source_id == 1)
+                .and_then(|folder| folder.container_class.as_deref()),
+            Some("IPF.Note")
         );
         let candidates = sink.spooled_candidates()?;
         assert_eq!(candidates.len(), 1);
@@ -5301,6 +5318,7 @@ mod tests {
             id: 1,
             parent_id: None,
             name: Some("folder".to_owned()),
+            container_class: Some("IPF.Note".to_owned()),
         })?;
         let descriptor = PropertyDescriptor {
             owner: PropertyOwner::Folder(1),
