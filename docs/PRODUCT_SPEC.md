@@ -213,12 +213,19 @@ without ambiguity. An unsupported property is recorded on its item and does
 not discard otherwise usable mail. An attachment failure leaves the parent
 mail partial rather than failed when the remaining message can be written.
 PSTForge preserves a nonempty source attachment MIME type. When that property
-is absent on a complete by-value attachment, PSTForge may derive
-`application/pdf`, `image/png`, `image/jpeg`, `image/gif`, or `image/tiff` from
-the format's exact leading signature after reading at most eleven verified
-payload bytes. It does not infer text types, use filenames, or label container
-formats such as ZIP or OLE when the contained media subtype remains ambiguous.
-An unrecognized attachment remains unlabeled rather than receiving a guess.
+is absent on a complete by-value attachment, PSTForge may derive a type from
+an exact leading signature or a bounded structural parse under the confidence
+rules in `docs/ATTACHMENT_RECOVERY.md`. ZIP is labeled as a generic container
+unless its package metadata and required main part unambiguously prove DOCX,
+XLSX, or PPTX. A Compound File Binary attachment is labeled DOC, XLS, or PPT
+only when its readable directory has one unambiguous corresponding main
+stream. It does not infer text types. For common Office files, a recognized
+source filename extension can serve as corroborating recovery evidence only
+when the payload is independently identified as the matching ZIP or CFB
+container and no stronger structural evidence conflicts. Unrecognized data
+remains unlabeled. When its source filename is also absent, the generated
+recovery filename ends in `.bin` so the byte-exact payload is available to
+later analysis.
 
 Writer inputs use typed recipient roles, body formats, attachment content,
 named-property identities, and raw-property values. Named-property identifiers

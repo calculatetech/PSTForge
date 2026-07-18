@@ -6,12 +6,14 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
+cfb.workspace = true
 chrono.workspace = true
 compressed-rtf.workspace = true
 libc.workspace = true
 libpff-sys = { path = "../libpff-sys" }
 pstforge-job = { path = "../pstforge-job" }
 pstforge-pst = { path = "../pstforge-pst" }
+quick-xml.workspace = true
 rustix.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -19,6 +21,7 @@ sha2.workspace = true
 signal-hook.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
+zip.workspace = true
 
 [dev-dependencies]
 rusqlite.workspace = true

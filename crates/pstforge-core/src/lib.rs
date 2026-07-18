@@ -1,5 +1,6 @@
 #![deny(unsafe_code)]
 
+mod attachment_mime;
 mod canonical;
 mod catalog;
 mod inspection;

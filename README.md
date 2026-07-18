@@ -59,6 +59,10 @@ through `libpff`, `pffinfo`, and independent `readpst`, and validates healthy
 external corpus cases.
 Detailed logs are written under the ignored `.agent/test-results/` directory;
 independent-reader output is redacted because it can contain mailbox data.
+The release-facing [attachment recovery matrix](docs/ATTACHMENT_RECOVERY.md)
+documents which missing MIME types can be proven from complete payload bytes,
+which damaged containers receive only a generic label, and which unknown data
+is retained for later analysis.
 
 Writer developers can generate the 0.2.1 acceptance store directly:
 

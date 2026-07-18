@@ -17,6 +17,7 @@ use thiserror::Error;
 use crate::{
     CanonicalAttachment, CanonicalFolder, CanonicalFolderLocation, CanonicalFolderRole,
     CanonicalMail, CanonicalMessagePlacement, CanonicalProperty, CanonicalRecipient,
+    attachment_mime::{self, BlobRange},
 };
 
 #[derive(Debug, Error)]
@@ -1075,6 +1076,19 @@ fn translate_attachment(
     } else {
         return Ok(None);
     };
+    let mime_type = if let Some(source) = mime_type.filter(|value| !value.is_empty()) {
+        Some(source)
+    } else if attachment.embedded.is_some() {
+        reconstructions.record_derived(ReconstructedField::AttachmentMimeType);
+        Some("message/rfc822".to_owned())
+    } else if let Some(data) = &attachment.data {
+        infer_attachment_mime(job, mail, data, attachment.filename.as_deref())?.map(|value| {
+            reconstructions.record_derived(ReconstructedField::AttachmentMimeType);
+            value.to_owned()
+        })
+    } else {
+        None
+    };
     let filename = attachment
         .filename
         .clone()
@@ -1083,23 +1097,12 @@ fn translate_attachment(
             reconstructions.record_generated(ReconstructedField::AttachmentFilename);
             if attachment.embedded.is_some() {
                 format!("Embedded message {}.msg", attachment.index)
+            } else if mime_type.is_none() {
+                format!("Recovered attachment {}.bin", attachment.index)
             } else {
                 format!("Recovered attachment {}", attachment.index)
             }
         });
-    let mime_type = if let Some(source) = mime_type {
-        Some(source)
-    } else if attachment.embedded.is_some() {
-        reconstructions.record_derived(ReconstructedField::AttachmentMimeType);
-        Some("message/rfc822".to_owned())
-    } else if let Some(data) = &attachment.data {
-        infer_attachment_mime(job, mail, data)?.map(|value| {
-            reconstructions.record_derived(ReconstructedField::AttachmentMimeType);
-            value.to_owned()
-        })
-    } else {
-        None
-    };
     if rendering_position.is_none() {
         reconstructions.record_generated(ReconstructedField::AttachmentRenderingPosition);
     }
@@ -1381,42 +1384,20 @@ fn infer_attachment_mime(
     job: &TranslationSource<'_>,
     mail: &CanonicalMail,
     blob: &SpooledBlob,
+    filename: Option<&str>,
 ) -> Result<Option<&'static str>, CanonicalWriteError> {
-    const MAX_SIGNATURE_BYTES: u64 = 11;
-    let expected = usize::try_from(blob.byte_len.min(MAX_SIGNATURE_BYTES)).map_err(|_| {
-        CanonicalWriteError::InvalidCandidate {
-            item_key: mail.durable_item_key.clone(),
-            detail: "attachment signature length does not fit memory index".to_owned(),
-        }
-    })?;
     let file = job.open_blob(blob)?;
-    let mut bytes = Vec::with_capacity(expected);
-    file.take(blob.byte_len.min(MAX_SIGNATURE_BYTES))
-        .read_to_end(&mut bytes)
-        .map_err(|source| CanonicalWriteError::BlobRead {
+    let mut range =
+        BlobRange::new(file, blob.byte_len).map_err(|source| CanonicalWriteError::BlobRead {
             item_key: mail.durable_item_key.clone(),
             source,
         })?;
-    if bytes.len() != expected {
-        return invalid(mail, "attachment length changed while reading signature");
-    }
-    Ok(mime_from_signature(&bytes))
-}
-
-fn mime_from_signature(bytes: &[u8]) -> Option<&'static str> {
-    if bytes.starts_with(b"%PDF-") {
-        Some("application/pdf")
-    } else if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
-        Some("image/png")
-    } else if bytes.starts_with(&[0xFF, 0xD8, 0xFF, 0xE0]) && bytes.get(6..11) == Some(b"JFIF\0") {
-        Some("image/jpeg")
-    } else if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
-        Some("image/gif")
-    } else if bytes.starts_with(b"II*\0") || bytes.starts_with(b"MM\0*") {
-        Some("image/tiff")
-    } else {
-        None
-    }
+    attachment_mime::detect(&mut range, blob.byte_len, filename).map_err(|source| {
+        CanonicalWriteError::BlobRead {
+            item_key: mail.durable_item_key.clone(),
+            source,
+        }
+    })
 }
 
 fn body_type_is_valid(id: u16, property_type: u16) -> bool {
@@ -1947,15 +1928,16 @@ mod tests {
     use super::{
         CanonicalWriteError, PartBuildOptions, attachment_property_type_is_preservable,
         build_part_writer_input, build_part_writer_input_with_folders_interruptible,
-        contain_body_metadata, mime_from_signature, named_property_set,
-        recipient_property_value_matches, record_internet_codepage_provenance,
-        supported_message_class, valid_compressed_rtf_container, valid_utf8_stream,
-        valid_utf16_stream, writer_stream_type_is_supported,
+        contain_body_metadata, named_property_set, recipient_property_value_matches,
+        record_internet_codepage_provenance, supported_message_class,
+        valid_compressed_rtf_container, valid_utf8_stream, valid_utf16_stream,
+        writer_stream_type_is_supported,
     };
     use crate::{
         CanonicalAttachment, CanonicalFolder, CanonicalFolderLocation, CanonicalFolderRole,
         CanonicalMail, CanonicalMessagePlacement, CanonicalProperty, CanonicalRecipient,
         ContentCompleteness, ItemKey, RecoveryProvenance,
+        attachment_mime::flat_signature as mime_from_signature,
     };
     use pstforge_pst::writer::{
         AttachmentContent, MailFolderRole, NamedPropertySet, NativeBody, validate_mail_store_input,
@@ -2191,7 +2173,7 @@ mod tests {
                 CanonicalAttachment {
                     index: 1,
                     attachment_type: Some(i32::from(b'd')),
-                    filename: Some("truncated.jpg".to_owned()),
+                    filename: None,
                     declared_size: Some(u64::try_from(truncated_jpeg.len())?),
                     data: Some(truncated_blob),
                     data_complete: true,
@@ -2217,6 +2199,10 @@ mod tests {
         assert_eq!(
             input.store.folders[0].messages[0].attachments[1].mime_type,
             None
+        );
+        assert_eq!(
+            input.store.folders[0].messages[0].attachments[1].filename,
+            "Recovered attachment 1.bin"
         );
         assert_eq!(
             input

@@ -1728,6 +1728,34 @@ work. Hash and identity evidence show that the source was not modified.
       `.agent/test-results/1784398030-full`. The owner reports ScanPST and
       Outlook acceptance clean, approving this output-changing checkpoint for
       commit and push.
+    - [ ] (2026-07-18) Extended missing attachment-type recovery to common
+      emailed containers without changing payload bytes. Exact ZIP signatures
+      produce the generic `application/zip` label; bounded OPC parsing upgrades
+      only an exact `[Content_Types].xml` override plus matching required main
+      part to DOCX, XLSX, or PPTX. Pre-bounded CFB parsing recognizes DOC, XLS,
+      or PPT from one unambiguous root main stream plus format markers.
+      Because source filename and MIME are independent MAPI properties, a
+      recognized extension can refine generic ZIP or a matching single-family
+      CFB, but never arbitrary bytes or a conflicting proven subtype. Parser
+      failure, cross-wired metadata, nested evidence, and conflicting subtypes
+      degrade to generic ZIP or unknown rather than dropping the attachment. An
+      unknown attachment with no nonempty source filename is exposed as
+      `Recovered attachment {index}.bin`; this renames no source and converts
+      no bytes. `docs/ATTACHMENT_RECOVERY.md` is the release-facing confidence
+      and corruption-limit matrix. The first fresh review found three
+      applicable gaps: CFB directory allocation preceded the entry cap, OPC
+      namespace/duplicate evidence was under-validated, and legacy root-stream
+      names alone did not prove their Office family. The implementation now
+      preflights CFB FAT chains and allocation counts before `cfb::open_with`,
+      requires a unique namespace-correct OPC package, validates DOC FIB, XLS
+      BOF, and PPT main/current-user record markers, and tests every rejected
+      ambiguity. The repeated full gate passed at
+      `.agent/test-results/1784400359-full`, and the fresh final-state
+      adversarial review reported no applicable blocker, high, or medium
+      findings. The focused attachment checkpoint at
+      `qualification-v042-attachment-types-r2` passed independent `pffinfo` and
+      `readpst` validation; the owner reports ScanPST and Outlook acceptance
+      clean.
     - [x] Create `docs/WRITER_CONFORMANCE.md` with one traceable row for every
       existing store, NDB, LTP, folder, message, recipient, attachment,
       embedded-message, associated-content, named-property, and publication
@@ -3060,6 +3088,27 @@ work. Hash and identity evidence show that the source was not modified.
   plausible but unproven value.
   Date/Author: 2026-07-18 / human owner direction to use data decoding when
   tests establish a clear winner.
+
+- Decision: Preserve every complete unknown attachment byte stream and use a
+  deterministic `.bin` recovery filename only when its source filename is
+  absent or empty. Classify common Office attachments from bounded
+  container structure, using a source extension only as correlated evidence:
+  exact ZIP is generic ZIP unless one supported OPC main content type and
+  required part agree or a recognized OOXML extension survives independently;
+  CFB is DOC, XLS, or PPT when one corresponding root stream has a valid format
+  marker or agrees with its source extension. Extension alone never classifies
+  arbitrary bytes, and proven content overrides a conflicting extension.
+  Rationale: Users need the original payload for later forensic recovery even
+  when PST metadata and the payload's own directory are damaged. A generic
+  container label communicates useful evidence without claiming document
+  integrity. The 256 MiB structural-inspection cap exceeds Exchange Online's
+  documented configurable 150 MB maximum message size and Gmail's 25 MB
+  personal attachment limit, while containing parser memory and CPU on hostile
+  input; larger attachments remain byte-exact and receive only signature-level
+  classification. ZIP entry, central-directory, XML-size, XML-event, and CFB
+  entry limits further bound corrupt-container work.
+  Date/Author: 2026-07-18 / human owner direction to cover common Office/ZIP
+  documents and retain unknown data for later recovery analysis.
 
 ## Outcomes & Retrospective
 
