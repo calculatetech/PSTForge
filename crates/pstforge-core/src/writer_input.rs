@@ -1157,6 +1157,9 @@ fn supported_message_class(value: &str) -> bool {
         || contact_message_class(value)
         || appointment_message_class(value)
         || meeting_message_class(value)
+        || task_message_class(value)
+        || sticky_note_message_class(value)
+        || post_message_class(value)
 }
 
 fn contact_message_class(value: &str) -> bool {
@@ -1171,8 +1174,23 @@ fn meeting_message_class(value: &str) -> bool {
     class_descends_from(value, "IPM.Schedule.Meeting")
 }
 
+fn task_message_class(value: &str) -> bool {
+    class_is_or_descends_from(value, "IPM.Task")
+}
+
+fn sticky_note_message_class(value: &str) -> bool {
+    class_is_or_descends_from(value, "IPM.StickyNote")
+}
+
+fn post_message_class(value: &str) -> bool {
+    class_is_or_descends_from(value, "IPM.Post")
+}
+
 fn sender_optional_message_class(value: &str) -> bool {
-    contact_message_class(value) || appointment_message_class(value)
+    contact_message_class(value)
+        || appointment_message_class(value)
+        || task_message_class(value)
+        || sticky_note_message_class(value)
 }
 
 fn default_container_class(value: &str) -> &'static str {
@@ -1180,6 +1198,10 @@ fn default_container_class(value: &str) -> &'static str {
         "IPF.Contact"
     } else if appointment_message_class(value) {
         "IPF.Appointment"
+    } else if task_message_class(value) {
+        "IPF.Task"
+    } else if sticky_note_message_class(value) {
+        "IPF.StickyNote"
     } else {
         "IPF.Note"
     }
@@ -2083,11 +2105,20 @@ mod tests {
         assert!(supported_message_class("ipm.appointment.custom"));
         assert!(supported_message_class("IPM.Schedule.Meeting.Request"));
         assert!(supported_message_class("ipm.schedule.meeting.resp.pos"));
+        assert!(supported_message_class("IPM.Task"));
+        assert!(supported_message_class("ipm.task.custom"));
+        assert!(supported_message_class("IPM.StickyNote"));
+        assert!(supported_message_class("ipm.stickynote.custom"));
+        assert!(supported_message_class("IPM.Post"));
+        assert!(supported_message_class("ipm.post.custom"));
         assert!(!supported_message_class("IPM.NoteCustom"));
         assert!(!supported_message_class("IPM.ContactCustom"));
         assert!(!supported_message_class("IPM.AppointmentCustom"));
         assert!(!supported_message_class("IPM.Schedule.Meeting"));
         assert!(!supported_message_class("IPM.Schedule.MeetingRequest"));
+        assert!(!supported_message_class("IPM.TaskRequest"));
+        assert!(!supported_message_class("IPM.StickyNoteCustom"));
+        assert!(!supported_message_class("IPM.PostCustom"));
         assert!(!supported_message_class("REPORT.IPM.NoteDR"));
 
         let directory = tempdir()?;

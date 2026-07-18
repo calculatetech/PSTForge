@@ -900,6 +900,9 @@ fn supported_message_class(value: &str) -> bool {
         || class_is_or_descends_from(value, "IPM.Contact")
         || class_is_or_descends_from(value, "IPM.Appointment")
         || class_descends_from(value, "IPM.Schedule.Meeting")
+        || class_is_or_descends_from(value, "IPM.Task")
+        || class_is_or_descends_from(value, "IPM.StickyNote")
+        || class_is_or_descends_from(value, "IPM.Post")
 }
 
 fn class_is_or_descends_from(value: &str, root: &str) -> bool {

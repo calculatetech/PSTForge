@@ -50,10 +50,17 @@ struct PropertyFingerprint {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct NamedPropertyFingerprint {
+    owner: NamedPropertyOwner,
     identity: NamedPropertyIdentity,
     value_type: Option<u32>,
     byte_len: u64,
     sha256: [u8; 32],
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct NamedPropertyOwner {
+    message_class: Option<String>,
+    subject: Option<String>,
 }
 
 struct ActiveNamedProperty {
@@ -67,6 +74,7 @@ struct ActiveNamedProperty {
 struct NamedPropertySink {
     pending: Option<(PropertyDescriptor, NamedPropertyIdentity)>,
     active: BTreeMap<(u32, u32, u32), ActiveNamedProperty>,
+    messages: BTreeMap<u32, NamedPropertyOwner>,
     completed: Vec<NamedPropertyFingerprint>,
 }
 
@@ -168,6 +176,26 @@ impl CatalogSink for IndependentFolderSink {
 impl CatalogSink for NamedPropertySink {
     fn event(&mut self, event: CatalogEvent<'_>) -> Result<(), String> {
         match event {
+            CatalogEvent::MessageStart {
+                id,
+                message_class,
+                subject,
+                ..
+            } => {
+                if self
+                    .messages
+                    .insert(
+                        id,
+                        NamedPropertyOwner {
+                            message_class,
+                            subject,
+                        },
+                    )
+                    .is_some()
+                {
+                    return Err("duplicate named-property message owner".to_owned());
+                }
+            }
             CatalogEvent::NamedProperty {
                 descriptor,
                 identity,
@@ -232,7 +260,13 @@ impl CatalogSink for NamedPropertySink {
                     descriptor.record_set_index,
                     descriptor.entry_index,
                 )) {
+                    let owner = self
+                        .messages
+                        .get(&message_id)
+                        .cloned()
+                        .ok_or_else(|| "named property has no message owner".to_owned())?;
                     self.completed.push(NamedPropertyFingerprint {
+                        owner,
                         identity: property.identity,
                         value_type: property.value_type,
                         byte_len: property.byte_len,
@@ -249,6 +283,11 @@ impl CatalogSink for NamedPropertySink {
                     descriptor.record_set_index,
                     descriptor.entry_index,
                 ));
+            }
+            CatalogEvent::MessageEnd { id, .. } => {
+                if self.messages.remove(&id).is_none() {
+                    return Err("named-property message ended without an owner".to_owned());
+                }
             }
             _ => {}
         }
@@ -723,7 +762,7 @@ fn independent_named_properties(
     if !catalog.issues.is_empty() || catalog.issues_dropped != 0 {
         return Err("named property catalog reported read issues".into());
     }
-    if sink.pending.is_some() || !sink.active.is_empty() {
+    if sink.pending.is_some() || !sink.active.is_empty() || !sink.messages.is_empty() {
         return Err("named property stream ended with unfinished state".into());
     }
     Ok(sink.completed)
@@ -985,6 +1024,10 @@ fn milestone_0_4_2_named_properties_roundtrip_through_libpff()
     let source = independent_named_properties(&case.path)?;
     let expected = [
         NamedPropertyFingerprint {
+            owner: NamedPropertyOwner {
+                message_class: Some("IPM.Note".to_owned()),
+                subject: Some("Named property fidelity checkpoint".to_owned()),
+            },
             identity: NamedPropertyIdentity {
                 guid: [0; 16],
                 name: NamedPropertyName::Numeric(0x8005),
@@ -1000,6 +1043,10 @@ fn milestone_0_4_2_named_properties_roundtrip_through_libpff()
             .into(),
         },
         NamedPropertyFingerprint {
+            owner: NamedPropertyOwner {
+                message_class: Some("IPM.Note".to_owned()),
+                subject: Some("Named property fidelity checkpoint".to_owned()),
+            },
             identity: NamedPropertyIdentity {
                 guid: *b"PSTForgeNamedSet",
                 name: NamedPropertyName::String("CustomCheckpoint".to_owned()),
@@ -1491,6 +1538,178 @@ fn milestone_0_4_2_meetings_roundtrip_through_libpff() -> Result<(), Box<dyn std
         != Some("IPF.Note")
     {
         return Err("generated meeting Inbox is not IPF.Note".into());
+    }
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires the external v042-pim-source corpus case"]
+fn milestone_0_4_2_pim_items_roundtrip_through_libpff() -> Result<(), Box<dyn std::error::Error>> {
+    let manifest_path = std::env::var_os("PSTFORGE_CORPUS_MANIFEST")
+        .ok_or("PSTFORGE_CORPUS_MANIFEST is required")?;
+    let manifest: Manifest = toml::from_str(&fs::read_to_string(&manifest_path)?)?;
+    let case = manifest
+        .cases
+        .iter()
+        .find(|case| case.name == "v042-pim-source")
+        .ok_or("manifest has no v042-pim-source case")?;
+    let identity = pstforge_core::SourceFile::open(&case.path)?
+        .identity()
+        .clone();
+    if identity.sha256 != case.sha256 {
+        return Err("PIM source SHA-256 does not match its manifest".into());
+    }
+
+    let source_messages = independent_messages(&case.path)?;
+    let item_contract = [
+        ("IPM.Task", "Task fidelity checkpoint", "Tasks", None, None),
+        (
+            "IPM.StickyNote",
+            "Sticky note fidelity checkpoint",
+            "Notes",
+            None,
+            None,
+        ),
+        (
+            "IPM.Post",
+            "Post fidelity checkpoint",
+            "Posts",
+            Some("PSTForge Poster"),
+            Some("poster@example.com"),
+        ),
+    ];
+    if source_messages.len() != item_contract.len()
+        || !item_contract
+            .iter()
+            .all(|(class, subject, folder, sender_name, sender_email)| {
+                source_messages.iter().any(|message| {
+                    message.folder_path == [*folder]
+                        && message.content.message_class.as_deref() == Some(*class)
+                        && message.content.subject.as_deref() == Some(*subject)
+                        && message.content.sender_name.as_deref() == *sender_name
+                        && message.content.sender_email.as_deref() == *sender_email
+                        && message.content.recipients.is_empty()
+                        && message.complete
+                })
+            })
+    {
+        return Err("PIM source does not match the three-item contract".into());
+    }
+    let source_named = independent_named_properties(&case.path)?;
+    let expected_named = [
+        ("IPM.Task", "Task fidelity checkpoint", 0x03, 0x8101, 0x0003),
+        ("IPM.Task", "Task fidelity checkpoint", 0x03, 0x8102, 0x0005),
+        ("IPM.Task", "Task fidelity checkpoint", 0x03, 0x8104, 0x0040),
+        ("IPM.Task", "Task fidelity checkpoint", 0x03, 0x8105, 0x0040),
+        ("IPM.Task", "Task fidelity checkpoint", 0x03, 0x811C, 0x000B),
+        ("IPM.Task", "Task fidelity checkpoint", 0x03, 0x8126, 0x000B),
+        (
+            "IPM.StickyNote",
+            "Sticky note fidelity checkpoint",
+            0x0E,
+            0x8B00,
+            0x0003,
+        ),
+        (
+            "IPM.StickyNote",
+            "Sticky note fidelity checkpoint",
+            0x0E,
+            0x8B02,
+            0x0003,
+        ),
+        (
+            "IPM.StickyNote",
+            "Sticky note fidelity checkpoint",
+            0x0E,
+            0x8B03,
+            0x0003,
+        ),
+    ];
+    if source_named.len() != expected_named.len()
+        || !expected_named.iter().all(
+            |(class, subject, guid_first, expected_lid, expected_type)| {
+                source_named.iter().any(|property| {
+                    property.owner.message_class.as_deref() == Some(*class)
+                        && property.owner.subject.as_deref() == Some(*subject)
+                        && property.identity.guid
+                            == [
+                                *guid_first,
+                                0x20,
+                                0x06,
+                                0x00,
+                                0x00,
+                                0x00,
+                                0x00,
+                                0x00,
+                                0xC0,
+                                0x00,
+                                0x00,
+                                0x00,
+                                0x00,
+                                0x00,
+                                0x00,
+                                0x46,
+                            ]
+                        && property.identity.name == NamedPropertyName::Numeric(*expected_lid)
+                        && property.value_type == Some(*expected_type)
+                })
+            },
+        )
+    {
+        return Err(format!("PIM source named-property contract changed: {source_named:?}").into());
+    }
+    let source_classes = independent_folder_classes(&case.path)?;
+    for (folder, class) in [
+        ("Tasks", "IPF.Task"),
+        ("Notes", "IPF.StickyNote"),
+        ("Posts", "IPF.Note"),
+    ] {
+        if source_classes
+            .get(&vec![folder.to_owned()])
+            .map(String::as_str)
+            != Some(class)
+        {
+            return Err(format!("PIM source folder {folder:?} is not {class}").into());
+        }
+    }
+
+    let directory = tempfile::tempdir()?;
+    let job = directory.path().join("job");
+    let output = Command::new(env!("CARGO_BIN_EXE_pstforge"))
+        .arg("split")
+        .arg(&case.path)
+        .arg("--output")
+        .arg(&job)
+        .arg("--max-pst-size")
+        .arg("4GiB")
+        .arg("--json")
+        .arg("--color")
+        .arg("never")
+        .output()?;
+    if !output.status.success() {
+        return Err(format!(
+            "PIM split failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        )
+        .into());
+    }
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+    if report["partial"].as_bool() != Some(false)
+        || report["written_candidates"].as_u64() != Some(3)
+        || report["parts"].as_array().map(Vec::len) != Some(1)
+        || report["parts"][0]["omitted_folders"].as_u64() != Some(0)
+        || report["parts"][0]["omitted_properties"].as_u64() != Some(0)
+        || report["parts"][0]["omitted_attachments"].as_u64() != Some(0)
+    {
+        return Err("PIM split did not report complete preservation".into());
+    }
+    let generated = job.join("parts/part-0001.pst");
+    verify_exact_message_fidelity(source_messages, independent_messages(&generated)?)?;
+    if independent_named_properties(&generated)? != source_named {
+        return Err("PIM named-property identity or payload changed".into());
+    }
+    if independent_folder_classes(&generated)? != source_classes {
+        return Err("PIM folder classes changed during the split".into());
     }
     Ok(())
 }

@@ -2449,7 +2449,7 @@ fn create_flat_store(
         .map_err(completed_validation_error)?;
     }
     check_interrupted(interrupted)?;
-    validate_completed_store(&validated_path, spec, message_parents[0])
+    validate_completed_store(&validated_path, spec, message_parents[0], &named_identities)
         .map_err(completed_validation_error)?;
     check_interrupted(interrupted)?;
     validate_completed_folder_store(&validated_path, spec.record_key, &folder_plans)
@@ -3696,6 +3696,9 @@ fn supported_message_class(value: &str) -> bool {
         || contact_message_class(value)
         || appointment_message_class(value)
         || meeting_message_class(value)
+        || task_message_class(value)
+        || sticky_note_message_class(value)
+        || post_message_class(value)
 }
 
 fn contact_message_class(value: &str) -> bool {
@@ -3710,8 +3713,23 @@ fn meeting_message_class(value: &str) -> bool {
     class_descends_from(value, "IPM.Schedule.Meeting")
 }
 
+fn task_message_class(value: &str) -> bool {
+    class_is_or_descends_from(value, "IPM.Task")
+}
+
+fn sticky_note_message_class(value: &str) -> bool {
+    class_is_or_descends_from(value, "IPM.StickyNote")
+}
+
+fn post_message_class(value: &str) -> bool {
+    class_is_or_descends_from(value, "IPM.Post")
+}
+
 fn sender_optional_message_class(value: &str) -> bool {
-    contact_message_class(value) || appointment_message_class(value)
+    contact_message_class(value)
+        || appointment_message_class(value)
+        || task_message_class(value)
+        || sticky_note_message_class(value)
 }
 
 fn class_is_or_descends_from(value: &str, root: &str) -> bool {
@@ -3868,6 +3886,7 @@ fn validate_completed_store(
     path: &Path,
     spec: &StoreInput<'_>,
     mail: NodeId,
+    named_identities: &[NamedIdentity],
 ) -> Result<(), WriterError> {
     use crate::{ltp::prop_context::PropertyValue as ReadValue, messaging::store::EntryId};
 
@@ -3956,8 +3975,7 @@ fn validate_completed_store(
         }
     }
 
-    let named_identities = collect_named_identities(spec.message);
-    let validation_ids = validation_property_ids(spec.message, &named_identities)?;
+    let validation_ids = validation_property_ids(spec.message, named_identities)?;
     let message_entry = EntryId::new(
         crate::messaging::store::StoreRecordKey::new(spec.record_key),
         message,
@@ -4101,7 +4119,9 @@ fn validate_completed_store(
             .get(id)
             .is_some_and(|actual| raw_value_matches(&property.value, actual))
         {
-            return Err(invalid("completed store named property mismatch"));
+            return Err(invalid(&format!(
+                "completed store named property 0x{id:04X} mismatch"
+            )));
         }
     }
     for property in &spec.message.raw_properties {
@@ -4194,7 +4214,7 @@ fn validate_completed_store(
             )))
             .map_err(|_| invalid("completed store attachment row identity mismatch"))?;
     }
-    validate_attachment_fidelity(path, spec, &named_identities)?;
+    validate_attachment_fidelity(path, spec, named_identities)?;
     Ok(())
 }
 
@@ -8097,6 +8117,48 @@ mod tests {
             Some(crate::ltp::prop_context::PropertyValue::Unicode(value))
                 if value.to_string() == "second"
         ));
+        Ok(())
+    }
+
+    #[test]
+    fn multi_message_validation_uses_the_store_wide_named_property_map()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("multiple-named-sets.pst");
+        let base = FidelityStore::default();
+        let named = |guid_first, subject: &str| {
+            let mut message = base.message.clone();
+            message.subject = subject.to_owned();
+            message.named_properties = vec![NamedProperty {
+                set: NamedPropertySet::Guid([
+                    guid_first, 0x20, 0x06, 0x00, 0x00, 0x00, 0x00, 0x00, 0xC0, 0x00, 0x00, 0x00,
+                    0x00, 0x00, 0x00, 0x46,
+                ]),
+                name: NamedPropertyName::Numeric(0x8101),
+                value: RawPropertyValue::Integer32(0),
+            }];
+            message
+        };
+        let spec = MailStoreSpec {
+            store_name: "PSTForge named map validation".to_owned(),
+            record_key: *b"PSTForgeNamedMap",
+            folders: vec![
+                MailFolderSpec {
+                    path: vec!["Notes".to_owned()],
+                    role: MailFolderRole::Ordinary,
+                    container_class: "IPF.Note".to_owned(),
+                    messages: vec![named(0x0E, "lexically first folder")],
+                },
+                MailFolderSpec {
+                    path: vec!["Tasks".to_owned()],
+                    role: MailFolderRole::Ordinary,
+                    container_class: "IPF.Task".to_owned(),
+                    messages: vec![named(0x03, "globally first named property")],
+                },
+            ],
+        };
+        create_mail_store(&path, &spec)?;
+        assert!(path.is_file());
         Ok(())
     }
 

@@ -23,7 +23,7 @@ use sha2::{Digest, Sha256};
 use tempfile::NamedTempFile;
 use thiserror::Error;
 
-const JOB_SCHEMA_VERSION: i64 = 11;
+const JOB_SCHEMA_VERSION: i64 = 12;
 const INLINE_BLOB_MAX_BYTES: u64 = 64 * 1024;
 const INLINE_CACHE_DIRECTORY: &str = ".pstforge-inline-cache";
 const PAYLOAD_PACK_FILENAME: &str = "payload.pack";
@@ -4417,7 +4417,7 @@ mod tests {
     }
 
     #[test]
-    fn resume_rejects_schema_ten_without_meeting_classification()
+    fn resume_rejects_schema_eleven_without_pim_classification()
     -> Result<(), Box<dyn std::error::Error>> {
         let directory = tempdir()?;
         let job = directory.path().join("job");
@@ -4447,7 +4447,7 @@ mod tests {
         let database = job.join(".pstforge/job.sqlite3");
         let connection = Connection::open(&database)?;
         connection.execute(
-            "UPDATE job_metadata SET value = '10' WHERE key = 'schema_version'",
+            "UPDATE job_metadata SET value = '11' WHERE key = 'schema_version'",
             [],
         )?;
         drop(connection);

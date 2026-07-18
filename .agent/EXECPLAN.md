@@ -1230,9 +1230,69 @@ work. Hash and identity evidence show that the source was not modified.
     - [x] (2026-07-18) The owner reports all-green ScanPST and Outlook
       acceptance for the original, unrepaired meeting candidate. This closes
       checkpoint 5 for commit and push.
-  - [ ] Checkpoints 6 onward: distribution lists, tasks, notes/posts,
-    OLE/documents, associated/configuration data, and remaining generic
-    classes, each proven separately where feasible.
+  - [x] Checkpoint 6: standalone tasks, sticky notes, and posts.
+    - [x] (2026-07-18) Consolidated `IPM.Task`, `IPM.StickyNote`, and
+      `IPM.Post` plus their dotted descendants because all three use the
+      existing normal-message and lossless named-property path. Standalone
+      tasks and sticky notes permit an absent sender and default to `IPF.Task`
+      and `IPF.StickyNote`; posts retain normal sender rules and `IPF.Note`.
+      `IPM.TaskRequest` is deliberately outside the admitted `IPM.Task`
+      boundary because task communications have different sender, recipient,
+      and embedded-task semantics.
+    - [x] (2026-07-18) Job schema 12 refuses schema-11 resumes because an
+      older durable catalog can already contain these three families marked
+      unsupported.
+    - [x] (2026-07-18) Added external case `v042-pim-source`, 271,360 bytes,
+      SHA-256
+      `1de2f8134c3e7fca9389977a909454a4cefdc0688ae9434ab1a802f99594d65f`.
+      It contains one standalone task with task named properties, one sticky
+      note with note display properties, and one post with sender identity in
+      three exact source folders.
+    - [x] (2026-07-18) The combined fixture exposed an existing completed-PST
+      validator defect: its first-message validation built property IDs from
+      that message's local named-property subset instead of the store-wide
+      NAMEID map. Validation now uses the same store-wide identity ordering as
+      serialization. The focused multi-message regression covers a
+      lexically-first folder whose named-property GUID sorts after another
+      message's GUID.
+    - [x] (2026-07-18) Complete fast automation passes at
+      `.agent/test-results/1784354764-fast`; the named-map regression and
+      ignored exact libpff source/output roundtrip pass separately. The
+      roundtrip writes three complete candidates in one part with zero folder,
+      property, or attachment omissions and exact message, body, folder-class,
+      named-property identity, type, length, and payload fidelity.
+    - [x] (2026-07-18) The first focused review found one applicable medium
+      evidence gap: named properties were compared as a store-wide aggregate,
+      so the test did not prove that task properties remained on the task and
+      note properties remained on the sticky note. Named-property
+      fingerprints now carry their owning message class and subject. The
+      fixture contract requires the task to own exactly six PSETID_Task
+      properties, the sticky note to own exactly three PSETID_Note properties,
+      and the post to own none.
+    - [x] (2026-07-18) The owner-bound PIM roundtrip and the earlier named-
+      property roundtrip pass, followed by the complete fast gate at
+      `.agent/test-results/1784355041-fast`.
+    - [x] (2026-07-18) The final fresh focused review confirms the prior
+      owner-accounting gap is closed and reports no remaining blocker, high,
+      or medium checkpoint-applicable finding.
+    - [x] (2026-07-18) Generated the single bounded human candidate at
+      `qualification-v042-pim-r1/parts/part-0001.pst`: 271,360 bytes, SHA-256
+      `a6594d5bd8df45bf166baaa33f40c4448097744c56b37a34210cc6697f35f59c`.
+      PSTForge full verification reports Unicode64, no observed corruption,
+      three complete items, zero unsupported items, and zero issues;
+      `pffinfo` opens it successfully. The recovery log reports no readable
+      data skipped, the external source retains SHA-256
+      `1de2f8134c3e7fca9389977a909454a4cefdc0688ae9434ab1a802f99594d65f`,
+      and transient schema-12 job/spool state was removed.
+    - [x] (2026-07-18) The owner reports all-green ScanPST and Outlook
+      acceptance for the original, unrepaired PIM candidate. Outlook presents
+      the task, sticky note, and post as their native item forms; the Post form
+      shows the expected `Task notes checkpoint.` body. This closes checkpoint
+      6 for commit and push.
+  - [ ] Checkpoints 7 onward: distribution lists; OLE, documents, and
+    reference attachments; associated/configuration data; task
+    communications; journal/activity objects; and remaining generic classes,
+    each proven separately where feasible.
   - [ ] Run the complete 19 GB split once after all focused checkpoints pass
     and reconcile discovered unique items against written plus explicitly
     unwritten items across every part.
@@ -2340,6 +2400,19 @@ work. Hash and identity evidence show that the source was not modified.
   meeting semantics absent from the source.
   Date/Author: 2026-07-17 / Codex from checkpoint-5 implementation evidence.
 
+- Decision: Job schema 12 admits standalone `IPM.Task`, `IPM.StickyNote`, and
+  `IPM.Post` families together, while distribution lists, task
+  communications, associated messages, and OLE/document storage remain
+  separate checkpoints.
+  Rationale: The admitted families require only normal-message class,
+  sender-policy, folder-class, and named-property handling already present in
+  the writer. Personal distribution lists require synchronized
+  multivalue-binary member properties; associated data uses a different PST
+  contents table; task communications can contain an embedded Task object;
+  and OLE/document payloads have their own storage contract. Combining those
+  would conceal materially different integrity risks.
+  Date/Author: 2026-07-18 / Codex from checkpoint-6 implementation evidence.
+
 - Decision: The appointment checkpoint proves a standalone, non-recurring
   `IPM.Appointment` before meeting and recurrence families. Preserve the exact
   PSETID_Appointment and PSETID_Common named-property identities and values;
@@ -2908,6 +2981,19 @@ attendee, January 15, 2025 from 10:00 AM to 11:00 AM America/Detroit
 (15:00-16:00 UTC), located in `Conference Room 42`, shown as Busy, with the
 15-minute reminder and expected notes. Confirm Outlook presents meeting
 request controls without an item-corruption warning; do not send a response.
+
+For checkpoint 6, select external case `v042-pim-source`, run ignored test
+`milestone_0_4_2_pim_items_roundtrip_through_libpff`, and scan only
+`qualification-v042-pim-r1/parts/part-0001.pst`. Then open the original,
+unrepaired candidate in Outlook. Confirm the `Tasks` folder is a normal Tasks
+folder containing `Task fidelity checkpoint`, with start and due dates, zero
+percent complete, incomplete state, and the expected notes. Confirm the
+`Notes` folder is a normal Notes folder containing
+`Sticky note fidelity checkpoint`, with yellow color, a usable note window,
+and the expected body. Confirm the `Posts` folder contains
+`Post fidelity checkpoint` from `PSTForge Poster`, opens as a Post item, and
+shows the expected body. Stop and provide the ScanPST log if ScanPST reports
+any error or requests repair.
 
 After every available focused checkpoint succeeds, run the complete 19 GB
 split once. Unique source items assigned across all output parts must equal the
