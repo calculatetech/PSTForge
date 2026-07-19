@@ -407,6 +407,7 @@ fn translate_message(
     let mut message_flags = None;
     let mut internet_codepage = None;
     let mut html_property = None;
+    let mut body_text = None;
     let mut serialized_ids = BTreeSet::new();
     let mut serialized_named = BTreeSet::new();
     let mut item_keys = vec![mail.durable_item_key.clone()];
@@ -685,6 +686,9 @@ fn translate_message(
         }
         if property.blob.byte_len == 0 {
             match property_type {
+                0x001F if id == 0x1000 => {
+                    body_text = Some(String::new());
+                }
                 0x001F => raw_properties.push(RawProperty {
                     id,
                     value: RawPropertyValue::Unicode(String::new()),
@@ -890,6 +894,7 @@ fn translate_message(
         &mut native_body,
         &mut rtf_in_sync,
         rtf_in_sync_observed,
+        body_text.is_some(),
         &spooled_properties,
         &mut partial,
         &mut omitted_properties,
@@ -1005,7 +1010,7 @@ fn translate_message(
             received_filetime,
             creation_filetime,
             modification_filetime,
-            body_text: None,
+            body_text,
             body_html: None,
             body_rtf: None,
             native_body,
@@ -2355,6 +2360,7 @@ fn contain_body_metadata(
     native_body: &mut Option<NativeBody>,
     rtf_in_sync: &mut bool,
     rtf_in_sync_observed: bool,
+    body_text_present: bool,
     properties: &[SpooledPropertySpec],
     partial: &mut bool,
     omitted_properties: &mut u64,
@@ -2366,7 +2372,7 @@ fn contain_body_metadata(
         *omitted_properties = omitted_properties.saturating_add(1);
     }
     let native_body_is_present = match native_body {
-        Some(NativeBody::PlainText) => has_property(0x1000),
+        Some(NativeBody::PlainText) => body_text_present || has_property(0x1000),
         Some(NativeBody::Rtf) => has_property(0x1009),
         Some(NativeBody::Html) => has_property(0x1013),
         None => true,
@@ -4360,6 +4366,103 @@ mod tests {
     }
 
     #[test]
+    fn explicit_empty_plain_body_survives_production_translation()
+    -> Result<(), Box<dyn std::error::Error>> {
+        fn send(
+            sink: &mut DurableCatalogSink,
+            event: CatalogEvent<'_>,
+        ) -> Result<(), std::io::Error> {
+            CatalogSink::event(sink, event).map_err(std::io::Error::other)
+        }
+
+        let directory = tempdir()?;
+        let mut job = DurableCatalogSink::create(&directory.path().join("job"))?;
+        send(
+            &mut job,
+            CatalogEvent::MessageStart {
+                id: 41,
+                provenance: CatalogProvenance::Normal,
+                recovery_index: None,
+                folder_id: None,
+                parent_message_id: None,
+                parent_attachment_index: None,
+                embedded_path: Vec::new(),
+                associated: false,
+                item_type: Some(11),
+                message_class: Some("IPM.Note".to_owned()),
+                subject: Some("Explicit empty body checkpoint".to_owned()),
+                sender_name: None,
+                sender_email: None,
+                submit_filetime: None,
+                delivery_filetime: None,
+                supported: true,
+            },
+        )?;
+        let descriptor = PropertyDescriptor {
+            owner: PropertyOwner::Message(41),
+            record_set_index: 0,
+            entry_index: 0,
+            entry_type: Some(0x1000),
+            value_type: Some(0x001F),
+            data_size: 0,
+        };
+        send(&mut job, CatalogEvent::PropertyStart(descriptor))?;
+        send(&mut job, CatalogEvent::PropertyEnd(descriptor))?;
+        let native_body = PropertyDescriptor {
+            owner: PropertyOwner::Message(41),
+            record_set_index: 0,
+            entry_index: 1,
+            entry_type: Some(0x1016),
+            value_type: Some(0x0003),
+            data_size: 4,
+        };
+        send(&mut job, CatalogEvent::PropertyStart(native_body))?;
+        send(
+            &mut job,
+            CatalogEvent::PropertyData {
+                descriptor: native_body,
+                bytes: &1_i32.to_le_bytes(),
+            },
+        )?;
+        send(&mut job, CatalogEvent::PropertyEnd(native_body))?;
+        send(
+            &mut job,
+            CatalogEvent::MessageEnd {
+                id: 41,
+                complete: true,
+            },
+        )?;
+
+        let mail = load_canonical_mail(&job)?.remove(0);
+        let input = build_part_writer_input(
+            &job,
+            &[&mail],
+            &"0".repeat(64),
+            "balanced",
+            4_294_967_296,
+            1,
+        )?;
+        assert!(!input.partial);
+        assert_eq!(input.omitted_properties, 0);
+        assert_eq!(input.item_keys, ["normal:41:-:0"]);
+        let output = &input.store.folders[0].messages[0];
+        assert_eq!(output.body_text.as_deref(), Some(""));
+        assert_eq!(output.native_body, Some(NativeBody::PlainText));
+        assert!(
+            !output
+                .raw_properties
+                .iter()
+                .any(|property| property.id == 0x1000)
+        );
+        validate_mail_store_input(&input.store)?;
+        pstforge_pst::writer::create_mail_store(
+            directory.path().join("production-empty-body.pst"),
+            &input.store,
+        )?;
+        Ok(())
+    }
+
+    #[test]
     fn attachment_larger_than_writer_field_is_omitted_without_losing_parent()
     -> Result<(), Box<dyn std::error::Error>> {
         let directory = tempdir()?;
@@ -4563,6 +4666,7 @@ mod tests {
             &mut native_body,
             &mut rtf_in_sync,
             true,
+            false,
             &[],
             &mut body_partial,
             &mut body_omissions,
@@ -4580,6 +4684,7 @@ mod tests {
             &mut no_native_body,
             &mut false_sync,
             true,
+            false,
             &[],
             &mut false_sync_partial,
             &mut false_sync_omissions,

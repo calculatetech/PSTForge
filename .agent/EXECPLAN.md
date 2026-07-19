@@ -2235,6 +2235,71 @@ work. Hash and identity evidence show that the source was not modified.
     The accepted incremental restartable path meets the immediate performance
     need; direct-mode write-amplification work must not delay the newly exposed
     native-item data-correctness remediation.
+- [ ] Milestone 0.4.4: Whole-Job Data Reconciliation.
+  - [x] (2026-07-19) Created
+    `milestone/v0.4.4-data-correctness` from merged and pushed `main` commit
+    `aefcbb7`. The 0.4.3 qualification establishes 37,402 readable native
+    candidates, 37,035 written candidates, and 367 whole-item omissions.
+  - [x] (2026-07-19) Checkpoint 1: preserve explicit empty writer-managed body properties
+    instead of rejecting the complete item. Recover the 315 complete and one
+    partial candidates whose Unicode `PidTagBody` is readable and explicitly
+    empty. Add normative conformance traceability, focused translation/writer
+    tests, independent-reader validation, and ScanPST-first evidence.
+    Microsoft MS-OXCMSG 2.2.1.58.1 defines `PidTagBody` as `PtypString`
+    without a non-empty restriction. Production translation now maps the
+    exact observed zero-byte Unicode property to a present empty body instead
+    of a conflicting raw property. The writer encodes the empty variable
+    value with a null HNID while retaining the property entry, and completed
+    validation distinguishes that present-null value from property absence.
+    Focused production-translation and writer reopen tests pass; complete
+    core and writer suites pass with 75 and 87 tests respectively. Fresh
+    adversarial review and ScanPST-first acceptance remain.
+    The first clean-context review found one high and two medium gaps:
+    embedded validation did not accept the same present-null empty value,
+    native-body containment ignored an in-memory empty plain body, and the
+    production regression did not serialize the folder-store path. Embedded
+    and normal completed-store validation now distinguish present empty from
+    absent, plain native-body presence includes the in-memory representation,
+    and the production regression writes and validates a real mail store.
+    Existing streamed bodies continue through their independent
+    type/length/hash validator. Focused tests and the repeated complete
+    core/writer suites pass after remediation. A fresh final-state
+    clean-context review returned `CLEAN`. The external r1 checkpoint is
+    271,360 bytes with SHA-256
+    `1b0fbbceee053302cba10d7aa17e1fa7d9955047e6610c5dcf47a12a1fef7d19`;
+    `pffinfo` identifies a 64-bit PST and `readpst` extracts exactly one
+    message with the expected subject and empty body without diagnostics.
+    Human acceptance confirms ScanPST and Outlook both pass: the unrepaired
+    candidate opens normally, contains the one expected message in the
+    expected folder, and preserves its explicit blank body. The canonical
+    full gate passes at `.agent/test-results/1784499956-full`.
+  - [ ] Checkpoint 2: replace the recipient-table single-heap-page limitation
+    with specification-conforming scalable storage. Recover 42 candidates,
+    including eight otherwise complete items, and prove recipient count,
+    roles, addresses, and property rows through independent reads.
+  - [ ] Checkpoint 3: remove the general message heap-page limitation for the
+    five affected candidates without imposing an arbitrary source-property or
+    item-count cap. Validate the exact resulting property contexts and tables.
+  - [ ] Checkpoint 4: diagnose from durable local evidence, then resolve the
+    two raw-property representation failures and one aggregate-recipient
+    metadata failure. Recover the embedded item stranded beneath a rejected
+    parent. Do not use an adversarial reviewer for diagnosis when the cause is
+    locally clear.
+  - [ ] Checkpoint 5: persist a bounded structured rejection category and
+    safe diagnostic summary whenever a candidate cannot be written. The
+    ledger event must not be `{}` and must never include subjects, addresses,
+    bodies, filenames, payload bytes, or private paths. `recovery.log` reports
+    exact aggregate counts without itemizing private mailbox data.
+  - [ ] Final gate: reconcile the 19 GB source's 37,402 readable candidate
+    keys to exactly 37,402 unique written item keys across finalized parts,
+    with zero unexplained `unsupported`, `failed`, stranded, duplicated, or
+    unassigned candidates. A writer limitation is a defect, not an approved
+    omission. Any claimed impossible recovery requires specific source-read
+    or Unicode-PST representation evidence and explicit human approval.
+    Require the canonical full gate, independent `pffinfo`/`readpst`, ScanPST
+    on every part, Outlook item/folder checks, unchanged source identity, one
+    serialization per normal part, less than 2 GiB RSS, and the accepted
+    20-minute cold-run ceiling.
 - [ ] Milestone 0.5.0: Operational UX and Debian Packaging.
 - [ ] Milestone 0.5.1: GitHub CI and Private-Corpus Automation; the remote is
   reachable, and work begins after the approved baseline is pushed.

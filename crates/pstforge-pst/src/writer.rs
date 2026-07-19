@@ -4827,11 +4827,6 @@ fn validate_message(message: &MessageSpec, depth: usize) -> Result<(), WriterErr
         _ => {}
     }
     if let Some(body) = &message.body_text {
-        if body.is_empty() {
-            return Err(WriterError::InvalidStructure(
-                "plain-text body must be non-empty when present".to_owned(),
-            ));
-        }
         validate_payload_len("plain-text body", unicode_payload_len(body)?)?;
     }
     if let Some(body) = &message.body_html {
@@ -5796,6 +5791,7 @@ fn validate_completed_store(
     }
     match (&spec.message.body_text, message.properties().get(0x1000)) {
         (Some(expected), Some(ReadValue::Unicode(actual))) if actual.to_string() == *expected => {}
+        (Some(expected), Some(ReadValue::Null)) if expected.is_empty() => {}
         (None, None) => {}
         _ => return Err(invalid("completed store plain body mismatch")),
     }
@@ -6124,10 +6120,28 @@ fn validate_completed_folder_store(
             {
                 return Err(invalid("completed store message flags mismatch"));
             }
-            let opened =
-                store.open_message(&store.properties().make_entry_id(message)?, Some(&[0x001A]))?;
+            let opened = store.open_message(
+                &store.properties().make_entry_id(message)?,
+                Some(&[0x001A, 0x1000]),
+            )?;
             if opened.properties().message_class()? != expected.message_class {
                 return Err(invalid("completed normal message class mismatch"));
+            }
+            if !expected
+                .spooled_properties
+                .iter()
+                .any(|property| property.id == 0x1000)
+            {
+                match (&expected.body_text, opened.properties().get(0x1000)) {
+                    (
+                        Some(expected),
+                        Some(crate::ltp::prop_context::PropertyValue::Unicode(actual)),
+                    ) if actual.to_string() == *expected => {}
+                    (Some(expected), Some(crate::ltp::prop_context::PropertyValue::Null))
+                        if expected.is_empty() => {}
+                    (None, None) => {}
+                    _ => return Err(invalid("completed normal message plain body mismatch")),
+                }
             }
         }
         let associated = folder
@@ -6936,6 +6950,7 @@ fn validate_embedded_message(
     }
     match (&expected.body_text, properties.get(0x1000)) {
         (Some(expected), Some(ReadValue::Unicode(actual))) if actual.to_string() == *expected => {}
+        (Some(expected), Some(ReadValue::Null)) if expected.is_empty() => {}
         (None, None) => {}
         _ => return Err(invalid("completed store embedded text mismatch")),
     }
@@ -12771,11 +12786,39 @@ mod tests {
 
     fn fidelity_validation_handles_empty_raw_values_and_rejects_ambiguous_inputs_inner()
     -> Result<(), Box<dyn std::error::Error>> {
+        use crate::{
+            ltp::prop_context::PropertyValue as ReadValue,
+            messaging::{
+                message::{Message, UnicodeMessage},
+                store::UnicodeStore,
+            },
+        };
+        use std::rc::Rc;
+
         let mut empty_body = FidelityStore::default();
         empty_body.message.body_text = Some(String::new());
+        let AttachmentContent::Embedded(embedded) = &mut empty_body.message.attachments[1].content
+        else {
+            return Err("expected embedded message".into());
+        };
+        embedded.body_text = Some(String::new());
+        validate_spec(&empty_body)?;
+        let directory = tempfile::tempdir()?;
+        let empty_body_path = directory.path().join("empty-body.pst");
+        create_fidelity_store(&empty_body_path, &empty_body)?;
+        let pst = Rc::new(UnicodePstFile::open(&empty_body_path)?);
+        let store = UnicodeStore::read(pst)?;
+        let message = UnicodeMessage::read(
+            store,
+            &EntryId::new(
+                crate::messaging::store::StoreRecordKey::new(empty_body.record_key),
+                node(NodeIdType::NormalMessage, MESSAGE_INDEX)?,
+            ),
+            None,
+        )?;
         assert!(matches!(
-            validate_spec(&empty_body),
-            Err(WriterError::InvalidStructure(_))
+            message.properties().get(0x1000),
+            Some(ReadValue::Null)
         ));
 
         let mut empty_raw = FidelityStore::default();

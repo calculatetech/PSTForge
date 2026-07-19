@@ -32,7 +32,7 @@ use crate::{
     load_canonical_mail_interruptible,
 };
 
-pub const SPLIT_SCHEMA_VERSION: &str = "0.4.3";
+pub const SPLIT_SCHEMA_VERSION: &str = "0.4.4";
 const TOOL_COMPATIBILITY_MAJOR: u64 = 0;
 const PART_SIZE_POLICY: &str = "hard-maximum-v1";
 const WRITER_FORMAT: &str = "unicode-pst-v23";
@@ -239,7 +239,7 @@ pub fn split(
         );
         let open = match open {
             Err(JobError::ResumeMismatch("split report schema version"))
-                if SPLIT_SCHEMA_VERSION == "0.4.3" =>
+                if SPLIT_SCHEMA_VERSION == "0.4.4" =>
             {
                 let mut legacy_configuration = configuration.clone();
                 legacy_configuration.split_schema_version = "0.4.2".to_owned();
@@ -2338,7 +2338,7 @@ mod tests {
 
     fn split_report() -> SplitReport {
         SplitReport {
-            schema_version: "0.4.3".to_owned(),
+            schema_version: "0.4.4".to_owned(),
             command: "split".to_owned(),
             maximum_pst_bytes: 4_294_967_296,
             resumed: false,
@@ -2356,7 +2356,7 @@ mod tests {
                 peak_process_rss_bytes: 1,
             },
             recovery: RecoveryReport {
-                schema_version: "0.4.3".to_owned(),
+                schema_version: "0.4.4".to_owned(),
                 command: "recover".to_owned(),
                 mode: "balanced".to_owned(),
                 source: SourceIdentity {

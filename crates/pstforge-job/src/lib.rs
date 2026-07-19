@@ -4827,7 +4827,7 @@ mod tests {
         };
         let configuration = JobConfiguration {
             tool_compatibility_major: 0,
-            split_schema_version: "0.4.3".to_owned(),
+            split_schema_version: "0.4.4".to_owned(),
             recovery_mode: "balanced".to_owned(),
             maximum_pst_bytes: 4_294_967_296,
             part_size_policy: "hard-maximum-v1".to_owned(),
@@ -4882,7 +4882,7 @@ mod tests {
         };
         let configuration = JobConfiguration {
             tool_compatibility_major: 0,
-            split_schema_version: "0.4.3".to_owned(),
+            split_schema_version: "0.4.4".to_owned(),
             recovery_mode: "balanced".to_owned(),
             maximum_pst_bytes: 4_294_967_296,
             part_size_policy: "hard-maximum-v1".to_owned(),
@@ -4956,7 +4956,7 @@ mod tests {
         };
         let configuration = JobConfiguration {
             tool_compatibility_major: 0,
-            split_schema_version: "0.4.3".to_owned(),
+            split_schema_version: "0.4.4".to_owned(),
             recovery_mode: "balanced".to_owned(),
             maximum_pst_bytes: 4_294_967_296,
             part_size_policy: "hard-maximum-v1".to_owned(),

@@ -122,14 +122,30 @@ the deferred 0.4.2 whole-job reconciliation across independently validated
 4 GiB splits before proceeding. A low-write direct-output mode remains future
 work after the newly exposed native-item data-correctness gaps are resolved.
 
-### 11. Version 0.5.0 - Operational UX and Debian Packaging
+### 11. Version 0.4.4 - Whole-Job Data Reconciliation
+
+Complete the deferred 19 GB input/output reconciliation. Every readable native
+candidate, including embedded items, must appear exactly once across the
+generated PST parts. A writer limitation is a defect, not evidence that source
+data is unrecoverable. Remove the known empty-body, recipient-table heap,
+general heap, raw-property, and aggregate-recipient rejection paths.
+
+Persist bounded structured rejection categories in the durable ledger and
+summarize exact counts in `recovery.log`. Any remaining unwritten item must be
+shown to be unreadable from the source or intrinsically impossible to
+represent safely, with comparative evidence and explicit human approval.
+Qualify against the 19 GB source with exactly 37,402 readable candidates
+reconciled to 37,402 unique written items, then require every output part to
+pass independent readers, ScanPST, and Outlook.
+
+### 12. Version 0.5.0 - Operational UX and Debian Packaging
 
 Finalize human and JSON reports, documented exit codes, privacy-preserving
 diagnostics, installation checks, and a reproducible Debian 13 x86_64 package.
 Verify operation with Debian's older supported `libpff` ABI as well as the
 newer Ubuntu development host package.
 
-### 12. Version 0.5.1 - GitHub CI and Private-Corpus Automation
+### 13. Version 0.5.1 - GitHub CI and Private-Corpus Automation
 
 The GitHub remote and approved documentation baseline are available. Add branch
 checks, scheduled security and fuzzing jobs, release automation, and an
@@ -137,14 +153,14 @@ explicitly invoked private self-hosted corpus runner that never uploads PST
 content or sensitive logs. This repository does not use pull requests, so
 required checks apply to milestone branches and pre-merge local gates.
 
-### 13. Version 0.6.0 - Interoperability Release Candidate
+### 14. Version 0.6.0 - Interoperability Release Candidate
 
 Freeze the candidate CLI and schemas, run the complete external corpus,
 exercise fault injection and resource limits, import generated parts into a
 test Synology MailPlus mailbox, and perform secondary Outlook checks. Resolve
 all blocker and high-severity adversarial review findings.
 
-### 14. Version 1.0.0 - MailPlus-Ready Release
+### 15. Version 1.0.0 - MailPlus-Ready Release
 
 Repeat the 50 GB recovery and MailPlus import rehearsal from a clean install,
 reproduce the Debian package, verify licenses and notices, finalize operator

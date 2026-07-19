@@ -383,8 +383,11 @@ logical source and finalized output bytes, average end-to-end source
 throughput, and peak sampled RSS across the supervisor and parser workers.
 Reports also include corruption observation, folders and candidates by
 provenance, items by completeness and status, attachment totals, unsupported
-item/property totals, part sizes and hashes, retries, worker crashes, bounded
-error summaries, and whether the source identity remained unchanged.
+item/property totals, exact aggregate rejection categories, part sizes and
+hashes, retries, worker crashes, bounded error summaries, and whether the
+source identity remained unchanged. A writer implementation limit is reported
+as a product defect and does not establish that readable source data is
+unrecoverable.
 
 Default progress events report only operation state, part index, counts, byte
 sizes, elapsed time, and interruption state. They never include mailbox names,
@@ -430,6 +433,13 @@ Release acceptance requires all local gates, the real external corpus, and the
 within 24 hours, keep peak PSTForge process RSS below 2 GiB, leave the source
 unchanged, survive forced termination without losing finalized parts, and
 account for every discovered mail item.
+
+For the 19 GB qualification source, the readable inventory and the union of
+unique item keys written across all finalized parts must match one-for-one.
+Every readable top-level or embedded candidate must be written exactly once.
+Any remaining unwritten item requires specific evidence that its source bytes
+cannot be read or cannot be represented safely in a Unicode PST; a generic
+writer rejection or unsupported status does not satisfy this exception.
 
 The 19 GB operational qualification has a stricter 20-minute cold-run ceiling
 on the current host, a six-minute maximum time to the first finalized part, and

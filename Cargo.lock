@@ -464,7 +464,7 @@ checksum = "68ab91017fe16c622486840e4c83c9a37afeff978bd239b5293d61ece587de66"
 
 [[package]]
 name = "libpff-sys"
-version = "0.4.3"
+version = "0.4.4"
 dependencies = [
  "pkg-config",
  "serde",
@@ -572,7 +572,7 @@ dependencies = [
 
 [[package]]
 name = "pstforge-cli"
-version = "0.4.3"
+version = "0.4.4"
 dependencies = [
  "clap",
  "libpff-sys",
@@ -593,7 +593,7 @@ dependencies = [
 
 [[package]]
 name = "pstforge-core"
-version = "0.4.3"
+version = "0.4.4"
 dependencies = [
  "cfb",
  "chrono",
@@ -617,7 +617,7 @@ dependencies = [
 
 [[package]]
 name = "pstforge-job"
-version = "0.4.3"
+version = "0.4.4"
 dependencies = [
  "libc",
  "libpff-sys",
@@ -632,7 +632,7 @@ dependencies = [
 
 [[package]]
 name = "pstforge-pst"
-version = "0.4.3"
+version = "0.4.4"
 dependencies = [
  "byteorder",
  "compressed-rtf",
@@ -1193,7 +1193,7 @@ dependencies = [
 
 [[package]]
 name = "xtask"
-version = "0.4.3"
+version = "0.4.4"
 dependencies = [
  "base64",
  "cfb",
