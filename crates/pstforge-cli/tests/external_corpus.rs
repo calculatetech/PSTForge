@@ -567,6 +567,7 @@ impl CatalogSink for AttachmentNamedPropertySink {
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 struct MessageContentFingerprint {
     embedded_path: Vec<u32>,
+    associated: bool,
     message_class: Option<String>,
     subject: Option<String>,
     sender_name: Option<String>,
@@ -643,6 +644,7 @@ impl CatalogSink for IndependentMessageSink {
                 folder_id,
                 parent_message_id,
                 embedded_path,
+                associated,
                 message_class,
                 subject,
                 sender_name,
@@ -674,6 +676,7 @@ impl CatalogSink for IndependentMessageSink {
                     folder_path,
                     content: MessageContentFingerprint {
                         embedded_path,
+                        associated,
                         message_class,
                         subject,
                         sender_name,
@@ -1338,8 +1341,12 @@ fn root_and_associated_data_roundtrip_through_the_supervised_split()
         return Err("placement split was not a complete one-part result".into());
     }
     let generated = output.join("parts/part-0001.pst");
-    if independent_placement(&generated)? != expected {
-        return Err("root hierarchy, associated placement, class, or property changed".into());
+    let actual = independent_placement(&generated)?;
+    if actual != expected {
+        return Err(format!(
+            "root hierarchy, associated placement, class, or property changed: expected {expected:?}, actual {actual:?}"
+        )
+        .into());
     }
     let pffinfo = Command::new("pffinfo").arg(&generated).output()?;
     if !pffinfo.status.success() {
@@ -1514,6 +1521,25 @@ fn normalize_current_recovery_policy(expected: &mut MessageContentFingerprint) {
         0x3008,
         source_delivery.unwrap_or_default(),
     );
+    if expected.associated
+        && !expected
+            .body_properties
+            .iter()
+            .any(|property| property.id == 0x3001)
+    {
+        let display_name = expected
+            .subject
+            .as_deref()
+            .filter(|value| !value.is_empty())
+            .unwrap_or("(no subject)");
+        let bytes = display_name
+            .encode_utf16()
+            .flat_map(u16::to_le_bytes)
+            .collect::<Vec<_>>();
+        expected
+            .body_properties
+            .push(property_fingerprint(0x3001, 0x001F, &bytes));
+    }
     expected.body_properties.sort();
 }
 
@@ -1521,6 +1547,7 @@ fn normalize_current_recovery_policy(expected: &mut MessageContentFingerprint) {
 fn recovery_policy_normalizes_explicit_empty_visible_metadata() {
     let mut expected = MessageContentFingerprint {
         embedded_path: Vec::new(),
+        associated: false,
         message_class: Some("IPM.Contact".to_owned()),
         subject: Some(String::new()),
         sender_name: Some(String::new()),

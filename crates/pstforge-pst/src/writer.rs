@@ -372,6 +372,52 @@ pub struct MailStoreSpec {
     pub folders: Vec<MailFolderSpec>,
 }
 
+/// Source-wide named-property identities required before transactional output begins.
+#[derive(Clone, Debug, Default)]
+pub struct NamedPropertyCatalog {
+    identities: BTreeSet<NamedIdentity>,
+}
+
+impl NamedPropertyCatalog {
+    /// Add every named-property identity reachable from one top-level message.
+    pub fn observe_message(&mut self, message: &MessageSpec) {
+        self.identities.extend(collect_named_identities(message));
+    }
+
+    /// Add one source-declared named-property identity without decoding its value.
+    pub fn observe(&mut self, set: NamedPropertySet, name: NamedPropertyName) {
+        self.identities.insert((set, name));
+    }
+
+    /// Reserve every documented by-reference attachment metadata identity.
+    pub fn observe_reference_attachment(&mut self) {
+        for name in [
+            ATTACHMENT_PROVIDER_TYPE,
+            ATTACHMENT_ORIGINAL_PERMISSION_TYPE,
+            ATTACHMENT_PERMISSION_TYPE,
+        ] {
+            self.identities.insert((
+                NamedPropertySet::Guid(PSETID_ATTACHMENT),
+                NamedPropertyName::String(name.to_owned()),
+            ));
+        }
+    }
+}
+
+/// Result of attempting to append one complete top-level message.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TransactionAppend {
+    Appended { projected_file_eof: u64 },
+    PartFull { rejected_file_eof: u64 },
+}
+
+/// Opaque byte-for-byte checkpoint for a private transactional writer batch.
+pub struct TransactionBatchCheckpoint {
+    message_stream: MessageAppendCheckpoint,
+    folder_lengths: Vec<(usize, usize)>,
+    last_order: Option<(MailFolderLocation, Vec<String>, bool)>,
+}
+
 struct StoreInput<'a> {
     store_name: &'a str,
     folder_name: &'a str,
@@ -791,6 +837,73 @@ struct BlockStream<'a> {
     cursor: &'a mut u64,
     written: &'a mut Vec<WrittenBlock>,
     interrupted: &'a AtomicBool,
+}
+
+#[allow(dead_code)]
+#[derive(Clone, Copy)]
+struct MessageAppendCheckpoint {
+    file_len: u64,
+    allocation_cursor: u64,
+    next_block_index: u64,
+    next_value_node: u32,
+    written_len: usize,
+    streamed_subnodes_len: usize,
+    contents_rows_len: usize,
+    associated_rows_len: usize,
+    top_nodes_len: usize,
+}
+
+#[allow(dead_code)]
+impl MessageAppendCheckpoint {
+    #[allow(clippy::too_many_arguments)]
+    fn capture(
+        file_len: u64,
+        allocation_cursor: u64,
+        next_block_index: u64,
+        next_value_node: u32,
+        written_len: usize,
+        streamed_subnodes_len: usize,
+        contents_rows_len: usize,
+        associated_rows_len: usize,
+        top_nodes_len: usize,
+    ) -> Self {
+        Self {
+            file_len,
+            allocation_cursor,
+            next_block_index,
+            next_value_node,
+            written_len,
+            streamed_subnodes_len,
+            contents_rows_len,
+            associated_rows_len,
+            top_nodes_len,
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn rollback(
+        self,
+        file: &mut std::fs::File,
+        allocation_cursor: &mut u64,
+        next_block_index: &mut u64,
+        next_value_node: &mut u32,
+        written: &mut Vec<WrittenBlock>,
+        streamed_subnodes: &mut Vec<NodeId>,
+        contents_rows: &mut Vec<TableRowSpec>,
+        associated_rows: &mut Vec<TableRowSpec>,
+        top_nodes: &mut Vec<TopMessageNode>,
+    ) -> Result<(), WriterError> {
+        file.set_len(self.file_len)?;
+        *allocation_cursor = self.allocation_cursor;
+        *next_block_index = self.next_block_index;
+        *next_value_node = self.next_value_node;
+        written.truncate(self.written_len);
+        streamed_subnodes.truncate(self.streamed_subnodes_len);
+        contents_rows.truncate(self.contents_rows_len);
+        associated_rows.truncate(self.associated_rows_len);
+        top_nodes.truncate(self.top_nodes_len);
+        Ok(())
+    }
 }
 
 impl BlockStream<'_> {
@@ -1370,6 +1483,74 @@ fn plan_folders<'a>(
     fallback_messages: &[&'a MessageSpec],
     folders: Option<&'a [MailFolderSpec]>,
 ) -> Result<Vec<FolderPlan<'a>>, WriterError> {
+    plan_folders_expected(fallback_name, fallback_messages, folders, true, false)
+}
+
+fn plan_transaction_folders<'a>(
+    fallback_name: &'a str,
+    fallback_messages: &[&'a MessageSpec],
+    folders: &'a [MailFolderSpec],
+    preserve_empty_folders: bool,
+) -> Result<Vec<FolderPlan<'a>>, WriterError> {
+    plan_folders_expected(
+        fallback_name,
+        fallback_messages,
+        Some(folders),
+        preserve_empty_folders,
+        false,
+    )
+}
+
+fn transaction_folder_node(
+    folders: &[MailFolderSpec],
+    location: MailFolderLocation,
+    path: &[String],
+    preserve_empty_folders: bool,
+) -> Result<NodeId, WriterError> {
+    let mut paths = BTreeSet::new();
+    for folder in folders {
+        if !preserve_empty_folders
+            && folder.messages.is_empty()
+            && folder.associated_messages.is_empty()
+        {
+            continue;
+        }
+        for depth in 1..=folder.path.len() {
+            paths.insert((folder.location, folder.path[..depth].to_vec()));
+        }
+    }
+    let target = (location, path.to_vec());
+    let index = paths
+        .iter()
+        .position(|candidate| candidate == &target)
+        .ok_or_else(|| {
+            WriterError::InvalidStructure("transactional message folder was not planned".to_owned())
+        })?;
+    let role = folders
+        .iter()
+        .find(|folder| folder.location == location && folder.path == path)
+        .map(|folder| folder.role)
+        .unwrap_or_default();
+    if role == MailFolderRole::DeletedItems {
+        node(NodeIdType::NormalFolder, DELETED_FOLDER_INDEX)
+    } else {
+        let index = u32::try_from(index).map_err(|_| WriterError::ValueTooLarge("folder count"))?;
+        node(
+            NodeIdType::NormalFolder,
+            MAIL_FOLDER_INDEX
+                .checked_add(index)
+                .ok_or(WriterError::ValueTooLarge("folder node"))?,
+        )
+    }
+}
+
+fn plan_folders_expected<'a>(
+    fallback_name: &'a str,
+    fallback_messages: &[&'a MessageSpec],
+    folders: Option<&'a [MailFolderSpec]>,
+    preserve_empty_folders: bool,
+    allow_empty_store: bool,
+) -> Result<Vec<FolderPlan<'a>>, WriterError> {
     let mut paths =
         BTreeMap::<(MailFolderLocation, Vec<String>), (Vec<&MessageSpec>, Vec<&MessageSpec>)>::new(
         );
@@ -1402,13 +1583,19 @@ fn plan_folders<'a>(
                     "folder container class must be non-empty".to_owned(),
                 ));
             }
+            roles.insert(key.clone(), folder.role);
+            container_classes.insert(key.clone(), folder.container_class.clone());
+            if !preserve_empty_folders
+                && folder.messages.is_empty()
+                && folder.associated_messages.is_empty()
+            {
+                continue;
+            }
             for depth in 1..=folder.path.len() {
                 paths
                     .entry((folder.location, folder.path[..depth].to_vec()))
                     .or_default();
             }
-            roles.insert(key.clone(), folder.role);
-            container_classes.insert(key.clone(), folder.container_class.clone());
             let (messages, associated_messages) = paths.get_mut(&key).ok_or_else(|| {
                 WriterError::InvalidStructure("mail folder path was not planned".to_owned())
             })?;
@@ -1434,9 +1621,10 @@ fn plan_folders<'a>(
             (fallback_messages.to_vec(), Vec::new()),
         );
     }
-    if paths
-        .values()
-        .all(|(messages, associated)| messages.is_empty() && associated.is_empty())
+    if !allow_empty_store
+        && paths
+            .values()
+            .all(|(messages, associated)| messages.is_empty() && associated.is_empty())
     {
         return Err(WriterError::InvalidStructure(
             "mail store must contain at least one message".to_owned(),
@@ -1921,18 +2109,36 @@ fn create_mail_store_expected(
     )
 }
 
+fn validate_mail_store_layout_expected(spec: &MailStoreSpec) -> Result<(), WriterError> {
+    if spec.store_name.is_empty() {
+        return Err(WriterError::InvalidStructure(
+            "store name must be non-empty".to_owned(),
+        ));
+    }
+    validate_unicode("store name", &spec.store_name)?;
+    for component in spec.folders.iter().flat_map(|folder| &folder.path) {
+        validate_unicode("folder name", component)?;
+    }
+    let fallback = spec
+        .folders
+        .iter()
+        .flat_map(|folder| folder.path.first())
+        .next()
+        .map(String::as_str)
+        .unwrap_or("Recovered Mail");
+    let folder_plans = plan_folders_expected(fallback, &[], Some(&spec.folders), true, true)?;
+    validate_folder_hierarchy_shapes(&folder_plans)
+}
+
+/// Validate source-controlled store and folder metadata without requiring a message.
+pub fn validate_mail_store_layout(spec: &MailStoreSpec) -> Result<(), WriterError> {
+    validate_mail_store_layout_expected(spec).map_err(input_rejection_error)
+}
+
 /// Validate every source-controlled mail-store shape without creating output.
 pub fn validate_mail_store_input(spec: &MailStoreSpec) -> Result<(), WriterError> {
     let validate = || -> Result<(), WriterError> {
-        if spec.store_name.is_empty() {
-            return Err(WriterError::InvalidStructure(
-                "store name must be non-empty".to_owned(),
-            ));
-        }
-        validate_unicode("store name", &spec.store_name)?;
-        for component in spec.folders.iter().flat_map(|folder| &folder.path) {
-            validate_unicode("folder name", component)?;
-        }
+        validate_mail_store_layout_expected(spec)?;
         for message in spec
             .folders
             .iter()
@@ -2177,98 +2383,68 @@ fn input_rejection_error(error: WriterError) -> WriterError {
     }
 }
 
-fn create_flat_store(
-    path: &Path,
-    spec: &StoreInput<'_>,
-    messages: &[&MessageSpec],
-    folders: Option<&[MailFolderSpec]>,
-    interrupted: &AtomicBool,
-    validator_supervisor: Option<&Path>,
-) -> Result<FidelityWriteReport, WriterError> {
-    check_interrupted(interrupted)?;
-    let folder_plans = plan_folders(spec.folder_name, messages, folders)?;
-    let top_level_messages = folder_plans
-        .iter()
-        .flat_map(|folder| {
-            folder
-                .messages
-                .iter()
-                .copied()
-                .map(|message| (message, folder.node, false))
-                .chain(
-                    folder
-                        .associated_messages
-                        .iter()
-                        .copied()
-                        .map(|message| (message, folder.node, true)),
-                )
-        })
-        .collect::<Vec<_>>();
-    let messages = top_level_messages
-        .iter()
-        .map(|(message, _, _)| *message)
-        .collect::<Vec<_>>();
-    let mut unsupported_properties = Vec::new();
-    for (index, message) in messages.iter().enumerate() {
-        let index =
-            u32::try_from(index).map_err(|_| WriterError::ValueTooLarge("message count"))?;
-        let path = (messages.len() != 1)
-            .then_some(index)
-            .into_iter()
-            .collect::<Vec<_>>();
-        unsupported_properties.extend(collect_unsupported_properties(message, &path)?);
-    }
-    let report = FidelityWriteReport {
-        unsupported_properties,
-    };
-    match path.symlink_metadata() {
-        Ok(_) => return Err(WriterError::OutputExists(path.to_path_buf())),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-        Err(error) => return Err(WriterError::Io(error)),
-    }
-    let parent = path
-        .parent()
-        .filter(|parent| !parent.as_os_str().is_empty())
-        .unwrap_or_else(|| Path::new("."));
-    let parent_directory = std::fs::File::open(parent)?;
-    let mut temporary = PublicationTemporary::new(parent)?;
-    let file = &mut temporary.file;
-    file.set_len(INITIAL_FILE_EOF)?;
-    let mut allocation_cursor = FIRST_DATA;
-    let mut written = Vec::new();
-    let mut streamed_subnodes = Vec::new();
+struct MessageStreamState {
+    file_len: u64,
+    allocation_cursor: u64,
+    written: Vec<WrittenBlock>,
+    streamed_subnodes: Vec<NodeId>,
+    next_block_index: u64,
+    next_value_node: u32,
+    contents_rows: Vec<TableRowSpec>,
+    associated_rows: Vec<TableRowSpec>,
+    top_nodes: Vec<TopMessageNode>,
+}
 
-    let root_folder = NID_ROOT_FOLDER;
-    let ipm_folder = node(NodeIdType::NormalFolder, IPM_FOLDER_INDEX)?;
-    let search_root = node(NodeIdType::NormalFolder, SEARCH_ROOT_INDEX)?;
-    let deleted_folder = node(NodeIdType::NormalFolder, DELETED_FOLDER_INDEX)?;
-    let spam_search = node(NodeIdType::SearchFolder, SPAM_SEARCH_INDEX)?;
-    let hierarchy_columns = hierarchy_columns()?;
-    let contents_columns = contents_columns()?;
-    let associated_columns = associated_columns()?;
-    let search_contents_columns = search_contents_columns()?;
-    let receive_folder_columns = receive_folder_columns()?;
-    let outgoing_queue_columns = outgoing_queue_columns()?;
-    let contents_index_columns = contents_index_columns()?;
-    let search_index_columns = search_index_columns()?;
-    let attachment_index_columns = attachment_index_columns()?;
-    if messages.is_empty() {
-        return Err(WriterError::InvalidStructure(
-            "mail store must contain at least one message".to_owned(),
-        ));
+impl MessageStreamState {
+    fn new(message_capacity: usize) -> Self {
+        Self {
+            file_len: INITIAL_FILE_EOF,
+            allocation_cursor: FIRST_DATA,
+            written: Vec::new(),
+            streamed_subnodes: Vec::new(),
+            next_block_index: 28,
+            next_value_node: 0x4_0000,
+            contents_rows: Vec::with_capacity(message_capacity),
+            associated_rows: Vec::with_capacity(message_capacity),
+            top_nodes: Vec::with_capacity(message_capacity),
+        }
     }
-    let named_identities = collect_named_identities_many_refs(&messages);
-    let mut next_block_index = 28_u64;
-    let mut next_value_node = 0x4_0000_u32;
-    let mut contents_rows = Vec::with_capacity(messages.len());
-    let mut associated_rows = Vec::with_capacity(messages.len());
-    let mut top_nodes = Vec::with_capacity(messages.len());
-    let mut single_message = None;
-    for (message_position, message_spec) in messages.iter().enumerate() {
+
+    fn message_count(&self) -> usize {
+        self.top_nodes.len()
+    }
+
+    fn checkpoint(&self) -> MessageAppendCheckpoint {
+        MessageAppendCheckpoint::capture(
+            self.file_len,
+            self.allocation_cursor,
+            self.next_block_index,
+            self.next_value_node,
+            self.written.len(),
+            self.streamed_subnodes.len(),
+            self.contents_rows.len(),
+            self.associated_rows.len(),
+            self.top_nodes.len(),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn append_message(
+        &mut self,
+        file: &mut std::fs::File,
+        message_spec: &MessageSpec,
+        parent: NodeId,
+        associated: bool,
+        store_record_key: [u8; 16],
+        named_identities: &[NamedIdentity],
+        contents_columns: &[TableColumnDescriptor],
+        associated_columns: &[TableColumnDescriptor],
+        interrupted: &AtomicBool,
+    ) -> Result<MessageAppendCheckpoint, WriterError> {
         check_interrupted(interrupted)?;
-        let index = u32::try_from(message_position)
+        let checkpoint = self.checkpoint();
+        let index = u32::try_from(self.message_count())
             .map_err(|_| WriterError::ValueTooLarge("message count"))?;
-        let associated = top_level_messages[message_position].2;
         let message_node = node(
             if associated {
                 NodeIdType::AssociatedMessage
@@ -2288,73 +2464,123 @@ fn create_flat_store(
             )
         } else {
             (
-                take_block_id(&mut next_block_index, false)?,
-                take_block_id(&mut next_block_index, false)?,
-                take_block_id(&mut next_block_index, false)?,
-                take_block_id(&mut next_block_index, true)?,
+                take_block_id(&mut self.next_block_index, false)?,
+                take_block_id(&mut self.next_block_index, false)?,
+                take_block_id(&mut self.next_block_index, false)?,
+                take_block_id(&mut self.next_block_index, true)?,
             )
         };
-        let stream_message = messages.len() > 1 || message_requires_streaming(message_spec);
-        let mut block_stream = stream_message.then_some(BlockStream {
-            file: &mut *file,
-            cursor: &mut allocation_cursor,
-            written: &mut written,
+        let mut stream = BlockStream {
+            file,
+            cursor: &mut self.allocation_cursor,
+            written: &mut self.written,
             interrupted,
-        });
+        };
         let message = build_message_blocks(
             message_spec,
             associated,
-            message_record_key(spec.record_key, message_node),
-            &named_identities,
+            message_record_key(store_record_key, message_node),
+            named_identities,
             recipient_block,
             attachment_block,
-            &mut next_block_index,
-            &mut next_value_node,
-            block_stream.as_mut(),
+            &mut self.next_block_index,
+            &mut self.next_value_node,
+            Some(&mut stream),
         )?;
         if associated {
-            associated_rows.push(associated_message_table_row(
+            self.associated_rows.push(associated_message_table_row(
                 message_node,
                 message_spec,
-                &associated_columns,
+                associated_columns,
             ));
         } else {
-            contents_rows.push(message_table_row(
+            self.contents_rows.push(message_table_row(
                 message_node,
                 message_spec,
-                spec.record_key,
+                store_record_key,
                 message.record_key,
                 message.message_size,
-                &contents_columns,
+                contents_columns,
             )?);
         }
-        top_nodes.push(TopMessageNode {
+        self.top_nodes.push(TopMessageNode {
             node: message_node,
             property_block,
             subnode_block,
-            parent: top_level_messages[message_position].1,
+            parent,
         });
-        let built = BuiltTopMessage {
+        let message_blocks = built_message_block_specs(BuiltTopMessage {
             property_block,
             recipient_block,
             attachment_block,
             subnode_block,
             shared_table_blocks: index == 0,
             message,
-        };
-        if !stream_message {
-            single_message = Some(built);
-        } else {
-            let message_blocks = built_message_block_specs(built);
-            collect_subnode_ids(&message_blocks, &mut streamed_subnodes);
-            let stream = block_stream.as_mut().ok_or_else(|| {
-                WriterError::InvalidStructure("message block stream is missing".to_owned())
-            })?;
-            for block in message_blocks {
-                stream.emit(block)?;
-            }
+        });
+        collect_subnode_ids(&message_blocks, &mut self.streamed_subnodes);
+        for block in message_blocks {
+            stream.emit(block)?;
         }
+        self.file_len = self.file_len.max(self.allocation_cursor);
+        Ok(checkpoint)
     }
+
+    #[allow(dead_code)]
+    fn rollback_message(
+        &mut self,
+        file: &mut std::fs::File,
+        checkpoint: MessageAppendCheckpoint,
+    ) -> Result<(), WriterError> {
+        checkpoint.rollback(
+            file,
+            &mut self.allocation_cursor,
+            &mut self.next_block_index,
+            &mut self.next_value_node,
+            &mut self.written,
+            &mut self.streamed_subnodes,
+            &mut self.contents_rows,
+            &mut self.associated_rows,
+            &mut self.top_nodes,
+        )?;
+        self.file_len = checkpoint.file_len;
+        Ok(())
+    }
+}
+
+struct FinalizationPlan {
+    blocks: Vec<BlockSpec>,
+    nodes: Vec<UnicodeNodeBTreeEntry>,
+    next_block_index: u64,
+    projected_file_eof: u64,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_finalization_plan(
+    spec: &StoreInput<'_>,
+    folder_plans: &[FolderPlan<'_>],
+    message_stream: &MessageStreamState,
+    single_message: Option<BuiltTopMessage>,
+    named_identities: &[NamedIdentity],
+    hierarchy_columns: &[TableColumnDescriptor],
+    contents_columns: &[TableColumnDescriptor],
+    associated_columns: &[TableColumnDescriptor],
+    search_contents_columns: &[TableColumnDescriptor],
+    receive_folder_columns: &[TableColumnDescriptor],
+    outgoing_queue_columns: &[TableColumnDescriptor],
+    contents_index_columns: &[TableColumnDescriptor],
+    search_index_columns: &[TableColumnDescriptor],
+    attachment_index_columns: &[TableColumnDescriptor],
+    root_folder: NodeId,
+    ipm_folder: NodeId,
+    search_root: NodeId,
+    deleted_folder: NodeId,
+    spam_search: NodeId,
+    interrupted: &AtomicBool,
+) -> Result<FinalizationPlan, WriterError> {
+    let contents_rows = &message_stream.contents_rows;
+    let associated_rows = &message_stream.associated_rows;
+    let top_nodes = &message_stream.top_nodes;
+    let mut next_block_index = message_stream.next_block_index;
     let mut folder_blocks = Vec::new();
     let mut top_folders = Vec::with_capacity(folder_plans.len());
     let mut row_start = 0_usize;
@@ -2411,7 +2637,7 @@ fn create_flat_store(
                 .collect::<Result<Vec<_>, WriterError>>()?;
             folder_blocks.push(BlockSpec {
                 id: block,
-                payload: BlockPayload::Data(table_context(&hierarchy_columns, &rows)?),
+                payload: BlockPayload::Data(table_context(hierarchy_columns, &rows)?),
                 ref_count: 2,
             });
             block
@@ -2432,12 +2658,12 @@ fn create_flat_store(
             };
             folder_blocks.push(BlockSpec {
                 id: block,
-                payload: BlockPayload::Data(table_context(&contents_columns, rows)?),
+                payload: BlockPayload::Data(table_context(contents_columns, rows)?),
                 ref_count: 2,
             });
             (block, None)
         } else {
-            let contents = table_context_external(&contents_columns, rows, &mut next_block_index)?;
+            let contents = table_context_external(contents_columns, rows, &mut next_block_index)?;
             let data = contents.data_block;
             let subnode = contents.subnode_block;
             folder_blocks.extend(contents.blocks);
@@ -2454,13 +2680,13 @@ fn create_flat_store(
             let block = take_block_id(&mut next_block_index, false)?;
             folder_blocks.push(BlockSpec {
                 id: block,
-                payload: BlockPayload::Data(table_context(&associated_columns, rows)?),
+                payload: BlockPayload::Data(table_context(associated_columns, rows)?),
                 ref_count: 2,
             });
             (block, None)
         } else {
             let associated =
-                table_context_external(&associated_columns, rows, &mut next_block_index)?;
+                table_context_external(associated_columns, rows, &mut next_block_index)?;
             let data = associated.data_block;
             let subnode = associated.subnode_block;
             folder_blocks.extend(associated.blocks);
@@ -2531,6 +2757,8 @@ fn create_flat_store(
     let deleted_uses_shared_contents = deleted_plan.is_none_or(|folder| folder.messages.is_empty());
     let deleted_uses_shared_hierarchy =
         deleted_plan.is_none_or(|folder| folder.children.is_empty());
+    let deleted_uses_shared_associated =
+        deleted_plan.is_none_or(|folder| folder.associated_messages.is_empty());
     let mut root_rows = vec![
         folder_table_row(ipm_folder, "Top of Personal Folders", 0, true),
         folder_table_row(search_root, "Search Root", 0, false),
@@ -2570,7 +2798,7 @@ fn create_flat_store(
         },
         BlockSpec {
             id: leaf_bid(2)?,
-            payload: BlockPayload::Data(property_context(&named_property_map(&named_identities)?)?),
+            payload: BlockPayload::Data(property_context(&named_property_map(named_identities)?)?),
             ref_count: 2,
         },
         BlockSpec {
@@ -2580,12 +2808,12 @@ fn create_flat_store(
         },
         BlockSpec {
             id: leaf_bid(4)?,
-            payload: BlockPayload::Data(table_context(&hierarchy_columns, &root_rows)?),
+            payload: BlockPayload::Data(table_context(hierarchy_columns, &root_rows)?),
             ref_count: 2,
         },
         BlockSpec {
             id: leaf_bid(5)?,
-            payload: BlockPayload::Data(table_context(&contents_columns, &[])?),
+            payload: BlockPayload::Data(table_context(contents_columns, &[])?),
             ref_count: shared_ref_count(
                 5 + usize::from(deleted_uses_shared_contents),
                 empty_contents,
@@ -2602,7 +2830,7 @@ fn create_flat_store(
         },
         BlockSpec {
             id: leaf_bid(7)?,
-            payload: BlockPayload::Data(table_context(&hierarchy_columns, &ipm_rows)?),
+            payload: BlockPayload::Data(table_context(hierarchy_columns, &ipm_rows)?),
             ref_count: 2,
         },
         BlockSpec {
@@ -2624,7 +2852,7 @@ fn create_flat_store(
         },
         BlockSpec {
             id: leaf_bid(9)?,
-            payload: BlockPayload::Data(table_context(&hierarchy_columns, &[])?),
+            payload: BlockPayload::Data(table_context(hierarchy_columns, &[])?),
             ref_count: shared_ref_count(
                 3 + usize::from(deleted_uses_shared_hierarchy),
                 empty_hierarchies,
@@ -2632,9 +2860,9 @@ fn create_flat_store(
         },
         BlockSpec {
             id: leaf_bid(13)?,
-            payload: BlockPayload::Data(table_context(&associated_columns, &[])?),
+            payload: BlockPayload::Data(table_context(associated_columns, &[])?),
             ref_count: shared_ref_count(
-                6,
+                5 + usize::from(deleted_uses_shared_associated),
                 folder_plans
                     .iter()
                     .filter(|folder| {
@@ -2663,7 +2891,7 @@ fn create_flat_store(
         },
         BlockSpec {
             id: leaf_bid(16)?,
-            payload: BlockPayload::Data(table_context(&search_contents_columns, &[])?),
+            payload: BlockPayload::Data(table_context(search_contents_columns, &[])?),
             ref_count: 3,
         },
         BlockSpec {
@@ -2674,7 +2902,7 @@ fn create_flat_store(
         BlockSpec {
             id: leaf_bid(20)?,
             payload: BlockPayload::Data(table_context(
-                &receive_folder_columns,
+                receive_folder_columns,
                 &[TableRowSpec {
                     id: NodeId::from(1_u32),
                     values: vec![
@@ -2693,22 +2921,22 @@ fn create_flat_store(
         },
         BlockSpec {
             id: leaf_bid(21)?,
-            payload: BlockPayload::Data(table_context(&outgoing_queue_columns, &[])?),
+            payload: BlockPayload::Data(table_context(outgoing_queue_columns, &[])?),
             ref_count: 2,
         },
         BlockSpec {
             id: leaf_bid(22)?,
-            payload: BlockPayload::Data(table_context(&contents_index_columns, &[])?),
+            payload: BlockPayload::Data(table_context(contents_index_columns, &[])?),
             ref_count: 2,
         },
         BlockSpec {
             id: leaf_bid(23)?,
-            payload: BlockPayload::Data(table_context(&search_index_columns, &[])?),
+            payload: BlockPayload::Data(table_context(search_index_columns, &[])?),
             ref_count: 2,
         },
         BlockSpec {
             id: leaf_bid(24)?,
-            payload: BlockPayload::Data(table_context(&attachment_index_columns, &[])?),
+            payload: BlockPayload::Data(table_context(attachment_index_columns, &[])?),
             ref_count: 2,
         },
         BlockSpec {
@@ -2730,6 +2958,762 @@ fn create_flat_store(
         blocks.extend(built_message_block_specs(message));
     }
     blocks.sort_by_key(|block| u64::from(block.id));
+    let nodes = node_entries(
+        root_folder,
+        ipm_folder,
+        search_root,
+        deleted_folder,
+        spam_search,
+        &top_folders,
+        top_nodes,
+    )?;
+    let projected_file_eof = projected_finalized_file_eof(
+        message_stream.allocation_cursor,
+        message_stream.written.len(),
+        &blocks,
+        nodes.len(),
+    )?;
+    Ok(FinalizationPlan {
+        blocks,
+        nodes,
+        next_block_index,
+        projected_file_eof,
+    })
+}
+
+/// Incremental Unicode PST writer that serializes each accepted message once.
+pub struct TransactionalMailStoreWriter {
+    destination: PathBuf,
+    parent_directory: std::fs::File,
+    temporary: PublicationTemporary,
+    spec: MailStoreSpec,
+    named_identities: Vec<NamedIdentity>,
+    message_stream: MessageStreamState,
+    last_order: Option<(MailFolderLocation, Vec<String>, bool)>,
+    preserve_empty_folders: bool,
+    validator_supervisor: Option<PathBuf>,
+}
+
+impl TransactionalMailStoreWriter {
+    /// Begin a private transaction from a folder-only store layout.
+    pub fn begin(
+        destination: impl AsRef<Path>,
+        layout: MailStoreSpec,
+        named_properties: &NamedPropertyCatalog,
+        preserve_empty_folders: bool,
+        validator_supervisor: Option<&Path>,
+    ) -> Result<Self, WriterError> {
+        if layout
+            .folders
+            .iter()
+            .any(|folder| !folder.messages.is_empty() || !folder.associated_messages.is_empty())
+        {
+            return Err(WriterError::InvalidStructure(
+                "transactional writer layout must not contain messages".to_owned(),
+            ));
+        }
+        validate_mail_store_layout_expected(&layout)?;
+        let destination = destination.as_ref().to_path_buf();
+        match destination.symlink_metadata() {
+            Ok(_) => return Err(WriterError::OutputExists(destination)),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(WriterError::Io(error)),
+        }
+        let parent = destination
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        let parent_directory = std::fs::File::open(parent)?;
+        let temporary = PublicationTemporary::new(parent)?;
+        temporary.file.set_len(INITIAL_FILE_EOF)?;
+        Ok(Self {
+            destination,
+            parent_directory,
+            temporary,
+            spec: layout,
+            named_identities: named_properties.identities.iter().cloned().collect(),
+            message_stream: MessageStreamState::new(0),
+            last_order: None,
+            preserve_empty_folders,
+            validator_supervisor: validator_supervisor.map(Path::to_path_buf),
+        })
+    }
+
+    /// Capture the exact private state before appending a bounded batch.
+    pub fn begin_batch(&self) -> TransactionBatchCheckpoint {
+        TransactionBatchCheckpoint {
+            message_stream: self.message_stream.checkpoint(),
+            folder_lengths: self
+                .spec
+                .folders
+                .iter()
+                .map(|folder| (folder.messages.len(), folder.associated_messages.len()))
+                .collect(),
+            last_order: self.last_order.clone(),
+        }
+    }
+
+    /// Restore a private writer to a previously captured batch boundary.
+    pub fn rollback_batch(
+        &mut self,
+        checkpoint: TransactionBatchCheckpoint,
+    ) -> Result<(), WriterError> {
+        if checkpoint.folder_lengths.len() != self.spec.folders.len() {
+            return Err(WriterError::InvalidStructure(
+                "transactional batch checkpoint does not match the writer layout".to_owned(),
+            ));
+        }
+        self.message_stream
+            .rollback_message(&mut self.temporary.file, checkpoint.message_stream)?;
+        for (folder, (messages, associated_messages)) in
+            self.spec.folders.iter_mut().zip(checkpoint.folder_lengths)
+        {
+            folder.messages.truncate(messages);
+            folder.associated_messages.truncate(associated_messages);
+        }
+        self.last_order = checkpoint.last_order;
+        Ok(())
+    }
+
+    /// Append a message privately without calculating the finalized PST size.
+    pub fn append_message_deferred(
+        &mut self,
+        location: MailFolderLocation,
+        path: &[String],
+        associated: bool,
+        message: MessageSpec,
+        interrupted: &AtomicBool,
+    ) -> Result<(), WriterError> {
+        check_interrupted(interrupted)?;
+        let order = (location, path.to_vec(), associated);
+        if self
+            .last_order
+            .as_ref()
+            .is_some_and(|previous| previous > &order)
+        {
+            return Err(WriterError::InvalidStructure(
+                "transactional messages are not in canonical folder and placement order".to_owned(),
+            ));
+        }
+        let message_identities = collect_named_identities(&message);
+        if message_identities
+            .iter()
+            .any(|identity| self.named_identities.binary_search(identity).is_err())
+        {
+            return Err(WriterError::InvalidStructure(
+                "transactional named-property catalog is incomplete".to_owned(),
+            ));
+        }
+        let folder_index = self
+            .spec
+            .folders
+            .iter()
+            .position(|folder| folder.location == location && folder.path == path)
+            .ok_or_else(|| {
+                WriterError::InvalidStructure(
+                    "transactional message folder is absent from the layout".to_owned(),
+                )
+            })?;
+        if associated {
+            self.spec.folders[folder_index]
+                .associated_messages
+                .push(message);
+        } else {
+            self.spec.folders[folder_index].messages.push(message);
+        }
+
+        let result = (|| {
+            let parent = transaction_folder_node(
+                &self.spec.folders,
+                location,
+                path,
+                self.preserve_empty_folders,
+            )?;
+            let message = if associated {
+                self.spec.folders[folder_index].associated_messages.last()
+            } else {
+                self.spec.folders[folder_index].messages.last()
+            }
+            .ok_or_else(|| {
+                WriterError::InvalidStructure(
+                    "transactional appended message is unavailable".to_owned(),
+                )
+            })?;
+            let contents_columns = contents_columns()?;
+            let associated_columns = associated_columns()?;
+            self.message_stream.append_message(
+                &mut self.temporary.file,
+                message,
+                parent,
+                associated,
+                self.spec.record_key,
+                &self.named_identities,
+                &contents_columns,
+                &associated_columns,
+                interrupted,
+            )?;
+            Ok(())
+        })();
+
+        if result.is_err() {
+            if associated {
+                self.spec.folders[folder_index].associated_messages.pop();
+            } else {
+                self.spec.folders[folder_index].messages.pop();
+            }
+        } else {
+            self.last_order = Some(order);
+        }
+        result
+    }
+
+    /// Calculate the exact byte length that finalization would publish.
+    pub fn projected_file_eof(&self, interrupted: &AtomicBool) -> Result<u64, WriterError> {
+        check_interrupted(interrupted)?;
+        let first_folder = self
+            .spec
+            .folders
+            .iter()
+            .find(|folder| !folder.messages.is_empty() || !folder.associated_messages.is_empty())
+            .ok_or_else(|| {
+                WriterError::InvalidStructure(
+                    "transactional store has no appended message".to_owned(),
+                )
+            })?;
+        let (first, first_associated) = first_folder
+            .messages
+            .first()
+            .map(|message| (message, false))
+            .or_else(|| {
+                first_folder
+                    .associated_messages
+                    .first()
+                    .map(|message| (message, true))
+            })
+            .ok_or_else(|| {
+                WriterError::InvalidStructure(
+                    "transactional first folder has no message".to_owned(),
+                )
+            })?;
+        let input = StoreInput {
+            store_name: &self.spec.store_name,
+            folder_name: first_folder
+                .path
+                .first()
+                .map(String::as_str)
+                .unwrap_or("Recovered Mail"),
+            record_key: self.spec.record_key,
+            message: first,
+            associated: first_associated,
+        };
+        let all_messages = self
+            .spec
+            .folders
+            .iter()
+            .flat_map(|folder| {
+                folder
+                    .messages
+                    .iter()
+                    .chain(folder.associated_messages.iter())
+            })
+            .collect::<Vec<_>>();
+        let folder_plans = plan_transaction_folders(
+            input.folder_name,
+            &all_messages,
+            &self.spec.folders,
+            self.preserve_empty_folders,
+        )?;
+        let plan = build_finalization_plan(
+            &input,
+            &folder_plans,
+            &self.message_stream,
+            None,
+            &self.named_identities,
+            &hierarchy_columns()?,
+            &contents_columns()?,
+            &associated_columns()?,
+            &search_contents_columns()?,
+            &receive_folder_columns()?,
+            &outgoing_queue_columns()?,
+            &contents_index_columns()?,
+            &search_index_columns()?,
+            &attachment_index_columns()?,
+            NID_ROOT_FOLDER,
+            node(NodeIdType::NormalFolder, IPM_FOLDER_INDEX)?,
+            node(NodeIdType::NormalFolder, SEARCH_ROOT_INDEX)?,
+            node(NodeIdType::NormalFolder, DELETED_FOLDER_INDEX)?,
+            node(NodeIdType::SearchFolder, SPAM_SEARCH_INDEX)?,
+            interrupted,
+        )?;
+        Ok(plan.projected_file_eof)
+    }
+
+    /// Return the bytes already allocated in the private output before final indexes.
+    pub fn private_file_eof(&self) -> u64 {
+        self.message_stream.file_len
+    }
+
+    /// Append one normal or associated message, rolling it back when it crosses the limit.
+    pub fn append_message(
+        &mut self,
+        location: MailFolderLocation,
+        path: &[String],
+        associated: bool,
+        message: MessageSpec,
+        maximum_pst_bytes: u64,
+        interrupted: &AtomicBool,
+    ) -> Result<TransactionAppend, WriterError> {
+        if maximum_pst_bytes == 0 {
+            return Err(WriterError::InvalidStructure(
+                "transactional maximum PST size must be nonzero".to_owned(),
+            ));
+        }
+        let checkpoint = self.begin_batch();
+        if let Err(error) =
+            self.append_message_deferred(location, path, associated, message, interrupted)
+        {
+            self.rollback_batch(checkpoint)?;
+            return Err(error);
+        }
+        let projected_file_eof = match self.projected_file_eof(interrupted) {
+            Ok(projected_file_eof) => projected_file_eof,
+            Err(error) => {
+                self.rollback_batch(checkpoint)?;
+                return Err(error);
+            }
+        };
+        if projected_file_eof > maximum_pst_bytes && self.message_stream.message_count() > 1 {
+            self.rollback_batch(checkpoint)?;
+            Ok(TransactionAppend::PartFull {
+                rejected_file_eof: projected_file_eof,
+            })
+        } else {
+            Ok(TransactionAppend::Appended { projected_file_eof })
+        }
+    }
+
+    pub fn message_count(&self) -> usize {
+        self.message_stream.message_count()
+    }
+
+    /// Finalize, validate, fsync, and atomically publish the accepted messages.
+    pub fn finalize(self, interrupted: &AtomicBool) -> Result<FidelityWriteReport, WriterError> {
+        check_interrupted(interrupted)?;
+        if self.message_stream.message_count() == 0 {
+            return Err(WriterError::InvalidStructure(
+                "transactional store has no accepted message".to_owned(),
+            ));
+        }
+        let Self {
+            destination,
+            parent_directory,
+            mut temporary,
+            spec,
+            named_identities,
+            message_stream,
+            last_order: _,
+            preserve_empty_folders,
+            validator_supervisor,
+        } = self;
+        let first_folder = spec
+            .folders
+            .iter()
+            .find(|folder| !folder.messages.is_empty() || !folder.associated_messages.is_empty())
+            .ok_or_else(|| {
+                WriterError::InvalidStructure(
+                    "transactional store has no accepted message".to_owned(),
+                )
+            })?;
+        let (first, first_associated) = first_folder
+            .messages
+            .first()
+            .map(|message| (message, false))
+            .or_else(|| {
+                first_folder
+                    .associated_messages
+                    .first()
+                    .map(|message| (message, true))
+            })
+            .ok_or_else(|| {
+                WriterError::InvalidStructure(
+                    "transactional first folder has no accepted message".to_owned(),
+                )
+            })?;
+        let input = StoreInput {
+            store_name: &spec.store_name,
+            folder_name: first_folder
+                .path
+                .first()
+                .map(String::as_str)
+                .unwrap_or("Recovered Mail"),
+            record_key: spec.record_key,
+            message: first,
+            associated: first_associated,
+        };
+        let messages = spec
+            .folders
+            .iter()
+            .flat_map(|folder| {
+                folder
+                    .messages
+                    .iter()
+                    .chain(folder.associated_messages.iter())
+            })
+            .collect::<Vec<_>>();
+        let report = FidelityWriteReport {
+            unsupported_properties: messages
+                .iter()
+                .enumerate()
+                .map(|(index, message)| {
+                    let index = u32::try_from(index)
+                        .map_err(|_| WriterError::ValueTooLarge("message count"))?;
+                    collect_unsupported_properties(message, &[index])
+                })
+                .collect::<Result<Vec<_>, WriterError>>()?
+                .into_iter()
+                .flatten()
+                .collect(),
+        };
+        let folder_plans = plan_transaction_folders(
+            input.folder_name,
+            &messages,
+            &spec.folders,
+            preserve_empty_folders,
+        )?;
+        let first_parent = folder_plans
+            .iter()
+            .find(|folder| {
+                folder.location == first_folder.location && folder.path == first_folder.path
+            })
+            .map(|folder| folder.node)
+            .ok_or_else(|| {
+                WriterError::InvalidStructure(
+                    "transactional first message folder was not planned".to_owned(),
+                )
+            })?;
+        let root_folder = NID_ROOT_FOLDER;
+        let ipm_folder = node(NodeIdType::NormalFolder, IPM_FOLDER_INDEX)?;
+        let search_root = node(NodeIdType::NormalFolder, SEARCH_ROOT_INDEX)?;
+        let deleted_folder = node(NodeIdType::NormalFolder, DELETED_FOLDER_INDEX)?;
+        let spam_search = node(NodeIdType::SearchFolder, SPAM_SEARCH_INDEX)?;
+        let hierarchy_columns = hierarchy_columns()?;
+        let contents_columns = contents_columns()?;
+        let associated_columns = associated_columns()?;
+        let search_contents_columns = search_contents_columns()?;
+        let receive_folder_columns = receive_folder_columns()?;
+        let outgoing_queue_columns = outgoing_queue_columns()?;
+        let contents_index_columns = contents_index_columns()?;
+        let search_index_columns = search_index_columns()?;
+        let attachment_index_columns = attachment_index_columns()?;
+        let FinalizationPlan {
+            blocks,
+            nodes,
+            next_block_index,
+            projected_file_eof,
+        } = build_finalization_plan(
+            &input,
+            &folder_plans,
+            &message_stream,
+            None,
+            &named_identities,
+            &hierarchy_columns,
+            &contents_columns,
+            &associated_columns,
+            &search_contents_columns,
+            &receive_folder_columns,
+            &outgoing_queue_columns,
+            &contents_index_columns,
+            &search_index_columns,
+            &attachment_index_columns,
+            root_folder,
+            ipm_folder,
+            search_root,
+            deleted_folder,
+            spam_search,
+            interrupted,
+        )?;
+        let MessageStreamState {
+            file_len: _,
+            mut allocation_cursor,
+            mut written,
+            streamed_subnodes,
+            next_block_index: _,
+            next_value_node: _,
+            contents_rows: _,
+            associated_rows: _,
+            top_nodes: _,
+        } = message_stream;
+        written.extend(write_blocks(
+            &mut temporary.file,
+            &blocks,
+            &mut allocation_cursor,
+            interrupted,
+        )?);
+        written.sort_by_key(|block| u64::from(block.id));
+        let page_offset = align_up(allocation_cursor, PAGE_SIZE);
+        let (bbt, nbt_offset, next_page_id) =
+            write_bbt(&mut temporary.file, page_offset, 0x100, &written)?;
+        let (nbt, allocated_end, next_page_id) =
+            write_nbt(&mut temporary.file, nbt_offset, next_page_id, &nodes)?;
+        let dynamic_allocation = allocated_end > INITIAL_FILE_EOF;
+        let file_eof = allocation_file_eof(allocated_end)?;
+        if file_eof != projected_file_eof {
+            return Err(WriterError::InvalidStructure(
+                "projected and written transactional PST extents disagree".to_owned(),
+            ));
+        }
+        temporary.file.set_len(file_eof)?;
+        if !dynamic_allocation {
+            write_fixed_pages(
+                &mut temporary.file,
+                allocated_end,
+                UnicodePageId::from(next_page_id),
+            )?;
+        }
+        write_header(
+            &mut temporary.file,
+            nbt,
+            bbt,
+            allocated_end,
+            UnicodePageId::from(next_page_id),
+            leaf_bid(next_block_index)?,
+            nid_counters(&nodes, &blocks, &streamed_subnodes)?,
+            dynamic_allocation,
+        )?;
+        temporary.file.sync_all()?;
+        check_interrupted(interrupted)?;
+        let validated_path = PathBuf::from(format!(
+            "/proc/{}/fd/{}",
+            std::process::id(),
+            temporary.file.as_raw_fd()
+        ));
+        if dynamic_allocation {
+            (|| -> Result<(), WriterError> {
+                let mut pst = UnicodePstFile::open(&validated_path)?;
+                let mut transaction = pst.lock()?;
+                transaction.flush()?;
+                drop(transaction);
+                drop(pst);
+                temporary.file.sync_all()?;
+                Ok(())
+            })()
+            .map_err(completed_validation_error)?;
+        }
+        check_interrupted(interrupted)?;
+        if !input.associated {
+            validate_completed_store(&validated_path, &input, first_parent, &named_identities)
+                .map_err(completed_validation_error)?;
+        }
+        check_interrupted(interrupted)?;
+        validate_completed_folder_store(&validated_path, spec.record_key, &folder_plans)
+            .map_err(completed_validation_error)?;
+        check_interrupted(interrupted)?;
+        validate_with_independent_readers(
+            &validated_path,
+            &mut temporary,
+            interrupted,
+            validator_supervisor.as_deref(),
+        )?;
+        check_interrupted(interrupted)?;
+        publish_noclobber(
+            temporary.source_name(),
+            &temporary.directory,
+            &parent_directory,
+            &destination,
+        )?;
+        sync_published_directory(&destination, &parent_directory)?;
+        verify_published_destination(&destination, &temporary.file)?;
+        Ok(report)
+    }
+}
+
+fn create_flat_store(
+    path: &Path,
+    spec: &StoreInput<'_>,
+    messages: &[&MessageSpec],
+    folders: Option<&[MailFolderSpec]>,
+    interrupted: &AtomicBool,
+    validator_supervisor: Option<&Path>,
+) -> Result<FidelityWriteReport, WriterError> {
+    check_interrupted(interrupted)?;
+    let folder_plans = plan_folders(spec.folder_name, messages, folders)?;
+    let top_level_messages = folder_plans
+        .iter()
+        .flat_map(|folder| {
+            folder
+                .messages
+                .iter()
+                .copied()
+                .map(|message| (message, folder.node, false))
+                .chain(
+                    folder
+                        .associated_messages
+                        .iter()
+                        .copied()
+                        .map(|message| (message, folder.node, true)),
+                )
+        })
+        .collect::<Vec<_>>();
+    let messages = top_level_messages
+        .iter()
+        .map(|(message, _, _)| *message)
+        .collect::<Vec<_>>();
+    let mut unsupported_properties = Vec::new();
+    for (index, message) in messages.iter().enumerate() {
+        let index =
+            u32::try_from(index).map_err(|_| WriterError::ValueTooLarge("message count"))?;
+        let path = (messages.len() != 1)
+            .then_some(index)
+            .into_iter()
+            .collect::<Vec<_>>();
+        unsupported_properties.extend(collect_unsupported_properties(message, &path)?);
+    }
+    let report = FidelityWriteReport {
+        unsupported_properties,
+    };
+    match path.symlink_metadata() {
+        Ok(_) => return Err(WriterError::OutputExists(path.to_path_buf())),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(WriterError::Io(error)),
+    }
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let parent_directory = std::fs::File::open(parent)?;
+    let mut temporary = PublicationTemporary::new(parent)?;
+    let file = &mut temporary.file;
+    file.set_len(INITIAL_FILE_EOF)?;
+
+    let root_folder = NID_ROOT_FOLDER;
+    let ipm_folder = node(NodeIdType::NormalFolder, IPM_FOLDER_INDEX)?;
+    let search_root = node(NodeIdType::NormalFolder, SEARCH_ROOT_INDEX)?;
+    let deleted_folder = node(NodeIdType::NormalFolder, DELETED_FOLDER_INDEX)?;
+    let spam_search = node(NodeIdType::SearchFolder, SPAM_SEARCH_INDEX)?;
+    let hierarchy_columns = hierarchy_columns()?;
+    let contents_columns = contents_columns()?;
+    let associated_columns = associated_columns()?;
+    let search_contents_columns = search_contents_columns()?;
+    let receive_folder_columns = receive_folder_columns()?;
+    let outgoing_queue_columns = outgoing_queue_columns()?;
+    let contents_index_columns = contents_index_columns()?;
+    let search_index_columns = search_index_columns()?;
+    let attachment_index_columns = attachment_index_columns()?;
+    if messages.is_empty() {
+        return Err(WriterError::InvalidStructure(
+            "mail store must contain at least one message".to_owned(),
+        ));
+    }
+    let named_identities = collect_named_identities_many_refs(&messages);
+    let mut message_stream = MessageStreamState::new(messages.len());
+    let mut single_message = None;
+    if messages.len() == 1 && !message_requires_streaming(messages[0]) {
+        let message_spec = messages[0];
+        let associated = top_level_messages[0].2;
+        let message_node = node(
+            if associated {
+                NodeIdType::AssociatedMessage
+            } else {
+                NodeIdType::NormalMessage
+            },
+            MESSAGE_INDEX,
+        )?;
+        let message = build_message_blocks(
+            message_spec,
+            associated,
+            message_record_key(spec.record_key, message_node),
+            &named_identities,
+            leaf_bid(17)?,
+            leaf_bid(18)?,
+            &mut message_stream.next_block_index,
+            &mut message_stream.next_value_node,
+            None,
+        )?;
+        if associated {
+            message_stream
+                .associated_rows
+                .push(associated_message_table_row(
+                    message_node,
+                    message_spec,
+                    &associated_columns,
+                ));
+        } else {
+            message_stream.contents_rows.push(message_table_row(
+                message_node,
+                message_spec,
+                spec.record_key,
+                message.record_key,
+                message.message_size,
+                &contents_columns,
+            )?);
+        }
+        message_stream.top_nodes.push(TopMessageNode {
+            node: message_node,
+            property_block: leaf_bid(12)?,
+            subnode_block: internal_bid(27)?,
+            parent: top_level_messages[0].1,
+        });
+        single_message = Some(BuiltTopMessage {
+            property_block: leaf_bid(12)?,
+            recipient_block: leaf_bid(17)?,
+            attachment_block: leaf_bid(18)?,
+            subnode_block: internal_bid(27)?,
+            shared_table_blocks: true,
+            message,
+        });
+    } else {
+        for (message_position, message_spec) in messages.iter().enumerate() {
+            message_stream.append_message(
+                &mut *file,
+                message_spec,
+                top_level_messages[message_position].1,
+                top_level_messages[message_position].2,
+                spec.record_key,
+                &named_identities,
+                &contents_columns,
+                &associated_columns,
+                interrupted,
+            )?;
+        }
+    }
+    let FinalizationPlan {
+        blocks,
+        nodes,
+        next_block_index,
+        projected_file_eof,
+    } = build_finalization_plan(
+        spec,
+        &folder_plans,
+        &message_stream,
+        single_message,
+        &named_identities,
+        &hierarchy_columns,
+        &contents_columns,
+        &associated_columns,
+        &search_contents_columns,
+        &receive_folder_columns,
+        &outgoing_queue_columns,
+        &contents_index_columns,
+        &search_index_columns,
+        &attachment_index_columns,
+        root_folder,
+        ipm_folder,
+        search_root,
+        deleted_folder,
+        spam_search,
+        interrupted,
+    )?;
+    let MessageStreamState {
+        file_len: _,
+        mut allocation_cursor,
+        mut written,
+        streamed_subnodes,
+        next_block_index: _,
+        next_value_node: _,
+        contents_rows: _,
+        associated_rows: _,
+        top_nodes: _,
+    } = message_stream;
 
     written.extend(write_blocks(
         &mut *file,
@@ -2740,20 +3724,16 @@ fn create_flat_store(
     written.sort_by_key(|block| u64::from(block.id));
     let page_offset = align_up(allocation_cursor, PAGE_SIZE);
     let (bbt, nbt_offset, next_page_id) = write_bbt(&mut *file, page_offset, 0x100, &written)?;
-    let nodes = node_entries(
-        root_folder,
-        ipm_folder,
-        search_root,
-        deleted_folder,
-        spam_search,
-        &top_folders,
-        &top_nodes,
-    )?;
     let (nbt, allocated_end, next_page_id) =
         write_nbt(&mut *file, nbt_offset, next_page_id, &nodes)?;
 
     let dynamic_allocation = allocated_end > INITIAL_FILE_EOF;
     let file_eof = allocation_file_eof(allocated_end)?;
+    if file_eof != projected_file_eof {
+        return Err(WriterError::InvalidStructure(
+            "projected and written PST extents disagree".to_owned(),
+        ));
+    }
     file.set_len(file_eof)?;
     if !dynamic_allocation {
         write_fixed_pages(&mut *file, allocated_end, UnicodePageId::from(next_page_id))?;
@@ -5159,6 +6139,7 @@ fn validate_completed_folder_store(
             ));
         }
         for expected in &folder_plan.associated_messages {
+            let expected_display_name = associated_display_name(expected);
             let message = node(
                 NodeIdType::AssociatedMessage,
                 MESSAGE_INDEX
@@ -5185,7 +6166,7 @@ fn validate_completed_folder_store(
                 .ok_or_else(|| invalid("completed associated display name is missing"))?;
             let actual = associated
                 .read_column(value, associated.context().columns()[subject].prop_type())?;
-            if !matches!(actual, crate::ltp::prop_context::PropertyValue::Unicode(value) if value.to_string() == associated_display_name(expected))
+            if !matches!(actual, crate::ltp::prop_context::PropertyValue::Unicode(value) if value.to_string() == expected_display_name)
             {
                 return Err(invalid("completed associated display-name mismatch"));
             }
@@ -5206,7 +6187,7 @@ fn validate_completed_folder_store(
             }
             let opened = store.open_message(
                 &store.properties().make_entry_id(message)?,
-                Some(&[0x001A, 0x0E07]),
+                Some(&[0x001A, 0x0E07, 0x3001]),
             )?;
             if opened.properties().message_class()? != expected.message_class {
                 return Err(invalid("completed associated message class mismatch"));
@@ -5215,6 +6196,15 @@ fn validate_completed_folder_store(
             {
                 return Err(invalid(
                     "completed associated message property flags mismatch",
+                ));
+            }
+            if !matches!(
+                opened.properties().get(0x3001),
+                Some(crate::ltp::prop_context::PropertyValue::Unicode(value))
+                    if value.to_string() == expected_display_name
+            ) {
+                return Err(invalid(
+                    "completed associated message PC/table display-name mismatch",
                 ));
             }
         }
@@ -6643,6 +7633,12 @@ fn message_properties(
     if !message.subject.is_empty() {
         properties.push((0x0037, PropertyValue::Unicode(message.subject.clone())));
     }
+    if associated {
+        properties.push((
+            0x3001,
+            PropertyValue::Unicode(associated_display_name(message).to_owned()),
+        ));
+    }
     if !message.sender_name.is_empty() && !message.sender_email.is_empty() {
         properties.extend([
             (0x0042, PropertyValue::Unicode(message.sender_name.clone())),
@@ -6692,6 +7688,9 @@ fn message_properties(
         properties.push((id, raw_property_value(&property.value)));
     }
     for raw in &message.raw_properties {
+        if associated && raw.id == 0x3001 {
+            continue;
+        }
         properties.push((raw.id, raw_property_value(&raw.value)));
     }
     Ok(properties)
@@ -8427,6 +9426,53 @@ fn write_blocks(
     Ok(written)
 }
 
+fn projected_finalized_file_eof(
+    allocation_cursor: u64,
+    written_block_count: usize,
+    final_blocks: &[BlockSpec],
+    node_count: usize,
+) -> Result<u64, WriterError> {
+    let mut cursor = allocation_cursor;
+    for block in final_blocks {
+        let size = u16::try_from(block.payload.logical_size())
+            .map_err(|_| WriterError::ValueTooLarge("data block"))?;
+        let physical_size = u64::from(block_size(size.saturating_add(16))?);
+        allocate_extent(&mut cursor, physical_size, SLOT_SIZE)?;
+    }
+    cursor = align_up(cursor, PAGE_SIZE);
+    let block_count = written_block_count
+        .checked_add(final_blocks.len())
+        .ok_or(WriterError::ValueTooLarge("BBT entry count"))?;
+    for _ in 0..btree_page_count(block_count, 20, 20)? {
+        allocate_extent(&mut cursor, PAGE_SIZE, PAGE_SIZE)?;
+    }
+    for _ in 0..btree_page_count(node_count, 15, 20)? {
+        allocate_extent(&mut cursor, PAGE_SIZE, PAGE_SIZE)?;
+    }
+    allocation_file_eof(cursor)
+}
+
+fn btree_page_count(
+    entries: usize,
+    leaf_capacity: usize,
+    intermediate_capacity: usize,
+) -> Result<usize, WriterError> {
+    if entries == 0 || leaf_capacity == 0 || intermediate_capacity == 0 {
+        return Err(WriterError::InvalidStructure(
+            "B-tree projection requires entries and nonzero capacities".to_owned(),
+        ));
+    }
+    let mut level = entries.div_ceil(leaf_capacity);
+    let mut pages = level;
+    while level > 1 {
+        level = level.div_ceil(intermediate_capacity);
+        pages = pages
+            .checked_add(level)
+            .ok_or(WriterError::ValueTooLarge("B-tree page count"))?;
+    }
+    Ok(pages)
+}
+
 fn write_bbt(
     file: &mut std::fs::File,
     first_offset: u64,
@@ -9107,6 +10153,256 @@ mod tests {
         open_store,
     };
     use std::fs::OpenOptions;
+
+    #[test]
+    fn message_append_rollback_restores_the_exact_private_writer_boundary()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("transaction.partial");
+        let mut file = OpenOptions::new()
+            .create_new(true)
+            .read(true)
+            .write(true)
+            .open(&path)?;
+        file.set_len(INITIAL_FILE_EOF)?;
+        let spec = FidelityStore::default();
+        let messages = [&spec.message, &spec.message];
+        let named_identities = collect_named_identities_many_refs(&messages);
+        let contents_columns = contents_columns()?;
+        let associated_columns = associated_columns()?;
+        let parent = node(NodeIdType::NormalFolder, IPM_FOLDER_INDEX)?;
+        let mut state = MessageStreamState::new(2);
+        state.append_message(
+            &mut file,
+            &spec.message,
+            parent,
+            false,
+            spec.record_key,
+            &named_identities,
+            &contents_columns,
+            &associated_columns,
+            &NEVER_INTERRUPTED,
+        )?;
+        let checkpoint = state.append_message(
+            &mut file,
+            &spec.message,
+            parent,
+            false,
+            spec.record_key,
+            &named_identities,
+            &contents_columns,
+            &associated_columns,
+            &NEVER_INTERRUPTED,
+        )?;
+        let expected_cursor = state.allocation_cursor;
+        let expected_written = state.written.len();
+        let expected_bytes = std::fs::read(&path)?;
+        state.rollback_message(&mut file, checkpoint)?;
+        assert_eq!(state.message_count(), 1);
+        assert_eq!(file.metadata()?.len(), checkpoint.file_len);
+        state.append_message(
+            &mut file,
+            &spec.message,
+            parent,
+            false,
+            spec.record_key,
+            &named_identities,
+            &contents_columns,
+            &associated_columns,
+            &NEVER_INTERRUPTED,
+        )?;
+        assert_eq!(state.allocation_cursor, expected_cursor);
+        assert_eq!(state.written.len(), expected_written);
+        assert_eq!(std::fs::read(path)?, expected_bytes);
+        Ok(())
+    }
+
+    #[test]
+    fn transactional_writer_matches_batch_output_and_rejects_only_the_boundary_message()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let batch_path = directory.path().join("batch.pst");
+        let transaction_path = directory.path().join("transaction.pst");
+        let boundary_path = directory.path().join("boundary.pst");
+        let fixture = FidelityStore::default();
+        let folder = MailFolderSpec {
+            path: vec!["Inbox".to_owned()],
+            location: MailFolderLocation::IpmSubtree,
+            role: MailFolderRole::Ordinary,
+            container_class: "IPF.Note".to_owned(),
+            messages: vec![fixture.message.clone(); 32],
+            associated_messages: Vec::new(),
+        };
+        let batch = MailStoreSpec {
+            store_name: fixture.store_name.clone(),
+            record_key: fixture.record_key,
+            folders: vec![folder.clone()],
+        };
+        create_mail_store(&batch_path, &batch)?;
+
+        let mut catalog = NamedPropertyCatalog::default();
+        for message in &folder.messages {
+            catalog.observe_message(message);
+        }
+        let layout = MailStoreSpec {
+            store_name: batch.store_name.clone(),
+            record_key: batch.record_key,
+            folders: vec![MailFolderSpec {
+                messages: Vec::new(),
+                ..folder.clone()
+            }],
+        };
+        let mut transaction = TransactionalMailStoreWriter::begin(
+            &transaction_path,
+            layout.clone(),
+            &catalog,
+            true,
+            None,
+        )?;
+        let mut projected_sizes = Vec::new();
+        for message in &folder.messages {
+            let projected_file_eof = match transaction.append_message(
+                MailFolderLocation::IpmSubtree,
+                &folder.path,
+                false,
+                message.clone(),
+                u64::MAX,
+                &NEVER_INTERRUPTED,
+            )? {
+                TransactionAppend::Appended { projected_file_eof } => projected_file_eof,
+                TransactionAppend::PartFull { .. } => {
+                    return Err("unlimited transaction rejected a message".into());
+                }
+            };
+            projected_sizes.push(projected_file_eof);
+        }
+        transaction.finalize(&NEVER_INTERRUPTED)?;
+        assert_eq!(
+            Sha256::digest(std::fs::read(&transaction_path)?),
+            Sha256::digest(std::fs::read(&batch_path)?)
+        );
+
+        let boundary_index = projected_sizes
+            .windows(2)
+            .position(|sizes| sizes[1] > sizes[0])
+            .map(|index| index + 1)
+            .ok_or("fixture did not cross an allocation boundary")?;
+        let maximum = projected_sizes[boundary_index - 1];
+        let mut boundary =
+            TransactionalMailStoreWriter::begin(&boundary_path, layout, &catalog, true, None)?;
+        for message in &folder.messages[..boundary_index] {
+            assert!(matches!(
+                boundary.append_message(
+                    MailFolderLocation::IpmSubtree,
+                    &folder.path,
+                    false,
+                    message.clone(),
+                    maximum,
+                    &NEVER_INTERRUPTED,
+                )?,
+                TransactionAppend::Appended { .. }
+            ));
+        }
+        assert!(matches!(
+            boundary.append_message(
+                MailFolderLocation::IpmSubtree,
+                &folder.path,
+                false,
+                folder.messages[boundary_index].clone(),
+                maximum,
+                &NEVER_INTERRUPTED,
+            )?,
+            TransactionAppend::PartFull { rejected_file_eof }
+                if rejected_file_eof == projected_sizes[boundary_index]
+        ));
+        assert_eq!(boundary.message_count(), boundary_index);
+        boundary.finalize(&NEVER_INTERRUPTED)?;
+        assert_eq!(boundary_path.metadata()?.len(), maximum);
+        Ok(())
+    }
+
+    #[test]
+    fn deferred_batch_projection_and_rollback_are_byte_exact()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let expected_path = directory.path().join("expected.pst");
+        let transaction_path = directory.path().join("transaction.pst");
+        let fixture = FidelityStore::default();
+        let folder = MailFolderSpec {
+            path: vec!["Inbox".to_owned()],
+            location: MailFolderLocation::IpmSubtree,
+            role: MailFolderRole::Ordinary,
+            container_class: "IPF.Note".to_owned(),
+            messages: vec![fixture.message.clone(); 32],
+            associated_messages: Vec::new(),
+        };
+        let expected = MailStoreSpec {
+            store_name: fixture.store_name.clone(),
+            record_key: fixture.record_key,
+            folders: vec![folder.clone()],
+        };
+        create_mail_store(&expected_path, &expected)?;
+        let mut catalog = NamedPropertyCatalog::default();
+        for message in &folder.messages {
+            catalog.observe_message(message);
+        }
+        let layout = MailStoreSpec {
+            store_name: expected.store_name.clone(),
+            record_key: expected.record_key,
+            folders: vec![MailFolderSpec {
+                messages: Vec::new(),
+                ..folder.clone()
+            }],
+        };
+        let mut transaction =
+            TransactionalMailStoreWriter::begin(&transaction_path, layout, &catalog, true, None)?;
+        for message in &folder.messages[..16] {
+            transaction.append_message_deferred(
+                folder.location,
+                &folder.path,
+                false,
+                message.clone(),
+                &NEVER_INTERRUPTED,
+            )?;
+        }
+        let checkpoint = transaction.begin_batch();
+        let checkpoint_private_eof = transaction.private_file_eof();
+        let checkpoint_projected_eof = transaction.projected_file_eof(&NEVER_INTERRUPTED)?;
+        for message in &folder.messages[16..] {
+            transaction.append_message_deferred(
+                folder.location,
+                &folder.path,
+                false,
+                message.clone(),
+                &NEVER_INTERRUPTED,
+            )?;
+        }
+        assert!(transaction.private_file_eof() > checkpoint_private_eof);
+        transaction.rollback_batch(checkpoint)?;
+        assert_eq!(transaction.message_count(), 16);
+        assert_eq!(transaction.private_file_eof(), checkpoint_private_eof);
+        assert_eq!(
+            transaction.projected_file_eof(&NEVER_INTERRUPTED)?,
+            checkpoint_projected_eof
+        );
+        for message in &folder.messages[16..] {
+            transaction.append_message_deferred(
+                folder.location,
+                &folder.path,
+                false,
+                message.clone(),
+                &NEVER_INTERRUPTED,
+            )?;
+        }
+        let projected_eof = transaction.projected_file_eof(&NEVER_INTERRUPTED)?;
+        transaction.finalize(&NEVER_INTERRUPTED)?;
+        assert_eq!(transaction_path.metadata()?.len(), projected_eof);
+        assert_eq!(
+            Sha256::digest(std::fs::read(transaction_path)?),
+            Sha256::digest(std::fs::read(expected_path)?)
+        );
+        Ok(())
+    }
 
     #[test]
     fn arbitrary_nonempty_classes_are_supported_but_calendar_exception_stays_exact() {
@@ -9874,12 +11170,17 @@ mod tests {
             &store
                 .properties()
                 .make_entry_id(node(NodeIdType::AssociatedMessage, MESSAGE_INDEX + 1)?)?,
-            Some(&[0x0E07]),
+            Some(&[0x0E07, 0x3001]),
         )?;
         assert!(matches!(
             associated_message.properties().get(0x0E07),
             Some(crate::ltp::prop_context::PropertyValue::Integer32(value))
                 if *value & MSGFLAG_ASSOCIATED != 0
+        ));
+        assert!(matches!(
+            associated_message.properties().get(0x3001),
+            Some(crate::ltp::prop_context::PropertyValue::Unicode(value))
+                if value.to_string() == "hidden associated item"
         ));
 
         let associated_only = MailStoreSpec {
@@ -9896,6 +11197,32 @@ mod tests {
                 .make_entry_id(node(NodeIdType::AssociatedMessage, MESSAGE_INDEX)?)?,
             Some(&[]),
         )?;
+
+        let mut derived_display_folder = spec.folders[1].clone();
+        derived_display_folder.associated_messages[0]
+            .raw_properties
+            .clear();
+        let derived_display_path = directory.path().join("associated-derived-display.pst");
+        create_mail_store(
+            &derived_display_path,
+            &MailStoreSpec {
+                store_name: "PSTForge associated derived display".to_owned(),
+                record_key: *b"PSTForgeAssocDer",
+                folders: vec![derived_display_folder],
+            },
+        )?;
+        let derived_store = open_store(&derived_display_path)?;
+        let derived_message = derived_store.open_message(
+            &derived_store
+                .properties()
+                .make_entry_id(node(NodeIdType::AssociatedMessage, MESSAGE_INDEX)?)?,
+            Some(&[0x3001]),
+        )?;
+        assert!(matches!(
+            derived_message.properties().get(0x3001),
+            Some(crate::ltp::prop_context::PropertyValue::Unicode(value))
+                if value.to_string() == "subject fallback must not replace display name"
+        ));
         Ok(())
     }
 
@@ -10128,6 +11455,57 @@ mod tests {
         ));
         assert!(blocks.is_empty());
         assert_eq!(next_block_index, 2);
+        Ok(())
+    }
+
+    #[test]
+    fn folder_layout_validation_is_independent_of_messages()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let base = FidelityStore::default();
+        let layout = MailStoreSpec {
+            store_name: "PSTForge layout".to_owned(),
+            record_key: base.record_key,
+            folders: vec![
+                MailFolderSpec {
+                    path: vec!["Inbox".to_owned()],
+                    location: MailFolderLocation::IpmSubtree,
+                    role: MailFolderRole::Ordinary,
+                    container_class: "IPF.Note".to_owned(),
+                    messages: Vec::new(),
+                    associated_messages: Vec::new(),
+                },
+                MailFolderSpec {
+                    path: vec!["Empty".to_owned()],
+                    location: MailFolderLocation::IpmSubtree,
+                    role: MailFolderRole::Ordinary,
+                    container_class: "IPF.Note".to_owned(),
+                    messages: Vec::new(),
+                    associated_messages: Vec::new(),
+                },
+            ],
+        };
+        assert!(validate_mail_store_layout(&layout).is_ok());
+        assert!(matches!(
+            validate_mail_store_input(&layout),
+            Err(WriterError::InputRejected(_))
+        ));
+        let mut duplicate = layout;
+        duplicate.folders.push(duplicate.folders[0].clone());
+        assert!(matches!(
+            validate_mail_store_layout(&duplicate),
+            Err(WriterError::InputRejected(_))
+        ));
+        let directory = tempfile::tempdir()?;
+        assert!(matches!(
+            TransactionalMailStoreWriter::begin(
+                directory.path().join("invalid-layout.pst"),
+                duplicate,
+                &NamedPropertyCatalog::default(),
+                true,
+                None,
+            ),
+            Err(WriterError::InvalidStructure(_))
+        ));
         Ok(())
     }
 
@@ -10867,6 +12245,17 @@ mod tests {
         create_mail_store(&path, &spec)?;
         assert_eq!(stored_block_ref_count(&path, leaf_bid(5)?)?, 5);
         assert_eq!(stored_block_ref_count(&path, leaf_bid(9)?)?, 5);
+        assert_eq!(stored_block_ref_count(&path, leaf_bid(13)?)?, 8);
+
+        spec.folders[0].associated_messages = vec![message("deleted associated")];
+        let private_deleted_associated_path =
+            directory.path().join("deleted-private-associated.pst");
+        create_mail_store(&private_deleted_associated_path, &spec)?;
+        assert_eq!(
+            stored_block_ref_count(&private_deleted_associated_path, leaf_bid(13)?)?,
+            7
+        );
+        spec.folders[0].associated_messages.clear();
 
         spec.folders[0].messages.clear();
         let empty_deleted_path = directory.path().join("empty-deleted-with-child.pst");

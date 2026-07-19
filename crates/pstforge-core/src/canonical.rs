@@ -272,44 +272,130 @@ fn load_canonical_mail_expected(
     job: &DurableCatalogSink,
     interrupted: Option<&AtomicBool>,
 ) -> Result<Vec<CanonicalMail>, CanonicalError> {
-    let check_interrupted = || {
-        if interrupted.is_some_and(|flag| flag.load(Ordering::Relaxed)) {
-            Err(CanonicalError::Job(JobError::Interrupted))
-        } else {
-            Ok(())
-        }
-    };
-    check_interrupted()?;
+    check_canonical_interrupted(interrupted)?;
     let folders = job.spooled_folders()?;
+    let candidates = match interrupted {
+        Some(flag) => job.spooled_candidates_interruptible(flag)?,
+        None => job.spooled_candidates()?,
+    };
+    let ownerships = match interrupted {
+        Some(flag) => job.candidate_ownerships_interruptible(flag)?,
+        None => job.candidate_ownerships()?,
+    };
+    assemble_canonical_mail(&folders, &candidates, &ownerships, interrupted)
+}
+
+pub fn load_canonical_mail_tree_interruptible(
+    job: &DurableCatalogSink,
+    root_item_key: &str,
+    interrupted: &AtomicBool,
+) -> Result<CanonicalMail, CanonicalError> {
+    check_canonical_interrupted(Some(interrupted))?;
+    let folders = job.spooled_folders()?;
+    load_canonical_mail_tree_from_folders_interruptible(job, &folders, root_item_key, interrupted)
+}
+
+pub(crate) fn load_canonical_mail_tree_from_folders_interruptible(
+    job: &DurableCatalogSink,
+    folders: &[pstforge_job::SpooledFolder],
+    root_item_key: &str,
+    interrupted: &AtomicBool,
+) -> Result<CanonicalMail, CanonicalError> {
+    check_canonical_interrupted(Some(interrupted))?;
+    let tree = job.spooled_candidate_tree_interruptible(root_item_key, interrupted)?;
+    let mut mail = assemble_canonical_mail(
+        folders,
+        &tree.candidates,
+        &tree.ownerships,
+        Some(interrupted),
+    )?;
+    if mail.len() != 1 {
+        return Err(CanonicalError::InvalidCandidate {
+            item_key: root_item_key.to_owned(),
+            detail: "candidate tree does not contain exactly one top-level message".to_owned(),
+        });
+    }
+    mail.pop().ok_or_else(|| CanonicalError::InvalidCandidate {
+        item_key: root_item_key.to_owned(),
+        detail: "candidate tree has no top-level message".to_owned(),
+    })
+}
+
+pub(crate) fn for_each_canonical_mail_header_interruptible(
+    job: &DurableCatalogSink,
+    folders: &[SpooledFolder],
+    interrupted: &AtomicBool,
+    mut visitor: impl FnMut(CanonicalMail) -> Result<(), CanonicalError>,
+) -> Result<u64, CanonicalError> {
+    const HEADER_PAGE_SIZE: u32 = 1_024;
+
+    check_canonical_interrupted(Some(interrupted))?;
+    let mut after_rowid = 0_i64;
+    let mut visited = 0_u64;
+    loop {
+        let page = job.spooled_top_level_candidate_headers_page_interruptible(
+            after_rowid,
+            HEADER_PAGE_SIZE,
+            interrupted,
+        )?;
+        if page.tree.candidates.is_empty() {
+            return Ok(visited);
+        }
+        if page.next_rowid <= after_rowid {
+            return Err(CanonicalError::InvalidCandidate {
+                item_key: "<job>".to_owned(),
+                detail: "top-level candidate header cursor did not advance".to_owned(),
+            });
+        }
+        after_rowid = page.next_rowid;
+        for header in assemble_canonical_mail(
+            folders,
+            &page.tree.candidates,
+            &page.tree.ownerships,
+            Some(interrupted),
+        )? {
+            visitor(header)?;
+            visited = visited.checked_add(1).ok_or(CanonicalError::SizeOverflow)?;
+        }
+    }
+}
+
+fn check_canonical_interrupted(interrupted: Option<&AtomicBool>) -> Result<(), CanonicalError> {
+    if interrupted.is_some_and(|flag| flag.load(Ordering::Relaxed)) {
+        Err(CanonicalError::Job(JobError::Interrupted))
+    } else {
+        Ok(())
+    }
+}
+
+fn assemble_canonical_mail(
+    folders: &[SpooledFolder],
+    candidates: &[SpooledCandidate],
+    ownerships: &[CandidateOwnership],
+    interrupted: Option<&AtomicBool>,
+) -> Result<Vec<CanonicalMail>, CanonicalError> {
+    let check_interrupted = || check_canonical_interrupted(interrupted);
     let folders_by_address = folders
         .iter()
         .filter_map(|folder| folder.address.map(|address| (address, folder)))
         .collect::<BTreeMap<_, _>>();
     let mut folders_by_id = BTreeMap::<u32, Option<&SpooledFolder>>::new();
-    for folder in &folders {
+    for folder in folders {
         folders_by_id
             .entry(folder.source_id)
             .and_modify(|value| *value = None)
             .or_insert(Some(folder));
     }
-    let candidates = match interrupted {
-        Some(flag) => job.spooled_candidates_interruptible(flag)?,
-        None => job.spooled_candidates()?,
-    };
     let by_key = candidates
         .iter()
         .map(|candidate| (candidate.item_key.as_str(), candidate))
         .collect::<BTreeMap<_, _>>();
-    let ownerships = match interrupted {
-        Some(flag) => job.candidate_ownerships_interruptible(flag)?,
-        None => job.candidate_ownerships()?,
-    };
     let ownership_by_key = ownerships
         .iter()
         .map(|ownership| (ownership.item_key.as_str(), ownership))
         .collect::<BTreeMap<_, _>>();
     let mut claimed_slots = BTreeMap::<(&str, u32), &CandidateOwnership>::new();
-    for ownership in &ownerships {
+    for ownership in ownerships {
         check_interrupted()?;
         validate_ownership(ownership, &ownership_by_key)?;
         if let (Some(parent), Some(index)) = (
@@ -328,7 +414,7 @@ fn load_canonical_mail_expected(
         }
     }
     let mut children = BTreeMap::<(&str, u32), &SpooledCandidate>::new();
-    for candidate in &candidates {
+    for candidate in candidates {
         check_interrupted()?;
         let ownership = ownership_by_key
             .get(candidate.item_key.as_str())
@@ -1196,6 +1282,8 @@ fn invalid_error(candidate: &SpooledCandidate, detail: &str) -> CanonicalError {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::AtomicBool;
+
     use libpff_sys::{
         CatalogEvent, CatalogProvenance, CatalogSink, FolderAddress, NamedPropertyIdentity,
         NamedPropertyName, PropertyDescriptor, PropertyOwner, RecoveryMode, RecoveryUnit,
@@ -1206,7 +1294,7 @@ mod tests {
 
     use super::{
         CanonicalFolder, CanonicalFolderLocation, CanonicalFolderRole, load_canonical_folders,
-        load_canonical_mail,
+        load_canonical_mail, load_canonical_mail_tree_interruptible,
     };
     use crate::{build_part_writer_input, split_recovered_job};
 
@@ -1445,6 +1533,11 @@ mod tests {
 
         let mail = load_canonical_mail(&sink)?;
         assert_eq!(mail.len(), 1);
+        let interrupted = AtomicBool::new(false);
+        let keys = sink.spooled_top_level_item_keys_interruptible(&interrupted)?;
+        assert_eq!(keys, ["normal:-:-:0"]);
+        let streamed = load_canonical_mail_tree_interruptible(&sink, &keys[0], &interrupted)?;
+        assert_eq!(streamed, mail[0]);
         assert_eq!(mail[0].folder_path, ["Inbox"]);
         assert_eq!(mail[0].recipients[0].properties.len(), 1);
         assert_eq!(mail[0].attachments[0].index, 3);
@@ -2284,12 +2377,61 @@ mod tests {
         let directory = tempdir()?;
         let job = directory.path().join("job");
         let mut sink = DurableCatalogSink::create(&job)?;
-        for (id, subject) in [(1, "x".repeat(2049)), (2, "valid".to_owned())] {
+        let root = FolderAddress::root();
+        let inbox = root.child(0).ok_or("inbox folder address")?;
+        let empty = root.child(1).ok_or("empty folder address")?;
+        let invalid = root.child(2).ok_or("invalid folder address")?;
+        let recoverable = root.child(3).ok_or("recoverable folder address")?;
+        for (address, id, parent_id, name, container_class) in [
+            (root, 99, None, "Root", None),
+            (inbox, 100, Some(99), "Inbox", Some("IPF.Note")),
+            (empty, 101, Some(99), "Empty", Some("IPF.Note")),
+        ] {
+            let unit = RecoveryUnit::Folder { address };
+            sink.event(CatalogEvent::UnitStart(unit))?;
+            sink.event(CatalogEvent::Folder {
+                id,
+                parent_id,
+                name: Some(name.to_owned()),
+                container_class: container_class.map(str::to_owned),
+            })?;
+            sink.event(CatalogEvent::UnitEnd(unit))?;
+        }
+        let invalid_folder_unit = RecoveryUnit::Folder { address: invalid };
+        sink.event(CatalogEvent::UnitStart(invalid_folder_unit))?;
+        sink.event(CatalogEvent::Folder {
+            id: 102,
+            parent_id: Some(99),
+            name: Some("f".repeat(2049)),
+            container_class: Some("IPF.Note".to_owned()),
+        })?;
+        sink.event(CatalogEvent::UnitEnd(invalid_folder_unit))?;
+        let recoverable_folder_unit = RecoveryUnit::Folder {
+            address: recoverable,
+        };
+        sink.event(CatalogEvent::UnitStart(recoverable_folder_unit))?;
+        sink.event(CatalogEvent::Folder {
+            id: 103,
+            parent_id: Some(99),
+            name: Some("Recoverable".to_owned()),
+            container_class: Some("c".repeat(2049)),
+        })?;
+        sink.event(CatalogEvent::UnitEnd(recoverable_folder_unit))?;
+        let messages = std::iter::once((1_u32, "x".repeat(2049)))
+            .chain((2_u32..=33).map(|id| (id, format!("{id:04} {}", "v".repeat(1995)))))
+            .chain(std::iter::once((34_u32, "z".repeat(2049))));
+        for (id, subject) in messages {
+            let unit = RecoveryUnit::Normal {
+                folder: inbox,
+                folder_id: 100,
+                message_index: u64::from(id),
+            };
+            sink.event(CatalogEvent::UnitStart(unit))?;
             sink.event(CatalogEvent::MessageStart {
                 id,
                 provenance: CatalogProvenance::Normal,
                 recovery_index: None,
-                folder_id: None,
+                folder_id: Some(100),
                 parent_message_id: None,
                 parent_attachment_index: None,
                 embedded_path: Vec::new(),
@@ -2304,26 +2446,160 @@ mod tests {
                 supported: true,
             })?;
             sink.event(CatalogEvent::MessageEnd { id, complete: true })?;
+            sink.event(CatalogEvent::UnitEnd(unit))?;
+        }
+        let invalid_folder_message = RecoveryUnit::Normal {
+            folder: invalid,
+            folder_id: 102,
+            message_index: 35,
+        };
+        sink.event(CatalogEvent::UnitStart(invalid_folder_message))?;
+        sink.event(CatalogEvent::MessageStart {
+            id: 35,
+            provenance: CatalogProvenance::Normal,
+            recovery_index: None,
+            folder_id: Some(102),
+            parent_message_id: None,
+            parent_attachment_index: None,
+            embedded_path: Vec::new(),
+            associated: false,
+            item_type: Some(11),
+            message_class: Some("IPM.Note".to_owned()),
+            subject: Some("valid message in invalid folder".to_owned()),
+            sender_name: None,
+            sender_email: None,
+            submit_filetime: None,
+            delivery_filetime: None,
+            supported: true,
+        })?;
+        sink.event(CatalogEvent::MessageEnd {
+            id: 35,
+            complete: true,
+        })?;
+        sink.event(CatalogEvent::UnitEnd(invalid_folder_message))?;
+        for (id, message_class) in [(36, "m".repeat(2049)), (37, "IPM.Note".to_owned())] {
+            let recoverable_folder_message = RecoveryUnit::Normal {
+                folder: recoverable,
+                folder_id: 103,
+                message_index: u64::from(id),
+            };
+            sink.event(CatalogEvent::UnitStart(recoverable_folder_message))?;
+            sink.event(CatalogEvent::MessageStart {
+                id,
+                provenance: CatalogProvenance::Normal,
+                recovery_index: None,
+                folder_id: Some(103),
+                parent_message_id: None,
+                parent_attachment_index: None,
+                embedded_path: Vec::new(),
+                associated: false,
+                item_type: Some(11),
+                message_class: Some(message_class),
+                subject: Some(format!("recoverable folder metadata {id}")),
+                sender_name: None,
+                sender_email: None,
+                submit_filetime: None,
+                delivery_filetime: None,
+                supported: true,
+            })?;
+            sink.event(CatalogEvent::MessageEnd { id, complete: true })?;
+            sink.event(CatalogEvent::UnitEnd(recoverable_folder_message))?;
         }
         sink.checkpoint()?;
         drop(sink);
 
-        let (parts, written, partial) = split_recovered_job(
-            &job,
-            &"0".repeat(64),
-            RecoveryMode::Balanced,
-            8 * 1024 * 1024,
-        )?;
-        assert_eq!(parts.len(), 1);
-        assert_eq!(parts[0].message_count, 1);
-        assert_eq!(written, 1);
+        let (parts, written, partial) =
+            split_recovered_job(&job, &"0".repeat(64), RecoveryMode::Balanced, 320 * 1024)?;
+        assert!(parts.len() > 1);
+        assert_eq!(parts[0].folder_count, 2);
+        assert_eq!(parts[0].omitted_folders, 1);
+        assert_eq!(parts.iter().map(|part| part.message_count).sum::<u64>(), 33);
+        assert_eq!(written, 33);
+        assert!(partial);
+
+        let reopened = DurableCatalogSink::open(&job)?;
+        let summary = reopened.summary()?;
+        assert_eq!(summary.committed_candidates, 37);
+        assert_eq!(summary.unsupported_candidates, 4);
+        assert_eq!(reopened.spooled_candidates()?.len(), 0);
+        Ok(())
+    }
+
+    #[test]
+    fn split_completes_partial_when_every_candidate_is_unrepresentable()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempdir()?;
+        let job = directory.path().join("job");
+        let mut sink = DurableCatalogSink::create(&job)?;
+        for id in 1_u32..=2 {
+            sink.event(CatalogEvent::MessageStart {
+                id,
+                provenance: CatalogProvenance::Normal,
+                recovery_index: None,
+                folder_id: None,
+                parent_message_id: None,
+                parent_attachment_index: None,
+                embedded_path: Vec::new(),
+                associated: false,
+                item_type: Some(11),
+                message_class: Some("IPM.Note".to_owned()),
+                subject: Some("x".repeat(2049)),
+                sender_name: None,
+                sender_email: None,
+                submit_filetime: None,
+                delivery_filetime: None,
+                supported: true,
+            })?;
+            sink.event(CatalogEvent::MessageEnd { id, complete: true })?;
+        }
+        sink.checkpoint()?;
+        drop(sink);
+
+        let (parts, written, partial) =
+            split_recovered_job(&job, &"0".repeat(64), RecoveryMode::Balanced, 320 * 1024)?;
+        assert!(parts.is_empty());
+        assert_eq!(written, 0);
         assert!(partial);
 
         let reopened = DurableCatalogSink::open(&job)?;
         let summary = reopened.summary()?;
         assert_eq!(summary.committed_candidates, 2);
-        assert_eq!(summary.unsupported_candidates, 1);
-        assert_eq!(reopened.spooled_candidates()?.len(), 0);
+        assert_eq!(summary.unsupported_candidates, 2);
+        assert!(reopened.spooled_candidates()?.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn split_refuses_a_part_name_conflict_before_creating_writer_scratch()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempdir()?;
+        let job = directory.path().join("job");
+        let mut sink = DurableCatalogSink::create(&job)?;
+        message_start(&mut sink, 1, None, None)?;
+        sink.event(CatalogEvent::MessageEnd {
+            id: 1,
+            complete: true,
+        })?;
+        sink.checkpoint()?;
+        drop(sink);
+        std::fs::write(job.join("parts/part-0001.pst"), b"existing output")?;
+
+        let error = split_recovered_job(
+            &job,
+            &"0".repeat(64),
+            RecoveryMode::Balanced,
+            64 * 1024 * 1024,
+        )
+        .expect_err("conflicting output must be refused");
+        assert!(matches!(
+            error,
+            crate::SplitError::Job(pstforge_job::JobError::OutputNameConflict(_))
+        ));
+        assert!(
+            std::fs::read_dir(job.join(".pstforge/partial"))?
+                .filter_map(Result::ok)
+                .all(|entry| !entry.file_name().to_string_lossy().contains("transaction"))
+        );
         Ok(())
     }
 }

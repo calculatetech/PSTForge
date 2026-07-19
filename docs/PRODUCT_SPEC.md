@@ -79,10 +79,13 @@ content-addressed payloads in a bundled-SQLite WAL job under
 `<job-dir>/.pstforge`.
 
 This command creates durable canonical recovery input, not importable PST
-parts. A fresh invocation refuses a nonempty job directory. It verifies the
-held source identity and SHA-256 before and after native parsing. Exit status
-`1` means the ledger is usable but one or more candidates or substreams are
-partial; output/durable-state failure is `4`.
+parts. A fresh invocation refuses a nonempty job directory. It computes the
+full source SHA-256 before native parsing while holding a read-only descriptor.
+Before completion it rechecks the descriptor and path device, inode, size,
+mtime, and ctime; any filesystem-mediated content change updates this identity
+even if size and mtime are restored. Exit status `1` means the ledger is usable
+but one or more candidates or substreams are partial; output/durable-state
+failure is `4`.
 
 ### `pstforge split <source.pst> --output <job-dir> [OPTIONS]`
 
@@ -94,13 +97,29 @@ partial; output/durable-state failure is `4`.
     --keep-work                  Retain the private spool after success.
     --json                       Print the final summary as JSON.
 
+`split` uses a durable SQLite ledger and private payload pack so recovery and
+writing can resume without rereading committed payloads. This restartability
+costs approximately one additional readable-payload write and corresponding
+temporary capacity. `--keep-work` retains that private state after successful
+completion; otherwise it is removed after finalized parts and accounting are
+durable.
+
 Without `--resume`, an existing nonempty job directory is an error. With
 `--resume`, the source SHA-256, source identity, job schema, recovery mode,
 part-size policy, writer format, and compatible tool major version must match.
-A mismatch is refused and neither existing parts nor state are changed.
-Fresh jobs require three times the source size as available output capacity.
+A mismatch is refused and neither existing parts nor state are changed. A
+fresh job retains the three-times-source conservative capacity requirement.
 On resume, validated allocation already consumed by the matching job is
-credited against that conservative requirement.
+credited against the requirement.
+
+PSTForge owns only ledger-tracked output names. It ignores and preserves
+untracked files placed in the public `parts/` directory, including human
+validation logs and repaired comparison PSTs, and never credits their
+allocation to the job. If an untracked file occupies the preferred
+`part-NNNN.pst` name, PSTForge aborts before writing that part with an explicit
+name-conflict diagnostic. It never renames, replaces, deletes, or works around
+the pre-existing file, so repaired or incompatible data cannot be mistaken for
+an official split part.
 
 Balanced recovery processes the normal tree, `libpff` deleted/recovered items,
 and orphan items. Aggressive recovery also sets the `libpff` flags to ignore
@@ -128,7 +147,9 @@ PSTForge refuses non-regular files, source symlinks, an output directory that
 contains the source, and a source path that aliases any output file. It opens
 the source read-only and retains identity metadata for the entire job. Before
 recovery it records canonical path, device, inode, byte size, modification
-time, and SHA-256. At completion and resume it rechecks identity metadata; an
+time, and SHA-256. At completion it rechecks device, inode, size, mtime, and
+ctime on both the held descriptor and source path. Resume recomputes the full
+SHA-256 and matches the durable source identity before trusting job state. An
 unexpected change stops new work and is reported.
 
 The program never changes source permissions, times, names, bytes, allocation,
@@ -136,11 +157,10 @@ or ownership. Corpus tests independently hash originals before and after every
 run. The source must remain safe even if a parser worker crashes, the output
 filesystem fills, or the supervisor is forcibly terminated.
 
-Before starting, `split` estimates space for the durable spool, output parts,
-the current temporary part, manifests, and safety margin. By default it refuses
-when available space is below three times the source size. This conservative
-preflight is reported explicitly; a later implementation may refine the
-estimate without weakening source or finalized-part safety.
+Before starting, `split` estimates space for output parts, the current
+temporary part, durable ledger and payload spool, independent-reader scratch,
+manifests, and safety margin. A fresh job is refused below three times the
+source size. Refinement may not weaken source or finalized-part safety.
 
 ## Recovery Model
 

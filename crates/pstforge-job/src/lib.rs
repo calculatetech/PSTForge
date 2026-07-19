@@ -40,6 +40,8 @@ pub enum JobError {
     Integrity(String),
     #[error("resume configuration does not match the existing job: {0}")]
     ResumeMismatch(&'static str),
+    #[error("output part name conflicts with existing data: {0}")]
+    OutputNameConflict(PathBuf),
     #[error("job validation was interrupted")]
     Interrupted,
     #[error("invalid catalog event sequence: {0}")]
@@ -130,6 +132,18 @@ pub struct CandidateOwnership {
     pub parent_attachment_index: Option<u32>,
     pub embedded_path: Vec<u32>,
     pub metadata: serde_json::Value,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SpooledCandidateTree {
+    pub candidates: Vec<SpooledCandidate>,
+    pub ownerships: Vec<CandidateOwnership>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SpooledCandidateHeaderPage {
+    pub next_rowid: i64,
+    pub tree: SpooledCandidateTree,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -671,7 +685,18 @@ impl DurableCatalogSink {
 
     pub fn allocated_bytes(&self) -> Result<u64, JobError> {
         Ok(allocated_private_bytes(&self.private_root)?
-            .saturating_add(allocated_tree_bytes(&self.parts, true)?))
+            .saturating_add(allocated_tracked_part_bytes(&self.connection, &self.parts)?))
+    }
+
+    pub fn available_part_filename(&self, part_index: u32) -> Result<String, JobError> {
+        let filename = format!("part-{part_index:04}.pst");
+        let sidecar = filename.trim_end_matches(".pst").to_owned() + ".json";
+        for path in [self.parts.join(&filename), self.manifests.join(sidecar)] {
+            if path_exists(&path)? {
+                return Err(JobError::OutputNameConflict(path));
+            }
+        }
+        Ok(filename)
     }
 
     pub fn checkpoint(&self) -> Result<(), JobError> {
@@ -916,6 +941,30 @@ impl DurableCatalogSink {
         Ok(())
     }
 
+    pub fn mark_stranded_embedded_candidates_unsupported(&mut self) -> Result<u64, JobError> {
+        let mut statement = self.connection.prepare(
+            "WITH RECURSIVE stranded(item_key) AS (\
+                 SELECT child.item_key FROM candidates child \
+                 JOIN candidates parent ON parent.item_key = child.parent_item_key \
+                 WHERE child.status = 'spooled' \
+                   AND parent.status IN ('written', 'unsupported') \
+                 UNION \
+                 SELECT child.item_key FROM candidates child \
+                 JOIN stranded parent ON parent.item_key = child.parent_item_key \
+                 WHERE child.status = 'spooled'\
+             ) SELECT item_key FROM stranded ORDER BY item_key",
+        )?;
+        let item_keys = statement
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        drop(statement);
+        if item_keys.is_empty() {
+            return Ok(0);
+        }
+        self.mark_candidates_unsupported(&item_keys)?;
+        Ok(u64::try_from(item_keys.len()).unwrap_or(u64::MAX))
+    }
+
     pub fn abort_worker_attempt(&mut self) -> Result<(), JobError> {
         self.property = None;
         self.attachment = None;
@@ -1025,6 +1074,24 @@ impl DurableCatalogSink {
         let attempts = read_optional_metadata_u32(&self.connection, "worker_attempts")?;
         let failures = read_optional_metadata_u32(&self.connection, "worker_failures")?;
         Ok((attempts, failures))
+    }
+
+    pub fn worker_retries_exhausted(&self) -> Result<bool, JobError> {
+        let value = self
+            .connection
+            .query_row(
+                "SELECT value FROM job_metadata WHERE key = 'worker_retries_exhausted'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        match value.as_deref() {
+            None | Some("false") => Ok(false),
+            Some("true") => Ok(true),
+            Some(_) => Err(JobError::Integrity(
+                "worker retry exhaustion metadata is invalid".to_owned(),
+            )),
+        }
     }
 
     pub fn record_recovery_completion(
@@ -1403,6 +1470,291 @@ impl DurableCatalogSink {
             ));
         }
         Ok(candidates)
+    }
+
+    pub fn spooled_top_level_item_keys_interruptible(
+        &self,
+        interrupted: &AtomicBool,
+    ) -> Result<Vec<String>, JobError> {
+        let mut statement = self.connection.prepare(
+            "SELECT item_key FROM candidates \
+             WHERE status = 'spooled' AND parent_item_key IS NULL \
+             ORDER BY provenance, source_node_id, recovery_index, occurrence, item_key",
+        )?;
+        let mut query = statement.query([])?;
+        let mut keys = Vec::new();
+        while let Some(row) = query.next()? {
+            check_job_interrupted(Some(interrupted))?;
+            keys.push(row.get(0)?);
+        }
+        Ok(keys)
+    }
+
+    pub fn spooled_top_level_candidate_headers_page_interruptible(
+        &self,
+        after_rowid: i64,
+        page_size: u32,
+        interrupted: &AtomicBool,
+    ) -> Result<SpooledCandidateHeaderPage, JobError> {
+        if after_rowid < 0 || page_size == 0 {
+            return Err(JobError::Integrity(
+                "invalid top-level candidate header page request".to_owned(),
+            ));
+        }
+        let mut statement = self.connection.prepare(
+            "SELECT rowid, item_key, provenance, source_node_id, recovery_index, occurrence, \
+                    completeness, metadata_json, recovery_unit_json, embedded_path_json \
+             FROM candidates \
+             WHERE rowid > ?1 AND status = 'spooled' AND parent_item_key IS NULL \
+             ORDER BY rowid LIMIT ?2",
+        )?;
+        let mut query = statement.query(params![after_rowid, i64::from(page_size)])?;
+        let mut candidates = Vec::new();
+        let mut ownerships = Vec::new();
+        let mut next_rowid = after_rowid;
+        while let Some(row) = query.next()? {
+            check_job_interrupted(Some(interrupted))?;
+            next_rowid = row.get(0)?;
+            let item_key: String = row.get(1)?;
+            let source_node_id = row
+                .get::<_, Option<i64>>(3)?
+                .map(|value| checked_u32(value, "candidate source node id"))
+                .transpose()?;
+            let metadata: serde_json::Value = serde_json::from_str(&row.get::<_, String>(7)?)?;
+            let embedded_path: Vec<u32> = serde_json::from_str(&row.get::<_, String>(9)?)?;
+            ownerships.push(CandidateOwnership {
+                item_key: item_key.clone(),
+                source_node_id,
+                writable: true,
+                parent_item_key: None,
+                parent_attachment_index: None,
+                embedded_path,
+                metadata: metadata.clone(),
+            });
+            candidates.push(SpooledCandidate {
+                item_key,
+                provenance: parse_provenance(&row.get::<_, String>(2)?)?,
+                source_node_id,
+                recovery_index: row
+                    .get::<_, Option<i64>>(4)?
+                    .map(|value| checked_u64(value, "candidate recovery index"))
+                    .transpose()?,
+                occurrence: checked_u32(row.get(5)?, "candidate occurrence")?,
+                parent_item_key: None,
+                parent_attachment_index: None,
+                unit: row
+                    .get::<_, Option<String>>(8)?
+                    .map(|value| serde_json::from_str(&value))
+                    .transpose()?,
+                completeness: row.get(6)?,
+                metadata,
+                events: Vec::new(),
+            });
+        }
+        Ok(SpooledCandidateHeaderPage {
+            next_rowid,
+            tree: SpooledCandidateTree {
+                candidates,
+                ownerships,
+            },
+        })
+    }
+
+    pub fn candidate_named_property_identities_interruptible(
+        &self,
+        interrupted: &AtomicBool,
+    ) -> Result<Vec<libpff_sys::NamedPropertyIdentity>, JobError> {
+        let mut statement = self.connection.prepare(
+            "SELECT DISTINCT json_extract(e.metadata_json, '$.named_property') \
+             FROM candidate_events e JOIN candidates c ON c.item_key = e.item_key \
+             WHERE c.status IN ('spooled', 'written', 'unsupported', 'failed') \
+               AND e.kind IN ('property', 'property_incomplete') \
+               AND json_type(e.metadata_json, '$.named_property') = 'object' \
+             ORDER BY 1",
+        )?;
+        let mut query = statement.query([])?;
+        let mut identities = Vec::new();
+        while let Some(row) = query.next()? {
+            check_job_interrupted(Some(interrupted))?;
+            identities.push(serde_json::from_str(&row.get::<_, String>(0)?)?);
+        }
+        Ok(identities)
+    }
+
+    pub fn spooled_candidate_tree_interruptible(
+        &self,
+        root_item_key: &str,
+        interrupted: &AtomicBool,
+    ) -> Result<SpooledCandidateTree, JobError> {
+        check_job_interrupted(Some(interrupted))?;
+        let tree_sql = "WITH RECURSIVE tree(item_key) AS (\
+                SELECT item_key FROM candidates \
+                WHERE item_key = ?1 AND status = 'spooled' \
+                UNION \
+                SELECT child.item_key FROM candidates child \
+                JOIN tree parent ON child.parent_item_key = parent.item_key \
+                WHERE child.status IN ('spooled', 'written', 'unsupported')\
+            ) ";
+        let candidate_sql = format!(
+            "{tree_sql}\
+             SELECT c.item_key, c.provenance, c.source_node_id, c.recovery_index, c.occurrence, \
+                    c.completeness, c.metadata_json, c.parent_item_key, \
+                    c.parent_attachment_index, c.recovery_unit_json \
+             FROM tree t CROSS JOIN candidates c ON c.item_key = t.item_key \
+             WHERE c.status = 'spooled' ORDER BY c.item_key"
+        );
+        let mut statement = self.connection.prepare(&candidate_sql)?;
+        let mut query = statement.query([root_item_key])?;
+        let mut rows = Vec::new();
+        while let Some(row) = query.next()? {
+            check_job_interrupted(Some(interrupted))?;
+            rows.push((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, Option<i64>>(2)?,
+                row.get::<_, Option<i64>>(3)?,
+                row.get::<_, i64>(4)?,
+                row.get::<_, String>(5)?,
+                row.get::<_, String>(6)?,
+                row.get::<_, Option<String>>(7)?,
+                row.get::<_, Option<i64>>(8)?,
+                row.get::<_, Option<String>>(9)?,
+            ));
+        }
+        drop(query);
+        drop(statement);
+        if rows.is_empty() {
+            return Err(JobError::Integrity(
+                "requested top-level spooled candidate does not exist".to_owned(),
+            ));
+        }
+
+        let event_sql = format!(
+            "{tree_sql}\
+             SELECT e.item_key, e.sequence, e.kind, e.metadata_json, \
+                    e.blob_sha256, e.byte_len, b.pack_offset \
+             FROM tree t \
+             CROSS JOIN candidate_events e ON e.item_key = t.item_key \
+             JOIN candidates c ON c.item_key = e.item_key \
+             LEFT JOIN blobs b ON b.sha256 = e.blob_sha256 \
+             WHERE c.status = 'spooled' ORDER BY e.item_key, e.sequence"
+        );
+        let mut statement = self.connection.prepare(&event_sql)?;
+        let mut query = statement.query([root_item_key])?;
+        let mut events_by_candidate = HashMap::<String, Vec<SpooledEvent>>::new();
+        while let Some(row) = query.next()? {
+            check_job_interrupted(Some(interrupted))?;
+            let item_key = row.get::<_, String>(0)?;
+            let sha256 = row.get::<_, Option<String>>(4)?;
+            let byte_len = row.get::<_, Option<i64>>(5)?;
+            let pack_offset = row.get::<_, Option<i64>>(6)?;
+            let blob = match (sha256, byte_len) {
+                (Some(sha256), Some(byte_len)) => Some(SpooledBlob {
+                    sha256,
+                    byte_len: checked_u64(byte_len, "candidate event byte length")?,
+                    pack_offset: pack_offset
+                        .map(|value| checked_u64(value, "payload pack offset"))
+                        .transpose()?,
+                }),
+                (None, None) if pack_offset.is_none() => None,
+                _ => {
+                    return Err(JobError::Integrity(
+                        "candidate event has an incomplete blob reference".to_owned(),
+                    ));
+                }
+            };
+            events_by_candidate
+                .entry(item_key)
+                .or_default()
+                .push(SpooledEvent {
+                    sequence: checked_u64(row.get::<_, i64>(1)?, "candidate event sequence")?,
+                    kind: row.get(2)?,
+                    metadata: serde_json::from_str(&row.get::<_, String>(3)?)?,
+                    blob,
+                });
+        }
+        drop(query);
+        drop(statement);
+
+        let mut candidates = Vec::with_capacity(rows.len());
+        for (
+            item_key,
+            provenance,
+            source_node_id,
+            recovery_index,
+            occurrence,
+            completeness,
+            metadata,
+            parent_item_key,
+            parent_attachment_index,
+            unit,
+        ) in rows
+        {
+            check_job_interrupted(Some(interrupted))?;
+            candidates.push(SpooledCandidate {
+                events: events_by_candidate.remove(&item_key).unwrap_or_default(),
+                item_key,
+                provenance: parse_provenance(&provenance)?,
+                source_node_id: source_node_id
+                    .map(|value| checked_u32(value, "candidate source node id"))
+                    .transpose()?,
+                recovery_index: recovery_index
+                    .map(|value| checked_u64(value, "candidate recovery index"))
+                    .transpose()?,
+                occurrence: checked_u32(occurrence, "candidate occurrence")?,
+                parent_item_key,
+                parent_attachment_index: parent_attachment_index
+                    .map(|value| checked_u32(value, "parent attachment index"))
+                    .transpose()?,
+                unit: unit.map(|value| serde_json::from_str(&value)).transpose()?,
+                completeness,
+                metadata: serde_json::from_str(&metadata)?,
+            });
+        }
+        if !events_by_candidate.is_empty() {
+            return Err(JobError::Integrity(
+                "candidate tree events refer to an unclaimed candidate".to_owned(),
+            ));
+        }
+
+        let ownership_sql = format!(
+            "{tree_sql}\
+             SELECT c.item_key, c.source_node_id, c.status, c.parent_item_key, \
+                    c.parent_attachment_index, c.embedded_path_json, c.metadata_json \
+             FROM tree t CROSS JOIN candidates c ON c.item_key = t.item_key \
+             ORDER BY c.item_key"
+        );
+        let mut statement = self.connection.prepare(&ownership_sql)?;
+        let mut query = statement.query([root_item_key])?;
+        let mut ownerships = Vec::new();
+        while let Some(row) = query.next()? {
+            check_job_interrupted(Some(interrupted))?;
+            let parent_item_key = row.get::<_, Option<String>>(3)?;
+            let parent_attachment_index = row.get::<_, Option<i64>>(4)?;
+            if parent_item_key.is_some() != parent_attachment_index.is_some() {
+                return Err(JobError::Integrity(
+                    "candidate has incomplete embedded ownership".to_owned(),
+                ));
+            }
+            ownerships.push(CandidateOwnership {
+                item_key: row.get(0)?,
+                source_node_id: row
+                    .get::<_, Option<i64>>(1)?
+                    .map(|value| checked_u32(value, "candidate source node id"))
+                    .transpose()?,
+                writable: row.get::<_, String>(2)? == "spooled",
+                parent_item_key,
+                parent_attachment_index: parent_attachment_index
+                    .map(|value| checked_u32(value, "parent attachment index"))
+                    .transpose()?,
+                embedded_path: serde_json::from_str(&row.get::<_, String>(5)?)?,
+                metadata: serde_json::from_str(&row.get::<_, String>(6)?)?,
+            });
+        }
+        Ok(SpooledCandidateTree {
+            candidates,
+            ownerships,
+        })
     }
 
     pub fn candidate_ownerships(&self) -> Result<Vec<CandidateOwnership>, JobError> {
@@ -2067,19 +2419,20 @@ impl DurableCatalogSink {
             .sequence
             .checked_add(1)
             .ok_or_else(|| JobError::EventSequence("candidate event count overflow".to_owned()))?;
-        self.connection.execute(
-            "INSERT INTO candidate_events(\
-                item_key, sequence, kind, metadata_json, blob_sha256, byte_len\
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            params![
+        self.connection
+            .prepare_cached(
+                "INSERT INTO candidate_events(\
+                    item_key, sequence, kind, metadata_json, blob_sha256, byte_len\
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            )?
+            .execute(params![
                 active.key,
                 active.sequence,
                 kind,
                 serde_json::to_string(&metadata)?,
                 blob.as_ref().map(|value| value.sha256.as_str()),
                 blob.as_ref().map(|value| value.bytes),
-            ],
-        )?;
+            ])?;
         Ok(())
     }
 
@@ -2193,19 +2546,18 @@ impl DurableCatalogSink {
         }
         let stored = self
             .connection
-            .query_row(
+            .prepare_cached(
                 "SELECT b.byte_len, b.pack_offset, EXISTS(\
                     SELECT 1 FROM inline_blobs i WHERE i.sha256 = b.sha256\
                  ) FROM blobs b WHERE b.sha256 = ?1",
-                [&sha256],
-                |row| {
-                    Ok((
-                        row.get::<_, u64>(0)?,
-                        row.get::<_, Option<u64>>(1)?,
-                        row.get::<_, bool>(2)?,
-                    ))
-                },
-            )
+            )?
+            .query_row([&sha256], |row| {
+                Ok((
+                    row.get::<_, u64>(0)?,
+                    row.get::<_, Option<u64>>(1)?,
+                    row.get::<_, bool>(2)?,
+                ))
+            })
             .optional()?;
         if let Some((stored_len, pack_offset, inline)) = stored {
             if stored_len != blob.bytes {
@@ -2241,10 +2593,11 @@ impl DurableCatalogSink {
             }
             self.truncate_payload_pack(blob.start_offset)?;
         } else {
-            self.connection.execute(
-                "INSERT INTO blobs(sha256, byte_len, pack_offset) VALUES (?1, ?2, ?3)",
-                params![&sha256, blob.bytes, blob.start_offset],
-            )?;
+            self.connection
+                .prepare_cached(
+                    "INSERT INTO blobs(sha256, byte_len, pack_offset) VALUES (?1, ?2, ?3)",
+                )?
+                .execute(params![&sha256, blob.bytes, blob.start_offset])?;
         }
         Ok(BlobRef {
             sha256,
@@ -2876,6 +3229,26 @@ fn allocated_private_bytes(private_root: &Path) -> Result<u64, JobError> {
     Ok(bytes)
 }
 
+fn allocated_tracked_part_bytes(connection: &Connection, parts: &Path) -> Result<u64, JobError> {
+    let mut bytes = allocated_node_bytes(parts, true)?;
+    let mut statement = connection.prepare("SELECT filename FROM parts ORDER BY part_index")?;
+    let filenames = statement
+        .query_map([], |row| row.get::<_, String>(0))?
+        .collect::<Result<Vec<_>, _>>()?;
+    for filename in filenames {
+        bytes = bytes.saturating_add(allocated_node_bytes(&parts.join(filename), false)?);
+    }
+    Ok(bytes)
+}
+
+fn path_exists(path: &Path) -> Result<bool, JobError> {
+    match path.symlink_metadata() {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == ErrorKind::NotFound => Ok(false),
+        Err(source) => Err(io_error(path, source)),
+    }
+}
+
 fn allocated_node_bytes(path: &Path, held_root: bool) -> Result<u64, JobError> {
     let metadata = if held_root {
         path.metadata()
@@ -3009,7 +3382,9 @@ fn ensure_inline_blob_table(connection: &Connection) -> Result<(), JobError> {
          CREATE INDEX IF NOT EXISTS candidate_events_blob_sha256 \
          ON candidate_events(blob_sha256) WHERE blob_sha256 IS NOT NULL;\
          CREATE INDEX IF NOT EXISTS candidates_occurrence \
-         ON candidates(provenance, source_node_id, recovery_index);",
+         ON candidates(provenance, source_node_id, recovery_index);\
+         CREATE INDEX IF NOT EXISTS candidates_parent_item_key \
+         ON candidates(parent_item_key) WHERE parent_item_key IS NOT NULL;",
     )?;
     Ok(())
 }
@@ -3128,6 +3503,8 @@ fn create_schema(connection: &Connection) -> Result<(), JobError> {
          ON candidate_events(blob_sha256) WHERE blob_sha256 IS NOT NULL;\
          CREATE INDEX candidates_occurrence \
          ON candidates(provenance, source_node_id, recovery_index);\
+         CREATE INDEX candidates_parent_item_key \
+         ON candidates(parent_item_key) WHERE parent_item_key IS NOT NULL;\
          CREATE TABLE worker_events(\
             sequence INTEGER PRIMARY KEY AUTOINCREMENT,\
             kind TEXT NOT NULL CHECK(kind IN ('started','failure')),\
@@ -3788,9 +4165,13 @@ fn validate_blob_store(
         ));
     }
     let mut statement = connection.prepare(
-        "SELECT b.sha256, b.byte_len, b.pack_offset, length(i.data), \
+        "SELECT DISTINCT b.sha256, b.byte_len, b.pack_offset, length(i.data), \
                 CASE WHEN length(i.data) <= ?1 THEN i.data END \
-         FROM blobs b LEFT JOIN inline_blobs i ON i.sha256 = b.sha256 \
+         FROM blobs b \
+         JOIN candidate_events e ON e.blob_sha256 = b.sha256 \
+         JOIN candidates c ON c.item_key = e.item_key \
+         LEFT JOIN inline_blobs i ON i.sha256 = b.sha256 \
+         WHERE c.status IN ('pending', 'spooled', 'failed') \
          ORDER BY b.pack_offset IS NULL, b.pack_offset, b.sha256",
     )?;
     let mut rows = statement.query([INLINE_BLOB_MAX_BYTES])?;
@@ -3926,7 +4307,6 @@ fn validate_part_store(
             ))
         })?
         .collect::<Result<Vec<_>, _>>()?;
-    let mut accounted = HashSet::new();
     let mut accounted_sidecars = HashSet::new();
     for (part, sidecar_json) in rows {
         validate_part_record(&part)?;
@@ -3936,21 +4316,6 @@ fn validate_part_store(
         validate_sidecar(&part, &expected_sidecar)?;
         verify_sidecar_artifact(&manifests.join(&sidecar_filename), &expected_sidecar)?;
         accounted_sidecars.insert(sidecar_filename);
-        accounted.insert(part.filename);
-    }
-    for entry in fs::read_dir(parts).map_err(|source| io_error(parts, source))? {
-        let entry = entry.map_err(|source| io_error(parts, source))?;
-        let name = entry.file_name();
-        let name = name.to_string_lossy();
-        if name.ends_with(".pst") && !accounted.contains(name.as_ref()) {
-            return Err(JobError::Integrity(format!(
-                "finalized PST {name:?} has no ledger record"
-            )));
-        } else if !accounted.contains(name.as_ref()) {
-            return Err(JobError::Integrity(format!(
-                "unrecognized finalized-part entry {name:?}"
-            )));
-        }
     }
     for entry in fs::read_dir(manifests).map_err(|source| io_error(manifests, source))? {
         let entry = entry.map_err(|source| io_error(manifests, source))?;
@@ -4425,9 +4790,11 @@ mod tests {
     use std::time::Duration;
 
     use libpff_sys::{
-        CatalogEvent, CatalogProvenance, CatalogSink, PropertyDescriptor, PropertyOwner,
+        CatalogEvent, CatalogProvenance, CatalogSink, NamedPropertyIdentity, NamedPropertyName,
+        PropertyDescriptor, PropertyOwner,
     };
     use rusqlite::Connection;
+    use serde_json::json;
     use tempfile::tempdir;
 
     use sha2::{Digest, Sha256};
@@ -4460,7 +4827,7 @@ mod tests {
         };
         let configuration = JobConfiguration {
             tool_compatibility_major: 0,
-            split_schema_version: "0.4.2".to_owned(),
+            split_schema_version: "0.4.3".to_owned(),
             recovery_mode: "balanced".to_owned(),
             maximum_pst_bytes: 4_294_967_296,
             part_size_policy: "hard-maximum-v1".to_owned(),
@@ -4515,7 +4882,7 @@ mod tests {
         };
         let configuration = JobConfiguration {
             tool_compatibility_major: 0,
-            split_schema_version: "0.4.2".to_owned(),
+            split_schema_version: "0.4.3".to_owned(),
             recovery_mode: "balanced".to_owned(),
             maximum_pst_bytes: 4_294_967_296,
             part_size_policy: "hard-maximum-v1".to_owned(),
@@ -4589,7 +4956,7 @@ mod tests {
         };
         let configuration = JobConfiguration {
             tool_compatibility_major: 0,
-            split_schema_version: "0.4.2".to_owned(),
+            split_schema_version: "0.4.3".to_owned(),
             recovery_mode: "balanced".to_owned(),
             maximum_pst_bytes: 4_294_967_296,
             part_size_policy: "hard-maximum-v1".to_owned(),
@@ -4620,19 +4987,26 @@ mod tests {
     }
 
     #[test]
-    fn resume_rejects_untracked_part_storage_before_capacity_credit()
+    fn resume_ignores_untracked_public_output_without_capacity_credit()
     -> Result<(), Box<dyn std::error::Error>> {
         let directory = tempdir()?;
         let job = directory.path().join("job");
         let sink = DurableCatalogSink::create(&job)?;
         sink.checkpoint()?;
         drop(sink);
-        let untracked = job.join("parts/untracked.bin");
-        std::fs::write(&untracked, vec![0_u8; 4096])?;
-        std::fs::set_permissions(&untracked, std::fs::Permissions::from_mode(0o600))?;
+        let baseline = DurableCatalogSink::open(&job)?;
+        let before = baseline.allocated_bytes()?;
+        drop(baseline);
+        for name in ["part-0001.log", "part-0001.pst"] {
+            let untracked = job.join("parts").join(name);
+            std::fs::write(&untracked, vec![0_u8; 4096])?;
+            std::fs::set_permissions(&untracked, std::fs::Permissions::from_mode(0o600))?;
+        }
+        let resumed = DurableCatalogSink::open(&job)?;
+        assert_eq!(resumed.allocated_bytes()?, before);
         assert!(matches!(
-            DurableCatalogSink::open(&job),
-            Err(JobError::Integrity(message)) if message.contains("unrecognized")
+            resumed.available_part_filename(1),
+            Err(JobError::OutputNameConflict(path)) if path.ends_with("part-0001.pst")
         ));
         Ok(())
     }
@@ -4898,14 +5272,121 @@ mod tests {
     }
 
     #[test]
+    fn named_property_catalog_is_stable_after_candidates_become_terminal()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempdir()?;
+        let job = directory.path().join("job");
+        let mut sink = DurableCatalogSink::create(&job)?;
+        for (id, name) in [(10, 0x1001), (11, 0x1002)] {
+            message_start(&mut sink, id)?;
+            let descriptor = PropertyDescriptor {
+                owner: PropertyOwner::Message(id),
+                record_set_index: 0,
+                entry_index: 0,
+                entry_type: Some(0x8001),
+                value_type: Some(0x0003),
+                data_size: 4,
+            };
+            sink.event(CatalogEvent::NamedProperty {
+                descriptor,
+                identity: NamedPropertyIdentity {
+                    guid: [u8::try_from(id)?; 16],
+                    name: NamedPropertyName::Numeric(name),
+                },
+            })?;
+            sink.event(CatalogEvent::PropertyStart(descriptor))?;
+            sink.event(CatalogEvent::PropertyData {
+                descriptor,
+                bytes: &42_i32.to_le_bytes(),
+            })?;
+            sink.event(CatalogEvent::PropertyEnd(descriptor))?;
+            sink.event(CatalogEvent::MessageEnd { id, complete: true })?;
+        }
+        let interrupted = AtomicBool::new(false);
+        let before = sink.candidate_named_property_identities_interruptible(&interrupted)?;
+
+        sink.mark_candidates_unsupported(&["normal:10:-:0".to_owned()])?;
+        sink.connection.execute(
+            "UPDATE candidates SET status = 'failed' WHERE item_key = 'normal:11:-:0'",
+            [],
+        )?;
+
+        let after = sink.candidate_named_property_identities_interruptible(&interrupted)?;
+        assert_eq!(after, before);
+        Ok(())
+    }
+
+    #[test]
+    fn top_level_header_cursor_pages_without_loading_embedded_candidates()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempdir()?;
+        let job = directory.path().join("job");
+        let mut sink = DurableCatalogSink::create(&job)?;
+        let transaction = sink.connection.transaction()?;
+        for id in 1_u32..=1_025 {
+            transaction.execute(
+                "INSERT INTO candidates(\
+                    item_key, provenance, source_node_id, occurrence, completeness, status,\
+                    metadata_json\
+                 ) VALUES (?1, 'normal', ?2, 0, 'complete', 'spooled', ?3)",
+                rusqlite::params![
+                    format!("normal:{id}:-:0"),
+                    id,
+                    serde_json::to_string(&json!({
+                        "parent_message_id": null,
+                        "parent_attachment_index": null,
+                        "embedded_path": []
+                    }))?
+                ],
+            )?;
+        }
+        transaction.execute(
+            "INSERT INTO candidates(\
+                item_key, provenance, source_node_id, occurrence, completeness, status,\
+                metadata_json, parent_item_key, parent_attachment_index, embedded_path_json\
+             ) VALUES ('normal:2000:-:0', 'normal', 2000, 0, 'complete', 'spooled', ?1,\
+                       'normal:1:-:0', 0, '[0]')",
+            [serde_json::to_string(&json!({
+                "parent_message_id": 1,
+                "parent_attachment_index": 0,
+                "embedded_path": [0]
+            }))?],
+        )?;
+        transaction.commit()?;
+
+        let interrupted = AtomicBool::new(false);
+        let first =
+            sink.spooled_top_level_candidate_headers_page_interruptible(0, 1_024, &interrupted)?;
+        assert_eq!(first.tree.candidates.len(), 1_024);
+        assert_eq!(first.tree.ownerships.len(), 1_024);
+        let second = sink.spooled_top_level_candidate_headers_page_interruptible(
+            first.next_rowid,
+            1_024,
+            &interrupted,
+        )?;
+        assert_eq!(second.tree.candidates.len(), 1);
+        assert_eq!(second.tree.ownerships.len(), 1);
+        let end = sink.spooled_top_level_candidate_headers_page_interruptible(
+            second.next_rowid,
+            1_024,
+            &interrupted,
+        )?;
+        assert!(end.tree.candidates.is_empty());
+        Ok(())
+    }
+
+    #[test]
     fn worker_supervision_events_survive_reopen() -> Result<(), Box<dyn std::error::Error>> {
         let directory = tempdir()?;
         let job = directory.path().join("job");
         let sink = DurableCatalogSink::create(&job)?;
         sink.record_worker_event("started", 1, "parser")?;
         sink.record_worker_event("failure", 1, "stall")?;
+        sink.record_worker_supervision(1, 1, true)?;
         drop(sink);
         let reopened = DurableCatalogSink::open(&job)?;
+        assert_eq!(reopened.worker_supervision()?, (1, 1));
+        assert!(reopened.worker_retries_exhausted()?);
         assert_eq!(
             reopened.worker_events()?,
             vec![
@@ -4921,6 +5402,47 @@ mod tests {
                 },
             ]
         );
+        Ok(())
+    }
+
+    #[test]
+    fn terminal_written_parent_strands_and_accounts_embedded_descendants()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempdir()?;
+        let job = directory.path().join("job");
+        let mut sink = DurableCatalogSink::create(&job)?;
+        sink.connection.execute(
+            "INSERT INTO candidates(\
+                item_key, provenance, source_node_id, occurrence, completeness, status,\
+                metadata_json\
+             ) VALUES ('normal:1:-:0', 'normal', 1, 0, 'partial', 'written', '{}')",
+            [],
+        )?;
+        sink.connection.execute(
+            "INSERT INTO candidates(\
+                item_key, provenance, source_node_id, occurrence, completeness, status,\
+                metadata_json, parent_item_key, parent_attachment_index, embedded_path_json\
+             ) VALUES ('normal:2:-:0', 'normal', 2, 0, 'complete', 'spooled', '{}',\
+                       'normal:1:-:0', 0, '[0]')",
+            [],
+        )?;
+        sink.connection.execute(
+            "INSERT INTO candidates(\
+                item_key, provenance, source_node_id, occurrence, completeness, status,\
+                metadata_json, parent_item_key, parent_attachment_index, embedded_path_json\
+             ) VALUES ('normal:3:-:0', 'normal', 3, 0, 'complete', 'spooled', '{}',\
+                       'normal:2:-:0', 0, '[0,0]')",
+            [],
+        )?;
+
+        assert_eq!(sink.mark_stranded_embedded_candidates_unsupported()?, 2);
+        let statuses = sink
+            .connection
+            .prepare("SELECT status FROM candidates ORDER BY source_node_id")?
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        assert_eq!(statuses, ["written", "unsupported", "unsupported"]);
+        assert_eq!(sink.mark_stranded_embedded_candidates_unsupported()?, 0);
         Ok(())
     }
 
@@ -5884,7 +6406,8 @@ mod tests {
         connection.execute_batch(
             "DROP TABLE inline_blobs;\
              DROP INDEX candidate_events_blob_sha256;\
-             DROP INDEX candidates_occurrence;",
+             DROP INDEX candidates_occurrence;\
+             DROP INDEX candidates_parent_item_key;",
         )?;
         drop(connection);
 
@@ -5925,6 +6448,42 @@ mod tests {
                 .iter()
                 .any(|detail| detail.contains("candidates_occurrence")),
             "candidate occurrence assignment must use its identity index: {details:?}"
+        );
+        drop(plan);
+        let mut plan = resumed.connection.prepare(
+            "EXPLAIN QUERY PLAN SELECT item_key FROM candidates \
+             WHERE parent_item_key = ?1",
+        )?;
+        let details = plan
+            .query_map(["normal:10:-:0"], |row| row.get::<_, String>(3))?
+            .collect::<Result<Vec<_>, _>>()?;
+        assert!(
+            details
+                .iter()
+                .any(|detail| detail.contains("candidates_parent_item_key")),
+            "bounded candidate-tree traversal must use its parent index: {details:?}"
+        );
+        drop(plan);
+        let mut plan = resumed.connection.prepare(
+            "EXPLAIN QUERY PLAN WITH RECURSIVE tree(item_key) AS (\
+                SELECT item_key FROM candidates WHERE item_key = ?1 \
+                UNION SELECT child.item_key FROM candidates child \
+                JOIN tree parent ON child.parent_item_key = parent.item_key\
+             ) SELECT e.item_key FROM tree t \
+             CROSS JOIN candidate_events e ON e.item_key = t.item_key",
+        )?;
+        let details = plan
+            .query_map(["normal:10:-:0"], |row| row.get::<_, String>(3))?
+            .collect::<Result<Vec<_>, _>>()?;
+        assert!(
+            details
+                .iter()
+                .any(|detail| detail.contains("candidates_parent_item_key"))
+                && details
+                    .iter()
+                    .any(|detail| { detail.contains("sqlite_autoindex_candidate_events_1") })
+                && !details.iter().any(|detail| detail == "SCAN e"),
+            "bounded candidate trees must use direct child and event lookups: {details:?}"
         );
         drop(plan);
         message_start(&mut resumed, 11)?;
@@ -6016,6 +6575,47 @@ mod tests {
             bytes: b"body",
         })?;
         assert!(sink.event(CatalogEvent::PropertyEnd(second)).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn consumed_blob_is_not_rehashed_until_a_candidate_attempts_reuse()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempdir()?;
+        let job = directory.path().join("job");
+        let mut sink = DurableCatalogSink::create(&job)?;
+        message_start(&mut sink, 10)?;
+        let payload = vec![0x5a; usize::try_from(INLINE_BLOB_MAX_BYTES)? + 1];
+        let first = body_descriptor(10, u64::try_from(payload.len())?);
+        sink.event(CatalogEvent::PropertyStart(first))?;
+        sink.event(CatalogEvent::PropertyData {
+            descriptor: first,
+            bytes: &payload,
+        })?;
+        sink.event(CatalogEvent::PropertyEnd(first))?;
+        sink.event(CatalogEvent::MessageEnd {
+            id: 10,
+            complete: true,
+        })?;
+        sink.mark_candidates_unsupported(&["normal:10:-:0".to_owned()])?;
+        sink.checkpoint()?;
+        drop(sink);
+
+        let pack = job.join(".pstforge/spool").join(PAYLOAD_PACK_FILENAME);
+        OpenOptions::new()
+            .write(true)
+            .open(&pack)?
+            .write_all(b"evil")?;
+        let mut reopened = DurableCatalogSink::open(&job)?;
+
+        message_start(&mut reopened, 11)?;
+        let second = body_descriptor(11, u64::try_from(payload.len())?);
+        reopened.event(CatalogEvent::PropertyStart(second))?;
+        reopened.event(CatalogEvent::PropertyData {
+            descriptor: second,
+            bytes: &payload,
+        })?;
+        assert!(reopened.event(CatalogEvent::PropertyEnd(second)).is_err());
         Ok(())
     }
 

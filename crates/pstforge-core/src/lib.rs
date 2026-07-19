@@ -16,6 +16,7 @@ pub use canonical::{
     CanonicalFolderRole, CanonicalFolderSet, CanonicalMail, CanonicalMessagePlacement,
     CanonicalProperty, CanonicalRecipient, load_canonical_folders,
     load_canonical_folders_interruptible, load_canonical_mail, load_canonical_mail_interruptible,
+    load_canonical_mail_tree_interruptible,
 };
 pub use inspection::{
     EncryptionMode, FileFormat, InfoReport, InspectionBackend, InspectionError, InventoryReport,

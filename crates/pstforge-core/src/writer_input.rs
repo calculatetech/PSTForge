@@ -69,6 +69,43 @@ pub(crate) struct PartBuildOptions<'a> {
     pub omitted_folders: u64,
 }
 
+pub(crate) fn build_part_writer_layout(
+    source_folders: &[CanonicalFolder],
+    options: PartBuildOptions<'_>,
+) -> Result<MailStoreSpec, CanonicalWriteError> {
+    let folders = source_folders
+        .iter()
+        .map(|folder| MailFolderSpec {
+            path: folder.path.clone(),
+            location: match folder.location {
+                CanonicalFolderLocation::StoreRoot => MailFolderLocation::StoreRoot,
+                CanonicalFolderLocation::IpmSubtree => MailFolderLocation::IpmSubtree,
+            },
+            role: match folder.role {
+                CanonicalFolderRole::Ordinary => MailFolderRole::Ordinary,
+                CanonicalFolderRole::DeletedItems => MailFolderRole::DeletedItems,
+            },
+            container_class: folder
+                .container_class
+                .clone()
+                .filter(|value| !value.is_empty())
+                .unwrap_or_else(|| "IPF.Note".to_owned()),
+            messages: Vec::new(),
+            associated_messages: Vec::new(),
+        })
+        .collect();
+    Ok(MailStoreSpec {
+        store_name: format!("PSTForge Recovery Part {:04}", options.part_index),
+        record_key: part_record_key(
+            options.source_sha256,
+            options.recovery_mode,
+            options.maximum_pst_bytes,
+            options.part_index,
+        )?,
+        folders,
+    })
+}
+
 pub fn build_part_writer_input(
     job: &DurableCatalogSink,
     messages: &[&CanonicalMail],
@@ -568,6 +605,43 @@ fn translate_message(
                     modification_filetime = Some(value);
                 }
                 _ => partial = true,
+            }
+            continue;
+        }
+        if mail.placement == CanonicalMessagePlacement::Associated && id == 0x3001 {
+            if !serialized_ids.insert(id) {
+                partial = true;
+                omitted_properties = omitted_properties.saturating_add(1);
+                continue;
+            }
+            if property_type != 0x001F {
+                partial = true;
+                omitted_properties = omitted_properties.saturating_add(1);
+                unsupported_properties.push(UnsupportedProperty {
+                    id,
+                    property_type,
+                    byte_len: property.blob.byte_len,
+                });
+                continue;
+            }
+            match omit_malformed(
+                read_unicode_value(job, mail, property),
+                &mut omitted_properties,
+            )? {
+                Some(value) => {
+                    raw_properties.push(RawProperty {
+                        id,
+                        value: RawPropertyValue::Unicode(value),
+                    });
+                }
+                None => {
+                    partial = true;
+                    unsupported_properties.push(UnsupportedProperty {
+                        id,
+                        property_type,
+                        byte_len: property.blob.byte_len,
+                    });
+                }
             }
             continue;
         }
@@ -1750,6 +1824,14 @@ fn read_unicode(
     mail: &CanonicalMail,
     property: &CanonicalProperty,
 ) -> Result<Option<String>, CanonicalWriteError> {
+    read_unicode_value(job, mail, property).map(|value| (!value.is_empty()).then_some(value))
+}
+
+fn read_unicode_value(
+    job: &TranslationSource<'_>,
+    mail: &CanonicalMail,
+    property: &CanonicalProperty,
+) -> Result<String, CanonicalWriteError> {
     if property.value_type != Some(0x001F) || property.blob.byte_len > 1_048_576 {
         return invalid(mail, "attachment text property is not bounded Unicode");
     }
@@ -1769,7 +1851,7 @@ fn read_unicode(
         property_id: property.property_id.unwrap_or(0),
         detail: "invalid UTF-16".to_owned(),
     })?;
-    Ok((!value.is_empty()).then_some(value))
+    Ok(value)
 }
 
 fn read_blob(
@@ -1830,7 +1912,7 @@ fn decode_sha256(value: &str) -> Result<[u8; 32], CanonicalWriteError> {
     Ok(output)
 }
 
-fn named_property_set(guid: [u8; 16]) -> NamedPropertySet {
+pub(crate) fn named_property_set(guid: [u8; 16]) -> NamedPropertySet {
     // libpff exposes the reserved NAMEID_GUID_MAPI selector as a zero GUID.
     // A literal custom zero GUID is not a valid named-property set identity.
     const LIBPFF_RESERVED_MAPI: [u8; 16] = [0; 16];
@@ -2026,7 +2108,7 @@ fn sender_optional_message_class(value: &str) -> bool {
         || sticky_note_message_class(value)
 }
 
-fn default_container_class(value: &str) -> &'static str {
+pub(crate) fn default_container_class(value: &str) -> &'static str {
     if contact_message_class(value) || distribution_list_message_class(value) {
         "IPF.Contact"
     } else if appointment_message_class(value) {
@@ -2546,13 +2628,13 @@ mod tests {
     use super::{
         CanonicalWriteError, PartBuildOptions, attachment_property_type_is_preservable,
         build_part_writer_input, build_part_writer_input_with_folders_interruptible,
-        contain_body_metadata, contain_distribution_list_properties, decode_multiple_binary,
-        decode_multiple_unicode, default_container_class, document_message_class,
-        extension_for_mime, named_property_set, normalize_associated_display_name,
-        public_keywords_are_valid, recipient_property_value_matches,
-        record_internet_codepage_provenance, supported_message_class,
-        valid_compressed_rtf_container, valid_utf8_stream, valid_utf16_stream,
-        writer_stream_type_is_supported,
+        build_part_writer_layout, contain_body_metadata, contain_distribution_list_properties,
+        decode_multiple_binary, decode_multiple_unicode, default_container_class,
+        document_message_class, extension_for_mime, named_property_set,
+        normalize_associated_display_name, public_keywords_are_valid,
+        recipient_property_value_matches, record_internet_codepage_provenance,
+        supported_message_class, valid_compressed_rtf_container, valid_utf8_stream,
+        valid_utf16_stream, writer_stream_type_is_supported,
     };
     use crate::{
         CanonicalAttachment, CanonicalFolder, CanonicalFolderLocation, CanonicalFolderRole,
@@ -3856,6 +3938,24 @@ mod tests {
         assert_eq!(input.store.folders[0].messages.len(), 1);
         assert!(input.partial);
         assert_eq!(input.omitted_folders, 1);
+        let layout = build_part_writer_layout(
+            &retained,
+            PartBuildOptions {
+                source_sha256: &"0".repeat(64),
+                recovery_mode: "balanced",
+                maximum_pst_bytes: 4_294_967_296,
+                part_index: 1,
+                omitted_folders: 1,
+            },
+        )?;
+        assert_eq!(layout.store_name, input.store.store_name);
+        assert_eq!(layout.record_key, input.store.record_key);
+        assert_eq!(layout.folders[0].path, input.store.folders[0].path);
+        assert_eq!(layout.folders[0].role, input.store.folders[0].role);
+        assert_eq!(
+            layout.folders[0].container_class,
+            input.store.folders[0].container_class
+        );
         Ok(())
     }
 
@@ -4140,6 +4240,122 @@ mod tests {
             Some(&1)
         );
         assert!(display_counts.generated.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn associated_display_translation_normalizes_empty_and_contains_duplicates()
+    -> Result<(), Box<dyn std::error::Error>> {
+        fn send(
+            sink: &mut DurableCatalogSink,
+            event: CatalogEvent<'_>,
+        ) -> Result<(), std::io::Error> {
+            CatalogSink::event(sink, event).map_err(std::io::Error::other)
+        }
+
+        let directory = tempdir()?;
+        let mut job = DurableCatalogSink::create(&directory.path().join("job"))?;
+        send(
+            &mut job,
+            CatalogEvent::MessageStart {
+                id: 40,
+                provenance: CatalogProvenance::Normal,
+                recovery_index: None,
+                folder_id: None,
+                parent_message_id: None,
+                parent_attachment_index: None,
+                embedded_path: Vec::new(),
+                associated: true,
+                item_type: Some(11),
+                message_class: Some("IPM.Configuration.PSTForge".to_owned()),
+                subject: Some("Readable associated subject".to_owned()),
+                sender_name: None,
+                sender_email: None,
+                submit_filetime: None,
+                delivery_filetime: None,
+                supported: true,
+            },
+        )?;
+        for (entry_index, bytes) in [
+            (0_u32, Vec::new()),
+            (
+                1_u32,
+                "duplicate display"
+                    .encode_utf16()
+                    .flat_map(u16::to_le_bytes)
+                    .collect::<Vec<_>>(),
+            ),
+        ] {
+            let descriptor = PropertyDescriptor {
+                owner: PropertyOwner::Message(40),
+                record_set_index: 0,
+                entry_index,
+                entry_type: Some(0x3001),
+                value_type: Some(0x001F),
+                data_size: u64::try_from(bytes.len())?,
+            };
+            send(&mut job, CatalogEvent::PropertyStart(descriptor))?;
+            if !bytes.is_empty() {
+                send(
+                    &mut job,
+                    CatalogEvent::PropertyData {
+                        descriptor,
+                        bytes: &bytes,
+                    },
+                )?;
+            }
+            send(&mut job, CatalogEvent::PropertyEnd(descriptor))?;
+        }
+        send(
+            &mut job,
+            CatalogEvent::MessageEnd {
+                id: 40,
+                complete: true,
+            },
+        )?;
+
+        let mut mail = load_canonical_mail(&job)?.remove(0);
+        mail.properties.truncate(1);
+        let empty = build_part_writer_input(
+            &job,
+            &[&mail],
+            &"0".repeat(64),
+            "balanced",
+            4_294_967_296,
+            1,
+        )?;
+        assert!(!empty.partial);
+        assert_eq!(empty.omitted_properties, 0);
+        assert_eq!(
+            empty
+                .reconstructions
+                .derived
+                .get(&ReconstructedField::AssociatedDisplayName),
+            Some(&1)
+        );
+
+        mail.properties = load_canonical_mail(&job)?.remove(0).properties;
+        let duplicate = build_part_writer_input(
+            &job,
+            &[&mail],
+            &"0".repeat(64),
+            "balanced",
+            4_294_967_296,
+            1,
+        )?;
+        assert!(duplicate.partial);
+        assert_eq!(duplicate.omitted_properties, 1);
+        let display_names = duplicate.store.folders[0].associated_messages[0]
+            .raw_properties
+            .iter()
+            .filter(|property| property.id == 0x3001)
+            .collect::<Vec<_>>();
+        assert_eq!(display_names.len(), 1);
+        assert!(matches!(
+            &display_names[0].value,
+            RawPropertyValue::Unicode(value) if value == "Readable associated subject"
+        ));
+        validate_mail_store_input(&duplicate.store)?;
         Ok(())
     }
 

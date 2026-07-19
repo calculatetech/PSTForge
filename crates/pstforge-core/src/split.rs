@@ -12,22 +12,27 @@ use pstforge_job::{
     PublishedPartRecord, ReconstructedField, ReconstructionCounts,
 };
 use pstforge_pst::writer::{
-    AttachmentContent, MessageSpec, WriterError, create_mail_store_interruptible,
-    create_mail_store_supervised, validate_mail_store_input,
+    AttachmentContent, MailFolderLocation, MessageSpec, NamedPropertyCatalog, NamedPropertyName,
+    TransactionAppend, TransactionalMailStoreWriter, WriterError, create_mail_store_interruptible,
+    create_mail_store_supervised, validate_mail_store_input, validate_mail_store_layout,
 };
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
-use crate::recovery::{InterruptHandler, recover_for_split};
-use crate::writer_input::{PartBuildOptions, build_part_writer_input_with_folders_interruptible};
+use crate::canonical::load_canonical_mail_tree_from_folders_interruptible;
+use crate::recovery::{InterruptHandler, PreparedSplitRecovery, recover_for_split};
+use crate::writer_input::{
+    PartBuildOptions, PartWriterInput, build_part_writer_input_with_folders_interruptible,
+    build_part_writer_layout,
+};
 use crate::{
     CanonicalError, CanonicalWriteError, PackCandidate, PackingError, PartSizeEstimator,
     RecoveryError, RecoveryReport, SourceError, SourceFile, load_canonical_folders_interruptible,
     load_canonical_mail_interruptible,
 };
 
-pub const SPLIT_SCHEMA_VERSION: &str = "0.4.2";
+pub const SPLIT_SCHEMA_VERSION: &str = "0.4.3";
 const TOOL_COMPATIBILITY_MAJOR: u64 = 0;
 const PART_SIZE_POLICY: &str = "hard-maximum-v1";
 const WRITER_FORMAT: &str = "unicode-pst-v23";
@@ -35,6 +40,7 @@ const ESTIMATED_STORE_BYTES: u64 = 1024 * 1024;
 const ESTIMATED_MESSAGE_BYTES: u64 = 64 * 1024;
 const ESTIMATED_FOLDER_BYTES: u64 = 16 * 1024;
 const MAX_RECOVERY_LOG_DETAIL_LINES: usize = 10_000;
+const MAX_BATCH_MESSAGES: usize = 2_048;
 
 #[derive(Debug, Error)]
 pub enum SplitError {
@@ -208,7 +214,7 @@ pub fn split(
             RecoveryError::Source(error)
         }
     })?;
-    let configuration = JobConfiguration {
+    let mut configuration = JobConfiguration {
         tool_compatibility_major: TOOL_COMPATIBILITY_MAJOR,
         split_schema_version: SPLIT_SCHEMA_VERSION.to_owned(),
         recovery_mode: recovery_mode_name(mode).to_owned(),
@@ -216,7 +222,7 @@ pub fn split(
         part_size_policy: PART_SIZE_POLICY.to_owned(),
         writer_format: WRITER_FORMAT.to_owned(),
     };
-    let existing_job_bytes = if resume {
+    let (existing_job_bytes, resumed_job) = if resume {
         let source_identity = JobSourceIdentity {
             canonical_path: source.identity().canonical_path.clone(),
             device: source.identity().device,
@@ -225,18 +231,46 @@ pub fn split(
             modified_at: source.identity().modified_at.clone(),
             sha256: source.identity().sha256.clone(),
         };
-        match DurableCatalogSink::open_resume_interruptible(
+        let open = DurableCatalogSink::open_resume_interruptible(
             job_directory,
             &source_identity,
             &configuration,
             &interrupt_flag,
-        ) {
-            Ok(job) => job.allocated_bytes()?,
+        );
+        let open = match open {
+            Err(JobError::ResumeMismatch("split report schema version"))
+                if SPLIT_SCHEMA_VERSION == "0.4.3" =>
+            {
+                let mut legacy_configuration = configuration.clone();
+                legacy_configuration.split_schema_version = "0.4.2".to_owned();
+                let legacy = DurableCatalogSink::open_resume_interruptible(
+                    job_directory,
+                    &source_identity,
+                    &legacy_configuration,
+                    &interrupt_flag,
+                );
+                if legacy.is_ok() {
+                    tracing::info!(
+                        stored_split_schema = "0.4.2",
+                        producer_version = SPLIT_SCHEMA_VERSION,
+                        "resuming compatible pre-performance durable recovery state"
+                    );
+                    configuration = legacy_configuration;
+                }
+                legacy
+            }
+            result => result,
+        };
+        match open {
+            Ok(job) => {
+                let allocated = job.allocated_bytes()?;
+                (allocated, Some(job))
+            }
             Err(JobError::Interrupted) => return Err(RecoveryError::Interrupted.into()),
             Err(error) => return Err(error.into()),
         }
     } else {
-        0
+        (0, None)
     };
     let disk_preflight = disk_preflight(
         job_directory,
@@ -249,18 +283,20 @@ pub fn split(
         existing_job_bytes = disk_preflight.existing_job_bytes,
         "output space preflight passed"
     );
-    let mut recovery = recover_for_split(
+    let (mut recovery, mut job) = recover_for_split(
         &source,
         job_directory,
         worker_executable,
         mode,
-        resume,
-        &configuration,
         std::sync::Arc::clone(&interrupt_flag),
+        PreparedSplitRecovery {
+            resume,
+            configuration: &configuration,
+            job: resumed_job,
+        },
     )?;
     if recovery.interrupted {
-        let (parts, written_candidates, unsupported_candidates) =
-            durable_output_snapshot(job_directory)?;
+        let (parts, written_candidates, unsupported_candidates) = durable_output_snapshot(&job)?;
         recovery.unsupported_candidates = unsupported_candidates;
         let metrics = execution_metrics(
             started,
@@ -281,7 +317,7 @@ pub fn split(
             written_candidates,
             partial: true,
         };
-        publish_recovery_log(job_directory, &report)?;
+        job.publish_recovery_log(&render_recovery_log(&report))?;
         return Ok(report);
     }
     if source.identity() != &recovery.source {
@@ -289,7 +325,7 @@ pub fn split(
     }
     let (parts, written_candidates, output_partial, split_interrupted) =
         split_recovered_job_with_interrupt(
-            job_directory,
+            &mut job,
             &recovery.source.sha256,
             mode,
             maximum_pst_bytes,
@@ -298,8 +334,7 @@ pub fn split(
         )?;
     recovery.interrupted |= split_interrupted;
     if split_interrupted {
-        let (parts, written_candidates, unsupported_candidates) =
-            durable_output_snapshot(job_directory)?;
+        let (parts, written_candidates, unsupported_candidates) = durable_output_snapshot(&job)?;
         recovery.unsupported_candidates = unsupported_candidates;
         let metrics = execution_metrics(
             started,
@@ -320,12 +355,10 @@ pub fn split(
             written_candidates,
             partial: true,
         };
-        publish_recovery_log(job_directory, &report)?;
+        job.publish_recovery_log(&render_recovery_log(&report))?;
         return Ok(report);
     }
-    recovery.unsupported_candidates = open_job_interruptible(job_directory, &interrupt_flag)?
-        .summary()?
-        .unsupported_candidates;
+    recovery.unsupported_candidates = job.summary()?.unsupported_candidates;
     match source.verify_unchanged_interruptible(&interrupt_flag) {
         Ok(()) => {}
         Err(SourceError::Interrupted) => {
@@ -338,9 +371,7 @@ pub fn split(
         recovery.interrupted = true;
     }
     if !recovery.interrupted {
-        match open_job_interruptible(job_directory, &interrupt_flag)?
-            .finalize_private_work_interruptible(keep_work, &interrupt_flag)
-        {
+        match job.finalize_private_work_interruptible(keep_work, &interrupt_flag) {
             Ok(()) => {}
             Err(JobError::Interrupted) => recovery.interrupted = true,
             Err(error) => return Err(error.into()),
@@ -382,19 +413,13 @@ pub fn split(
         written_candidates,
         partial,
     };
-    publish_recovery_log(job_directory, &report)?;
+    job.publish_recovery_log(&render_recovery_log(&report))?;
     Ok(report)
 }
 
-fn publish_recovery_log(job_directory: &Path, report: &SplitReport) -> Result<(), SplitError> {
-    DurableCatalogSink::open(job_directory)?.publish_recovery_log(&render_recovery_log(report))?;
-    Ok(())
-}
-
 fn durable_output_snapshot(
-    job_directory: &Path,
+    job: &DurableCatalogSink,
 ) -> Result<(Vec<PartReport>, u64, u64), SplitError> {
-    let job = DurableCatalogSink::open(job_directory)?;
     let records = job.published_parts()?;
     let parts = records
         .iter()
@@ -602,8 +627,9 @@ pub fn split_recovered_job(
     maximum_pst_bytes: u64,
 ) -> Result<(Vec<PartReport>, u64, bool), SplitError> {
     let interrupted = AtomicBool::new(false);
+    let mut job = DurableCatalogSink::open(job_directory)?;
     let (parts, written, partial, _) = split_recovered_job_with_interrupt(
-        job_directory,
+        &mut job,
         source_sha256,
         recovery_mode,
         maximum_pst_bytes,
@@ -613,7 +639,677 @@ pub fn split_recovered_job(
     Ok((parts, written, partial))
 }
 
+#[derive(Clone)]
+struct IncrementalCandidate {
+    durable_key: String,
+    folder_location: crate::CanonicalFolderLocation,
+    folder_path: Vec<String>,
+    folder_role: crate::CanonicalFolderRole,
+    container_class: String,
+    placement: crate::CanonicalMessagePlacement,
+    key: crate::ItemKey,
+}
+
+#[derive(Clone, Default)]
+struct IncrementalPartStats {
+    item_keys: Vec<String>,
+    unsupported_item_keys: Vec<String>,
+    folder_keys: BTreeSet<(MailFolderLocation, Vec<String>)>,
+    message_count: u64,
+    partial: bool,
+    omitted_folders: u64,
+    omitted_properties: u64,
+    omitted_attachments: u64,
+    reconstructions: ReconstructionCounts,
+}
+
+fn projection_batch_byte_target(maximum_pst_bytes: u64, private_file_eof: u64) -> u64 {
+    let finalization_reserve = (maximum_pst_bytes / 16).max(1);
+    if private_file_eof >= maximum_pst_bytes.saturating_sub(finalization_reserve) {
+        (maximum_pst_bytes / 256).max(1)
+    } else {
+        (maximum_pst_bytes / 16).max(1)
+    }
+}
+
 fn split_recovered_job_with_interrupt(
+    job: &mut DurableCatalogSink,
+    source_sha256: &str,
+    recovery_mode: RecoveryMode,
+    maximum_pst_bytes: u64,
+    interrupted: &AtomicBool,
+    validator_supervisor: Option<&Path>,
+) -> Result<(Vec<PartReport>, u64, bool, bool), SplitError> {
+    if maximum_pst_bytes == 0 {
+        return Err(SplitError::ZeroMaximumSize);
+    }
+    let existing = job.published_parts()?;
+    let mut reports = existing
+        .iter()
+        .map(part_report)
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut written_candidates = existing
+        .iter()
+        .map(|record| record.item_count)
+        .fold(0_u64, u64::saturating_add);
+    let mut any_partial = reports
+        .iter()
+        .any(|report| report.partial || report.oversize);
+    let mut part_index = existing.last().map_or(Ok(1_u32), |record| {
+        record
+            .part
+            .index
+            .checked_add(1)
+            .ok_or(SplitError::TooManyParts)
+    })?;
+    let source_folders = match load_canonical_folders_interruptible(job, interrupted) {
+        Ok(folders) => folders,
+        Err(CanonicalError::Job(JobError::Interrupted)) => {
+            return finish_incremental_interruption(job, reports, written_candidates);
+        }
+        Err(error) => return Err(error.into()),
+    };
+    let spooled_folders = job.spooled_folders()?;
+    let mode_name = match recovery_mode {
+        RecoveryMode::Balanced => "balanced",
+        RecoveryMode::Aggressive => "aggressive",
+    };
+    let metadata_started = Instant::now();
+    let mut candidates = Vec::new();
+    let header_count = match crate::canonical::for_each_canonical_mail_header_interruptible(
+        job,
+        &spooled_folders,
+        interrupted,
+        |mail| {
+            candidates.push(IncrementalCandidate {
+                durable_key: mail.durable_item_key,
+                folder_location: mail.folder_location,
+                folder_path: mail.folder_path,
+                folder_role: mail.folder_role,
+                container_class: crate::writer_input::default_container_class(
+                    mail.message_class.as_deref().unwrap_or("IPM.Note"),
+                )
+                .to_owned(),
+                placement: mail.placement,
+                key: mail.key,
+            });
+            Ok(())
+        },
+    ) {
+        Ok(count) => count,
+        Err(CanonicalError::Job(JobError::Interrupted)) => {
+            return finish_incremental_interruption(job, reports, written_candidates);
+        }
+        Err(error) => return Err(error.into()),
+    };
+    if header_count == 0 {
+        return finish_incremental_completion(job, reports, written_candidates, any_partial);
+    }
+    let identities = match job.candidate_named_property_identities_interruptible(interrupted) {
+        Ok(identities) => identities,
+        Err(JobError::Interrupted) => {
+            return finish_incremental_interruption(job, reports, written_candidates);
+        }
+        Err(error) => return Err(error.into()),
+    };
+    let mut named_properties = NamedPropertyCatalog::default();
+    for identity in identities {
+        let name = match identity.name {
+            libpff_sys::NamedPropertyName::Numeric(value) => NamedPropertyName::Numeric(value),
+            libpff_sys::NamedPropertyName::String(value) => NamedPropertyName::String(value),
+        };
+        named_properties.observe(crate::writer_input::named_property_set(identity.guid), name);
+    }
+    // These three identities are a bounded conservative superset. They avoid
+    // decoding attachment properties during the metadata-only catalog pass.
+    named_properties.observe_reference_attachment();
+    candidates.sort_by(|left, right| {
+        (
+            left.folder_location,
+            &left.folder_path,
+            left.placement,
+            left.key,
+        )
+            .cmp(&(
+                right.folder_location,
+                &right.folder_path,
+                right.placement,
+                right.key,
+            ))
+    });
+    if candidates.is_empty() {
+        return finish_incremental_completion(job, reports, written_candidates, true);
+    }
+    tracing::info!(
+        candidate_count = candidates.len(),
+        elapsed_ms = metadata_started.elapsed().as_millis(),
+        "incremental metadata catalog completed"
+    );
+    if test_pause_at_prefilter(job, interrupted)? {
+        return finish_incremental_interruption(job, reports, written_candidates);
+    }
+    let mut accepted_folders = Vec::with_capacity(source_folders.folders.len());
+    let mut omitted_folders = source_folders.omitted_folders;
+    let mut rejected_folder_keys = BTreeSet::new();
+    for folder in source_folders.folders {
+        let key = (folder.location, folder.path.clone());
+        let trial = [folder.clone()];
+        let layout = build_part_writer_layout(
+            &trial,
+            PartBuildOptions {
+                source_sha256,
+                recovery_mode: mode_name,
+                maximum_pst_bytes,
+                part_index,
+                omitted_folders: 0,
+            },
+        )?;
+        match validate_mail_store_layout(&layout) {
+            Ok(()) => accepted_folders.push(folder),
+            Err(WriterError::InputRejected(_)) => {
+                rejected_folder_keys.insert(key);
+                omitted_folders = omitted_folders.saturating_add(1);
+                any_partial = true;
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
+    let mut recovered_folder_keys = accepted_folders
+        .iter()
+        .map(|folder| (folder.location, folder.path.clone()))
+        .collect::<BTreeSet<_>>();
+    let mut invalid_recovered_folder_keys = BTreeSet::new();
+    let mut recovered_from_messages = 0_u64;
+    for candidate in &candidates {
+        let key = (candidate.folder_location, candidate.folder_path.clone());
+        if !recovered_folder_keys.contains(&key) {
+            let recovered = crate::CanonicalFolder {
+                path: candidate.folder_path.clone(),
+                location: candidate.folder_location,
+                role: candidate.folder_role,
+                container_class: Some(candidate.container_class.clone()),
+            };
+            let layout = build_part_writer_layout(
+                std::slice::from_ref(&recovered),
+                PartBuildOptions {
+                    source_sha256,
+                    recovery_mode: mode_name,
+                    maximum_pst_bytes,
+                    part_index,
+                    omitted_folders: 0,
+                },
+            )?;
+            match validate_mail_store_layout(&layout) {
+                Ok(()) => {
+                    recovered_folder_keys.insert(key);
+                    accepted_folders.push(recovered);
+                    recovered_from_messages = recovered_from_messages.saturating_add(1);
+                }
+                Err(WriterError::InputRejected(_)) => {
+                    if !rejected_folder_keys.contains(&key)
+                        && invalid_recovered_folder_keys.insert(key)
+                    {
+                        omitted_folders = omitted_folders.saturating_add(1);
+                    }
+                    any_partial = true;
+                }
+                Err(error) => return Err(error.into()),
+            }
+        }
+    }
+    accepted_folders
+        .sort_by(|left, right| (left.location, &left.path).cmp(&(right.location, &right.path)));
+    tracing::info!(
+        recovered_from_messages,
+        folder_count = accepted_folders.len(),
+        "incremental folder layout completed"
+    );
+    let source_folders = crate::CanonicalFolderSet {
+        folders: accepted_folders,
+        omitted_folders,
+    };
+
+    let mut terminal_candidate_keys = BTreeSet::new();
+    let mut candidate_index = 0_usize;
+    while candidate_index < candidates.len() {
+        if interrupted.load(Ordering::Relaxed) {
+            return finish_incremental_interruption(job, reports, written_candidates);
+        }
+        let filename = job.available_part_filename(part_index)?;
+        let layout = build_part_writer_layout(
+            &source_folders.folders,
+            PartBuildOptions {
+                source_sha256,
+                recovery_mode: mode_name,
+                maximum_pst_bytes,
+                part_index,
+                omitted_folders: 0,
+            },
+        )?;
+        let store_record_key = layout.record_key;
+        let layout_folder_count = saturating_len(layout.folders.len());
+        let staged_filename = format!("part-{part_index:04}-transaction.pst.partial");
+        let staged_path = job.staged_part_path(&staged_filename)?;
+        remove_staged_if_present(&staged_path)?;
+        let mut writer = TransactionalMailStoreWriter::begin(
+            &staged_path,
+            layout,
+            &named_properties,
+            part_index == 1,
+            validator_supervisor,
+        )?;
+        let mut stats = IncrementalPartStats {
+            omitted_folders: if part_index == 1 {
+                source_folders.omitted_folders
+            } else {
+                0
+            },
+            ..IncrementalPartStats::default()
+        };
+        let part_started = Instant::now();
+        let mut appended_top_level = 0_usize;
+        let mut last_progress = Instant::now();
+        let mut batch_checkpoint = Some(writer.begin_batch());
+        let mut batch_candidate_index = candidate_index;
+        let mut batch_stats = stats.clone();
+        let mut batch_appended_top_level = appended_top_level;
+        let mut batch_attempts = 0_usize;
+        let mut batch_private_file_eof = writer.private_file_eof();
+        let mut exact_replay = false;
+
+        loop {
+            if interrupted.load(Ordering::Relaxed) {
+                drop(writer);
+                return finish_incremental_interruption(job, reports, written_candidates);
+            }
+            let private_file_eof = writer.private_file_eof();
+            let batch_byte_target =
+                projection_batch_byte_target(maximum_pst_bytes, private_file_eof);
+            let batch_bytes = private_file_eof.saturating_sub(batch_private_file_eof);
+            if !exact_replay
+                && batch_attempts != 0
+                && writer.message_count() != 0
+                && (batch_bytes >= batch_byte_target
+                    || batch_attempts >= MAX_BATCH_MESSAGES
+                    || candidate_index == candidates.len())
+            {
+                let projected_file_eof = writer.projected_file_eof(interrupted)?;
+                if projected_file_eof > maximum_pst_bytes && writer.message_count() > 1 {
+                    let checkpoint = batch_checkpoint.take().ok_or_else(|| {
+                        WriterError::InvalidStructure(
+                            "transactional batch checkpoint is unavailable".to_owned(),
+                        )
+                    })?;
+                    writer.rollback_batch(checkpoint)?;
+                    candidate_index = batch_candidate_index;
+                    stats = batch_stats.clone();
+                    appended_top_level = batch_appended_top_level;
+                    batch_attempts = 0;
+                    exact_replay = true;
+                    tracing::debug!(
+                        part_index,
+                        projected_file_eof,
+                        maximum_pst_bytes,
+                        "transactional batch crossed the part boundary and will be replayed"
+                    );
+                    continue;
+                }
+                tracing::info!(
+                    part_index,
+                    appended_top_level,
+                    private_file_eof = writer.private_file_eof(),
+                    projected_file_eof,
+                    maximum_pst_bytes,
+                    elapsed_ms = part_started.elapsed().as_millis(),
+                    "transactional PST batch accepted"
+                );
+                batch_checkpoint = Some(writer.begin_batch());
+                batch_candidate_index = candidate_index;
+                batch_stats = stats.clone();
+                batch_appended_top_level = appended_top_level;
+                batch_attempts = 0;
+                batch_private_file_eof = writer.private_file_eof();
+                last_progress = Instant::now();
+            }
+            if candidate_index == candidates.len() {
+                break;
+            }
+            if terminal_candidate_keys.contains(&candidates[candidate_index].durable_key) {
+                candidate_index = candidate_index.saturating_add(1);
+                continue;
+            }
+            let candidate = &candidates[candidate_index];
+            let mail = match load_canonical_mail_tree_from_folders_interruptible(
+                job,
+                &spooled_folders,
+                &candidate.durable_key,
+                interrupted,
+            ) {
+                Ok(mail) => mail,
+                Err(CanonicalError::Job(JobError::Interrupted)) => {
+                    drop(writer);
+                    return finish_incremental_interruption(job, reports, written_candidates);
+                }
+                Err(error) => return Err(error.into()),
+            };
+            let relevant_folders = source_folders_for_mail(&source_folders.folders, &mail);
+            let mut input = match build_part_writer_input_with_folders_interruptible(
+                job,
+                &[&mail],
+                &relevant_folders,
+                PartBuildOptions {
+                    source_sha256,
+                    recovery_mode: mode_name,
+                    maximum_pst_bytes,
+                    part_index,
+                    omitted_folders: 0,
+                },
+                interrupted,
+            ) {
+                Ok(input) => input,
+                Err(CanonicalWriteError::Job(JobError::Interrupted)) => {
+                    drop(writer);
+                    return finish_incremental_interruption(job, reports, written_candidates);
+                }
+                Err(error) if candidate_local_translation_error(&error) => {
+                    tracing::debug!(
+                        error = %error,
+                        durable_key = %candidate.durable_key,
+                        "candidate rejected during incremental translation"
+                    );
+                    let mut item_keys = Vec::new();
+                    collect_item_keys(&mail, &mut item_keys);
+                    job.mark_candidates_unsupported(&item_keys)?;
+                    any_partial = true;
+                    terminal_candidate_keys.insert(candidate.durable_key.clone());
+                    candidate_index = candidate_index.saturating_add(1);
+                    batch_attempts = batch_attempts.saturating_add(1);
+                    continue;
+                }
+                Err(error) => return Err(error.into()),
+            };
+            match validate_mail_store_input(&input.store) {
+                Ok(()) => {}
+                Err(WriterError::InputRejected(detail)) => {
+                    tracing::debug!(
+                        %detail,
+                        durable_key = %candidate.durable_key,
+                        "writer rejected candidate during incremental translation"
+                    );
+                    let mut item_keys = Vec::new();
+                    collect_item_keys(&mail, &mut item_keys);
+                    job.mark_candidates_unsupported(&item_keys)?;
+                    any_partial = true;
+                    terminal_candidate_keys.insert(candidate.durable_key.clone());
+                    candidate_index = candidate_index.saturating_add(1);
+                    batch_attempts = batch_attempts.saturating_add(1);
+                    continue;
+                }
+                Err(error) => return Err(error.into()),
+            }
+            let (location, path, associated, message) = take_incremental_message(&mut input)?;
+            let message_count = count_messages(&message);
+            let append_result = if exact_replay {
+                writer.append_message(
+                    location,
+                    &path,
+                    associated,
+                    message,
+                    maximum_pst_bytes,
+                    interrupted,
+                )
+            } else {
+                writer
+                    .append_message_deferred(location, &path, associated, message, interrupted)
+                    .map(|()| TransactionAppend::Appended {
+                        projected_file_eof: 0,
+                    })
+            };
+            match append_result {
+                Ok(TransactionAppend::Appended { projected_file_eof }) => {
+                    stats.item_keys.append(&mut input.item_keys);
+                    stats
+                        .unsupported_item_keys
+                        .append(&mut input.unsupported_item_keys);
+                    for folder in &input.store.folders {
+                        stats
+                            .folder_keys
+                            .insert((folder.location, folder.path.clone()));
+                    }
+                    stats.message_count = stats.message_count.saturating_add(message_count);
+                    stats.partial |= input.partial;
+                    stats.omitted_properties = stats
+                        .omitted_properties
+                        .saturating_add(input.omitted_properties);
+                    stats.omitted_attachments = stats
+                        .omitted_attachments
+                        .saturating_add(input.omitted_attachments);
+                    stats.reconstructions.merge(input.reconstructions);
+                    candidate_index = candidate_index.saturating_add(1);
+                    appended_top_level = appended_top_level.saturating_add(1);
+                    batch_attempts = batch_attempts.saturating_add(1);
+                    if exact_replay
+                        && (appended_top_level % 250 == 0
+                            || last_progress.elapsed() >= Duration::from_secs(5))
+                    {
+                        tracing::info!(
+                            part_index,
+                            appended_top_level,
+                            projected_file_eof,
+                            maximum_pst_bytes,
+                            elapsed_ms = part_started.elapsed().as_millis(),
+                            "transactional PST append progress"
+                        );
+                        last_progress = Instant::now();
+                    }
+                }
+                Ok(TransactionAppend::PartFull { rejected_file_eof }) => {
+                    tracing::debug!(
+                        part_index,
+                        rejected_file_eof,
+                        maximum_pst_bytes,
+                        "transactional append established exact part boundary"
+                    );
+                    break;
+                }
+                Err(WriterError::Interrupted) => {
+                    drop(writer);
+                    return finish_incremental_interruption(job, reports, written_candidates);
+                }
+                Err(error) => return Err(error.into()),
+            }
+        }
+        let top_level_count = writer.message_count();
+        if top_level_count == 0 {
+            drop(writer);
+            any_partial = true;
+            continue;
+        }
+        writer.finalize(interrupted)?;
+        let byte_len = staged_path
+            .metadata()
+            .map_err(|source| staged_io(&staged_path, source))?
+            .len();
+        let oversize = byte_len > maximum_pst_bytes;
+        if oversize && top_level_count != 1 {
+            return Err(SplitError::PartExceedsMaximum {
+                part_index,
+                byte_len,
+                maximum_bytes: maximum_pst_bytes,
+            });
+        }
+        let Some(sha256) = hash_file(&staged_path, interrupted)? else {
+            remove_staged_if_present(&staged_path)?;
+            return finish_incremental_interruption(job, reports, written_candidates);
+        };
+        if !stats.unsupported_item_keys.is_empty() {
+            job.mark_candidates_unsupported(&stats.unsupported_item_keys)?;
+            any_partial = true;
+        }
+        let folder_count = if part_index == 1 {
+            layout_folder_count
+        } else {
+            saturating_len(stats.folder_keys.len())
+        };
+        let partial = stats.partial
+            || stats.omitted_folders != 0
+            || stats.omitted_properties != 0
+            || stats.omitted_attachments != 0;
+        let published = PublishedPart {
+            index: part_index,
+            filename: filename.clone(),
+            byte_len,
+            sha256: sha256.clone(),
+            oversize,
+        };
+        let sidecar = PartSidecar {
+            schema_version: "1.1.0".to_owned(),
+            producer_version: crate::VERSION.to_owned(),
+            index: part_index,
+            filename: filename.clone(),
+            byte_len,
+            sha256: sha256.clone(),
+            store_record_key: hex(&store_record_key),
+            folder_count,
+            message_count: stats.message_count,
+            oversize,
+            partial,
+            omitted_folders: stats.omitted_folders,
+            omitted_properties: stats.omitted_properties,
+            omitted_attachments: stats.omitted_attachments,
+            reconstructions: stats.reconstructions.clone(),
+        };
+        job.publish_validated_part_interruptible(
+            &staged_filename,
+            &published,
+            &sidecar,
+            &stats.item_keys,
+            interrupted,
+        )?;
+        tracing::info!(
+            part_index,
+            byte_len,
+            message_count = stats.message_count,
+            top_level_count,
+            oversize,
+            partial,
+            serialization_count = 1,
+            elapsed_ms = part_started.elapsed().as_millis(),
+            "transactional PST part published"
+        );
+        reports.push(PartReport {
+            index: part_index,
+            filename,
+            byte_len,
+            sha256,
+            folder_count,
+            message_count: stats.message_count,
+            oversize,
+            partial,
+            omitted_folders: stats.omitted_folders,
+            omitted_properties: stats.omitted_properties,
+            omitted_attachments: stats.omitted_attachments,
+            reconstructions: stats.reconstructions,
+        });
+        written_candidates =
+            written_candidates.saturating_add(saturating_len(stats.item_keys.len()));
+        any_partial |= partial || oversize;
+        part_index = part_index.checked_add(1).ok_or(SplitError::TooManyParts)?;
+        if let Some(milliseconds) = test_pause_after_part() {
+            std::thread::sleep(std::time::Duration::from_millis(milliseconds));
+        }
+    }
+    finish_incremental_completion(job, reports, written_candidates, any_partial)
+}
+
+fn finish_incremental_completion(
+    job: &mut DurableCatalogSink,
+    reports: Vec<PartReport>,
+    written_candidates: u64,
+    mut any_partial: bool,
+) -> Result<(Vec<PartReport>, u64, bool, bool), SplitError> {
+    let stranded_embedded = job.mark_stranded_embedded_candidates_unsupported()?;
+    if stranded_embedded != 0 {
+        tracing::warn!(
+            stranded_embedded,
+            "embedded candidates stranded by finalized parents were marked unsupported"
+        );
+        any_partial = true;
+    }
+    job.clear_interrupted()?;
+    job.checkpoint()?;
+    Ok((reports, written_candidates, any_partial, false))
+}
+
+fn finish_incremental_interruption(
+    job: &mut DurableCatalogSink,
+    reports: Vec<PartReport>,
+    written_candidates: u64,
+) -> Result<(Vec<PartReport>, u64, bool, bool), SplitError> {
+    job.record_interrupted()?;
+    job.checkpoint()?;
+    Ok((reports, written_candidates, true, true))
+}
+
+fn source_folders_for_mail(
+    source_folders: &[crate::CanonicalFolder],
+    mail: &crate::CanonicalMail,
+) -> Vec<crate::CanonicalFolder> {
+    source_folders
+        .iter()
+        .filter(|folder| {
+            folder.location == mail.folder_location && mail.folder_path.starts_with(&folder.path)
+        })
+        .cloned()
+        .collect()
+}
+
+fn take_incremental_message(
+    input: &mut PartWriterInput,
+) -> Result<(MailFolderLocation, Vec<String>, bool, MessageSpec), SplitError> {
+    let mut found = None;
+    for folder in &mut input.store.folders {
+        if folder
+            .messages
+            .len()
+            .saturating_add(folder.associated_messages.len())
+            > 1
+        {
+            return Err(WriterError::InvalidStructure(
+                "bounded translation produced multiple top-level messages".to_owned(),
+            )
+            .into());
+        }
+        let message = folder
+            .messages
+            .pop()
+            .map(|message| (false, message))
+            .or_else(|| {
+                folder
+                    .associated_messages
+                    .pop()
+                    .map(|message| (true, message))
+            });
+        if let Some((associated, message)) = message {
+            if found.is_some() {
+                return Err(WriterError::InvalidStructure(
+                    "bounded translation assigned a message to multiple folders".to_owned(),
+                )
+                .into());
+            }
+            found = Some((folder.location, folder.path.clone(), associated, message));
+        }
+    }
+    found.ok_or_else(|| {
+        WriterError::InvalidStructure(
+            "bounded translation produced no top-level message".to_owned(),
+        )
+        .into()
+    })
+}
+
+#[allow(dead_code)]
+fn split_recovered_job_with_interrupt_legacy(
     job_directory: &Path,
     source_sha256: &str,
     recovery_mode: RecoveryMode,
@@ -1191,17 +1887,6 @@ fn recovery_mode_name(mode: RecoveryMode) -> &'static str {
     }
 }
 
-fn open_job_interruptible(
-    job_directory: &Path,
-    interrupted: &AtomicBool,
-) -> Result<DurableCatalogSink, SplitError> {
-    match DurableCatalogSink::open_interruptible(job_directory, interrupted) {
-        Ok(job) => Ok(job),
-        Err(JobError::Interrupted) => Err(RecoveryError::Interrupted.into()),
-        Err(error) => Err(error.into()),
-    }
-}
-
 fn disk_preflight(
     job_directory: &Path,
     source_bytes: u64,
@@ -1561,8 +2246,8 @@ mod tests {
         AdaptiveSizeModel, DiskPreflight, ExecutionMetrics, LayoutEstimator,
         MAX_RECOVERY_LOG_DETAIL_LINES, PartReport, SplitError, SplitFailureKind, SplitReport,
         disk_preflight, extend_to_fitting_prefix, hash_file, preflight_filesystem_path,
-        render_recovery_log, shrink_to_fitting_prefix, source_folders_for_part,
-        take_fitting_prefix,
+        projection_batch_byte_target, render_recovery_log, shrink_to_fitting_prefix,
+        source_folders_for_part, take_fitting_prefix,
     };
     use crate::{
         CanonicalFolder, CanonicalFolderRole, CanonicalMail, ContentCompleteness, ItemKey,
@@ -1582,6 +2267,19 @@ mod tests {
             folder_path: vec!["Inbox".to_owned()],
             payload_bytes,
         }
+    }
+
+    #[test]
+    fn projection_batches_scale_with_the_requested_part_size() {
+        const MIB: u64 = 1024 * 1024;
+        const GIB: u64 = 1024 * MIB;
+        assert_eq!(projection_batch_byte_target(64 * MIB, 0), 4 * MIB);
+        assert_eq!(projection_batch_byte_target(64 * MIB, 60 * MIB), 256 * 1024);
+        assert_eq!(projection_batch_byte_target(4 * GIB, 0), 256 * MIB);
+        assert_eq!(
+            projection_batch_byte_target(4 * GIB, 4 * GIB - 256 * MIB),
+            16 * MIB
+        );
     }
 
     #[test]
@@ -1640,7 +2338,7 @@ mod tests {
 
     fn split_report() -> SplitReport {
         SplitReport {
-            schema_version: "0.4.2".to_owned(),
+            schema_version: "0.4.3".to_owned(),
             command: "split".to_owned(),
             maximum_pst_bytes: 4_294_967_296,
             resumed: false,
@@ -1658,7 +2356,7 @@ mod tests {
                 peak_process_rss_bytes: 1,
             },
             recovery: RecoveryReport {
-                schema_version: "0.4.2".to_owned(),
+                schema_version: "0.4.3".to_owned(),
                 command: "recover".to_owned(),
                 mode: "balanced".to_owned(),
                 source: SourceIdentity {

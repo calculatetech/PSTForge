@@ -110,14 +110,17 @@ bounded transactional PST construction. Append complete messages
 incrementally, use actual allocation plus bounded finalization headroom to
 decide whether the next indivisible message fits, and serialize each normal
 part once. Preserve independent validation, atomic publication, source safety,
-and durable restart state while making interruption prompt and resume
-materially faster than a cold restart.
+bounded memory, durable restart state, and materially faster resume than a
+cold restart. The accepted restartable implementation retains a private
+payload spool and therefore costs approximately one extra full
+readable-payload write and temporary allocation.
 
 Restore the 19 GB cold-run ceiling to 20 minutes on the current host, target the
 previously demonstrated approximately ten-minute result, publish the first
 part within six minutes, and keep aggregate PSTForge RSS below 2 GiB. Complete
 the deferred 0.4.2 whole-job reconciliation across independently validated
-4 GiB splits before proceeding.
+4 GiB splits before proceeding. A low-write direct-output mode remains future
+work after the newly exposed native-item data-correctness gaps are resolved.
 
 ### 11. Version 0.5.0 - Operational UX and Debian Packaging
 

@@ -2075,7 +2075,166 @@ work. Hash and identity evidence show that the source was not modified.
     57:47 because only one 4 GiB part had finalized and the writer was
     repeatedly serializing trial parts. This is an explicit performance-gate
     failure deferred to 0.4.3, not a successful 0.4.2 scale result.
-- [ ] Milestone 0.4.3: Incremental Writer Performance.
+- [x] Milestone 0.4.3: Incremental Writer Performance.
+  - [x] (2026-07-19) Recorded the failed 0.4.2 cold qualification and created
+    `milestone/v0.4.3-performance` from pushed `main` commit `4ebb7dd`.
+  - [x] (2026-07-19) Checkpoint 1: expose a transactional writer that appends one complete
+    top-level message, projects the exact finalized file extent from retained
+    blocks/tables/B-trees, and rolls back only the newest uncommitted message.
+    A normal finalized part is serialized once. Byte-equivalence, exact
+    projection, individual rollback, and bounded-batch rollback tests pass.
+  - [x] (2026-07-19) Checkpoint 2: replace whole-mailbox canonical and writer-input vectors
+    with an ordered ledger cursor. Translate, validate, and append one
+    top-level candidate tree at a time. The header pass pages 1,024 top-level
+    metadata/ownership rows at a time and immediately reduces them to the
+    compact deterministic packing index; it never loads source-wide embedded
+    ownership or property events. The 19 GB run holds about 321 MiB peak RSS
+    and serializes every normal part once.
+  - [x] Checkpoint 3: persist the current part transaction boundary and make
+    SIGINT/SIGTERM observable throughout canonical reads, blob streaming,
+    append, finalization, hashing, and validation. Prove that materially
+    progressed resume is faster than cold restart. Retained-spool r4
+    republished all five parts in 2:45.09 versus the 7:35.21 cold r3 run,
+    without restarting libpff.
+  - [x] Checkpoint 4: run the retained-job benchmark, then a fresh named 19 GB
+    split. Require one serialization per normal part, first publication within
+    six minutes, completion within 20 minutes, less than 2 GiB aggregate RSS,
+    exact accounting, independent validation, and unchanged source identity.
+    Baseline r1 completed in 11:03.95 with first publication at approximately
+    6:49. Optimized r2 published part 1 in approximately 5:20 and reduced its
+    private append phase from about 104 seconds to 15 seconds, but exposed and
+    then reproduced a batch replay defect involving a durably unsupported
+    candidate. The focused regression, complete core/writer suites, and strict
+    Clippy pass after the fix. Final uninterrupted r3 completed in 7:35.21,
+    published part 1 in 5:21, used 320,416 KiB maximum RSS, serialized every
+    part once, wrote 37,035 candidates, and kept the source unchanged. Its five
+    part lengths, SHA-256 values, message/omission counts, recovery counts, and
+    total 19,333,198,848 output bytes are byte-for-byte identical to independent
+    baseline r1. Automated performance and deterministic-output requirements
+    pass. Canonical combined-manifest full gate
+    `.agent/test-results/1784489410-full` passes, including licenses,
+    advisories, writer `pffinfo`/`readpst`, and all external corpus cases.
+    The first clean-context review found one high candidate-dependent folder
+    validation defect and one medium terminal-candidate replay defect. Folder
+    layout construction/validation is now message-independent, and terminal
+    candidate keys persist across part boundaries. Focused regressions place
+    invalid candidates both before and after the eventual exact boundary while
+    preserving every later valid message and accepted folder. Complete
+    core/writer suites, strict Clippy, and repeated combined-manifest full gate
+    `.agent/test-results/1784490091-full` pass after remediation.
+    A second fresh review found that rejected catalog folders could still be
+    synthesized from candidate headers and that an all-terminal batch tried to
+    project an empty writer. Catalog keys now prevent rejected source folders
+    from re-entry, newly recovered header-only folders pass the same independent
+    layout validator, writer `begin` enforces layout validation itself, and an
+    empty transaction completes partial without projection. Regressions cover
+    an overlong candidate-owned folder plus all-terminal input. Complete suites
+    and strict Clippy pass after this remediation. Repeated combined-manifest
+    full gate `.agent/test-results/1784490465-full` also passes.
+    A third review found that a folder rejected only for source container-class
+    metadata could not use a valid candidate-derived class, and that the product
+    spec prematurely advertised the still-pending direct/restartable mode.
+    Candidate-derived folder metadata is now admitted only after independent
+    layout validation while the rejected source metadata remains counted;
+    overlong paths remain contained. The product spec again documents the
+    implemented durable-spool CLI, while direct mode remains explicitly pending
+    in Checkpoint 5. Focused tests and repeated combined-manifest full gate
+    `.agent/test-results/1784490920-full` pass. ScanPST-first and Outlook human
+    acceptance remain.
+    A fourth fresh review found three milestone-relevant containment/resume
+    defects: a failed candidate-derived folder class reserved the folder key
+    before a later valid candidate could recover it; named-property discovery
+    excluded terminal durable candidates and could therefore renumber later
+    properties after resume; and the metadata header pass loaded ownership for
+    every candidate. Folder keys are now reserved only after successful
+    independent validation, while failed attempts are counted once and remain
+    retryable. The source-wide named-property identity query includes spooled,
+    written, unsupported, and failed durable candidates. Top-level headers and
+    their ownership are read together in bounded 1,024-row pages and reduced
+    immediately to the compact packing index. Regressions cover invalid-then-
+    valid candidate folder metadata, terminal-status catalog stability, a
+    1,025-row page boundary, exclusion of embedded candidates, and the 64 MiB
+    versus 4 GiB adaptive projection policy. The canonical combined-manifest
+    full gate passes at `.agent/test-results/1784491725-full`.
+    The next focused review found that an exact public part or sidecar
+    filename conflict was detected only after writing, validating, and hashing
+    the private PST. The intended names are now checked before transactional
+    writer construction, while publication retains its no-clobber race check.
+    A regression proves a conflicting `part-0001.pst` creates no transaction
+    scratch. The repeated canonical full gate passes at
+    `.agent/test-results/1784492088-full`.
+    A fresh clean-context final review returned `CLEAN`: no blocker, high, or
+    outcome-relevant medium findings remain.
+    Human ScanPST rejected r3 parts 0001, 0003, 0004, and 0005. Every failure
+    reported FAI Associated Contents rows that disagreed with their message
+    subobjects; part 0001 also reported shared BID `0x34` at `cRef` 147 versus
+    146. The normative FAI template marks `PidTagDisplayName` as copied from
+    the message PC. PSTForge had synthesized that value only in the table row
+    when the source property was absent, or synthesized it alongside a
+    separately streamed source value. Associated `0x3001` is now materialized
+    and normalized once, then emitted identically in the PC and row. The
+    shared empty FAI-table BID now counts Deleted Items only when Deleted Items
+    actually references that shared block. Focused PC/table, private-Deleted-
+    Items refcount, independent libpff roundtrip, complete writer/core, and
+    private external-corpus tests pass. The canonical full gate passes at
+    `.agent/test-results/1784496402-full`.
+    The focused fix review found that duplicate source `0x3001` records bypassed
+    normal first-value deduplication and that an explicit empty Unicode value
+    was incorrectly marked partial before safe normalization. Associated
+    display-name translation now applies the standard duplicate containment,
+    preserves a readable empty string for derived/generated normalization, and
+    omits malformed values with explicit accounting. A production-path
+    regression covers empty-first plus duplicate-later input. The repeated
+    canonical full gate passes at `.agent/test-results/1784496760-full`.
+    The next focused review found that completed-store validation compared the
+    associated-contents row display name with its expected value but did not
+    compare the message property context's `PidTagDisplayName` with that same
+    value. Publication validation now opens associated message PCs with
+    `0x3001` and requires exact PC/table/expected equality. The focused writer
+    regression covers both source-provided and derived display names. The
+    canonical combined-manifest full gate passes at
+    `.agent/test-results/1784496965-full`.
+    A fresh pre-publication review found no production defect. Its only
+    finding was a hypothetical external-corpus comparator mismatch for an
+    empty-first/duplicate-later associated `0x3001`; the production
+    translation path already has a focused regression for that malformed
+    input, so this test-harness-only extension does not block the real-spool
+    qualification.
+    Qualification r4 was republished from a copy-on-write clone of r3's
+    retained 10.2 GiB payload pack without restarting libpff. The five parts
+    completed in 2:45.09 at 247,988 KiB maximum RSS, with one serialization
+    each, 37,035 written candidates, 19,333,198,848 total output bytes, and an
+    unchanged source. Part lengths and per-part item counts are identical to
+    r3. The only byte-identical part is part 0002, which was also the only r3
+    part that passed ScanPST; parts 0001 and 0003-0005 changed under the FAI
+    row/PC and shared-table refcount corrections. ScanPST-first human
+    acceptance of r4 remains pending.
+    A debug-only replay of the 367 durable unsupported candidates in a
+    temporary clone identified 316 writer-managed `PidTagBody`/raw-property
+    collisions (285 contacts and 31 mail messages), 42 recipient-table heap
+    page limits, five general heap page limits, two raw-property
+    representation failures, and one aggregate-recipient-metadata failure.
+    One additional embedded mail item is stranded beneath a rejected parent.
+    These are whole native items absent from output, distinct from bounded
+    property omissions, and remain a data-correctness gap. The temporary clone
+    was removed after aggregate evidence was retained under untracked
+    `.agent/test-results/v043-unsupported-diagnostic/`.
+    The owner reports all five r4 parts clean in ScanPST and operational in
+    Outlook. This closes the 0.4.3 performance milestone; the 367 unsupported
+    native candidates become the first blocking evidence for the next
+    data-correctness patch milestone.
+  - [ ] Checkpoint 5: make bounded non-restartable streaming the default
+    `split` execution mode. Add explicit `--restartable` durable
+    ledger/payload-spool selection; restrict `--resume` and `--keep-work` to
+    that mode; report estimated and measured temporary writes and peak output
+    allocation. Prove that streaming does not create a mailbox-sized payload
+    pack, handles an oversize single item without whole-item RAM
+    materialization, preserves finalized parts on interruption, and stays
+    bounded on the 19 GB qualification before the 83 GB release-scale source.
+    This checkpoint is explicitly deferred by owner direction at 0.4.3 close.
+    The accepted incremental restartable path meets the immediate performance
+    need; direct-mode write-amplification work must not delay the newly exposed
+    native-item data-correctness remediation.
 - [ ] Milestone 0.5.0: Operational UX and Debian Packaging.
 - [ ] Milestone 0.5.1: GitHub CI and Private-Corpus Automation; the remote is
   reachable, and work begins after the approved baseline is pushed.
@@ -2099,6 +2258,67 @@ work. Hash and identity evidence show that the source was not modified.
   exited 137 after 57:47.52 with 3,288.08 user CPU seconds, 192.82 system CPU
   seconds, and 6,293,820 KiB maximum RSS. Finalized part 0001 is 4,289,520,640
   bytes and contains 10,226 messages.
+
+- Observation: The incremental 0.4.3 retained-job run published four new
+  parts while using 321,888 KiB peak RSS and no swap, proving that PST payload
+  bytes are streamed to the private PST rather than retained in process RAM.
+  Parts 0002 through 0004 are between 4,276,315,136 and 4,293,075,968 bytes;
+  final part 0005 is 2,227,430,400 bytes. The private publication directory
+  peaked at 4,363,942,890 bytes while validating part 0005, about 69 MB above
+  the part target. Atomic publication is a same-filesystem no-replace rename
+  and does not rewrite payload bytes. The durable payload pack remains a real
+  additional readable-payload write and capacity cost.
+  Evidence: external `v043-retained-resume-r5.log`,
+  `v043-retained-resume-r6.log`, and
+  `v043-retained-resume-r6-peak-bytes.txt`.
+
+- Observation: Exact finalized-size projection after every message was a
+  serialized CPU bottleneck, not an NVMe throughput limit. During the 19 GB r1
+  baseline the source and output devices stayed roughly 7-20% utilized with
+  effectively zero I/O wait while the parser/supervisor consumed about one CPU
+  core. The run completed in 11:03.95 at 321,676 KiB maximum RSS, but first
+  publication took about 6:49 and part 1 spent about 104 seconds in append and
+  boundary work. The adaptive transactional r2 append reached the identical
+  part-1 byte boundary in about 15 seconds and published it in about 34.5
+  seconds after writer start, placing first publication about 5:20 after
+  invocation.
+  Evidence: external `v043-spooled-r1.log`, `v043-spooled-r1.json`,
+  `v043-spooled-r2.log`, and live `pidstat`/`iostat` sampling on 2026-07-19.
+
+- Observation: A provisional batch can contain a candidate that translation
+  durably marks unsupported. If a later candidate makes that batch exceed the
+  part limit, rewinding the candidate cursor across the terminal candidate and
+  trying to load it as spooled fails ledger validation. Retaining the terminal
+  candidate indexes for exact replay makes the rewind skip those already
+  accounted candidates. A focused 320 KiB split now forces this shape and
+  proves that every later valid message is published.
+  Evidence: external r2 failure at 5:46 after part 1 publication and
+  `split_contains_unrepresentable_candidate_and_writes_later_mail`.
+
+- Observation: Two fresh libpff traversals of the same corrupt 19 GB source
+  produced the same 37,402 committed candidates and 37,035 written candidates,
+  but differed by 10 complete/partial classifications and 24 readable blobs.
+  Part message counts remained identical; the later traversal omitted one
+  fewer attachment but 10 additional properties, making part 4 about 4.8 MB
+  smaller. This is recovery nondeterminism rather than a writer-boundary
+  difference. A third fresh traversal reproduced r1 exactly, including all
+  recovery counts and every part SHA-256, establishing that adaptive writer
+  batching itself is byte deterministic while retaining the anomalous r2
+  evidence for later recovery-layer investigation.
+  Evidence: external r1/r2/r3 JSON comparison; source identity and SHA-256
+  match.
+
+- Observation: Human ScanPST evidence and a repaired comparison PST placed
+  beside part 0001 exposed two independent facts. First, part 0001 from the
+  prior 0.4.2 implementation fails ScanPST and requires a later focused
+  correctness comparison; it is not evidence against the new transactional
+  parts and is deferred until the performance path is stable. Second, the
+  resume validator incorrectly treated unrelated public `parts/` files as
+  private-ledger corruption. Public evidence and comparisons are now ignored,
+  preserved, and excluded from capacity credit; only private `.pstforge/`
+  storage remains exclusive.
+  Evidence: external `parts/part-0001.log` and
+  `parts/part-0001-repaired.pst`.
 
 - Observation: Classic Outlook compressed RTF can include a final NUL in the
   header's `RAWSIZE`. The `compressed-rtf` decoder deliberately removes that
@@ -2705,6 +2925,25 @@ work. Hash and identity evidence show that the source was not modified.
   validation, atomic publication, and durable recovery remain non-negotiable,
   but they do not require this work amplification.
   Date/Author: 2026-07-19 / project owner and Codex.
+
+- Decision: Use bytes allocated in the private PST, not source-payload bytes or
+  a fixed message count, as the primary cheap projection trigger. Far from the
+  boundary, perform exact finalized-size projection after approximately
+  `part_size / 16` new private bytes. Within the final `part_size / 16`, reduce
+  the batch target to `part_size / 256`. Keep a 2,048-message ceiling only as a
+  replay-latency guard for unusually small items. Accept a batch only after an
+  exact projection; roll back an over-limit batch byte-for-byte and replay it
+  individually to select the last fitting message.
+  Rationale: Source and output lengths differ because property contexts,
+  tables, block trailers, alignment, allocation maps, and final NBT/BBT pages
+  are reconstructed. Their exact final form need not be rebuilt after every
+  append. The policy scales to a 64 MiB split (about 4 MiB far batches and 256
+  KiB near batches) and a 4 GiB split (about 256 MiB and 16 MiB), while exact
+  projection remains the hard-limit authority. Observed 4 GiB finalization
+  overhead is about 32 MiB, so the 256 MiB near window retains substantial
+  measured headroom.
+  Date/Author: 2026-07-19 / project owner direction and measured 0.4.3
+  qualification.
 
 - Decision: Treat performance and interruption behavior as release
   correctness. On the current high-end host, a cold 19 GB split must restore
@@ -3647,6 +3886,52 @@ work. Hash and identity evidence show that the source was not modified.
   Date/Author: 2026-07-19 / clean-context review followed by focused writer
   regression and independent completed-store evidence.
 
+- Decision: Make low-write non-restartable streaming the default `split`
+  mode. Add `--restartable` as the deliberate opt-in for the durable SQLite
+  ledger and payload pack; `--resume` resumes only such a job and
+  `--keep-work` is invalid otherwise. Deleting a spool after success does not
+  reduce device writes and therefore is not an acceptable implementation of
+  streaming mode. Both modes build each PST under a private name on the output
+  filesystem, `fsync` and independently validate it, and publish it with an
+  atomic no-replace rename that never falls back to a cross-filesystem copy.
+  Report the selected mode plus conservative estimated and measured temporary
+  writes/disk use. Streaming may retain compact current-part indexes and
+  bounded current-item state, but it must not materialize an entire attachment,
+  PST, or mailbox in RAM or a mailbox-sized payload spool.
+  Rationale: Restartable spooling writes every readable payload once before
+  writing it again into PST output. That recovery guarantee is useful but can
+  impose roughly dataset-sized extra SSD writes and capacity, materially
+  affecting QLC endurance on 19 GB, 50 GB, and 83 GB recovery jobs. The owner
+  requires that tradeoff to be explicit rather than the default.
+  Date/Author: 2026-07-19 / human owner direction after measured 0.4.3
+  retained-job write amplification.
+
+- Decision: Hash the complete source once at invocation open, match that hash
+  before trusting resume state, and use held-descriptor/path identity including
+  Linux ctime for the completion recheck instead of rereading the entire source
+  for a second SHA-256.
+  Rationale: PSTForge never writes through the held read-only descriptor. Any
+  filesystem-mediated content or metadata write changes ctime even when an
+  actor restores the original size and mtime. Comparing device, inode, size,
+  mtime, and ctime on both the held descriptor and pathname therefore detects
+  an in-run source change without another 19/50/83 GB read. Full SHA-256 remains
+  mandatory before recovery and on every later invocation before a durable job
+  is trusted.
+  Date/Author: 2026-07-19 / 0.4.3 measured resume optimization under the
+  repository's source-identity recheck contract.
+
+- Decision: On durable open, hash-verify payload blobs only when at least one
+  `pending`, `spooled`, or `failed` candidate can still consume them. Continue
+  validating the pack inode, bounds, non-overlap, ledger relationships, every
+  finalized PST hash, and every private-state path. A later candidate that
+  attempts to reuse a consumed blob must verify that exact range before reuse.
+  Rationale: Blobs referenced exclusively by `written` candidates have already
+  been incorporated into independently validated, hashed, atomically published
+  PSTs. Blobs referenced exclusively by `unsupported` candidates cannot enter
+  output. Rehashing those mailbox-sized private ranges on every resume adds
+  SSD reads without protecting any future write.
+  Date/Author: 2026-07-19 / 0.4.3 retained-job resume profiling.
+
 ## Outcomes & Retrospective
 
 Version 0.1.0 now lets an operator inspect a healthy PST in human or JSON form
@@ -4292,6 +4577,66 @@ split output and explicit omission record. Delete failed private scratch after
 retaining bounded evidence. Do not begin 0.5.0 until this gate passes or the
 owner records a specific exception.
 
+Implement checkpoint 1 in `crates/pstforge-pst/src/writer.rs`. Define
+`TransactionalMailStoreWriter` as the sole owner of its private temporary file,
+allocation cursor, emitted block records, next BID/NID counters, compact folder
+rows, compact validation expectations, and interruption reference.
+`TransactionalMailStoreWriter::append_message` accepts one folder identity,
+placement, and `MessageSpec`. Before mutation it records the file length,
+allocation cursor, ID counters, and vector lengths. It writes that message's
+blocks exactly as the existing batch loop does, then computes the exact
+projected final extent by applying the documented block/page alignment and
+NBT/BBT page capacities to the retained state. `rollback_message` truncates to
+the recorded file length and restores every counter/vector length; it is legal
+only for the most recent uncommitted append. `finalize` writes folder and
+template blocks, BBT, NBT, allocation maps, and header once, then uses the
+existing internal validation, independent-reader supervision, sync, and
+no-clobber publication path. The existing `create_mail_store*` functions become
+compatibility wrappers over this API and must retain byte-for-byte output for
+the same input.
+
+Named property IDs are store-wide, so `begin` receives a sorted,
+duplicate-free named-property identity catalog before the first message.
+Checkpoint 1 derives it from the existing batch input. Checkpoint 2 obtains it
+through one bounded ledger query over named-property descriptors; it must not
+read property payloads or construct messages. Including a mapping that a
+particular part does not use is valid and gives every output part the same
+deterministic source-wide identity-to-ID assignment.
+
+Implement checkpoint 2 in `crates/pstforge-job/src/lib.rs`,
+`crates/pstforge-core/src/canonical.rs`,
+`crates/pstforge-core/src/writer_input.rs`, and
+`crates/pstforge-core/src/split.rs`. Add an ordered top-level candidate cursor
+that returns one candidate and its recursively owned descendants with only
+their events. Do not call `spooled_candidates_interruptible`,
+`candidate_ownerships_interruptible`, or `load_canonical_mail_interruptible`
+from the production split path. Translate the returned tree with a
+single-message function that returns the `MessageSpec`, all durable item keys,
+omission/reconstruction accounting, and compact folder placement. Feed it to
+the transactional writer immediately. If appending it would make the exact
+projected final extent exceed the target and the part already has a message,
+roll back only that candidate, finalize and publish the current part, begin the
+next part, and append the candidate there. If it alone exceeds the target,
+finalize it as the documented oversize part.
+
+The current prefix estimator, adaptive calibration, whole-candidate
+`write_staged_part` attempts, and complete `BTreeMap<ItemKey, CanonicalMail>`
+materialization leave the production path after checkpoint 2. Focused unit
+tests may retain pure packing estimators as test substitutes, but no real split
+may serialize a normal part more than once. Instrument an exact
+`part_serializations` counter and fail the 19 GB gate if it exceeds the number
+of finalized parts plus documented oversize retries.
+
+Checkpoint 3 may persist only deterministic, reconstructible writer state. A
+finalized part and its ledger publication transaction remain the primary
+restart boundary. If interruption occurs inside an unpublished part, discard
+that known partial file and replay only its candidates from the ledger; never
+reparse or retransmit candidates assigned to finalized parts. This is expected
+to be faster and safer than attempting to deserialize live Rust writer
+internals. Observe the interruption flag at least once per candidate, per
+streamed 64 KiB blob chunk, per BBT/NBT page, per allocation-map page, and
+before every sync, validation process, hash pass, and rename.
+
 ### Milestone 11: Version 0.5.0 - Operational UX and Debian Packaging
 
 Finalize report schemas, privacy redaction, exit statuses, error wording,
@@ -4512,7 +4857,6 @@ and self-hosted runner configuration build on the approved remote baseline.
 Recheck authentication and repository settings before creating or configuring
 them. Local work must never depend on their existence.
 
-Revision note (2026-07-19): Closed the human-accepted 0.4.2 focused
-data-correctness checkpoints, recorded the aborted 19 GB run as a failed
-performance gate, and made incremental transactional writing the immediate
-0.4.3 milestone.
+Revision note (2026-07-19): Initialized 0.4.3 with concrete transactional
+writer, ordered-ledger streaming, bounded cancellation/resume, instrumentation,
+and 19 GB acceptance checkpoints after the 0.4.2 scale failure.

@@ -337,11 +337,11 @@ overview reference is replaced by a section-specific reference.
 - **Evidence:** rich-mail and embedded-message roundtrips; exact maximum-depth guard; ScanPST fidelity candidates
 
 ### NDB-05
-- **Status:** Verified: Unicode leaf/intermediate entry widths, 20-entry BBT/intermediate capacity, 15-entry NBT-leaf capacity, first-key parent separators, sorted keys, page levels, page BIDs, root BREFs, and balanced non-root occupancy match. Constructors enforce the documented maximum depth.
-- **Requirement:** NBT and BBT leaf/intermediate pages are sorted, bounded, linked, and rooted correctly
-- **Sources:** MS-PST 2.2.2.7.7 and child structure pages
-- **Implementation:** `write_bbt`, `write_nbt`, `plan_leaf_pages`
-- **Evidence:** `btree_leaf_planning_splits_at_ms_pst_capacity`; ScanPST 19 GB parts
+- **Status:** Verified: Unicode leaf/intermediate entry widths, 20-entry BBT/intermediate capacity, 15-entry NBT-leaf capacity, first-key parent separators, sorted keys, page levels, page BIDs, root BREFs, reference counts, and balanced non-root occupancy match. Constructors enforce the documented maximum depth.
+- **Requirement:** NBT and BBT leaf/intermediate pages are sorted, bounded, linked, and rooted correctly; every BBT `cRef` equals the BBT entry's own reference plus the actual NBT, SLBLOCK, and data-tree references to that BID
+- **Sources:** MS-PST 2.2.2.7.7 and child structure pages; [MS-PST 2.2.2.7.7.3.1 Reference Counts](https://learn.microsoft.com/en-us/openspecs/office_file_formats/ms-pst/3301874b-7150-4968-9a2d-1425ca494c21), page date 2024-08-20
+- **Implementation:** `write_bbt`, `write_nbt`, `plan_leaf_pages`, `initial_blocks`
+- **Evidence:** `btree_leaf_planning_splits_at_ms_pst_capacity`, shared-table reference-count regressions; ScanPST 19 GB parts
 
 ### NDB-06
 - **Status:** Verified for the DList allocation mode used by supported Outlook generations: first offsets, recurring intervals, reserved pages, AMap self-allocation, extent bits/free counts, page conventions/checksums, and large-file rebuild match. Deprecated PMap/FMap/FPMap pages are retained at required intervals and are not used for allocation, consistent with MS-PST product behavior.
@@ -356,6 +356,13 @@ overview reference is replaced by a section-specific reference.
 - **Sources:** PST-INT 2.6; the verified NDB/LTP/Messaging rows above; POSIX durability is a PSTForge safety requirement
 - **Implementation:** `create_flat_store`, `validate_completed_store`, `validate_completed_folder_store`, `validate_with_independent_readers`, `publish_noclobber`, `sync_published_directory`, `verify_published_destination`
 - **Evidence:** publication, timeout, retained-candidate, moved-directory, no-clobber, and validator-scratch tests
+
+### NDB-08
+- **Status:** Verified; the transactional writer emits each accepted message block once before final NBT, BBT, allocation-map, and header construction. Bounded private batches amortize exact finalized-size projection while exact replay fixes every part boundary.
+- **Requirement:** Transactional construction may append complete message nodes and their referenced blocks before finalization, provided final NBT and BBT entries remain sorted and complete, allocation maps cover exactly retained extents, the header references only the final roots and high-water marks, and no pre-finalized file is published. Folder hierarchy and metadata validation is independent of any recovered message, so an unrepresentable candidate cannot suppress otherwise valid or empty source folders. A provisional batch may defer finalized-size projection; its primary bound scales from the requested part size and the bytes actually allocated in the private PST, with a message-count ceiling only to bound latency for very small items. The batch is accepted only after one exact projection. If that projection exceeds the part limit, the complete batch is rolled back to its byte-for-byte private checkpoint and replayed one message at a time with exact projection so the published part remains at the last fitting message.
+- **Sources:** NDB-01 through NDB-07; MS-PST 2.2.2.1 defines the NDB as nodes and blocks addressed through the NBT and BBT, and PST-INT 2.6 requires the final database relationships and allocation state to be internally consistent
+- **Implementation:** `validate_mail_store_layout`, `TransactionalMailStoreWriter::begin`, `begin_batch`, `append_message_deferred`, `projected_file_eof`, `rollback_batch`, `append_message`, and `finalize`; `write_bbt`, `write_nbt`, `write_fixed_pages`, `write_header`, and the NDB-07 publication path remain authoritative
+- **Evidence:** focused append, batch rollback, exact-boundary, and byte-comparison tests; independent `pffinfo` and `readpst`; all five 19 GB qualification parts pass ScanPST and open in Outlook
 
 ## LTP Structures
 
@@ -440,10 +447,10 @@ overview reference is replaced by a section-specific reference.
 
 ### MSG-08
 - **Status:** Verified
-- **Requirement:** Associated messages are written only to the associated contents table and carry `MSGFLAG_ASSOCIATED` in both PC and table row; normal/embedded messages do not
-- **Sources:** MAPI-FAI; MAPI-FLAGS; MAPI-CONTENTS
-- **Implementation:** `output_message_flags`, `associated_message_table_row`, `build_message_blocks`
-- **Evidence:** `root_folders_and_associated_messages_keep_their_source_placement`; ScanPST/Outlook r2
+- **Requirement:** Associated messages are written only to the associated contents table and carry `MSGFLAG_ASSOCIATED` in both PC and table row; normal/embedded messages do not. Every copied FAI table column, including `PidTagDisplayName`, has the same value and type in the associated message PC.
+- **Sources:** MAPI-FAI; MAPI-FLAGS; MAPI-CONTENTS; PST-FAI, whose `Copied?` column is `Y` for `PidTagDisplayName`
+- **Implementation:** `output_message_flags`, `associated_message_table_row`, `associated_display_name`, `message_properties`, `build_message_blocks`
+- **Evidence:** `root_folders_and_associated_messages_keep_their_source_placement`, derived-display-name PC/table equality regression; ScanPST/Outlook r2
 
 ### MSG-09
 - **Status:** Accepted mixed conformance: populated mappings are verified; reserved-only/empty GUID and entry sentinels use EMP-03

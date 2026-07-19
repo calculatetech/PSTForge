@@ -21,7 +21,7 @@ use crate::{
 };
 use libpff_sys::{RecoveryMode, RecoveryUnit};
 
-pub const RECOVERY_SCHEMA_VERSION: &str = "0.4.2";
+pub const RECOVERY_SCHEMA_VERSION: &str = "0.4.3";
 const MAX_WORKER_RETRIES: u32 = 3;
 const MAX_UNIT_RETRIES: u32 = 0;
 
@@ -94,15 +94,21 @@ pub fn recover(
             RecoveryError::Source(error)
         }
     })?;
-    recover_source(
+    let (report, _job) = recover_source(
         &source,
         job_directory,
         worker_executable,
         mode,
-        false,
-        None,
         interrupted,
-    )
+        None,
+    )?;
+    Ok(report)
+}
+
+pub(crate) struct PreparedSplitRecovery<'a> {
+    pub resume: bool,
+    pub configuration: &'a JobConfiguration,
+    pub job: Option<DurableCatalogSink>,
 }
 
 pub(crate) fn recover_for_split(
@@ -110,18 +116,16 @@ pub(crate) fn recover_for_split(
     job_directory: &Path,
     worker_executable: &Path,
     mode: RecoveryMode,
-    resume: bool,
-    configuration: &JobConfiguration,
     interrupted: Arc<AtomicBool>,
-) -> Result<RecoveryReport, RecoveryError> {
+    prepared: PreparedSplitRecovery<'_>,
+) -> Result<(RecoveryReport, DurableCatalogSink), RecoveryError> {
     recover_source(
         source,
         job_directory,
         worker_executable,
         mode,
-        resume,
-        Some(configuration),
         interrupted,
+        Some(prepared),
     )
 }
 
@@ -130,10 +134,13 @@ fn recover_source(
     job_directory: &Path,
     worker_executable: &Path,
     mode: RecoveryMode,
-    resume: bool,
-    configuration: Option<&JobConfiguration>,
     interrupted: Arc<AtomicBool>,
-) -> Result<RecoveryReport, RecoveryError> {
+    prepared: Option<PreparedSplitRecovery<'_>>,
+) -> Result<(RecoveryReport, DurableCatalogSink), RecoveryError> {
+    let (resume, configuration, prepared_job) = match prepared {
+        Some(prepared) => (prepared.resume, Some(prepared.configuration), prepared.job),
+        None => (false, None, None),
+    };
     let job_source = JobSourceIdentity {
         canonical_path: source.identity().canonical_path.clone(),
         device: source.identity().device,
@@ -142,7 +149,9 @@ fn recover_source(
         modified_at: source.identity().modified_at.clone(),
         sha256: source.identity().sha256.clone(),
     };
-    let mut resumed_sink = if resume {
+    let mut resumed_sink = if let Some(job) = prepared_job {
+        Some(job)
+    } else if resume {
         let configuration = configuration.ok_or(RecoveryError::ResumeConfigurationRequired)?;
         match DurableCatalogSink::open_resume_interruptible(
             job_directory,
@@ -170,12 +179,45 @@ fn recover_source(
         .into_iter()
         .map(|(unit, _)| unit)
         .collect::<HashSet<_>>();
-    if let Some(completion) = resumed_sink
+    let mut completion = resumed_sink
         .as_ref()
         .map(DurableCatalogSink::recovery_completion)
         .transpose()?
-        .flatten()
+        .flatten();
+    if completion.is_none()
+        && resumed_sink
+            .as_ref()
+            .map(DurableCatalogSink::worker_retries_exhausted)
+            .transpose()?
+            .unwrap_or(false)
     {
+        let sink = resumed_sink.as_ref().ok_or_else(|| {
+            RecoveryError::Job(JobError::Integrity(
+                "terminal recovery is missing its ledger".to_owned(),
+            ))
+        })?;
+        let summary = sink.summary()?;
+        let normal_items = summary
+            .committed_candidates
+            .checked_sub(summary.recovered_candidates)
+            .and_then(|value| value.checked_sub(summary.orphan_candidates))
+            .and_then(|value| value.checked_sub(summary.fragment_candidates))
+            .ok_or(RecoveryError::InconsistentCounters)?;
+        let terminal = RecoveryCompletion {
+            normal_items,
+            recovered_items: summary.recovered_candidates,
+            orphan_items: summary.orphan_candidates,
+            fragment_items: summary.fragment_candidates,
+            issues: 1,
+            issues_dropped: 0,
+            peak_worker_rss_bytes: 0,
+        };
+        sink.record_recovery_completion(&terminal)?;
+        sink.checkpoint()?;
+        tracing::info!("terminal exhausted recovery outcome migrated without parser restart");
+        completion = Some(terminal);
+    }
+    if let Some(completion) = completion {
         let sink = resumed_sink.as_ref().ok_or_else(|| {
             RecoveryError::Job(JobError::Integrity(
                 "completed recovery is missing its ledger".to_owned(),
@@ -184,31 +226,38 @@ fn recover_source(
         let summary = sink.summary()?;
         verify_recovery_source(source, &interrupted, sink)?;
         tracing::info!("completed recovery ledger reused without parser restart");
-        return Ok(RecoveryReport {
-            schema_version: RECOVERY_SCHEMA_VERSION.to_owned(),
-            command: "recover".to_owned(),
-            mode: recovery_mode_name(mode).to_owned(),
-            source: source.identity().clone(),
-            job_directory: canonical_job_directory(job_directory),
-            normal_items: completion.normal_items,
-            recovered_items: completion.recovered_items,
-            orphan_items: completion.orphan_items,
-            fragment_items: completion.fragment_items,
-            committed_candidates: summary.committed_candidates,
-            complete_candidates: summary.complete_candidates,
-            partial_candidates: summary.partial_candidates,
-            unsupported_candidates: summary.unsupported_candidates,
-            blob_count: summary.blob_count,
-            blob_bytes: summary.blob_bytes,
-            issues: completion.issues,
-            issues_dropped: completion.issues_dropped,
-            worker_attempts: prior_worker_attempts,
-            worker_failures: prior_worker_failures,
-            isolated_units: u64::try_from(skipped_units.len()).unwrap_or(u64::MAX),
-            peak_worker_rss_bytes: completion.peak_worker_rss_bytes,
-            interrupted: false,
-            source_unchanged: true,
-        });
+        return Ok((
+            RecoveryReport {
+                schema_version: RECOVERY_SCHEMA_VERSION.to_owned(),
+                command: "recover".to_owned(),
+                mode: recovery_mode_name(mode).to_owned(),
+                source: source.identity().clone(),
+                job_directory: canonical_job_directory(job_directory),
+                normal_items: completion.normal_items,
+                recovered_items: completion.recovered_items,
+                orphan_items: completion.orphan_items,
+                fragment_items: completion.fragment_items,
+                committed_candidates: summary.committed_candidates,
+                complete_candidates: summary.complete_candidates,
+                partial_candidates: summary.partial_candidates,
+                unsupported_candidates: summary.unsupported_candidates,
+                blob_count: summary.blob_count,
+                blob_bytes: summary.blob_bytes,
+                issues: completion.issues,
+                issues_dropped: completion.issues_dropped,
+                worker_attempts: prior_worker_attempts,
+                worker_failures: prior_worker_failures,
+                isolated_units: u64::try_from(skipped_units.len()).unwrap_or(u64::MAX),
+                peak_worker_rss_bytes: completion.peak_worker_rss_bytes,
+                interrupted: false,
+                source_unchanged: true,
+            },
+            resumed_sink.take().ok_or_else(|| {
+                RecoveryError::Job(JobError::Integrity(
+                    "completed recovery lost its ledger owner".to_owned(),
+                ))
+            })?,
+        ));
     }
     let worker_controls = WorkerControls {
         mode,
@@ -491,7 +540,7 @@ fn recover_source(
     let peak_worker_rss_bytes = worker_controls
         .peak_worker_rss_bytes
         .load(Ordering::Relaxed);
-    if !interrupted && !retries_exhausted {
+    if !interrupted {
         sink.record_recovery_completion(&RecoveryCompletion {
             normal_items,
             recovered_items: catalog.recovered_messages,
@@ -503,31 +552,34 @@ fn recover_source(
         })?;
         sink.checkpoint()?;
     }
-    Ok(RecoveryReport {
-        schema_version: RECOVERY_SCHEMA_VERSION.to_owned(),
-        command: "recover".to_owned(),
-        mode: recovery_mode_name(mode).to_owned(),
-        source: source.identity().clone(),
-        job_directory: canonical_job_directory(job_directory),
-        normal_items,
-        recovered_items: catalog.recovered_messages,
-        orphan_items: catalog.orphan_messages,
-        fragment_items: catalog.fragment_messages,
-        committed_candidates: summary.committed_candidates,
-        complete_candidates: summary.complete_candidates,
-        partial_candidates: summary.partial_candidates,
-        unsupported_candidates: summary.unsupported_candidates,
-        blob_count: summary.blob_count,
-        blob_bytes: summary.blob_bytes,
-        issues: catalog.issues,
-        issues_dropped: catalog.issues_dropped,
-        worker_attempts: total_worker_attempts,
-        worker_failures: total_worker_failures,
-        isolated_units: u64::try_from(skipped_units.len()).unwrap_or(u64::MAX),
-        peak_worker_rss_bytes,
-        interrupted,
-        source_unchanged: true,
-    })
+    Ok((
+        RecoveryReport {
+            schema_version: RECOVERY_SCHEMA_VERSION.to_owned(),
+            command: "recover".to_owned(),
+            mode: recovery_mode_name(mode).to_owned(),
+            source: source.identity().clone(),
+            job_directory: canonical_job_directory(job_directory),
+            normal_items,
+            recovered_items: catalog.recovered_messages,
+            orphan_items: catalog.orphan_messages,
+            fragment_items: catalog.fragment_messages,
+            committed_candidates: summary.committed_candidates,
+            complete_candidates: summary.complete_candidates,
+            partial_candidates: summary.partial_candidates,
+            unsupported_candidates: summary.unsupported_candidates,
+            blob_count: summary.blob_count,
+            blob_bytes: summary.blob_bytes,
+            issues: catalog.issues,
+            issues_dropped: catalog.issues_dropped,
+            worker_attempts: total_worker_attempts,
+            worker_failures: total_worker_failures,
+            isolated_units: u64::try_from(skipped_units.len()).unwrap_or(u64::MAX),
+            peak_worker_rss_bytes,
+            interrupted,
+            source_unchanged: true,
+        },
+        sink,
+    ))
 }
 
 fn verify_recovery_source(

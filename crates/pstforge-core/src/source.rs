@@ -54,6 +54,8 @@ struct StatIdentity {
     size: u64,
     modified_seconds: i64,
     modified_nanoseconds: i64,
+    changed_seconds: i64,
+    changed_nanoseconds: i64,
 }
 
 pub struct SourceFile {
@@ -167,7 +169,7 @@ impl SourceFile {
     fn verify_unchanged_with_interrupt(
         &self,
         interrupted: Option<&AtomicBool>,
-        observer: impl FnMut(u64),
+        mut observer: impl FnMut(u64),
     ) -> Result<(), SourceError> {
         let fd_metadata = self
             .file
@@ -183,10 +185,9 @@ impl SourceFile {
         {
             return Err(SourceError::Changed(self.path.clone()));
         }
-        if hash_file_at_interruptible_observing(&self.file, &self.path, interrupted, observer)?
-            != self.identity.sha256
-        {
-            return Err(SourceError::Changed(self.path.clone()));
+        observer(self.stat.size);
+        if interrupted.is_some_and(|flag| flag.load(Ordering::Relaxed)) {
+            return Err(SourceError::Interrupted);
         }
         let final_fd_metadata = self
             .file
@@ -306,6 +307,8 @@ impl From<&Metadata> for StatIdentity {
             size: value.size(),
             modified_seconds: value.mtime(),
             modified_nanoseconds: value.mtime_nsec(),
+            changed_seconds: value.ctime(),
+            changed_nanoseconds: value.ctime_nsec(),
         }
     }
 }
@@ -363,8 +366,8 @@ mod tests {
         let mut changed = original;
         changed[0] = 1;
         let mut injected = false;
-        let result = source.verify_unchanged_observing(|offset| {
-            if !injected && offset == super::HASH_BUFFER_SIZE as u64 {
+        let result = source.verify_unchanged_observing(|_| {
+            if !injected {
                 fs::write(&path, &changed).expect("inject same-size source mutation");
                 injected = true;
             }
