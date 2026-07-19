@@ -866,7 +866,7 @@ work. Hash and identity evidence show that the source was not modified.
     the job for diagnosis and another resume. A direct failed-resume regression
     preserved a sentinel, shell syntax passed, and the complete fast gate passes
     at `.agent/test-results/1784329593-fast`.
-- [ ] Milestone 0.4.2: Incremental Data Correctness.
+- [x] Milestone 0.4.2: Incremental Data Correctness.
   - [x] (2026-07-17) The owner approved an incremental checkpoint workflow.
     Each data family produces one focused validation PST, pauses for ScanPST
     and Outlook, and receives a local and pushed branch commit only after human
@@ -2067,9 +2067,15 @@ work. Hash and identity evidence show that the source was not modified.
         reports ScanPST clean and confirms Outlook preserves the original
         rendered state exactly. This satisfies the checkpoint interoperability
         gate.
-  - [ ] Run the complete 19 GB split once after all focused checkpoints pass
-    and reconcile discovered unique items against written plus explicitly
-    unwritten items across every part.
+  - [x] (2026-07-19) Close the focused 0.4.2 data-correctness checkpoint
+    series after every admitted data type passed its required automated,
+    ScanPST, and Outlook evidence.
+  - [x] (2026-07-19) Record rather than conceal the incomplete final 19 GB
+    split and whole-job reconciliation. The owner stopped the cold run after
+    57:47 because only one 4 GiB part had finalized and the writer was
+    repeatedly serializing trial parts. This is an explicit performance-gate
+    failure deferred to 0.4.3, not a successful 0.4.2 scale result.
+- [ ] Milestone 0.4.3: Incremental Writer Performance.
 - [ ] Milestone 0.5.0: Operational UX and Debian Packaging.
 - [ ] Milestone 0.5.1: GitHub CI and Private-Corpus Automation; the remote is
   reachable, and work begins after the approved baseline is pushed.
@@ -2077,6 +2083,22 @@ work. Hash and identity evidence show that the source was not modified.
 - [ ] Milestone 1.0.0: MailPlus-Ready Release.
 
 ## Surprises & Discoveries
+
+- Observation: The 0.4.2 fidelity expansion regressed a cold 19 GB split from
+  approximately ten minutes in 0.4.1 to more than 57 minutes without
+  finalizing the second part. Recovery durably cataloged 37,399 normal items,
+  29,168 attachments, 310 embedded messages, and 3,469,174 raw properties, but
+  packing then held up to 6,293,820 KiB RSS and rewrote near-4-GiB candidate
+  parts repeatedly. Part 0002 reached at least its fifth full serialization
+  attempt. SIGTERM did not stop the CPU-bound writer within 30 seconds and the
+  owner authorized SIGKILL. The source device, inode, size, modification time,
+  and SHA-256 remained unchanged; finalized part 0001 and durable job state
+  remained intact.
+  Evidence: bounded timing and `pidstat` evidence under the untracked
+  `.agent/test-results/v042-final-qualification/` directory. The killed command
+  exited 137 after 57:47.52 with 3,288.08 user CPU seconds, 192.82 system CPU
+  seconds, and 6,293,820 KiB maximum RSS. Finalized part 0001 is 4,289,520,640
+  bytes and contains 10,226 messages.
 
 - Observation: Classic Outlook compressed RTF can include a final NUL in the
   header's `RAWSIZE`. The `compressed-rtf` decoder deliberately removes that
@@ -2655,6 +2677,47 @@ work. Hash and identity evidence show that the source was not modified.
   `large-qualification-20260717T204931Z`.
 
 ## Decision Log
+
+- Decision: Close 0.4.2 at the owner-approved focused data-correctness
+  boundary and move the failed final 19 GB scale reconciliation to an immediate
+  0.4.3 performance milestone. Do not represent the aborted run as passing.
+  Preserve the one finalized part and matching durable job temporarily as a
+  0.4.3 performance fixture; delete it after bounded replacement evidence
+  exists so failed runs do not consume permanent disk space.
+  Rationale: Each 0.4.2 data-type checkpoint passed its independent and human
+  interoperability gates, while the aggregate run exposed a different,
+  blocking implementation defect. Keeping that defect in an unbounded
+  validation loop delays useful recovery and obscures the already accepted
+  correctness checkpoints.
+  Date/Author: 2026-07-19 / project owner and Codex.
+
+- Decision: Version 0.4.3 will write each part incrementally and make the fit
+  decision only for the next indivisible top-level message. It will not
+  materialize the complete mailbox before publication, determine the total
+  recoverable byte count before writing, or repeatedly serialize whole
+  candidate parts to discover their size. Track actual allocated PST bytes and
+  bounded finalization headroom; finalize the current part when the next
+  message cannot fit. Only one indivisible oversize message may exceed the
+  target.
+  Rationale: PST files are procedurally constructed. The current immutable
+  full-store specification and prefix-calibration loop turn a bounded packing
+  choice into multiple multi-gigabyte rewrites. Source safety, independent
+  validation, atomic publication, and durable recovery remain non-negotiable,
+  but they do not require this work amplification.
+  Date/Author: 2026-07-19 / project owner and Codex.
+
+- Decision: Treat performance and interruption behavior as release
+  correctness. On the current high-end host, a cold 19 GB split must restore
+  the accepted 20-minute ceiling and target the previously demonstrated
+  approximately ten-minute runtime, publish its first part within six minutes,
+  stay below 2 GiB aggregate RSS, and stop at a durable boundary promptly on
+  SIGINT or SIGTERM. Resuming a materially progressed job must be faster than
+  restarting it from the beginning. Qualification must measure cold and resume
+  runs and must not leave failed scratch output after evidence is retained.
+  Rationale: Faster hardware masks rather than fixes serial work amplification.
+  A restartable design is defective when replaying its persistence state costs
+  more than repeating source recovery.
+  Date/Author: 2026-07-19 / project owner and Codex.
 
 - Decision: Reference attachment classification comes from the readable
   `PidTagAttachMethod` property, not libpff's narrower convenience type API.
@@ -3731,6 +3794,21 @@ The owner accepted that evidence as completion of 0.4.1. Peak RSS remains
 is reserved for the separately planned 0.4.2 milestone, and the 50 GB source
 remains the final release-scale gate.
 
+Version 0.4.2 completed its focused data-correctness series through small,
+independently verifiable checkpoint commits. Recursive embedded attachments,
+native item classes, associated data, document/reference/OLE representations,
+missing metadata behavior, and the conformance remediation set passed their
+required automated gates and owner-run ScanPST and Outlook checks. The final
+cold 19 GB reconciliation was stopped by owner direction after 57:47 because
+only one part had finalized, part 0002 had reached at least its fifth full
+serialization attempt, RSS reached 6,293,820 KiB, and SIGTERM was not observed
+within 30 seconds. The source remained byte-for-byte and identity-metadata
+unchanged and finalized work survived SIGKILL. Therefore 0.4.2 closes on its
+accepted correctness evidence with the scale reconciliation explicitly
+incomplete. Version 0.4.3 immediately owns the blocking writer, memory, resume,
+and cancellation performance defects before any operational UX or packaging
+work begins.
+
 ## Context and Orientation
 
 The repository initially contains only documentation. `AGENTS.md` governs all
@@ -4166,9 +4244,55 @@ readable source inventory, or the recovery record must establish high
 confidence by exactly reconciling readable items, failed source slots,
 recovery-collection boundaries, written fingerprints, and explicitly
 unwritten content. Validate all final parts with independent readers, ScanPST,
-Outlook, and MailPlus. The 50 GB source remains a later release gate.
+Outlook, and MailPlus. The first cold attempt was stopped after 57:47 with only
+one finalized part because whole-part trial serialization made the validation
+operationally intolerable. Preserve that failed-gate conclusion and complete
+this reconciliation under milestone 0.4.3 after the incremental writer meets
+its performance budgets. The 50 GB source remains a later release gate.
 
-### Milestone 10: Version 0.5.0 - Operational UX and Debian Packaging
+### Milestone 10: Version 0.4.3 - Incremental Writer Performance
+
+Replace whole-mailbox canonical materialization and repeated whole-part trial
+serialization with a bounded transactional stream. Recovery may continue to
+append payload bytes and canonical metadata durably, but the writer consumes
+completed top-level messages in deterministic order as they become eligible.
+It appends one indivisible message at a time to the current PST, tracks actual
+allocated bytes plus a measured upper bound for finalization structures, and
+finalizes before the next message would cross the requested target. It does
+not need the total readable mailbox size before writing. A message larger than
+the target remains the sole permitted oversize case.
+
+Introduce a writer transaction boundary that can either commit one complete
+message or discard only that uncommitted message. Persist the last committed
+source candidate, part index, writer allocation state, and payload-pack cursor
+often enough that resume does not replay completed source recovery or rebuild
+already finalized parts. Make every data-dependent writer and validator loop
+observe the shared interruption flag at bounded intervals. SIGINT and SIGTERM
+must stop assignment, preserve finalized parts, remove only known partial
+scratch, checkpoint durable state, and exit with status 130 promptly.
+
+Prove the architecture first with deterministic fake-backend tests that force
+part boundaries, oversized messages, interruption during append and finalize,
+disk exhaustion, and resume from every transaction boundary. Add instrumentation
+for source hashing, recovery, canonicalization, append, finalization, and
+validation, including bytes read/written, CPU time, wall time, peak aggregate
+RSS, trial-write count, and time to first finalized part. A normal part must be
+serialized exactly once; validation reads are permitted but must not rewrite
+it.
+
+Use the retained interrupted 0.4.2 job only as a temporary private performance
+fixture while developing the writer path. Once focused proof exists, perform a
+cold run against the named 19 GB manifest case. Acceptance requires a first
+part within six minutes, total completion within 20 minutes with the previous
+approximately ten-minute run as the optimization target, less than 2 GiB
+aggregate RSS, no repeated whole-part trial writes, prompt graceful
+interruption, and a materially faster resume than cold restart. Independently
+validate every part and reconcile the readable source inventory against the
+split output and explicit omission record. Delete failed private scratch after
+retaining bounded evidence. Do not begin 0.5.0 until this gate passes or the
+owner records a specific exception.
+
+### Milestone 11: Version 0.5.0 - Operational UX and Debian Packaging
 
 Finalize report schemas, privacy redaction, exit statuses, error wording,
 report regeneration, install diagnostics, spool cleanup, and operator docs.
@@ -4181,7 +4305,7 @@ Acceptance: installing the package on clean Debian 13 makes `pstforge info`,
 it leaves user jobs and source PSTs untouched; package contents, licenses, and
 dependency metadata pass inspection.
 
-### Milestone 11: Version 0.5.1 - GitHub CI and Private-Corpus Automation
+### Milestone 12: Version 0.5.1 - GitHub CI and Private-Corpus Automation
 
 Begin after the human-approved documentation baseline is pushed to the
 reachable `origin` remote and repository settings can be configured. This
@@ -4196,7 +4320,7 @@ Add a release workflow that builds but cannot publish without an approved tag
 and environment. Repository automation does not waive the rule that agents may
 not push, merge, tag, or publish without explicit human approval.
 
-### Milestone 12: Version 0.6.0 - Interoperability Release Candidate
+### Milestone 13: Version 0.6.0 - Interoperability Release Candidate
 
 Freeze CLI/schema changes, run every local and GitHub gate, fuzz parsers and
 writer structures, inject disk and process failures, and complete security,
@@ -4208,7 +4332,7 @@ No blocker or high-severity review finding may remain. Medium findings must be
 fixed or explicitly accepted by the human owner in the Decision Log. A release
 candidate is not 1.0 until the real 50 GB rehearsal succeeds from clean state.
 
-### Milestone 13: Version 1.0.0 - MailPlus-Ready Release
+### Milestone 14: Version 1.0.0 - MailPlus-Ready Release
 
 From a clean Debian package install, repeat balanced recovery of the real 50 GB
 source, validate all parts, and import them into MailPlus. Confirm source
@@ -4388,6 +4512,7 @@ and self-hosted runner configuration build on the approved remote baseline.
 Recheck authentication and repository settings before creating or configuring
 them. Local work must never depend on their existence.
 
-Revision note (2026-07-14): Initial decision-complete ExecPlan created from the
-reviewed outline, host/package inspection, upstream source and license review,
-and owner decisions prioritizing mail-only PST output for Synology MailPlus.
+Revision note (2026-07-19): Closed the human-accepted 0.4.2 focused
+data-correctness checkpoints, recorded the aborted 19 GB run as a failed
+performance gate, and made incremental transactional writing the immediate
+0.4.3 milestone.

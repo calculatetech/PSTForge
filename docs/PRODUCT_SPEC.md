@@ -411,6 +411,15 @@ within 24 hours, keep peak PSTForge process RSS below 2 GiB, leave the source
 unchanged, survive forced termination without losing finalized parts, and
 account for every discovered mail item.
 
+The 19 GB operational qualification has a stricter 20-minute cold-run ceiling
+on the current host, a six-minute maximum time to the first finalized part, and
+the same 2 GiB aggregate RSS limit. A normal part is serialized once; the
+implementation must not repeatedly rewrite a multi-gigabyte candidate merely
+to discover whether it fits. Resume after material progress must complete less
+work and finish faster than an equivalent cold restart. SIGINT and SIGTERM must
+be observed at bounded data-processing intervals so a CPU-bound writer can
+checkpoint and exit with status 130 promptly.
+
 Every output part must pass PSTForge structural checks, Ubuntu/Debian
 `pffinfo`, independent `readpst`, size and SHA-256 verification, and repeated
 determinism tests. Representative healthy, partial, orphan, attachment, and

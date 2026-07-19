@@ -97,14 +97,36 @@ specifications in `docs/WRITER_CONFORMANCE.md`; every remaining writer change
 must add its normative reference, implementation symbol, focused test, and
 independent evidence before implementation.
 
-### 10. Version 0.5.0 - Operational UX and Debian Packaging
+The focused correctness checkpoints passed. The final cold 19 GB reconciliation
+was stopped after more than 57 minutes with only one finalized part because the
+expanded fidelity path repeatedly serialized multi-gigabyte trial parts and
+exceeded 6 GiB RSS. That is recorded as a failed performance gate, not a
+successful scale result, and is the immediate scope of version 0.4.3.
+
+### 10. Version 0.4.3 - Incremental Writer Performance
+
+Replace whole-mailbox materialization and repeated whole-part trial writes with
+bounded transactional PST construction. Append complete messages
+incrementally, use actual allocation plus bounded finalization headroom to
+decide whether the next indivisible message fits, and serialize each normal
+part once. Preserve independent validation, atomic publication, source safety,
+and durable restart state while making interruption prompt and resume
+materially faster than a cold restart.
+
+Restore the 19 GB cold-run ceiling to 20 minutes on the current host, target the
+previously demonstrated approximately ten-minute result, publish the first
+part within six minutes, and keep aggregate PSTForge RSS below 2 GiB. Complete
+the deferred 0.4.2 whole-job reconciliation across independently validated
+4 GiB splits before proceeding.
+
+### 11. Version 0.5.0 - Operational UX and Debian Packaging
 
 Finalize human and JSON reports, documented exit codes, privacy-preserving
 diagnostics, installation checks, and a reproducible Debian 13 x86_64 package.
 Verify operation with Debian's older supported `libpff` ABI as well as the
 newer Ubuntu development host package.
 
-### 11. Version 0.5.1 - GitHub CI and Private-Corpus Automation
+### 12. Version 0.5.1 - GitHub CI and Private-Corpus Automation
 
 The GitHub remote and approved documentation baseline are available. Add branch
 checks, scheduled security and fuzzing jobs, release automation, and an
@@ -112,14 +134,14 @@ explicitly invoked private self-hosted corpus runner that never uploads PST
 content or sensitive logs. This repository does not use pull requests, so
 required checks apply to milestone branches and pre-merge local gates.
 
-### 12. Version 0.6.0 - Interoperability Release Candidate
+### 13. Version 0.6.0 - Interoperability Release Candidate
 
 Freeze the candidate CLI and schemas, run the complete external corpus,
 exercise fault injection and resource limits, import generated parts into a
 test Synology MailPlus mailbox, and perform secondary Outlook checks. Resolve
 all blocker and high-severity adversarial review findings.
 
-### 13. Version 1.0.0 - MailPlus-Ready Release
+### 14. Version 1.0.0 - MailPlus-Ready Release
 
 Repeat the 50 GB recovery and MailPlus import rehearsal from a clean install,
 reproduce the Debian package, verify licenses and notices, finalize operator
