@@ -136,6 +136,7 @@ const ADDRESS_TYPE: u32 = 0x3002;
 const EMAIL_ADDRESS: u32 = 0x3003;
 const ATTACH_FILENAME: u32 = 0x3707;
 const ATTACH_FILENAME_SHORT: u32 = 0x3704;
+const ATTACH_METHOD: u32 = 0x3705;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -1112,18 +1113,36 @@ fn stream_attachments(
                 continue;
             }
         };
-        let attachment_type = recover_attachment_value(
+        let attachment_method = recover_attachment_value(
             catalog,
             message_id,
-            "get attachment type",
-            attachment.attachment_type(),
+            "get attachment method",
+            attachment
+                .first_record_set()
+                .and_then(|set| set.map(|set| set.optional_u32(ATTACH_METHOD)).transpose())
+                .map(Option::flatten),
         )?;
-        let data_size = recover_attachment_value(
-            catalog,
-            message_id,
-            "get attachment size",
-            attachment.attachment_size(),
-        )?;
+        let reference_attachment = matches!(attachment_method, Some(2 | 3 | 4 | 7));
+        let attachment_type = if reference_attachment {
+            Some(i32::from(b'r'))
+        } else {
+            recover_attachment_value(
+                catalog,
+                message_id,
+                "get attachment type",
+                attachment.attachment_type(),
+            )?
+        };
+        let data_size = if reference_attachment {
+            None
+        } else {
+            recover_attachment_value(
+                catalog,
+                message_id,
+                "get attachment size",
+                attachment.attachment_size(),
+            )?
+        };
         let filename = recover_attachment_value(
             catalog,
             message_id,
@@ -1179,7 +1198,7 @@ fn stream_attachments(
             )?;
         }
         let embedded_attachment = attachment_type == Some(i32::from(b'i'));
-        if !embedded_attachment {
+        if !embedded_attachment && !reference_attachment {
             let result = data_size
                 .ok_or(PffError::Native {
                     operation: "get attachment size",

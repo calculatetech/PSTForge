@@ -259,11 +259,14 @@ fn run() -> Result<(), String> {
             Some("pim-items") => qualify_pim_items(&root, Path::new(&output)),
             Some("distribution-list") => qualify_distribution_list(&root, Path::new(&output)),
             Some("document-object") => qualify_document_object(&root, Path::new(&output)),
+            Some("reference-attachments") => {
+                qualify_reference_attachments(&root, Path::new(&output))
+            }
             Some("calendar-exceptions") => {
                 qualify_calendar_exceptions(&root, Path::new(&output))
             }
             Some("associated-data") => qualify_associated_data(&root, Path::new(&output)),
-            _ => Err("unknown qualification checkpoint; expected embedded-attachments, named-properties, empty-folders, contacts, appointments, meetings, pim-items, distribution-list, document-object, calendar-exceptions, or associated-data".to_owned()),
+            _ => Err("unknown qualification checkpoint; expected embedded-attachments, named-properties, empty-folders, contacts, appointments, meetings, pim-items, distribution-list, document-object, reference-attachments, calendar-exceptions, or associated-data".to_owned()),
         };
     }
     if command != std::ffi::OsStr::new("gate") {
@@ -295,7 +298,7 @@ fn run() -> Result<(), String> {
 }
 
 fn usage() -> String {
-    "usage: cargo xtask gate <fast|full|release> | qualify <embedded-attachments|named-properties|empty-folders|contacts|appointments|meetings|pim-items|distribution-list|document-object|calendar-exceptions|associated-data> <output>"
+    "usage: cargo xtask gate <fast|full|release> | qualify <embedded-attachments|named-properties|empty-folders|contacts|appointments|meetings|pim-items|distribution-list|document-object|reference-attachments|calendar-exceptions|associated-data> <output>"
         .to_owned()
 }
 
@@ -309,7 +312,9 @@ fn qualify_embedded_attachments(root: &Path, output: &Path) -> Result<(), String
         .iter_mut()
         .find_map(|attachment| match &mut attachment.content {
             AttachmentContent::Embedded(message) => Some(message.as_mut()),
-            AttachmentContent::Binary(_) | AttachmentContent::Spooled(_) => None,
+            AttachmentContent::Binary(_)
+            | AttachmentContent::Spooled(_)
+            | AttachmentContent::Reference(_) => None,
         })
         .ok_or_else(|| "writer fixture has no embedded message".to_owned())?;
     let mut nested = embedded.clone();
@@ -1137,6 +1142,94 @@ fn document_checkpoint_payload() -> Result<Vec<u8>, String> {
         .finish()
         .map_err(|error| format!("cannot finish DOCX fixture: {error}"))
         .map(std::io::Cursor::into_inner)
+}
+
+fn qualify_reference_attachments(root: &Path, output: &Path) -> Result<(), String> {
+    use pstforge_pst::writer::{
+        AttachmentContent, AttachmentReferenceMethod, AttachmentReferenceSpec, AttachmentSpec,
+        FidelityStore, MailFolderLocation, MailFolderRole, MailFolderSpec, MailStoreSpec,
+        MinimalStore,
+    };
+
+    let mut fixture = FidelityStore::from(&MinimalStore {
+        store_name: "PSTForge reference source".to_owned(),
+        folder_name: "Reference Attachments".to_owned(),
+        subject: "Reference attachment fidelity checkpoint".to_owned(),
+        body: "Data-less MAPI reference attachment checkpoint.".to_owned(),
+        sender_name: "PSTForge".to_owned(),
+        sender_email: "sender@example.com".to_owned(),
+        recipient: "recipient@example.com".to_owned(),
+        record_key: *b"PSTForgeRefAtt01",
+    });
+    let reference = |method, filename: &str, long_pathname: &str| AttachmentSpec {
+        filename: filename.to_owned(),
+        mime_type: None,
+        content_id: None,
+        content_location: None,
+        rendering_position: Some(-1),
+        flags: 0,
+        raw_properties: Vec::new(),
+        content: AttachmentContent::Reference(AttachmentReferenceSpec {
+            method,
+            long_pathname: long_pathname.to_owned(),
+            pathname: Some(filename.to_owned()),
+            provider_type: None,
+            original_permission: None,
+            permission: None,
+        }),
+    };
+    fixture.message.attachments = vec![
+        reference(
+            AttachmentReferenceMethod::ByReference,
+            "shared-reference.txt",
+            r"\\unreachable.invalid\recovery\shared-reference.txt",
+        ),
+        reference(
+            AttachmentReferenceMethod::ByReferenceResolve,
+            "resolved-reference.txt",
+            r"\\unreachable.invalid\recovery\resolved-reference.txt",
+        ),
+        reference(
+            AttachmentReferenceMethod::ByReferenceOnly,
+            "reference-only.txt",
+            r"Z:\unavailable\reference-only.txt",
+        ),
+        AttachmentSpec {
+            filename: "web-reference.docx".to_owned(),
+            mime_type: Some(
+                "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+                    .to_owned(),
+            ),
+            content_id: None,
+            content_location: None,
+            rendering_position: Some(-1),
+            flags: 0,
+            raw_properties: Vec::new(),
+            content: AttachmentContent::Reference(AttachmentReferenceSpec {
+                method: AttachmentReferenceMethod::ByWebReference,
+                long_pathname: "https://example.invalid/recovery/web-reference.docx".to_owned(),
+                pathname: None,
+                provider_type: Some("RecoveryProvider".to_owned()),
+                original_permission: Some(1),
+                permission: Some(2),
+            }),
+        },
+    ];
+    let spec = MailStoreSpec {
+        store_name: fixture.store_name,
+        record_key: fixture.record_key,
+        folders: vec![MailFolderSpec {
+            path: vec!["Reference Attachments".to_owned()],
+            location: MailFolderLocation::IpmSubtree,
+            role: MailFolderRole::Ordinary,
+            container_class: "IPF.Note".to_owned(),
+            messages: vec![fixture.message],
+            associated_messages: Vec::new(),
+        }],
+    };
+    publish_qualification(root, output, 1, |part| {
+        pstforge_pst::writer::create_mail_store(part, &spec)
+    })
 }
 
 fn qualify_calendar_exceptions(root: &Path, output: &Path) -> Result<(), String> {

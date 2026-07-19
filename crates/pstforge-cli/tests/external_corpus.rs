@@ -226,6 +226,22 @@ struct ActiveNamedProperty {
     hasher: Sha256,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AttachmentNamedPropertyFingerprint {
+    attachment_index: u32,
+    identity: NamedPropertyIdentity,
+    value_type: Option<u32>,
+    byte_len: u64,
+    sha256: [u8; 32],
+}
+
+#[derive(Default)]
+struct AttachmentNamedPropertySink {
+    pending: Option<(PropertyDescriptor, NamedPropertyIdentity)>,
+    active: BTreeMap<(u32, u32, u32, u32), ActiveNamedProperty>,
+    completed: Vec<AttachmentNamedPropertyFingerprint>,
+}
+
 #[derive(Default)]
 struct NamedPropertySink {
     pending: Option<(PropertyDescriptor, NamedPropertyIdentity)>,
@@ -451,6 +467,103 @@ impl CatalogSink for NamedPropertySink {
     }
 }
 
+impl CatalogSink for AttachmentNamedPropertySink {
+    fn event(&mut self, event: CatalogEvent<'_>) -> Result<(), String> {
+        match event {
+            CatalogEvent::NamedProperty {
+                descriptor,
+                identity,
+            } => {
+                if self.pending.replace((descriptor, identity)).is_some() {
+                    return Err("attachment named property identity was not consumed".to_owned());
+                }
+            }
+            CatalogEvent::PropertyStart(descriptor) => {
+                let Some((expected, identity)) = self.pending.take() else {
+                    return Ok(());
+                };
+                if descriptor != expected {
+                    return Err(
+                        "attachment named property identity did not precede its value".to_owned(),
+                    );
+                }
+                let PropertyOwner::Attachment { message_id, index } = descriptor.owner else {
+                    return Ok(());
+                };
+                if self
+                    .active
+                    .insert(
+                        (
+                            message_id,
+                            index,
+                            descriptor.record_set_index,
+                            descriptor.entry_index,
+                        ),
+                        ActiveNamedProperty {
+                            identity,
+                            value_type: descriptor.value_type,
+                            byte_len: 0,
+                            hasher: Sha256::new(),
+                        },
+                    )
+                    .is_some()
+                {
+                    return Err("duplicate active attachment named property".to_owned());
+                }
+            }
+            CatalogEvent::PropertyData { descriptor, bytes } => {
+                let PropertyOwner::Attachment { message_id, index } = descriptor.owner else {
+                    return Ok(());
+                };
+                if let Some(property) = self.active.get_mut(&(
+                    message_id,
+                    index,
+                    descriptor.record_set_index,
+                    descriptor.entry_index,
+                )) {
+                    property.byte_len = property
+                        .byte_len
+                        .checked_add(u64::try_from(bytes.len()).map_err(|error| error.to_string())?)
+                        .ok_or_else(|| "attachment named property size overflow".to_owned())?;
+                    property.hasher.update(bytes);
+                }
+            }
+            CatalogEvent::PropertyEnd(descriptor) => {
+                let PropertyOwner::Attachment { message_id, index } = descriptor.owner else {
+                    return Ok(());
+                };
+                if let Some(property) = self.active.remove(&(
+                    message_id,
+                    index,
+                    descriptor.record_set_index,
+                    descriptor.entry_index,
+                )) {
+                    self.completed.push(AttachmentNamedPropertyFingerprint {
+                        attachment_index: index,
+                        identity: property.identity,
+                        value_type: property.value_type,
+                        byte_len: property.byte_len,
+                        sha256: property.hasher.finalize().into(),
+                    });
+                }
+            }
+            CatalogEvent::PropertyAbort { descriptor, .. } => {
+                let PropertyOwner::Attachment { message_id, index } = descriptor.owner else {
+                    return Ok(());
+                };
+                self.active.remove(&(
+                    message_id,
+                    index,
+                    descriptor.record_set_index,
+                    descriptor.entry_index,
+                ));
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 struct MessageContentFingerprint {
     embedded_path: Vec<u32>,
@@ -633,7 +746,8 @@ impl CatalogSink for IndependentMessageSink {
                     attachment.hasher.update(bytes);
                 }
             }
-            CatalogEvent::AttachmentEnd { message_id, index } => {
+            CatalogEvent::AttachmentEnd { message_id, index }
+            | CatalogEvent::AttachmentAbort { message_id, index } => {
                 if let Some(mut attachment) = self.attachments.remove(&(message_id, index)) {
                     let message = self
                         .active
@@ -707,9 +821,13 @@ impl CatalogSink for IndependentMessageSink {
                         matches!(
                             id,
                             0x3001
+                                | 0x3701
                                 | 0x3702
+                                | 0x3705
+                                | 0x3708
                                 | 0x3709
                                 | 0x370b
+                                | 0x370d
                                 | 0x370e
                                 | 0x3712
                                 | 0x3713
@@ -837,6 +955,17 @@ impl CatalogSink for IndependentMessageSink {
 }
 
 fn finish_property(property: ActivePropertyFingerprint) -> PropertyFingerprint {
+    if property.id == 0x3701 {
+        // Embedded-object data contains store-local node references. Attachment
+        // payload bytes are compared independently; normalize this fingerprint
+        // to presence and type so deterministic relocation is not a false diff.
+        return PropertyFingerprint {
+            id: property.id,
+            value_type: property.value_type,
+            byte_len: 0,
+            sha256: Sha256::digest([]).into(),
+        };
+    }
     PropertyFingerprint {
         id: property.id,
         value_type: property.value_type,
@@ -923,7 +1052,16 @@ fn independent_messages(
         || !sink.properties.is_empty()
         || !sink.attachment_properties.is_empty()
     {
-        return Err("independent message catalog was incomplete".into());
+        return Err(format!(
+            "independent message catalog was incomplete: issues={:?}, dropped={}, active={}, attachments={}, properties={}, attachment_properties={}",
+            catalog.issues,
+            catalog.issues_dropped,
+            sink.active.len(),
+            sink.attachments.len(),
+            sink.properties.len(),
+            sink.attachment_properties.len(),
+        )
+        .into());
     }
     Ok(sink.completed)
 }
@@ -941,6 +1079,30 @@ fn independent_named_properties(
     if sink.pending.is_some() || !sink.active.is_empty() || !sink.messages.is_empty() {
         return Err("named property stream ended with unfinished state".into());
     }
+    Ok(sink.completed)
+}
+
+fn independent_attachment_named_properties(
+    path: &std::path::Path,
+) -> Result<Vec<AttachmentNamedPropertyFingerprint>, Box<dyn std::error::Error>> {
+    let file = fs::File::open(path)?;
+    let native = libpff_sys::PffFile::open_fd(file.as_fd())?;
+    let mut sink = AttachmentNamedPropertySink::default();
+    let catalog = native.catalog(&mut sink)?;
+    if !catalog.issues.is_empty()
+        || catalog.issues_dropped != 0
+        || sink.pending.is_some()
+        || !sink.active.is_empty()
+    {
+        return Err("attachment named property catalog was incomplete".into());
+    }
+    sink.completed.sort_by_key(|property| {
+        (
+            property.attachment_index,
+            property.identity.guid,
+            format!("{:?}", property.identity.name),
+        )
+    });
     Ok(sink.completed)
 }
 
@@ -2382,6 +2544,194 @@ fn milestone_0_4_2_document_object_roundtrip_through_libpff()
 }
 
 #[test]
+#[ignore = "requires the external v042-reference-attachments-source corpus case"]
+fn milestone_0_4_2_reference_attachments_roundtrip_through_libpff()
+-> Result<(), Box<dyn std::error::Error>> {
+    let manifest_path = std::env::var_os("PSTFORGE_CORPUS_MANIFEST")
+        .ok_or("PSTFORGE_CORPUS_MANIFEST is required")?;
+    let manifest: Manifest = toml::from_str(&fs::read_to_string(&manifest_path)?)?;
+    let case = manifest
+        .cases
+        .iter()
+        .find(|case| case.name == "v042-reference-attachments-source")
+        .ok_or("manifest has no v042-reference-attachments-source case")?;
+    let identity = pstforge_core::SourceFile::open(&case.path)?
+        .identity()
+        .clone();
+    if identity.sha256 != case.sha256 {
+        return Err("reference attachment source SHA-256 does not match its manifest".into());
+    }
+
+    let source_messages = independent_messages(&case.path)?;
+    let source = source_messages
+        .first()
+        .ok_or("reference attachment source has no message")?;
+    let methods = [2_i32, 3, 4, 7];
+    let relationships = [
+        (
+            "shared-reference.txt",
+            r"\\unreachable.invalid\recovery\shared-reference.txt",
+            Some("shared-reference.txt"),
+        ),
+        (
+            "resolved-reference.txt",
+            r"\\unreachable.invalid\recovery\resolved-reference.txt",
+            Some("resolved-reference.txt"),
+        ),
+        (
+            "reference-only.txt",
+            r"Z:\unavailable\reference-only.txt",
+            Some("reference-only.txt"),
+        ),
+        (
+            "web-reference.docx",
+            "https://example.invalid/recovery/web-reference.docx",
+            None,
+        ),
+    ];
+    let unicode_hash = |value: &str| -> [u8; 32] {
+        let bytes = value
+            .encode_utf16()
+            .flat_map(u16::to_le_bytes)
+            .collect::<Vec<_>>();
+        Sha256::digest(bytes).into()
+    };
+    if source_messages.len() != 1
+        || source.folder_path != ["Reference Attachments"]
+        || source.content.subject.as_deref() != Some("Reference attachment fidelity checkpoint")
+        || source.content.attachments.len() != 4
+        || !source.complete
+        || source
+            .content
+            .attachments
+            .iter()
+            .zip(methods.into_iter().zip(relationships))
+            .any(
+                |(attachment, (method, (filename, long_pathname, pathname)))| {
+                    let expected_method_hash: [u8; 32] =
+                        Sha256::digest(method.to_le_bytes()).into();
+                    attachment.attachment_type != Some(i32::from(b'r'))
+                        || attachment.filename.as_deref() != Some(filename)
+                        || attachment.declared_size.is_some()
+                        || attachment.streamed_size != 0
+                        || attachment
+                            .rendering_properties
+                            .iter()
+                            .any(|property| property.id == 0x3701)
+                        || !attachment.rendering_properties.iter().any(|property| {
+                            property.id == 0x3705
+                                && property.value_type == Some(0x0003)
+                                && property.sha256 == expected_method_hash
+                        })
+                        || !attachment.rendering_properties.iter().any(|property| {
+                            property.id == 0x370D
+                                && property.value_type == Some(0x001F)
+                                && property.sha256 == unicode_hash(long_pathname)
+                        })
+                        || match pathname {
+                            Some(pathname) => {
+                                !attachment.rendering_properties.iter().any(|property| {
+                                    property.id == 0x3708
+                                        && property.value_type == Some(0x001F)
+                                        && property.sha256 == unicode_hash(pathname)
+                                })
+                            }
+                            None => attachment
+                                .rendering_properties
+                                .iter()
+                                .any(|property| property.id == 0x3708),
+                        }
+                },
+            )
+    {
+        return Err(format!(
+            "reference attachment source does not match the relationship contract: {source:?}"
+        )
+        .into());
+    }
+
+    let source_named = independent_attachment_named_properties(&case.path)?;
+    let attachment_set = [
+        0x7F, 0x7F, 0x35, 0x96, 0xE1, 0x59, 0xD0, 0x47, 0x99, 0xA7, 0x46, 0x51, 0x5C, 0x18, 0x3B,
+        0x54,
+    ];
+    let expected_names: [(&str, u32, [u8; 32]); 3] = [
+        (
+            "AttachmentOriginalPermissionType",
+            0x0003,
+            Sha256::digest(1_i32.to_le_bytes()).into(),
+        ),
+        (
+            "AttachmentPermissionType",
+            0x0003,
+            Sha256::digest(2_i32.to_le_bytes()).into(),
+        ),
+        (
+            "AttachmentProviderType",
+            0x001F,
+            unicode_hash("RecoveryProvider"),
+        ),
+    ];
+    if source_named.len() != expected_names.len()
+        || !expected_names
+            .iter()
+            .all(|(name, property_type, expected_hash)| {
+                source_named.iter().any(|property| {
+                    property.attachment_index == 3
+                        && property.identity.guid == attachment_set
+                        && property.identity.name == NamedPropertyName::String((*name).to_owned())
+                        && property.value_type == Some(*property_type)
+                        && property.sha256 == *expected_hash
+                })
+            })
+    {
+        return Err(
+            format!("reference attachment NAMEID contract changed: {source_named:?}").into(),
+        );
+    }
+
+    let directory = tempfile::tempdir()?;
+    let job = directory.path().join("job");
+    let output = Command::new(env!("CARGO_BIN_EXE_pstforge"))
+        .arg("split")
+        .arg(&case.path)
+        .arg("--output")
+        .arg(&job)
+        .arg("--max-pst-size")
+        .arg("4GiB")
+        .arg("--json")
+        .arg("--color")
+        .arg("never")
+        .output()?;
+    if !output.status.success() {
+        return Err(format!(
+            "reference attachment split failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        )
+        .into());
+    }
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+    if report["partial"].as_bool() != Some(false)
+        || report["written_candidates"].as_u64() != Some(1)
+        || report["parts"].as_array().map(Vec::len) != Some(1)
+        || report["parts"][0]["omitted_properties"].as_u64() != Some(0)
+        || report["parts"][0]["omitted_attachments"].as_u64() != Some(0)
+    {
+        return Err("reference attachment split did not report complete preservation".into());
+    }
+    let generated = job.join("parts/part-0001.pst");
+    let generated_messages = independent_messages(&generated)?;
+    verify_exact_message_fidelity(source_messages, generated_messages)?;
+    if independent_attachment_named_properties(&generated)? != source_named {
+        return Err("reference attachment NAMEID identity or payload changed".into());
+    }
+    if pstforge_core::SourceFile::open(&case.path)?.identity() != &identity {
+        return Err("reference attachment source identity changed during the split".into());
+    }
+    Ok(())
+}
+
+#[test]
 #[ignore = "requires the external v042-calendar-exception-source corpus case"]
 fn milestone_0_4_2_calendar_exceptions_roundtrip_through_libpff()
 -> Result<(), Box<dyn std::error::Error>> {
@@ -2415,8 +2765,8 @@ fn milestone_0_4_2_calendar_exceptions_roundtrip_through_libpff()
                     .map(|property| property.id)
                     .collect::<BTreeSet<_>>()
                     == BTreeSet::from([
-                        0x3001, 0x3702, 0x3709, 0x370b, 0x370e, 0x3714, 0x7ffa, 0x7ffb, 0x7ffc,
-                        0x7ffd, 0x7ffe, 0x7fff,
+                        0x3001, 0x3701, 0x3702, 0x3705, 0x3709, 0x370b, 0x370e, 0x3714, 0x7ffa,
+                        0x7ffb, 0x7ffc, 0x7ffd, 0x7ffe, 0x7fff,
                     ])
         })
         || !source_messages.iter().any(|message| {

@@ -147,7 +147,36 @@ pub enum AttachmentContent {
     Binary(Vec<u8>),
     Spooled(FileBlobSpec),
     Embedded(Box<MessageSpec>),
+    Reference(AttachmentReferenceSpec),
 }
+
+/// A data-less MAPI reference attachment.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AttachmentReferenceSpec {
+    pub method: AttachmentReferenceMethod,
+    pub long_pathname: String,
+    pub pathname: Option<String>,
+    pub provider_type: Option<String>,
+    pub original_permission: Option<i32>,
+    pub permission: Option<i32>,
+}
+
+/// Reference attachment methods preserved from PidTagAttachMethod.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(i32)]
+pub enum AttachmentReferenceMethod {
+    ByReference = 2,
+    ByReferenceResolve = 3,
+    ByReferenceOnly = 4,
+    ByWebReference = 7,
+}
+
+const PSETID_ATTACHMENT: [u8; 16] = [
+    0x7F, 0x7F, 0x35, 0x96, 0xE1, 0x59, 0xD0, 0x47, 0x99, 0xA7, 0x46, 0x51, 0x5C, 0x18, 0x3B, 0x54,
+];
+const ATTACHMENT_PROVIDER_TYPE: &str = "AttachmentProviderType";
+const ATTACHMENT_ORIGINAL_PERMISSION_TYPE: &str = "AttachmentOriginalPermissionType";
+const ATTACHMENT_PERMISSION_TYPE: &str = "AttachmentPermissionType";
 
 /// Immutable private-spool payload streamed into a PST data tree.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1303,7 +1332,7 @@ fn message_requires_streaming(message: &MessageSpec) -> bool {
             .any(|attachment| match &attachment.content {
                 AttachmentContent::Spooled(_) => true,
                 AttachmentContent::Embedded(message) => message_requires_streaming(message),
-                AttachmentContent::Binary(_) => false,
+                AttachmentContent::Binary(_) | AttachmentContent::Reference(_) => false,
             })
 }
 
@@ -1503,7 +1532,7 @@ fn build_message_blocks(
         let mut attachment_local_subnodes = Vec::new();
         let mut streamed_size = None;
         let (method, data_property) = match &attachment.content {
-            AttachmentContent::Binary(data) => (1, PropertyValue::Binary(data.clone())),
+            AttachmentContent::Binary(data) => (1, Some(PropertyValue::Binary(data.clone()))),
             AttachmentContent::Spooled(blob) => {
                 let value_node = node(NodeIdType::ListsTablesProperties, *next_value_node)?;
                 *next_value_node = next_value_node
@@ -1522,7 +1551,10 @@ fn build_message_blocks(
                 attachment_local_subnodes
                     .push(UnicodeLeafSubNodeTreeEntry::new(value_node, root, None));
                 streamed_size = Some(blob.byte_len);
-                (1, PropertyValue::External(PropertyType::Binary, value_node))
+                (
+                    1,
+                    Some(PropertyValue::External(PropertyType::Binary, value_node)),
+                )
             }
             AttachmentContent::Embedded(embedded) => {
                 let embedded_node = node(
@@ -1582,14 +1614,21 @@ fn build_message_blocks(
                 ));
                 (
                     5,
-                    PropertyValue::Object(embedded_node, embedded_object_size),
+                    Some(PropertyValue::Object(embedded_node, embedded_object_size)),
                 )
             }
+            AttachmentContent::Reference(reference) => (reference.method as i32, None),
         };
         let attachment_number =
             i32::try_from(index).map_err(|_| WriterError::ValueTooLarge("attachment number"))?;
-        let mut properties =
-            attachment_properties(attachment, attachment_number, method, 0, data_property);
+        let mut properties = attachment_properties_mapped(
+            attachment,
+            attachment_number,
+            method,
+            0,
+            data_property,
+            named_identities,
+        )?;
         let size = attachment_property_size_with_stream(&properties, streamed_size)?;
         set_attachment_size(&mut properties, size)?;
         attachment_rows.push(attachment_table_row(
@@ -1956,6 +1995,7 @@ fn validate_message_size_bound(message: &MessageSpec) -> Result<(), WriterError>
                 validate_message_size_bound(embedded)?;
                 estimated_message_payload(embedded)?
             }
+            AttachmentContent::Reference(_) => 0,
         };
         let metadata_bytes = attachment_metadata_bytes(attachment)?;
         if content_bytes
@@ -2001,6 +2041,34 @@ fn attachment_metadata_bytes(attachment: &AttachmentSpec) -> Result<u64, WriterE
             .checked_add(
                 u64::try_from(unicode_payload_len(value)?)
                     .map_err(|_| WriterError::ValueTooLarge("attachment properties"))?,
+            )
+            .ok_or(WriterError::ValueTooLarge("attachment properties"))?;
+    }
+    if let AttachmentContent::Reference(reference) = &attachment.content {
+        for value in [
+            Some(&reference.long_pathname),
+            reference.pathname.as_ref(),
+            reference.provider_type.as_ref(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            bytes = bytes
+                .checked_add(
+                    u64::try_from(unicode_payload_len(value)?)
+                        .map_err(|_| WriterError::ValueTooLarge("attachment properties"))?,
+                )
+                .ok_or(WriterError::ValueTooLarge("attachment properties"))?;
+        }
+        bytes = bytes
+            .checked_add(
+                u64::try_from(
+                    usize::from(reference.original_permission.is_some())
+                        + usize::from(reference.permission.is_some()),
+                )
+                .map_err(|_| WriterError::ValueTooLarge("attachment properties"))?
+                .checked_mul(4)
+                .ok_or(WriterError::ValueTooLarge("attachment properties"))?,
             )
             .ok_or(WriterError::ValueTooLarge("attachment properties"))?;
     }
@@ -3093,9 +3161,9 @@ fn validate_spec(spec: &FidelityStore) -> Result<(), WriterError> {
 }
 
 fn validate_aggregate_properties(message: &MessageSpec) -> Result<(), WriterError> {
-    fn visit<'a>(
-        message: &'a MessageSpec,
-        identities: &mut BTreeSet<(NamedPropertySet, &'a NamedPropertyName)>,
+    fn visit(
+        message: &MessageSpec,
+        identities: &mut BTreeSet<NamedIdentity>,
         named_occurrences: &mut usize,
         unsupported_occurrences: &mut usize,
     ) -> Result<(), WriterError> {
@@ -3144,7 +3212,7 @@ fn validate_aggregate_properties(message: &MessageSpec) -> Result<(), WriterErro
             message
                 .named_properties
                 .iter()
-                .map(|property| (property.set, &property.name)),
+                .map(|property| (property.set, property.name.clone())),
         );
         if message.attachments.len() > MAX_FIDELITY_COLLECTION_ITEMS {
             return Err(WriterError::ValueTooLarge("attachment count"));
@@ -3160,6 +3228,20 @@ fn validate_aggregate_properties(message: &MessageSpec) -> Result<(), WriterErro
             return Err(WriterError::ValueTooLarge("unsupported-property count"));
         }
         for attachment in &message.attachments {
+            if let AttachmentContent::Reference(reference) = &attachment.content {
+                let names = reference_named_property_names(reference).collect::<Vec<_>>();
+                *named_occurrences = named_occurrences
+                    .checked_add(names.len())
+                    .ok_or(WriterError::ValueTooLarge("named-property count"))?;
+                if *named_occurrences > MAX_FIDELITY_COLLECTION_ITEMS {
+                    return Err(WriterError::ValueTooLarge("named-property count"));
+                }
+                identities.extend(
+                    names
+                        .into_iter()
+                        .map(|name| (NamedPropertySet::Guid(PSETID_ATTACHMENT), name)),
+                );
+            }
             if let AttachmentContent::Embedded(child) = &attachment.content {
                 visit(
                     child,
@@ -3220,7 +3302,7 @@ fn validate_aggregate_properties(message: &MessageSpec) -> Result<(), WriterErro
 }
 
 fn validate_named_property_map_shape(
-    identities: &BTreeSet<(NamedPropertySet, &NamedPropertyName)>,
+    identities: &BTreeSet<NamedIdentity>,
     custom_guids: &BTreeSet<&[u8; 16]>,
     string_bytes: usize,
 ) -> Result<(), WriterError> {
@@ -3410,6 +3492,25 @@ fn validate_attachment_property_context_shape(
     let mut property_count = 8_usize;
     let filename_bytes = unicode_payload_len(&attachment.filename)?;
     let mut lengths = vec![filename_bytes, filename_bytes];
+    if let AttachmentContent::Reference(reference) = &attachment.content {
+        lengths.push(unicode_payload_len(&reference.long_pathname)?);
+        if let Some(pathname) = &reference.pathname {
+            property_count = property_count
+                .checked_add(1)
+                .ok_or(WriterError::ValueTooLarge("attachment property count"))?;
+            lengths.push(unicode_payload_len(pathname)?);
+        }
+        if let Some(provider) = &reference.provider_type {
+            property_count = property_count
+                .checked_add(1)
+                .ok_or(WriterError::ValueTooLarge("attachment property count"))?;
+            lengths.push(unicode_payload_len(provider)?);
+        }
+        property_count = property_count
+            .checked_add(usize::from(reference.original_permission.is_some()))
+            .and_then(|count| count.checked_add(usize::from(reference.permission.is_some())))
+            .ok_or(WriterError::ValueTooLarge("attachment property count"))?;
+    }
     for value in [
         &attachment.mime_type,
         &attachment.content_id,
@@ -3432,7 +3533,9 @@ fn validate_attachment_property_context_shape(
     match &attachment.content {
         AttachmentContent::Binary(data) if data.len() <= 2048 => lengths.push(data.len()),
         AttachmentContent::Embedded(_) => lengths.push(8),
-        AttachmentContent::Binary(_) | AttachmentContent::Spooled(_) => {}
+        AttachmentContent::Binary(_)
+        | AttachmentContent::Spooled(_)
+        | AttachmentContent::Reference(_) => {}
     }
     validate_property_context_shape("attachment property context", property_count, &lengths)
 }
@@ -3850,6 +3953,53 @@ fn validate_message(message: &MessageSpec, depth: usize) -> Result<(), WriterErr
             }
             if blob.byte_len > i32::MAX as u64 {
                 return Err(WriterError::ValueTooLarge("spooled attachment payload"));
+            }
+        }
+        if let AttachmentContent::Reference(reference) = &attachment.content {
+            if reference.long_pathname.is_empty() {
+                return Err(WriterError::InvalidStructure(
+                    "reference attachment long pathname must be non-empty".to_owned(),
+                ));
+            }
+            validate_unicode(
+                "reference attachment long pathname",
+                &reference.long_pathname,
+            )?;
+            if let Some(pathname) = &reference.pathname {
+                if pathname.is_empty() {
+                    return Err(WriterError::InvalidStructure(
+                        "reference attachment pathname must be non-empty when present".to_owned(),
+                    ));
+                }
+                validate_unicode("reference attachment pathname", pathname)?;
+            }
+            if let Some(provider) = &reference.provider_type {
+                if provider.is_empty() {
+                    return Err(WriterError::InvalidStructure(
+                        "reference attachment provider must be non-empty when present".to_owned(),
+                    ));
+                }
+                validate_unicode("reference attachment provider", provider)?;
+            }
+            if reference.method != AttachmentReferenceMethod::ByWebReference
+                && (reference.provider_type.is_some()
+                    || reference.original_permission.is_some()
+                    || reference.permission.is_some())
+            {
+                return Err(WriterError::InvalidStructure(
+                    "attachment provider and permission properties require a web reference"
+                        .to_owned(),
+                ));
+            }
+            if [reference.original_permission, reference.permission]
+                .into_iter()
+                .flatten()
+                .any(|value| !(0..=2).contains(&value))
+            {
+                return Err(WriterError::InvalidStructure(
+                    "reference attachment permission must be in the documented 0..=2 range"
+                        .to_owned(),
+                ));
             }
         }
         if let AttachmentContent::Embedded(child) = &attachment.content {
@@ -5116,6 +5266,99 @@ fn raw_value_matches(
     }
 }
 
+fn reference_named_property_id(
+    named_identities: &[NamedIdentity],
+    name: &str,
+) -> Result<u16, WriterError> {
+    let identity = (
+        NamedPropertySet::Guid(PSETID_ATTACHMENT),
+        NamedPropertyName::String(name.to_owned()),
+    );
+    let index = named_identities.binary_search(&identity).map_err(|_| {
+        WriterError::InvalidStructure(
+            "completed store reference named property is not mapped".to_owned(),
+        )
+    })?;
+    0x8000_u16
+        .checked_add(u16::try_from(index).map_err(|_| {
+            WriterError::InvalidStructure(
+                "completed store reference named property index overflow".to_owned(),
+            )
+        })?)
+        .ok_or_else(|| {
+            WriterError::InvalidStructure(
+                "completed store reference named property ID overflow".to_owned(),
+            )
+        })
+}
+
+fn validate_reference_named_values(
+    properties: &crate::messaging::attachment::AttachmentProperties,
+    reference: &AttachmentReferenceSpec,
+    named_identities: &[NamedIdentity],
+) -> Result<(), WriterError> {
+    let expected = [
+        (
+            ATTACHMENT_PROVIDER_TYPE,
+            reference
+                .provider_type
+                .as_ref()
+                .map(|value| RawPropertyValue::Unicode(value.clone())),
+        ),
+        (
+            ATTACHMENT_ORIGINAL_PERMISSION_TYPE,
+            reference
+                .original_permission
+                .map(RawPropertyValue::Integer32),
+        ),
+        (
+            ATTACHMENT_PERMISSION_TYPE,
+            reference.permission.map(RawPropertyValue::Integer32),
+        ),
+    ];
+    for (name, expected) in expected {
+        let identity = (
+            NamedPropertySet::Guid(PSETID_ATTACHMENT),
+            NamedPropertyName::String(name.to_owned()),
+        );
+        match expected {
+            Some(expected) => {
+                let id = reference_named_property_id(named_identities, name)?;
+                if !properties
+                    .get(id)
+                    .is_some_and(|actual| raw_value_matches(&expected, actual))
+                {
+                    return Err(WriterError::InvalidStructure(
+                        "completed store reference named property value mismatch".to_owned(),
+                    ));
+                }
+            }
+            None => {
+                if let Ok(index) = named_identities.binary_search(&identity) {
+                    let id = 0x8000_u16
+                        .checked_add(u16::try_from(index).map_err(|_| {
+                            WriterError::InvalidStructure(
+                                "completed store reference named property index overflow"
+                                    .to_owned(),
+                            )
+                        })?)
+                        .ok_or_else(|| {
+                            WriterError::InvalidStructure(
+                                "completed store reference named property ID overflow".to_owned(),
+                            )
+                        })?;
+                    if properties.get(id).is_some() {
+                        return Err(WriterError::InvalidStructure(
+                            "completed store unexpected reference named property".to_owned(),
+                        ));
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 fn validate_attachment_fidelity(
     path: &Path,
     spec: &StoreInput<'_>,
@@ -5158,7 +5401,7 @@ fn validate_attachment_fidelity(
                 .ok_or(WriterError::ValueTooLarge("attachment node"))?,
         )?;
         let attachment = match &expected.content {
-            AttachmentContent::Spooled(_) => {
+            AttachmentContent::Spooled(_) | AttachmentContent::Reference(_) => {
                 UnicodeAttachment::read_metadata(top.clone(), attachment_node)
             }
             AttachmentContent::Embedded(message) => {
@@ -5325,6 +5568,32 @@ fn validate_attachment_fidelity(
                         index_u32,
                     ),
                 )?;
+            }
+            (AttachmentContent::Reference(reference), None) => {
+                let expected_properties = attachment_properties_mapped(
+                    expected,
+                    expected_number,
+                    reference.method as i32,
+                    0,
+                    None,
+                    named_identities,
+                )?;
+                let expected_size = attachment_property_size(&expected_properties)?;
+                if pc_method != reference.method as i32
+                    || pc_size != expected_size
+                    || properties.get(0x3701).is_some()
+                    || !matches!(
+                        properties.get(0x370D),
+                        Some(crate::ltp::prop_context::PropertyValue::Unicode(value))
+                            if value.to_string() == reference.long_pathname
+                    )
+                    || !unicode_matches(0x3708, &reference.pathname)
+                {
+                    return Err(invalid(
+                        "completed store reference attachment relationship mismatch",
+                    ));
+                }
+                validate_reference_named_values(properties, reference, named_identities)?;
             }
             _ => return Err(invalid("completed store attachment content mismatch")),
         }
@@ -5607,7 +5876,9 @@ fn validate_embedded_message(
             AttachmentContent::Embedded(message) => {
                 Some(validation_property_ids(message, named_identities)?)
             }
-            AttachmentContent::Binary(_) | AttachmentContent::Spooled(_) => None,
+            AttachmentContent::Binary(_)
+            | AttachmentContent::Spooled(_)
+            | AttachmentContent::Reference(_) => None,
         };
         let streamed_ids = match &expected_attachment.content {
             AttachmentContent::Embedded(message) => message
@@ -5615,7 +5886,9 @@ fn validate_embedded_message(
                 .iter()
                 .map(|property| property.id)
                 .collect::<Vec<_>>(),
-            AttachmentContent::Binary(_) | AttachmentContent::Spooled(_) => Vec::new(),
+            AttachmentContent::Binary(_)
+            | AttachmentContent::Spooled(_)
+            | AttachmentContent::Reference(_) => Vec::new(),
         };
         let attachment = actual
             .clone()
@@ -5775,6 +6048,32 @@ fn validate_embedded_message(
                     embedded_message_record_key(record_key, index_u32),
                 )?;
             }
+            (AttachmentContent::Reference(reference), None) => {
+                let expected_properties = attachment_properties_mapped(
+                    expected_attachment,
+                    expected_number,
+                    reference.method as i32,
+                    0,
+                    None,
+                    named_identities,
+                )?;
+                let expected_size = attachment_property_size(&expected_properties)?;
+                if pc_method != reference.method as i32
+                    || pc_size != expected_size
+                    || properties.get(0x3701).is_some()
+                    || !matches!(
+                        properties.get(0x370D),
+                        Some(ReadValue::Unicode(value))
+                            if value.to_string() == reference.long_pathname
+                    )
+                    || !unicode_matches(0x3708, &reference.pathname)
+                {
+                    return Err(invalid(
+                        "completed store nested reference attachment relationship mismatch",
+                    ));
+                }
+                validate_reference_named_values(properties, reference, named_identities)?;
+            }
             _ => {
                 return Err(invalid(
                     "completed store nested attachment content mismatch",
@@ -5840,28 +6139,46 @@ fn folder_properties_with_unread(
 type NamedIdentity = (NamedPropertySet, NamedPropertyName);
 
 fn collect_named_identities(message: &MessageSpec) -> Vec<NamedIdentity> {
-    fn collect<'a>(
-        message: &'a MessageSpec,
-        identities: &mut BTreeSet<(NamedPropertySet, &'a NamedPropertyName)>,
-    ) {
+    fn collect(message: &MessageSpec, identities: &mut BTreeSet<NamedIdentity>) {
         identities.extend(
             message
                 .named_properties
                 .iter()
-                .map(|property| (property.set, &property.name)),
+                .map(|property| (property.set, property.name.clone())),
         );
         for attachment in &message.attachments {
-            if let AttachmentContent::Embedded(embedded) = &attachment.content {
-                collect(embedded, identities);
+            match &attachment.content {
+                AttachmentContent::Embedded(embedded) => collect(embedded, identities),
+                AttachmentContent::Reference(reference) => {
+                    for name in reference_named_property_names(reference) {
+                        identities.insert((NamedPropertySet::Guid(PSETID_ATTACHMENT), name));
+                    }
+                }
+                AttachmentContent::Binary(_) | AttachmentContent::Spooled(_) => {}
             }
         }
     }
     let mut identities = BTreeSet::new();
     collect(message, &mut identities);
-    identities
-        .into_iter()
-        .map(|(set, name)| (set, name.clone()))
-        .collect()
+    identities.into_iter().collect()
+}
+
+fn reference_named_property_names(
+    reference: &AttachmentReferenceSpec,
+) -> impl Iterator<Item = NamedPropertyName> {
+    [
+        reference
+            .provider_type
+            .as_ref()
+            .map(|_| ATTACHMENT_PROVIDER_TYPE),
+        reference
+            .original_permission
+            .map(|_| ATTACHMENT_ORIGINAL_PERMISSION_TYPE),
+        reference.permission.map(|_| ATTACHMENT_PERMISSION_TYPE),
+    ]
+    .into_iter()
+    .flatten()
+    .map(|name| NamedPropertyName::String(name.to_owned()))
 }
 
 fn collect_named_identities_many_refs(messages: &[&MessageSpec]) -> Vec<NamedIdentity> {
@@ -6465,10 +6782,81 @@ fn attachment_properties(
     size: i32,
     data: PropertyValue,
 ) -> Vec<(u16, PropertyValue)> {
+    let mut properties = attachment_base_properties(attachment, attachment_number, method, size);
+    properties.push((0x3701, data));
+    properties
+}
+
+fn attachment_properties_mapped(
+    attachment: &AttachmentSpec,
+    attachment_number: i32,
+    method: i32,
+    size: i32,
+    data: Option<PropertyValue>,
+    named_identities: &[NamedIdentity],
+) -> Result<Vec<(u16, PropertyValue)>, WriterError> {
+    let mut properties = attachment_base_properties(attachment, attachment_number, method, size);
+    if let Some(data) = data {
+        properties.push((0x3701, data));
+    }
+    if let AttachmentContent::Reference(reference) = &attachment.content {
+        properties.push((
+            0x370D,
+            PropertyValue::Unicode(reference.long_pathname.clone()),
+        ));
+        if let Some(pathname) = &reference.pathname {
+            properties.push((0x3708, PropertyValue::Unicode(pathname.clone())));
+        }
+        for (name, value) in [
+            (
+                ATTACHMENT_PROVIDER_TYPE,
+                reference
+                    .provider_type
+                    .as_ref()
+                    .map(|value| PropertyValue::Unicode(value.clone())),
+            ),
+            (
+                ATTACHMENT_ORIGINAL_PERMISSION_TYPE,
+                reference.original_permission.map(PropertyValue::Integer32),
+            ),
+            (
+                ATTACHMENT_PERMISSION_TYPE,
+                reference.permission.map(PropertyValue::Integer32),
+            ),
+        ] {
+            let Some(value) = value else {
+                continue;
+            };
+            let identity = (
+                NamedPropertySet::Guid(PSETID_ATTACHMENT),
+                NamedPropertyName::String(name.to_owned()),
+            );
+            let index = named_identities.binary_search(&identity).map_err(|_| {
+                WriterError::InvalidStructure(
+                    "reference attachment named property is not mapped".to_owned(),
+                )
+            })?;
+            let id = 0x8000_u16
+                .checked_add(
+                    u16::try_from(index)
+                        .map_err(|_| WriterError::ValueTooLarge("named-property count"))?,
+                )
+                .ok_or(WriterError::ValueTooLarge("named-property identifier"))?;
+            properties.push((id, value));
+        }
+    }
+    Ok(properties)
+}
+
+fn attachment_base_properties(
+    attachment: &AttachmentSpec,
+    attachment_number: i32,
+    method: i32,
+    size: i32,
+) -> Vec<(u16, PropertyValue)> {
     let mut properties = vec![
         (0x0E20, PropertyValue::Integer32(size)),
         (0x0E21, PropertyValue::Integer32(attachment_number)),
-        (0x3701, data),
         (0x3704, PropertyValue::Unicode(attachment.filename.clone())),
         (0x3705, PropertyValue::Integer32(method)),
         (0x3707, PropertyValue::Unicode(attachment.filename.clone())),
@@ -10216,7 +10604,9 @@ mod tests {
             .map_err(|error| format!("binary attachment read failed: {error}"))?;
         let expected_binary = match &spec.message.attachments[0].content {
             AttachmentContent::Binary(value) => value,
-            AttachmentContent::Embedded(_) | AttachmentContent::Spooled(_) => {
+            AttachmentContent::Embedded(_)
+            | AttachmentContent::Spooled(_)
+            | AttachmentContent::Reference(_) => {
                 return Err("expected binary attachment".into());
             }
         };
@@ -10780,7 +11170,9 @@ mod tests {
                 message.attachments.clear();
                 message
             }
-            AttachmentContent::Binary(_) | AttachmentContent::Spooled(_) => {
+            AttachmentContent::Binary(_)
+            | AttachmentContent::Spooled(_)
+            | AttachmentContent::Reference(_) => {
                 return Err("expected embedded fixture".into());
             }
         };
@@ -11079,14 +11471,18 @@ mod tests {
                     value: RawPropertyValue::Boolean(true),
                 });
             }
-            AttachmentContent::Binary(_) | AttachmentContent::Spooled(_) => {
+            AttachmentContent::Binary(_)
+            | AttachmentContent::Spooled(_)
+            | AttachmentContent::Reference(_) => {
                 return Err("expected embedded fixture".into());
             }
         }
         let identities = collect_named_identities(&spec.message);
         let embedded = match &spec.message.attachments[1].content {
             AttachmentContent::Embedded(message) => message,
-            AttachmentContent::Binary(_) | AttachmentContent::Spooled(_) => {
+            AttachmentContent::Binary(_)
+            | AttachmentContent::Spooled(_)
+            | AttachmentContent::Reference(_) => {
                 return Err("expected embedded fixture".into());
             }
         };
@@ -11414,6 +11810,93 @@ mod tests {
         }
         let directory = tempfile::tempdir()?;
         create_fidelity_store(directory.path().join("optional-values.pst"), &spec)?;
+        Ok(())
+    }
+
+    #[test]
+    fn reference_attachment_methods_and_web_metadata_round_trip_without_content()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut spec = FidelityStore::default();
+        let reference = |method, filename: &str, long_pathname: &str| AttachmentSpec {
+            filename: filename.to_owned(),
+            mime_type: None,
+            content_id: None,
+            content_location: None,
+            rendering_position: None,
+            flags: 0,
+            raw_properties: Vec::new(),
+            content: AttachmentContent::Reference(AttachmentReferenceSpec {
+                method,
+                long_pathname: long_pathname.to_owned(),
+                pathname: Some(filename.to_owned()),
+                provider_type: None,
+                original_permission: None,
+                permission: None,
+            }),
+        };
+        spec.message.attachments = vec![
+            reference(
+                AttachmentReferenceMethod::ByReference,
+                "shared-reference.txt",
+                r"\\unreachable.invalid\recovery\shared-reference.txt",
+            ),
+            reference(
+                AttachmentReferenceMethod::ByReferenceResolve,
+                "resolved-reference.txt",
+                r"\\unreachable.invalid\recovery\resolved-reference.txt",
+            ),
+            reference(
+                AttachmentReferenceMethod::ByReferenceOnly,
+                "reference-only.txt",
+                r"Z:\unavailable\reference-only.txt",
+            ),
+            AttachmentSpec {
+                filename: "web-reference.docx".to_owned(),
+                mime_type: Some(
+                    "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+                        .to_owned(),
+                ),
+                content_id: None,
+                content_location: None,
+                rendering_position: None,
+                flags: 0,
+                raw_properties: Vec::new(),
+                content: AttachmentContent::Reference(AttachmentReferenceSpec {
+                    method: AttachmentReferenceMethod::ByWebReference,
+                    long_pathname: "https://example.invalid/recovery/web-reference.docx".to_owned(),
+                    pathname: None,
+                    provider_type: Some("RecoveryProvider".to_owned()),
+                    original_permission: Some(1),
+                    permission: Some(2),
+                }),
+            },
+        ];
+        let directory = tempfile::tempdir()?;
+        create_fidelity_store(directory.path().join("reference-attachments.pst"), &spec)?;
+
+        let mut invalid = spec.clone();
+        let AttachmentContent::Reference(reference) = &mut invalid.message.attachments[0].content
+        else {
+            return Err("expected reference attachment".into());
+        };
+        reference.long_pathname.clear();
+        assert!(matches!(
+            validate_spec(&invalid),
+            Err(WriterError::InvalidStructure(detail))
+                if detail.contains("long pathname")
+        ));
+
+        let mut invalid = spec;
+        let AttachmentContent::Reference(reference) = &mut invalid.message.attachments[3].content
+        else {
+            return Err("expected web reference attachment".into());
+        };
+        reference.permission = Some(3);
+        assert!(matches!(
+            validate_spec(&invalid),
+            Err(WriterError::InvalidStructure(detail))
+                if detail.contains("permission")
+        ));
         Ok(())
     }
 }

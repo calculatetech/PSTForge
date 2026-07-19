@@ -42,6 +42,7 @@ pub struct CanonicalAttachment {
     pub declared_size: Option<u64>,
     pub data: Option<SpooledBlob>,
     pub data_complete: bool,
+    pub reference_complete: bool,
     pub properties: Vec<CanonicalProperty>,
     pub embedded: Option<Box<CanonicalMail>>,
 }
@@ -106,6 +107,7 @@ pub enum CanonicalMessagePlacement {
 enum AttachmentTerminal {
     Payload,
     Missing,
+    Reference,
 }
 
 #[derive(serde::Deserialize)]
@@ -551,6 +553,7 @@ fn build_mail_inner(
                             declared_size: optional_u64(candidate, event, "data_size")?,
                             data: None,
                             data_complete: false,
+                            reference_complete: false,
                             properties: Vec::new(),
                             embedded: None,
                         },
@@ -602,13 +605,15 @@ fn build_mail_inner(
                 attachment.data = event.blob.clone();
                 attachment.data_complete = event.kind == "attachment_data";
             }
-            "attachment_missing" => {
+            "attachment_missing" | "attachment_reference" => {
                 let index = required_u32(candidate, event, "index")?;
                 validate_event_message(candidate, event)?;
-                if attachment_terminals
-                    .insert(index, AttachmentTerminal::Missing)
-                    .is_some()
-                {
+                let terminal = if event.kind == "attachment_reference" {
+                    AttachmentTerminal::Reference
+                } else {
+                    AttachmentTerminal::Missing
+                };
+                if attachment_terminals.insert(index, terminal).is_some() {
                     return invalid(candidate, "duplicate attachment terminal state");
                 }
                 let declared_size = optional_u64(candidate, event, "declared_size")?;
@@ -622,6 +627,7 @@ fn build_mail_inner(
                     );
                 }
                 attachment.data_complete = false;
+                attachment.reference_complete = terminal == AttachmentTerminal::Reference;
             }
             "property" => {
                 let property = canonical_property(candidate, event)?;
@@ -685,8 +691,26 @@ fn build_mail_inner(
             .is_some_and(|indices| indices.contains(index));
         let terminal = attachment_terminals.get(index).copied();
         let embedded_type = attachment.attachment_type == Some(i32::from(b'i'));
-        if embedded_type && terminal == Some(AttachmentTerminal::Payload) {
-            return invalid(candidate, "embedded attachment has binary payload state");
+        let reference_type = attachment.attachment_type == Some(i32::from(b'r'));
+        if embedded_type
+            && matches!(
+                terminal,
+                Some(AttachmentTerminal::Payload | AttachmentTerminal::Reference)
+            )
+        {
+            return invalid(
+                candidate,
+                "embedded attachment has non-embedded terminal state",
+            );
+        }
+        if terminal == Some(AttachmentTerminal::Reference) && !reference_type {
+            return invalid(
+                candidate,
+                "reference attachment terminal has non-reference metadata",
+            );
+        }
+        if terminal == Some(AttachmentTerminal::Payload) && reference_type {
+            return invalid(candidate, "reference attachment has binary payload state");
         }
         if embedded_type
             && child.is_none()

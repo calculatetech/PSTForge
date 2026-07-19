@@ -6,10 +6,10 @@ use pstforge_job::{
     DurableCatalogSink, JobError, ReconstructedField, ReconstructionCounts, SpooledBlob,
 };
 use pstforge_pst::writer::{
-    AttachmentContent, AttachmentSpec, FileBlobSpec, MailFolderLocation, MailFolderRole,
-    MailFolderSpec, MailStoreSpec, MessageSpec, NamedProperty, NamedPropertyName, NamedPropertySet,
-    NativeBody, RawProperty, RawPropertyValue, RecipientKind, RecipientSpec, SpooledPropertySpec,
-    UnsupportedProperty,
+    AttachmentContent, AttachmentReferenceMethod, AttachmentReferenceSpec, AttachmentSpec,
+    FileBlobSpec, MailFolderLocation, MailFolderRole, MailFolderSpec, MailStoreSpec, MessageSpec,
+    NamedProperty, NamedPropertyName, NamedPropertySet, NativeBody, RawProperty, RawPropertyValue,
+    RecipientKind, RecipientSpec, SpooledPropertySpec, UnsupportedProperty,
 };
 use sha2::{Digest, Sha256};
 use thiserror::Error;
@@ -22,6 +22,9 @@ use crate::{
 
 const PSETID_ADDRESS: [u8; 16] = [
     0x04, 0x20, 0x06, 0x00, 0x00, 0x00, 0x00, 0x00, 0xC0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x46,
+];
+const PSETID_ATTACHMENT: [u8; 16] = [
+    0x7F, 0x7F, 0x35, 0x96, 0xE1, 0x59, 0xD0, 0x47, 0x99, 0xA7, 0x46, 0x51, 0x5C, 0x18, 0x3B, 0x54,
 ];
 const MAX_DISTRIBUTION_LIST_PROPERTY_BYTES: u64 = 15_000;
 
@@ -1000,6 +1003,12 @@ fn translate_attachment(
     let mut rendering_position = None;
     let mut flags = 0;
     let mut flags_observed = false;
+    let mut attachment_method = None;
+    let mut long_pathname = None;
+    let mut pathname = None;
+    let mut provider_type = None;
+    let mut original_permission = None;
+    let mut permission = None;
     let mut raw_properties = Vec::new();
     let mut omitted_properties = 0_u64;
     let mut mapped_property_ids = BTreeSet::new();
@@ -1021,7 +1030,59 @@ fn translate_attachment(
             omitted_properties = omitted_properties.saturating_add(1);
             continue;
         }
+        if let Some(name) = attachment_named_property_name(property) {
+            match name {
+                "AttachmentProviderType" => {
+                    provider_type =
+                        omit_malformed(read_unicode(job, mail, property), &mut omitted_properties)?
+                            .flatten()
+                            .filter(|value| !value.is_empty());
+                }
+                "AttachmentOriginalPermissionType" => {
+                    original_permission =
+                        omit_malformed(read_i32(job, mail, property), &mut omitted_properties)?
+                            .filter(|value| {
+                                let valid = (0..=2).contains(value);
+                                if !valid {
+                                    omitted_properties = omitted_properties.saturating_add(1);
+                                }
+                                valid
+                            });
+                }
+                "AttachmentPermissionType" => {
+                    permission =
+                        omit_malformed(read_i32(job, mail, property), &mut omitted_properties)?
+                            .filter(|value| {
+                                let valid = (0..=2).contains(value);
+                                if !valid {
+                                    omitted_properties = omitted_properties.saturating_add(1);
+                                }
+                                valid
+                            });
+                }
+                _ => {}
+            }
+            continue;
+        }
         match property_id {
+            0x3705 => {
+                if attachment.embedded.is_none() {
+                    attachment_method =
+                        omit_malformed(read_i32(job, mail, property), &mut omitted_properties)?;
+                }
+            }
+            0x370D => {
+                long_pathname =
+                    omit_malformed(read_unicode(job, mail, property), &mut omitted_properties)?
+                        .flatten()
+                        .filter(|value| !value.is_empty());
+            }
+            0x3708 => {
+                pathname =
+                    omit_malformed(read_unicode(job, mail, property), &mut omitted_properties)?
+                        .flatten()
+                        .filter(|value| !value.is_empty());
+            }
             0x370E => {
                 mime_type =
                     omit_malformed(read_unicode(job, mail, property), &mut omitted_properties)?
@@ -1108,7 +1169,51 @@ fn translate_attachment(
         child_partial,
         child_omitted_properties,
         child_omitted_attachments,
-    ) = if let Some(embedded) = &attachment.embedded {
+    ) = if let Some(method) = attachment_method
+        .and_then(reference_attachment_method)
+        .filter(|_| attachment.reference_complete)
+    {
+        let Some(long_pathname) = long_pathname else {
+            return Ok(Some(TranslatedAttachment {
+                attachment: None,
+                item_keys: Vec::new(),
+                unsupported_item_keys: Vec::new(),
+                partial: true,
+                omitted_properties,
+                omitted_attachments: 1,
+                reconstructions,
+            }));
+        };
+        if method != AttachmentReferenceMethod::ByWebReference {
+            omitted_properties = omitted_properties.saturating_add(
+                u64::from(provider_type.take().is_some())
+                    + u64::from(original_permission.take().is_some())
+                    + u64::from(permission.take().is_some()),
+            );
+        }
+        if attachment.data.is_some()
+            || attachment.properties.iter().any(|property| {
+                property.record_set_index == 0 && property.property_id == Some(0x3701)
+            })
+        {
+            omitted_properties = omitted_properties.saturating_add(1);
+        }
+        (
+            AttachmentContent::Reference(AttachmentReferenceSpec {
+                method,
+                long_pathname,
+                pathname,
+                provider_type,
+                original_permission,
+                permission,
+            }),
+            Vec::new(),
+            Vec::new(),
+            false,
+            0,
+            0,
+        )
+    } else if let Some(embedded) = &attachment.embedded {
         let message_class = embedded.message_class.as_deref().unwrap_or("IPM.Note");
         let calendar_exception = calendar_exception_message_class(message_class);
         if !supported_message_class(message_class)
@@ -1157,16 +1262,19 @@ fn translate_attachment(
         .filename
         .clone()
         .filter(|value| !value.is_empty());
-    let detected_mime =
-        if attachment.embedded.is_none() && (source_mime.is_none() || source_filename.is_none()) {
-            if let Some(data) = &attachment.data {
-                infer_attachment_mime(job, mail, data, attachment.filename.as_deref())?
-            } else {
-                None
-            }
+    let reference_attachment = matches!(content, AttachmentContent::Reference(_));
+    let detected_mime = if !reference_attachment
+        && attachment.embedded.is_none()
+        && (source_mime.is_none() || source_filename.is_none())
+    {
+        if let Some(data) = &attachment.data {
+            infer_attachment_mime(job, mail, data, attachment.filename.as_deref())?
         } else {
             None
-        };
+        }
+    } else {
+        None
+    };
     let mime_type = if let Some(source) = source_mime {
         Some(source)
     } else if attachment.embedded.is_some() {
@@ -1182,6 +1290,8 @@ fn translate_attachment(
         reconstructions.record_generated(ReconstructedField::AttachmentFilename);
         if attachment.embedded.is_some() {
             format!("Embedded message {}.msg", attachment.index)
+        } else if reference_attachment {
+            format!("Referenced attachment {}", attachment.index)
         } else {
             let extension = detected_mime
                 .and_then(extension_for_mime)
@@ -1209,7 +1319,9 @@ fn translate_attachment(
         }),
         item_keys,
         unsupported_item_keys,
-        partial: (attachment.embedded.is_none() && !attachment.data_complete)
+        partial: (!reference_attachment
+            && attachment.embedded.is_none()
+            && !attachment.data_complete)
             || omitted_properties != 0
             || child_partial
             || child_omitted_properties != 0
@@ -2153,7 +2265,40 @@ fn expected_recipient_property_value(
 }
 
 fn attachment_property_is_mapped(id: u32) -> bool {
-    matches!(id, 0x0E20 | 0x0E21 | 0x3701 | 0x3704 | 0x3705 | 0x3707)
+    matches!(
+        id,
+        0x0E20 | 0x0E21 | 0x3701 | 0x3704 | 0x3705 | 0x3707 | 0x3708 | 0x370D
+    )
+}
+
+fn reference_attachment_method(value: i32) -> Option<AttachmentReferenceMethod> {
+    match value {
+        2 => Some(AttachmentReferenceMethod::ByReference),
+        3 => Some(AttachmentReferenceMethod::ByReferenceResolve),
+        4 => Some(AttachmentReferenceMethod::ByReferenceOnly),
+        7 => Some(AttachmentReferenceMethod::ByWebReference),
+        _ => None,
+    }
+}
+
+fn attachment_named_property_name(property: &CanonicalProperty) -> Option<&str> {
+    let identity = property.named_property.as_ref()?;
+    if identity.guid != PSETID_ATTACHMENT {
+        return None;
+    }
+    match &identity.name {
+        libpff_sys::NamedPropertyName::String(name)
+            if matches!(
+                name.as_str(),
+                "AttachmentProviderType"
+                    | "AttachmentOriginalPermissionType"
+                    | "AttachmentPermissionType"
+            ) =>
+        {
+            Some(name)
+        }
+        _ => None,
+    }
 }
 
 fn attachment_property_is_preservable(id: u32) -> bool {
@@ -2269,11 +2414,12 @@ mod tests {
         CanonicalAttachment, CanonicalFolder, CanonicalFolderLocation, CanonicalFolderRole,
         CanonicalMail, CanonicalMessagePlacement, CanonicalProperty, CanonicalRecipient,
         ContentCompleteness, ItemKey, RecoveryProvenance,
-        attachment_mime::flat_signature as mime_from_signature,
+        attachment_mime::flat_signature as mime_from_signature, load_canonical_mail,
     };
     use pstforge_pst::writer::{
-        AttachmentContent, MailFolderRole, NamedProperty, NamedPropertyName, NamedPropertySet,
-        NativeBody, RawPropertyValue, validate_mail_store_input,
+        AttachmentContent, AttachmentReferenceMethod, MailFolderRole, NamedProperty,
+        NamedPropertyName, NamedPropertySet, NativeBody, RawPropertyValue,
+        validate_mail_store_input,
     };
 
     #[test]
@@ -2368,6 +2514,7 @@ mod tests {
                     pack_offset: Some(0),
                 }),
                 data_complete,
+                reference_complete: false,
                 properties: Vec::new(),
                 embedded: None,
             }
@@ -2757,6 +2904,144 @@ mod tests {
     }
 
     #[test]
+    fn missing_reference_path_omits_only_that_attachment() -> Result<(), Box<dyn std::error::Error>>
+    {
+        fn send(
+            sink: &mut DurableCatalogSink,
+            event: CatalogEvent<'_>,
+        ) -> Result<(), std::io::Error> {
+            CatalogSink::event(sink, event).map_err(std::io::Error::other)
+        }
+
+        fn property(
+            sink: &mut DurableCatalogSink,
+            message_id: u32,
+            attachment_index: u32,
+            entry_index: u32,
+            property_id: u32,
+            value_type: u32,
+            bytes: &[u8],
+        ) -> Result<(), Box<dyn std::error::Error>> {
+            let descriptor = PropertyDescriptor {
+                owner: PropertyOwner::Attachment {
+                    message_id,
+                    index: attachment_index,
+                },
+                record_set_index: 0,
+                entry_index,
+                entry_type: Some(property_id),
+                value_type: Some(value_type),
+                data_size: u64::try_from(bytes.len())?,
+            };
+            send(sink, CatalogEvent::PropertyStart(descriptor))?;
+            send(sink, CatalogEvent::PropertyData { descriptor, bytes })?;
+            send(sink, CatalogEvent::PropertyEnd(descriptor))?;
+            Ok(())
+        }
+
+        let directory = tempdir()?;
+        let mut job = DurableCatalogSink::create(&directory.path().join("job"))?;
+        let unit = RecoveryUnit::Recovered { index: 0 };
+        send(&mut job, CatalogEvent::UnitStart(unit))?;
+        send(
+            &mut job,
+            CatalogEvent::MessageStart {
+                id: 11,
+                provenance: CatalogProvenance::Recovered,
+                recovery_index: Some(0),
+                folder_id: None,
+                parent_message_id: None,
+                parent_attachment_index: None,
+                embedded_path: Vec::new(),
+                associated: false,
+                item_type: None,
+                message_class: Some("IPM.Note".to_owned()),
+                subject: Some("reference containment".to_owned()),
+                sender_name: None,
+                sender_email: None,
+                submit_filetime: Some(1),
+                delivery_filetime: Some(1),
+                supported: true,
+            },
+        )?;
+        for (index, filename) in [
+            (0, "missing.txt"),
+            (1, "preserved.txt"),
+            (2, "incomplete.txt"),
+        ] {
+            send(
+                &mut job,
+                CatalogEvent::AttachmentStart {
+                    message_id: 11,
+                    index,
+                    attachment_type: Some(i32::from(if index == 2 { b'd' } else { b'r' })),
+                    data_size: None,
+                    filename: Some(filename.to_owned()),
+                },
+            )?;
+            property(&mut job, 11, index, 0, 0x3705, 0x0003, &2_i32.to_le_bytes())?;
+            if index != 0 {
+                let pathname = format!(r"\\unreachable.invalid\recovery\{filename}")
+                    .encode_utf16()
+                    .chain(std::iter::once(0))
+                    .flat_map(u16::to_le_bytes)
+                    .collect::<Vec<_>>();
+                property(&mut job, 11, index, 1, 0x370D, 0x001F, &pathname)?;
+            }
+            if index == 1 {
+                property(&mut job, 11, index, 2, 0x3701, 0x0102, b"")?;
+            }
+            send(
+                &mut job,
+                if index == 2 {
+                    CatalogEvent::AttachmentAbort {
+                        message_id: 11,
+                        index,
+                    }
+                } else {
+                    CatalogEvent::AttachmentEnd {
+                        message_id: 11,
+                        index,
+                    }
+                },
+            )?;
+        }
+        send(
+            &mut job,
+            CatalogEvent::MessageEnd {
+                id: 11,
+                complete: true,
+            },
+        )?;
+        send(&mut job, CatalogEvent::UnitEnd(unit))?;
+
+        let mail = load_canonical_mail(&job)?;
+        assert!(mail[0].attachments[0].reference_complete);
+        assert!(mail[0].attachments[1].reference_complete);
+        assert!(!mail[0].attachments[2].reference_complete);
+        let input = build_part_writer_input(
+            &job,
+            &mail.iter().collect::<Vec<_>>(),
+            &"0".repeat(64),
+            "balanced",
+            4_294_967_296,
+            1,
+        )?;
+        assert!(input.partial);
+        assert_eq!(input.omitted_attachments, 2);
+        assert_eq!(input.omitted_properties, 1);
+        assert_eq!(input.store.folders[0].messages[0].attachments.len(), 1);
+        assert!(matches!(
+            &input.store.folders[0].messages[0].attachments[0].content,
+            AttachmentContent::Reference(reference)
+                if reference.method == AttachmentReferenceMethod::ByReference
+                    && reference.long_pathname
+                        == r"\\unreachable.invalid\recovery\preserved.txt"
+        ));
+        Ok(())
+    }
+
+    #[test]
     fn generated_attachment_extensions_require_recognized_mime() {
         for (mime, expected) in [
             ("application/pdf", "pdf"),
@@ -3005,6 +3290,7 @@ mod tests {
                     declared_size: Some(u64::try_from(payload.len())?),
                     data: Some(blob),
                     data_complete: true,
+                    reference_complete: false,
                     properties: Vec::new(),
                     embedded: None,
                 },
@@ -3015,6 +3301,7 @@ mod tests {
                     declared_size: Some(u64::try_from(truncated_jpeg.len())?),
                     data: Some(truncated_blob),
                     data_complete: true,
+                    reference_complete: false,
                     properties: Vec::new(),
                     embedded: None,
                 },
@@ -3025,6 +3312,7 @@ mod tests {
                     declared_size: Some(u64::try_from(truncated_jpeg.len())?),
                     data: Some(docx_payload_blob),
                     data_complete: true,
+                    reference_complete: false,
                     properties: vec![CanonicalProperty {
                         owner: "attachment".to_owned(),
                         owner_index: Some(2),
@@ -3517,6 +3805,7 @@ mod tests {
                     pack_offset: None,
                 }),
                 data_complete: true,
+                reference_complete: false,
                 properties: Vec::new(),
                 embedded: None,
             }],
@@ -3840,6 +4129,7 @@ mod tests {
             declared_size: None,
             data: None,
             data_complete: false,
+            reference_complete: false,
             properties: [0x0E20, 0x3701, 0x3704, 0x3705, 0x3707]
                 .into_iter()
                 .enumerate()
@@ -3981,6 +4271,7 @@ mod tests {
             declared_size: None,
             data: None,
             data_complete: true,
+            reference_complete: false,
             properties: Vec::new(),
             embedded: Some(Box::new(nested_child)),
         });
@@ -4047,6 +4338,7 @@ mod tests {
                         declared_size: None,
                         data: None,
                         data_complete: true,
+                        reference_complete: false,
                         properties: Vec::new(),
                         embedded: Some(Box::new(child)),
                     });

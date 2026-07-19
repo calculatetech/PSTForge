@@ -122,6 +122,9 @@ pub enum AttachmentMethod {
     /// contains a fully qualified path identifying the attachment To recipients with access to a
     /// common file server.
     ByReference = 0x00000002,
+    /// Legacy `ATTACH_BY_REF_RESOLVE`: a data-less reference whose long
+    /// pathname is resolved by the consuming MAPI implementation.
+    ByReferenceResolve = 0x00000003,
     /// `afByReferenceOnly`: The `PidTagAttachLongPathname` property contains a fully qualified
     /// path identifying the attachment.
     ByReferenceOnly = 0x00000004,
@@ -145,6 +148,7 @@ impl TryFrom<i32> for AttachmentMethod {
             0x00000000 => Ok(Self::None),
             0x00000001 => Ok(Self::ByValue),
             0x00000002 => Ok(Self::ByReference),
+            0x00000003 => Ok(Self::ByReferenceResolve),
             0x00000004 => Ok(Self::ByReferenceOnly),
             0x00000005 => Ok(Self::EmbeddedMessage),
             0x00000006 => Ok(Self::Storage),

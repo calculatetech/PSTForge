@@ -212,6 +212,14 @@ properties are preserved when their MAPI type and value can be serialized
 without ambiguity. An unsupported property is recorded on its item and does
 not discard otherwise usable mail. An attachment failure leaves the parent
 mail partial rather than failed when the remaining message can be written.
+Data-less reference attachments preserve methods `2`, `3`, `4`, and `7`,
+their nonempty long pathname or URL, an optional short pathname, and readable
+web-provider permission metadata. PSTForge never opens, resolves, stats, or
+fetches the referenced target. A missing or malformed required long pathname
+omits only that attachment and makes the result partial. If damaged source
+metadata asserts both a reference method and a readable by-value content
+property, the reference relationship wins and the conflicting content
+property is counted as an explicit omission, including when it is zero bytes.
 PSTForge preserves a nonempty source attachment MIME type. When that property
 is absent on a complete by-value attachment, PSTForge may derive a type from
 an exact leading signature or a bounded structural parse under the confidence

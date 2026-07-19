@@ -1904,9 +1904,45 @@ work. Hash and identity evidence show that the source was not modified.
       while the focused fixture test asserts the package relationship type and
       target. The owner reports ScanPST clean, Outlook displays the Document
       object, and Word opens the DOCX normally.
-    - [ ] Checkpoint 11b: By-reference and web-reference attachments. Preserve
+    - [x] Checkpoint 11b: By-reference and web-reference attachments. Preserve
       documented method/path or URL relationships without fetching external
-      content or converting a reference into by-value data.
+      content or converting a reference into by-value data. Support OXCMSG
+      methods `2`, `4`, and `7`, plus legacy MAPI method `3` as proven Outlook
+      reality. Methods remain data-less and require a readable long pathname.
+      Preserve optional short pathname and exact PSETID_Attachment provider and
+      permission metadata for web references. Never stat, open, resolve, or
+      fetch any referenced target. Missing/malformed required relationships
+      omit only that attachment and report partial recovery. Advance the job
+      schema from 17 to 18, prove exact source/output method, path, NAMEID, and
+      absence-of-content fingerprints using one bounded external fixture, then
+      stop for ScanPST-first Outlook verification before commit.
+      - [x] (2026-07-18) The parser now reads `PidTagAttachMethod` directly
+        before invoking libpff attachment-content helpers. Methods `2`, `3`,
+        `4`, and `7` are durably classified as data-less references, so the
+        parser never requests target size or content and valid references no
+        longer create false native read issues. Schema 18 records the
+        `attachment_reference` terminal separately from missing payload data.
+      - [x] (2026-07-18) Typed canonical and writer models preserve exact
+        method, long and optional short path, filename, and web provider and
+        permission NAMEID values. Completed-store validation requires no
+        `PidTagAttachDataBinary`. Missing long paths omit only the attachment;
+        any contradictory readable by-value property is counted as a property
+        omission rather than silently discarded, including a zero-byte value.
+        Canonical replay retains the distinct reference terminal and will not
+        reconstruct an incomplete attachment from surviving path properties.
+      - [x] (2026-07-18) The bounded external
+        `v042-reference-attachments-source` fixture and split output compare
+        exactly through libpff for all relationships and report zero
+        omissions. The fixture uses unreachable `.invalid` UNC/URL targets,
+        proving the implementation does not depend on their existence.
+        `pffinfo` accepts the fixture and `readpst` completes. The complete
+        corrected full gate passed at
+        `.agent/test-results/1784429473-full`, including every earlier 0.4.2
+        external checkpoint. A first clean-context review found the zero-byte
+        contradiction and durable-terminal gaps above; both now have focused
+        regressions. A fresh final-state clean-context review returned `CLEAN`.
+        The owner reports that the r2 candidate works, satisfying the
+        ScanPST-first Outlook interoperability gate.
     - [ ] Checkpoint 11c: OLE attachments. Preserve source object/binary data,
       attach tag, static rendition, and method relationship without converting
       or executing the object.
@@ -1920,6 +1956,13 @@ work. Hash and identity evidence show that the source was not modified.
 - [ ] Milestone 1.0.0: MailPlus-Ready Release.
 
 ## Surprises & Discoveries
+
+- Observation: libpff's attachment convenience APIs recognize method `2` as a
+  reference but reject methods `3`, `4`, and `7`, then attempt to stream data
+  from every data-less reference. The raw attachment property set still
+  exposes `PidTagAttachMethod` and all path/NAMEID values correctly. Reading
+  that method before content dispatch avoids false parser issues and avoids
+  any request for nonexistent or external content.
 
 - Observation: The first by-value Document candidate preserved its attachment
   byte-for-byte, but the synthetic DOCX was itself invalid because its OPC ZIP
@@ -2428,6 +2471,23 @@ work. Hash and identity evidence show that the source was not modified.
   `large-qualification-20260717T204931Z`.
 
 ## Decision Log
+
+- Decision: Reference attachment classification comes from the readable
+  `PidTagAttachMethod` property, not libpff's narrower convenience type API.
+  Preserve methods `2`, `3`, `4`, and `7` as data-less relationships and never
+  dereference their path/URL. Any readable conflicting
+  `PidTagAttachDataBinary`, including an empty value, is a counted
+  damaged-source omission; it is not allowed to silently change the reference
+  into a by-value attachment. Durable replay preserves reference and missing
+  terminal states separately, so surviving properties cannot promote an
+  incomplete attachment to a complete reference.
+  Rationale: Current OXCMSG documents methods `2`, `4`, and `7`; Outlook's
+  canonical MAPI property documents legacy method `3`. The external fixture
+  proves that libpff exposes their raw relationship properties even when its
+  convenience API rejects the method. Preserving source semantics without I/O
+  is both the documented behavior and the safest recovery boundary.
+  Date/Author: 2026-07-18 / Codex and project owner after clean r2
+  interoperability acceptance.
 
 - Decision: PSTForge 1.0 writes smaller PSTs; general export formats move
   beyond 1.0.

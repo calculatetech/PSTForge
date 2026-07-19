@@ -23,7 +23,7 @@ use sha2::{Digest, Sha256};
 use tempfile::NamedTempFile;
 use thiserror::Error;
 
-const JOB_SCHEMA_VERSION: i64 = 17;
+const JOB_SCHEMA_VERSION: i64 = 18;
 const INLINE_BLOB_MAX_BYTES: u64 = 64 * 1024;
 const INLINE_CACHE_DIRECTORY: &str = ".pstforge-inline-cache";
 const PAYLOAD_PACK_FILENAME: &str = "payload.pack";
@@ -2127,6 +2127,16 @@ impl DurableCatalogSink {
             )?;
         } else if complete && active.attachment_type == Some(i32::from(b'i')) {
             return Ok(());
+        } else if complete && active.attachment_type == Some(i32::from(b'r')) {
+            self.record_event(
+                "attachment_reference",
+                json!({
+                    "message_id": active.message_id,
+                    "index": active.index,
+                    "declared_size": active.expected,
+                }),
+                None,
+            )?;
         } else if complete && active.expected == Some(0) {
             let blob = BlobWriter::new(&mut self.payload_pack, &self.payload_pack_path)?;
             let blob = self.finish_blob(blob, Some(0))?;
