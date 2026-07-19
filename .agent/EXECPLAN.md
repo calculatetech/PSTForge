@@ -2273,10 +2273,48 @@ work. Hash and identity evidence show that the source was not modified.
     candidate opens normally, contains the one expected message in the
     expected folder, and preserves its explicit blank body. The canonical
     full gate passes at `.agent/test-results/1784499956-full`.
-  - [ ] Checkpoint 2: replace the recipient-table single-heap-page limitation
+  - [x] (2026-07-19) Checkpoint 2: replace the recipient-table single-heap-page limitation
     with specification-conforming scalable storage. Recover 42 candidates,
     including eight otherwise complete items, and prove recipient count,
     roles, addresses, and property rows through independent reads.
+    The writer now retains its compact single-page TC when it fits and falls
+    back to the existing specification-backed multi-page HN/BTH, data-tree row
+    matrix, and subnode-value representation otherwise. Focused cases cover
+    long variable values, 448 rows crossing the 447-record BTH leaf capacity,
+    a later transactional message, part-boundary rollback/reappend, and the
+    same external TC in an embedded message. Completed-output validation now
+    compares every recipient row for normal, associated, and embedded
+    messages. Two clean-context reviews identified and closed the later-message
+    ownership and validation gaps; the final fresh review returned `CLEAN`.
+    The writer suite passes 88 active tests with one existing ignored scale
+    test, and the fast gate passes at
+    `.agent/test-results/1784500826-fast`. External candidate r1 is 779,264
+    bytes with SHA-256
+    `b34c927f41e074028d4a3487a21de0c49b1088cf9141c1e013c0beb2d89f0fc9`;
+    `pffinfo` accepts it and `readpst` extracts exactly the two expected
+    top-level messages without diagnostics. ScanPST-first and Outlook
+    acceptance remain. Human ScanPST r1 instead found an exact size-accounting
+    failure: the 448-row external TC's 43,256 bytes of XBLOCK/SLBLOCK/SIBLOCK
+    index payload were added to both embedded and containing Message object
+    sizes. The repaired reference retains the data and changes the embedded
+    message from 112,998 to 69,742 bytes and the containing message from
+    226,804 to 140,204 bytes. EMP-16 records the resulting logical-data size
+    rule; r1 is rejected. The first remediation review found the same
+    structural-index overcount in streamed XBLOCK/XXBLOCK paths. Those paths
+    now use the same data-only contribution, with a regression proving equal
+    top-level, attachment, and embedded sizes for identical in-memory and
+    multi-block spooled properties. The complete writer suite passes 89 active
+    tests with one existing ignored scale test; the fast gate passes at
+    `.agent/test-results/1784503858-fast`, and a fresh final review returned
+    `CLEAN`. Replacement r2 is 779,264 bytes with SHA-256
+    `773be042e192595b69e35309fea059365bdcdd75ea5e84fb64743a849576b2ec`.
+    Its failed object chain exactly matches the repaired r1 values: containing
+    message 140,204, attachment 69,862, and embedded message 69,742 bytes.
+    `pffinfo` and `readpst` accept r2 and extract both top-level messages
+    without diagnostics. Human acceptance confirms r2 is clean in ScanPST and
+    passes the required Outlook message, recipient-list, and embedded-message
+    checks. The canonical full gate passes at
+    `.agent/test-results/1784504284-full`.
   - [ ] Checkpoint 3: remove the general message heap-page limitation for the
     five affected candidates without imposing an arbitrary source-property or
     item-count cap. Validate the exact resulting property contexts and tables.

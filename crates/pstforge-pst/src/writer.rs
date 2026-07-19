@@ -823,6 +823,13 @@ impl BlockPayload {
             }
         }
     }
+
+    fn message_size_contribution(&self) -> usize {
+        match self {
+            Self::Data(data) => data.len(),
+            Self::Subnode(_) | Self::IntermediateSubnode { .. } | Self::DataTree { .. } => 0,
+        }
+    }
 }
 
 struct WrittenBlock {
@@ -1186,7 +1193,7 @@ fn append_spooled_data_tree(
             ref_count: 2,
         };
         logical_size = logical_size
-            .checked_add(block.payload.logical_size())
+            .checked_add(block.payload.message_size_contribution())
             .ok_or(WriterError::ValueTooLarge("spooled attachment size"))?;
         stream.emit(block)?;
         leaves.push((id, length));
@@ -1211,7 +1218,7 @@ fn append_spooled_data_tree(
                 ref_count: 2,
             };
             logical_size = logical_size
-                .checked_add(block.payload.logical_size())
+                .checked_add(block.payload.message_size_contribution())
                 .ok_or(WriterError::ValueTooLarge("spooled attachment size"))?;
             stream.emit(block)?;
             xblocks.push((id, total_size));
@@ -1232,7 +1239,7 @@ fn append_spooled_data_tree(
             ref_count: 2,
         };
         logical_size = logical_size
-            .checked_add(block.payload.logical_size())
+            .checked_add(block.payload.message_size_contribution())
             .ok_or(WriterError::ValueTooLarge("spooled attachment size"))?;
         stream.emit(block)?;
         return Ok((id, logical_size));
@@ -1260,7 +1267,7 @@ fn append_spooled_data_tree(
             ref_count: 2,
         };
         logical_size = logical_size
-            .checked_add(block.payload.logical_size())
+            .checked_add(block.payload.message_size_contribution())
             .ok_or(WriterError::ValueTooLarge("spooled attachment size"))?;
         stream.emit(block)?;
         xblocks.push((id, total_size));
@@ -1289,7 +1296,7 @@ fn append_spooled_data_tree(
         ref_count: 2,
     };
     logical_size = logical_size
-        .checked_add(block.payload.logical_size())
+        .checked_add(block.payload.message_size_contribution())
         .ok_or(WriterError::ValueTooLarge("spooled attachment size"))?;
     stream.emit(block)?;
     Ok((id, logical_size))
@@ -1401,7 +1408,8 @@ pub fn create_minimal_store(
 
 struct MessageBlocks {
     property_context: Vec<u8>,
-    recipient_table: Vec<u8>,
+    recipient_table: Option<Vec<u8>>,
+    recipient_table_referenced_by_message: bool,
     attachment_table: Vec<u8>,
     subnodes: Vec<UnicodeLeafSubNodeTreeEntry>,
     dynamic_blocks: Vec<BlockSpec>,
@@ -1420,17 +1428,25 @@ struct BuiltTopMessage {
 }
 
 fn built_message_block_specs(built: BuiltTopMessage) -> Vec<BlockSpec> {
-    let mut blocks = vec![
-        BlockSpec {
-            id: built.property_block,
-            payload: BlockPayload::Data(built.message.property_context),
-            ref_count: 2,
-        },
-        BlockSpec {
+    let mut blocks = vec![BlockSpec {
+        id: built.property_block,
+        payload: BlockPayload::Data(built.message.property_context),
+        ref_count: 2,
+    }];
+    if let Some(recipient_table) = built.message.recipient_table {
+        blocks.push(BlockSpec {
             id: built.recipient_block,
-            payload: BlockPayload::Data(built.message.recipient_table),
-            ref_count: if built.shared_table_blocks { 3 } else { 2 },
-        },
+            payload: BlockPayload::Data(recipient_table),
+            ref_count: if built.shared_table_blocks
+                && built.message.recipient_table_referenced_by_message
+            {
+                3
+            } else {
+                2
+            },
+        });
+    }
+    blocks.extend([
         BlockSpec {
             id: built.attachment_block,
             payload: BlockPayload::Data(built.message.attachment_table),
@@ -1441,7 +1457,7 @@ fn built_message_block_specs(built: BuiltTopMessage) -> Vec<BlockSpec> {
             payload: BlockPayload::Subnode(built.message.subnodes),
             ref_count: 2,
         },
-    ];
+    ]);
     blocks.extend(built.message.dynamic_blocks);
     blocks.sort_by_key(|block| u64::from(block.id));
     blocks
@@ -1709,15 +1725,40 @@ fn build_message_blocks(
         .enumerate()
         .map(|(index, recipient)| recipient_table_row(index, recipient))
         .collect::<Result<Vec<_>, _>>()?;
-    let recipient_table = table_context(&recipient_columns, &recipient_rows)?;
     let mut attachment_rows = Vec::new();
     let mut dynamic_blocks = Vec::new();
     let mut streamed_logical_size = 0_usize;
+    let (
+        recipient_table,
+        recipient_table_referenced_by_message,
+        recipient_inline_size,
+        recipient_data_block,
+        recipient_subnode_block,
+    ) = match table_context(&recipient_columns, &recipient_rows) {
+        Ok(table) => {
+            let size = table.len();
+            (Some(table), true, size, recipient_block, None)
+        }
+        Err(WriterError::ValueTooLarge("heap page")) => {
+            let external =
+                table_context_external(&recipient_columns, &recipient_rows, next_block_index)?;
+            let data_block = external.data_block;
+            let subnode_block = external.subnode_block;
+            dynamic_blocks.extend(external.blocks);
+            let template = if recipient_block == leaf_bid(17)? {
+                Some(table_context(&recipient_columns, &[])?)
+            } else {
+                None
+            };
+            (template, false, 0, data_block, Some(subnode_block))
+        }
+        Err(error) => return Err(error),
+    };
     let mut message_subnodes = vec![
         UnicodeLeafSubNodeTreeEntry::new(
             NodeId::from(NID_RECIPIENT_TABLE_TEMPLATE),
-            recipient_block,
-            None,
+            recipient_data_block,
+            recipient_subnode_block,
         ),
         UnicodeLeafSubNodeTreeEntry::new(
             NodeId::from(NID_ATTACHMENT_TABLE_TEMPLATE),
@@ -1790,17 +1831,19 @@ fn build_message_blocks(
                 let embedded_object_size = u32::try_from(embedded_size)
                     .map_err(|_| WriterError::ValueTooLarge("embedded message"))?;
                 let embedded_subnode_block = take_block_id(next_block_index, true)?;
-                dynamic_blocks.extend([
-                    BlockSpec {
-                        id: embedded_pc_block,
-                        payload: BlockPayload::Data(embedded_blocks.property_context),
-                        ref_count: 2,
-                    },
-                    BlockSpec {
+                dynamic_blocks.push(BlockSpec {
+                    id: embedded_pc_block,
+                    payload: BlockPayload::Data(embedded_blocks.property_context),
+                    ref_count: 2,
+                });
+                if let Some(recipient_table) = embedded_blocks.recipient_table {
+                    dynamic_blocks.push(BlockSpec {
                         id: embedded_recipient_block,
-                        payload: BlockPayload::Data(embedded_blocks.recipient_table),
+                        payload: BlockPayload::Data(recipient_table),
                         ref_count: 2,
-                    },
+                    });
+                }
+                dynamic_blocks.extend([
                     BlockSpec {
                         id: embedded_attachment_block,
                         payload: BlockPayload::Data(embedded_blocks.attachment_table),
@@ -1962,11 +2005,11 @@ fn build_message_blocks(
     message_subnodes.sort_by_key(|entry| u32::from(entry.node()));
     let message_bytes = property_context(&top_properties)?
         .len()
-        .checked_add(recipient_table.len())
+        .checked_add(recipient_inline_size)
         .and_then(|total| total.checked_add(attachment_table.len()))
         .and_then(|total| {
             dynamic_blocks.iter().try_fold(total, |sum, block| {
-                sum.checked_add(block.payload.logical_size())
+                sum.checked_add(block.payload.message_size_contribution())
             })
         })
         .and_then(|total| total.checked_add(streamed_logical_size))
@@ -1977,6 +2020,7 @@ fn build_message_blocks(
     Ok(MessageBlocks {
         property_context: property_context(&top_properties)?,
         recipient_table,
+        recipient_table_referenced_by_message,
         attachment_table,
         subnodes: message_subnodes,
         dynamic_blocks,
@@ -4464,57 +4508,20 @@ fn validate_named_property_map_shape(
 }
 
 fn validate_recipient_table_shape(message: &MessageSpec) -> Result<(), WriterError> {
-    let rows = (0..message.recipients.len())
-        .map(|index| {
-            let index = u32::try_from(index)
-                .map_err(|_| WriterError::ValueTooLarge("recipient row count"))?;
-            let index = index
-                .checked_add(1)
-                .ok_or(WriterError::ValueTooLarge("recipient row count"))?;
-            Ok(TableRowSpec {
-                id: NodeId::from(index),
-                values: Vec::new(),
-            })
-        })
+    let rows = message
+        .recipients
+        .iter()
+        .enumerate()
+        .map(|(index, recipient)| recipient_table_row(index, recipient))
         .collect::<Result<Vec<_>, WriterError>>()?;
-    let base_size = table_context(&recipient_columns()?, &rows)?.len();
-    let (variable_bytes, variable_count) =
-        message
-            .recipients
-            .iter()
-            .try_fold((0_usize, 0_usize), |(bytes, count), recipient| {
-                let mut lengths = [
-                    unicode_payload_len(&recipient.display_name)?,
-                    8,
-                    unicode_payload_len(&recipient.email_address)?,
-                    unicode_payload_len(&recipient.email_address)?,
-                ];
-                lengths
-                    .iter_mut()
-                    .try_fold((bytes, count), |(bytes, count), length| {
-                        if *length == 0 {
-                            return Ok::<_, WriterError>((bytes, count));
-                        }
-                        Ok((
-                            bytes
-                                .checked_add(*length)
-                                .ok_or(WriterError::ValueTooLarge("recipient table heap page"))?,
-                            count.checked_add(1).ok_or(WriterError::ValueTooLarge(
-                                "recipient table allocation count",
-                            ))?,
-                        ))
-                    })
-            })?;
-    let total = base_size
-        .checked_add(variable_bytes)
-        .and_then(|size| {
-            variable_count
-                .checked_mul(2)
-                .and_then(|map| size.checked_add(map))
-        })
-        .ok_or(WriterError::ValueTooLarge("recipient table heap page"))?;
-    if total > MAX_DATA_BLOCK_PAYLOAD {
-        return Err(WriterError::ValueTooLarge("recipient table heap page"));
+    let columns = recipient_columns()?;
+    match table_context(&columns, &rows) {
+        Ok(_) => {}
+        Err(WriterError::ValueTooLarge("heap page")) => {
+            let mut next_block_index = 0x10_0000;
+            table_context_external(&columns, &rows, &mut next_block_index)?;
+        }
+        Err(error) => return Err(error),
     }
     Ok(())
 }
@@ -5898,63 +5905,7 @@ fn validate_completed_store(
     let recipients = message
         .recipient_table()
         .ok_or_else(|| invalid("completed store recipient table is missing"))?;
-    if recipients
-        .find_row(crate::ltp::table_context::TableRowId::new(0))
-        .is_ok()
-    {
-        return Err(invalid(
-            "completed store recipient table contains row ID zero",
-        ));
-    }
-    if recipients.rows_matrix().count() != spec.message.recipients.len() {
-        return Err(invalid("completed store recipient count mismatch"));
-    }
-    let recipient_columns = recipients.context().columns();
-    let column_index = |property_id| {
-        recipient_columns
-            .iter()
-            .position(|column| column.prop_id() == property_id)
-            .ok_or_else(|| invalid("completed store recipient column is missing"))
-    };
-    let role_column = column_index(0x0C15)?;
-    let name_column = column_index(0x3001)?;
-    let address_type_column = column_index(0x3002)?;
-    let email_column = column_index(0x3003)?;
-    let smtp_column = column_index(0x39FF)?;
-    for (index, (row, expected)) in recipients
-        .rows_matrix()
-        .zip(spec.message.recipients.iter())
-        .enumerate()
-    {
-        let expected_row = u32::try_from(index)
-            .ok()
-            .and_then(|row| row.checked_add(1))
-            .ok_or_else(|| invalid("completed store recipient row ID overflow"))?;
-        let expected_row = crate::ltp::table_context::TableRowId::new(expected_row);
-        let indexed_row = recipients
-            .find_row(expected_row)
-            .map_err(|_| invalid("completed store recipient row is not indexed"))?;
-        if row.id() != expected_row || indexed_row.id() != expected_row {
-            return Err(invalid("completed store recipient row ID mismatch"));
-        }
-        let values = row.columns(recipients.context())?;
-        let read = |index: usize| {
-            let value = values[index]
-                .as_ref()
-                .ok_or_else(|| invalid("completed store recipient value is missing"))?;
-            recipients
-                .read_column(value, recipient_columns[index].prop_type())
-                .map_err(WriterError::from)
-        };
-        if !matches!(read(role_column)?, ReadValue::Integer32(value) if value == expected.kind as i32)
-            || !matches!(read(name_column)?, ReadValue::Unicode(value) if value.to_string() == expected.display_name)
-            || !matches!(read(address_type_column)?, ReadValue::Unicode(value) if value.to_string() == "SMTP")
-            || !matches!(read(email_column)?, ReadValue::Unicode(value) if value.to_string() == expected.email_address)
-            || !matches!(read(smtp_column)?, ReadValue::Unicode(value) if value.to_string() == expected.email_address)
-        {
-            return Err(invalid("completed store recipient value mismatch"));
-        }
-    }
+    validate_completed_recipients(recipients.as_ref(), &spec.message.recipients)?;
     let attachments = message
         .attachment_table()
         .ok_or_else(|| invalid("completed store attachment table is missing"))?;
@@ -5977,6 +5928,73 @@ fn validate_completed_store(
             .map_err(|_| invalid("completed store attachment row identity mismatch"))?;
     }
     validate_attachment_fidelity(path, spec, named_identities)?;
+    Ok(())
+}
+
+fn validate_completed_recipients(
+    recipients: &dyn crate::ltp::table_context::TableContext,
+    expected_recipients: &[RecipientSpec],
+) -> Result<(), WriterError> {
+    use crate::ltp::prop_context::PropertyValue as ReadValue;
+
+    let invalid = |message: &str| WriterError::InvalidStructure(message.to_owned());
+    if recipients
+        .find_row(crate::ltp::table_context::TableRowId::new(0))
+        .is_ok()
+    {
+        return Err(invalid(
+            "completed store recipient table contains row ID zero",
+        ));
+    }
+    if recipients.rows_matrix().count() != expected_recipients.len() {
+        return Err(invalid("completed store recipient count mismatch"));
+    }
+    let columns = recipients.context().columns();
+    let column = |property_id| {
+        columns
+            .iter()
+            .position(|candidate| candidate.prop_id() == property_id)
+            .ok_or_else(|| invalid("completed store recipient column is missing"))
+    };
+    let role = column(0x0C15)?;
+    let name = column(0x3001)?;
+    let address_type = column(0x3002)?;
+    let email = column(0x3003)?;
+    let smtp = column(0x39FF)?;
+    for (index, (row, expected)) in recipients
+        .rows_matrix()
+        .zip(expected_recipients)
+        .enumerate()
+    {
+        let expected_row = u32::try_from(index)
+            .ok()
+            .and_then(|row| row.checked_add(1))
+            .ok_or_else(|| invalid("completed store recipient row ID overflow"))?;
+        let expected_row = crate::ltp::table_context::TableRowId::new(expected_row);
+        let indexed_row = recipients
+            .find_row(expected_row)
+            .map_err(|_| invalid("completed store recipient row is not indexed"))?;
+        if row.id() != expected_row || indexed_row.id() != expected_row {
+            return Err(invalid("completed store recipient row ID mismatch"));
+        }
+        let values = row.columns(recipients.context())?;
+        let read = |index: usize| -> Result<ReadValue, WriterError> {
+            Ok(recipients.read_column(
+                values[index]
+                    .as_ref()
+                    .ok_or_else(|| invalid("completed store recipient value is missing"))?,
+                columns[index].prop_type(),
+            )?)
+        };
+        if !matches!(read(role)?, ReadValue::Integer32(value) if value == expected.kind as i32)
+            || !matches!(read(name)?, ReadValue::Unicode(value) if value.to_string() == expected.display_name)
+            || !matches!(read(address_type)?, ReadValue::Unicode(value) if value.to_string() == "SMTP")
+            || !matches!(read(email)?, ReadValue::Unicode(value) if value.to_string() == expected.email_address)
+            || !matches!(read(smtp)?, ReadValue::Unicode(value) if value.to_string() == expected.email_address)
+        {
+            return Err(invalid("completed store recipient value mismatch"));
+        }
+    }
     Ok(())
 }
 
@@ -6127,6 +6145,13 @@ fn validate_completed_folder_store(
             if opened.properties().message_class()? != expected.message_class {
                 return Err(invalid("completed normal message class mismatch"));
             }
+            validate_completed_recipients(
+                opened
+                    .recipient_table()
+                    .ok_or_else(|| invalid("completed normal recipient table is missing"))?
+                    .as_ref(),
+                &expected.recipients,
+            )?;
             if !expected
                 .spooled_properties
                 .iter()
@@ -6206,6 +6231,13 @@ fn validate_completed_folder_store(
             if opened.properties().message_class()? != expected.message_class {
                 return Err(invalid("completed associated message class mismatch"));
             }
+            validate_completed_recipients(
+                opened
+                    .recipient_table()
+                    .ok_or_else(|| invalid("completed associated recipient table is missing"))?
+                    .as_ref(),
+                &expected.recipients,
+            )?;
             if !matches!(opened.properties().get(0x0E07), Some(crate::ltp::prop_context::PropertyValue::Integer32(value)) if *value == output_message_flags(expected, true))
             {
                 return Err(invalid(
@@ -7041,17 +7073,7 @@ fn validate_embedded_message(
     let recipients = actual
         .recipient_table()
         .ok_or_else(|| invalid("completed store embedded recipient table is missing"))?;
-    if recipients
-        .find_row(crate::ltp::table_context::TableRowId::new(0))
-        .is_ok()
-    {
-        return Err(invalid(
-            "completed store embedded recipient table contains row ID zero",
-        ));
-    }
-    if recipients.rows_matrix().count() != expected.recipients.len() {
-        return Err(invalid("completed store embedded recipient count mismatch"));
-    }
+    validate_completed_recipients(recipients.as_ref(), &expected.recipients)?;
     let attachments = actual
         .attachment_table()
         .ok_or_else(|| invalid("completed store embedded attachment table is missing"))?;
@@ -7059,52 +7081,6 @@ fn validate_embedded_message(
         return Err(invalid(
             "completed store embedded attachment count mismatch",
         ));
-    }
-    let columns = recipients.context().columns();
-    let column = |id| {
-        columns
-            .iter()
-            .position(|column| column.prop_id() == id)
-            .ok_or_else(|| invalid("embedded recipient column is missing"))
-    };
-    let role = column(0x0C15)?;
-    let name = column(0x3001)?;
-    let address_type = column(0x3002)?;
-    let email = column(0x3003)?;
-    let smtp = column(0x39FF)?;
-    for (index, (row, expected)) in recipients
-        .rows_matrix()
-        .zip(&expected.recipients)
-        .enumerate()
-    {
-        let expected_row = u32::try_from(index)
-            .ok()
-            .and_then(|row| row.checked_add(1))
-            .ok_or_else(|| invalid("embedded recipient row ID overflow"))?;
-        let expected_row = crate::ltp::table_context::TableRowId::new(expected_row);
-        let indexed_row = recipients
-            .find_row(expected_row)
-            .map_err(|_| invalid("embedded recipient row is not indexed"))?;
-        if row.id() != expected_row || indexed_row.id() != expected_row {
-            return Err(invalid("embedded recipient row ID mismatch"));
-        }
-        let values = row.columns(recipients.context())?;
-        let read = |index: usize| -> Result<ReadValue, WriterError> {
-            Ok(recipients.read_column(
-                values[index]
-                    .as_ref()
-                    .ok_or_else(|| invalid("embedded recipient value is missing"))?,
-                columns[index].prop_type(),
-            )?)
-        };
-        if !matches!(read(role)?, ReadValue::Integer32(value) if value == expected.kind as i32)
-            || !matches!(read(name)?, ReadValue::Unicode(value) if value.to_string() == expected.display_name)
-            || !matches!(read(address_type)?, ReadValue::Unicode(value) if value.to_string() == "SMTP")
-            || !matches!(read(email)?, ReadValue::Unicode(value) if value.to_string() == expected.email_address)
-            || !matches!(read(smtp)?, ReadValue::Unicode(value) if value.to_string() == expected.email_address)
-        {
-            return Err(invalid("completed store embedded recipient mismatch"));
-        }
     }
     for (index, expected_attachment) in expected.attachments.iter().enumerate() {
         use crate::messaging::attachment::AttachmentData;
@@ -10420,6 +10396,129 @@ mod tests {
     }
 
     #[test]
+    fn external_recipient_tables_survive_transactional_rollback_and_embedding()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let expected_path = directory.path().join("expected.pst");
+        let transaction_path = directory.path().join("transaction.pst");
+        let fixture = FidelityStore::default();
+        let first = fixture.message.clone();
+        let recipients = (0..448)
+            .map(|index| RecipientSpec {
+                kind: match index % 3 {
+                    0 => RecipientKind::To,
+                    1 => RecipientKind::Cc,
+                    _ => RecipientKind::Bcc,
+                },
+                display_name: format!("R{index:x}"),
+                email_address: format!("r{index:x}@x"),
+            })
+            .collect::<Vec<_>>();
+        let mut external = fixture.message.clone();
+        external.subject = "External recipient table checkpoint".to_owned();
+        external.recipients = recipients.clone();
+        let embedded_attachment = external.attachments.remove(1);
+        external.attachments = vec![embedded_attachment];
+        let AttachmentContent::Embedded(embedded) = &mut external.attachments[0].content else {
+            return Err("expected embedded message fixture".into());
+        };
+        embedded.subject = "Embedded multi-page recipient checkpoint".to_owned();
+        embedded.recipients = recipients;
+
+        let folder = MailFolderSpec {
+            path: vec!["Inbox".to_owned()],
+            location: MailFolderLocation::IpmSubtree,
+            role: MailFolderRole::Ordinary,
+            container_class: "IPF.Note".to_owned(),
+            messages: vec![first.clone(), external.clone()],
+            associated_messages: Vec::new(),
+        };
+        let expected = MailStoreSpec {
+            store_name: fixture.store_name.clone(),
+            record_key: fixture.record_key,
+            folders: vec![folder.clone()],
+        };
+        create_mail_store(&expected_path, &expected)?;
+
+        let mut catalog = NamedPropertyCatalog::default();
+        catalog.observe_message(&first);
+        catalog.observe_message(&external);
+        let layout = MailStoreSpec {
+            store_name: expected.store_name.clone(),
+            record_key: expected.record_key,
+            folders: vec![MailFolderSpec {
+                messages: Vec::new(),
+                ..folder
+            }],
+        };
+        let mut transaction =
+            TransactionalMailStoreWriter::begin(&transaction_path, layout, &catalog, true, None)?;
+        let first_projected = match transaction.append_message(
+            MailFolderLocation::IpmSubtree,
+            &["Inbox".to_owned()],
+            false,
+            first,
+            u64::MAX,
+            &NEVER_INTERRUPTED,
+        )? {
+            TransactionAppend::Appended { projected_file_eof } => projected_file_eof,
+            TransactionAppend::PartFull { .. } => return Err("first message was rejected".into()),
+        };
+        assert!(matches!(
+            transaction.append_message(
+                MailFolderLocation::IpmSubtree,
+                &["Inbox".to_owned()],
+                false,
+                external.clone(),
+                first_projected,
+                &NEVER_INTERRUPTED,
+            )?,
+            TransactionAppend::PartFull { .. }
+        ));
+        assert_eq!(transaction.message_count(), 1);
+        assert!(matches!(
+            transaction.append_message(
+                MailFolderLocation::IpmSubtree,
+                &["Inbox".to_owned()],
+                false,
+                external,
+                u64::MAX,
+                &NEVER_INTERRUPTED,
+            )?,
+            TransactionAppend::Appended { .. }
+        ));
+        transaction.finalize(&NEVER_INTERRUPTED)?;
+        assert_eq!(
+            Sha256::digest(std::fs::read(&transaction_path)?),
+            Sha256::digest(std::fs::read(expected_path)?)
+        );
+        let store = open_store(&transaction_path)?;
+        let message = store.open_message(
+            &store
+                .properties()
+                .make_entry_id(node(NodeIdType::NormalMessage, MESSAGE_INDEX + 1)?)?,
+            Some(&[0x0E08]),
+        )?;
+        assert_eq!(message.properties().message_size()?, 140_204);
+        let attachment = message.clone().read_attachment(
+            node(NodeIdType::Attachment, 0x2_0000)?,
+            None,
+            &[],
+            &[],
+            true,
+        )?;
+        assert_eq!(attachment.properties().attachment_size()?, 69_862);
+        let crate::messaging::attachment::AttachmentData::Message(embedded) = attachment
+            .data()
+            .ok_or("embedded attachment data is missing")?
+        else {
+            return Err("expected embedded message attachment".into());
+        };
+        assert_eq!(embedded.properties().message_size()?, 69_742);
+        Ok(())
+    }
+
+    #[test]
     fn arbitrary_nonempty_classes_are_supported_but_calendar_exception_stays_exact() {
         assert!(supported_message_class(
             "IPM.OLE.CLASS.{00061055-0000-0000-C000-000000000046}"
@@ -11438,7 +11537,8 @@ mod tests {
             shared_table_blocks: false,
             message: MessageBlocks {
                 property_context: Vec::new(),
-                recipient_table: Vec::new(),
+                recipient_table: Some(Vec::new()),
+                recipient_table_referenced_by_message: true,
                 attachment_table: Vec::new(),
                 subnodes: Vec::new(),
                 dynamic_blocks: Vec::new(),
@@ -11725,6 +11825,94 @@ mod tests {
         });
 
         create_fidelity_store(directory.path().join("streamed-properties.pst"), &spec)?;
+        Ok(())
+    }
+
+    #[test]
+    fn spooled_data_tree_indexes_do_not_change_message_or_embedded_sizes()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let source = directory.path().join("payload.bin");
+        let payload = vec![0x5A; MAX_DATA_BLOCK_PAYLOAD + 17];
+        std::fs::write(&source, &payload)?;
+        let byte_len = u64::try_from(payload.len())?;
+        let blob = || FileBlobSpec {
+            path: source.clone(),
+            offset: 0,
+            byte_len,
+            sha256: Sha256::digest(&payload).into(),
+        };
+
+        let mut in_memory = FidelityStore::default();
+        in_memory.message.raw_properties.push(RawProperty {
+            id: 0x1100,
+            value: RawPropertyValue::Binary(payload.clone()),
+        });
+        let AttachmentContent::Embedded(in_memory_embedded) =
+            &mut in_memory.message.attachments[1].content
+        else {
+            return Err("expected embedded message fixture".into());
+        };
+        in_memory_embedded.raw_properties.push(RawProperty {
+            id: 0x1101,
+            value: RawPropertyValue::Binary(payload.clone()),
+        });
+
+        let mut spooled = FidelityStore::default();
+        spooled
+            .message
+            .spooled_properties
+            .push(SpooledPropertySpec {
+                id: 0x1100,
+                property_type: u16::from(PropertyType::Binary),
+                blob: blob(),
+            });
+        let AttachmentContent::Embedded(spooled_embedded) =
+            &mut spooled.message.attachments[1].content
+        else {
+            return Err("expected embedded message fixture".into());
+        };
+        spooled_embedded
+            .spooled_properties
+            .push(SpooledPropertySpec {
+                id: 0x1101,
+                property_type: u16::from(PropertyType::Binary),
+                blob: blob(),
+            });
+
+        let in_memory_path = directory.path().join("in-memory.pst");
+        let spooled_path = directory.path().join("spooled.pst");
+        create_fidelity_store(&in_memory_path, &in_memory)?;
+        create_fidelity_store(&spooled_path, &spooled)?;
+        let sizes = |path: &Path| -> Result<(i32, i32, i32), Box<dyn std::error::Error>> {
+            let store = open_store(path)?;
+            let message = store.open_message(
+                &store
+                    .properties()
+                    .make_entry_id(node(NodeIdType::NormalMessage, MESSAGE_INDEX)?)?,
+                Some(&[0x0E08]),
+            )?;
+            let attachment = message.clone().read_attachment(
+                node(NodeIdType::Attachment, 0x2_0001)?,
+                None,
+                &[],
+                &[],
+                true,
+            )?;
+            let attachment_size = attachment.properties().attachment_size()?;
+            let crate::messaging::attachment::AttachmentData::Message(embedded) = attachment
+                .data()
+                .ok_or("embedded attachment data is missing")?
+            else {
+                return Err("expected embedded message attachment".into());
+            };
+            Ok((
+                message.properties().message_size()?,
+                attachment_size,
+                embedded.properties().message_size()?,
+            ))
+        };
+        assert_eq!(sizes(&spooled_path)?, sizes(&in_memory_path)?);
         Ok(())
     }
 
@@ -13085,23 +13273,37 @@ mod tests {
         let directory = tempfile::tempdir()?;
         let recipient = |length| RecipientSpec {
             kind: RecipientKind::To,
-            display_name: "R".repeat(length),
-            email_address: "r@example.com".to_owned(),
+            display_name: "R".to_owned(),
+            email_address: "r".repeat(length),
         };
         let mut recipients_at_limit = FidelityStore::default();
-        recipients_at_limit.message.recipients = vec![recipient(2048)];
+        recipients_at_limit.message.recipients = vec![recipient(1024)];
         create_fidelity_store(
             directory.path().join("recipient-limit.pst"),
             &recipients_at_limit,
         )?;
-        recipients_at_limit.message.recipients.push(recipient(2048));
-        assert!(matches!(
-            create_fidelity_store(
-                directory.path().join("recipient-overflow.pst"),
-                &recipients_at_limit
-            ),
-            Err(WriterError::ValueTooLarge("recipient table heap page"))
-        ));
+        recipients_at_limit.message.recipients = vec![recipient(2048)];
+        validate_spec(&recipients_at_limit)
+            .map_err(|error| format!("multi-page recipient preflight failed: {error}"))?;
+        create_fidelity_store(
+            directory.path().join("recipient-multi-page-values.pst"),
+            &recipients_at_limit,
+        )
+        .map_err(|error| format!("multi-page recipient values failed: {error}"))?;
+
+        let mut many_recipients = FidelityStore::default();
+        many_recipients.message.recipients = (0..200)
+            .map(|_| RecipientSpec {
+                kind: RecipientKind::To,
+                display_name: "R".to_owned(),
+                email_address: "r@x".to_owned(),
+            })
+            .collect();
+        create_fidelity_store(
+            directory.path().join("recipient-multi-page-rows.pst"),
+            &many_recipients,
+        )
+        .map_err(|error| format!("multi-page recipient rows failed: {error}"))?;
 
         let property = |name: String| NamedProperty {
             set: NamedPropertySet::PublicStrings,
