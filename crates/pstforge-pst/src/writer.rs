@@ -148,6 +148,7 @@ pub enum AttachmentContent {
     Spooled(FileBlobSpec),
     Embedded(Box<MessageSpec>),
     Reference(AttachmentReferenceSpec),
+    Ole(OleAttachmentSpec),
 }
 
 /// A data-less MAPI reference attachment.
@@ -169,6 +170,20 @@ pub enum AttachmentReferenceMethod {
     ByReferenceResolve = 3,
     ByReferenceOnly = 4,
     ByWebReference = 7,
+}
+
+/// A streamed OLE payload whose source property type remains authoritative.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OleAttachmentSpec {
+    pub data: FileBlobSpec,
+    pub data_kind: OleDataKind,
+}
+
+/// The two documented property representations for an ATTACH_OLE payload.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OleDataKind {
+    Object,
+    Binary,
 }
 
 const PSETID_ATTACHMENT: [u8; 16] = [
@@ -205,6 +220,7 @@ pub struct AttachmentSpec {
     pub rendering_position: Option<i32>,
     pub flags: i32,
     pub raw_properties: Vec<RawProperty>,
+    pub spooled_properties: Vec<SpooledPropertySpec>,
     pub content: AttachmentContent,
 }
 
@@ -487,6 +503,7 @@ impl Default for FidelityStore {
                         rendering_position: Some(0),
                         flags: 4,
                         raw_properties: Vec::new(),
+                        spooled_properties: Vec::new(),
                         content: AttachmentContent::Binary(
                             (0..16 * 1024)
                                 .map(|index| b'A' + (index % 26) as u8)
@@ -501,6 +518,7 @@ impl Default for FidelityStore {
                         rendering_position: None,
                         flags: 0,
                         raw_properties: Vec::new(),
+                        spooled_properties: Vec::new(),
                         content: AttachmentContent::Embedded(Box::new(embedded)),
                     },
                 ],
@@ -1326,14 +1344,14 @@ fn collect_subnode_ids(blocks: &[BlockSpec], output: &mut Vec<NodeId>) {
 
 fn message_requires_streaming(message: &MessageSpec) -> bool {
     !message.spooled_properties.is_empty()
-        || message
-            .attachments
-            .iter()
-            .any(|attachment| match &attachment.content {
-                AttachmentContent::Spooled(_) => true,
-                AttachmentContent::Embedded(message) => message_requires_streaming(message),
-                AttachmentContent::Binary(_) | AttachmentContent::Reference(_) => false,
-            })
+        || message.attachments.iter().any(|attachment| {
+            !attachment.spooled_properties.is_empty()
+                || match &attachment.content {
+                    AttachmentContent::Spooled(_) | AttachmentContent::Ole(_) => true,
+                    AttachmentContent::Embedded(message) => message_requires_streaming(message),
+                    AttachmentContent::Binary(_) | AttachmentContent::Reference(_) => false,
+                }
+        })
 }
 
 struct FolderPlan<'a> {
@@ -1618,6 +1636,47 @@ fn build_message_blocks(
                 )
             }
             AttachmentContent::Reference(reference) => (reference.method as i32, None),
+            AttachmentContent::Ole(ole)
+                if ole.data_kind == OleDataKind::Binary && ole.data.byte_len == 0 =>
+            {
+                verify_empty_file_blob(&ole.data)?;
+                streamed_size = Some(0);
+                (6, Some(PropertyValue::Binary(Vec::new())))
+            }
+            AttachmentContent::Ole(ole) => {
+                let value_node_type = match ole.data_kind {
+                    OleDataKind::Object => NodeIdType::OleObjectData,
+                    OleDataKind::Binary => NodeIdType::ListsTablesProperties,
+                };
+                let value_node = node(value_node_type, *next_value_node)?;
+                *next_value_node = next_value_node
+                    .checked_add(1)
+                    .ok_or(WriterError::ValueTooLarge("OLE attachment value node"))?;
+                let stream = block_stream.as_deref_mut().ok_or_else(|| {
+                    WriterError::InvalidStructure(
+                        "OLE attachment requires streaming output".to_owned(),
+                    )
+                })?;
+                let (root, logical_size) =
+                    append_spooled_data_tree(&ole.data, next_block_index, stream)?;
+                streamed_logical_size = streamed_logical_size
+                    .checked_add(logical_size)
+                    .ok_or(WriterError::ValueTooLarge("message size"))?;
+                attachment_local_subnodes
+                    .push(UnicodeLeafSubNodeTreeEntry::new(value_node, root, None));
+                streamed_size = Some(ole.data.byte_len);
+                let data = match ole.data_kind {
+                    OleDataKind::Object => PropertyValue::Object(
+                        value_node,
+                        u32::try_from(ole.data.byte_len)
+                            .map_err(|_| WriterError::ValueTooLarge("OLE attachment object"))?,
+                    ),
+                    OleDataKind::Binary => {
+                        PropertyValue::External(PropertyType::Binary, value_node)
+                    }
+                };
+                (6, Some(data))
+            }
         };
         let attachment_number =
             i32::try_from(index).map_err(|_| WriterError::ValueTooLarge("attachment number"))?;
@@ -1629,7 +1688,25 @@ fn build_message_blocks(
             data_property,
             named_identities,
         )?;
-        let size = attachment_property_size_with_stream(&properties, streamed_size)?;
+        let mut size = attachment_property_size_with_stream(&properties, streamed_size)?;
+        if !attachment.spooled_properties.is_empty() {
+            let stream = block_stream.as_deref_mut().ok_or_else(|| {
+                WriterError::InvalidStructure(
+                    "spooled attachment property requires streaming output".to_owned(),
+                )
+            })?;
+            streamed_logical_size = streamed_logical_size
+                .checked_add(append_spooled_properties(
+                    &attachment.spooled_properties,
+                    &mut properties,
+                    &mut attachment_local_subnodes,
+                    next_block_index,
+                    next_value_node,
+                    stream,
+                )?)
+                .ok_or(WriterError::ValueTooLarge("message size"))?;
+            size = attachment_size_with_spooled_properties(size, &attachment.spooled_properties)?;
+        }
         set_attachment_size(&mut properties, size)?;
         attachment_rows.push(attachment_table_row(
             attachment_node,
@@ -1987,32 +2064,36 @@ fn validate_message_size_bound(message: &MessageSpec) -> Result<(), WriterError>
         bytes = bytes
             .checked_add(ATTACHMENT_OVERHEAD)
             .ok_or(WriterError::ValueTooLarge("message size"))?;
-        let content_bytes = match &attachment.content {
-            AttachmentContent::Binary(data) => u64::try_from(data.len())
-                .map_err(|_| WriterError::ValueTooLarge("attachment properties"))?,
-            AttachmentContent::Spooled(blob) => blob.byte_len,
-            AttachmentContent::Embedded(embedded) => {
-                validate_message_size_bound(embedded)?;
-                estimated_message_payload(embedded)?
-            }
-            AttachmentContent::Reference(_) => 0,
-        };
-        let metadata_bytes = attachment_metadata_bytes(attachment)?;
-        if content_bytes
-            .checked_add(metadata_bytes)
-            .is_none_or(|size| size > i32::MAX as u64)
-        {
+        if let AttachmentContent::Embedded(embedded) = &attachment.content {
+            validate_message_size_bound(embedded)?;
+        }
+        let attachment_bytes = attachment_logical_size(attachment)?;
+        if attachment_bytes > i32::MAX as u64 {
             return Err(WriterError::ValueTooLarge("attachment properties"));
         }
         bytes = bytes
-            .checked_add(content_bytes)
-            .and_then(|value| value.checked_add(metadata_bytes))
+            .checked_add(attachment_bytes)
             .ok_or(WriterError::ValueTooLarge("message size"))?;
     }
     if bytes > i32::MAX as u64 {
         return Err(WriterError::ValueTooLarge("message size"));
     }
     Ok(())
+}
+
+/// Return the aggregate logical property bytes represented by one attachment.
+pub fn attachment_logical_size(attachment: &AttachmentSpec) -> Result<u64, WriterError> {
+    let content_bytes = match &attachment.content {
+        AttachmentContent::Binary(data) => u64::try_from(data.len())
+            .map_err(|_| WriterError::ValueTooLarge("attachment properties"))?,
+        AttachmentContent::Spooled(blob) => blob.byte_len,
+        AttachmentContent::Embedded(embedded) => estimated_message_payload(embedded)?,
+        AttachmentContent::Reference(_) => 0,
+        AttachmentContent::Ole(ole) => ole.data.byte_len,
+    };
+    content_bytes
+        .checked_add(attachment_metadata_bytes(attachment)?)
+        .ok_or(WriterError::ValueTooLarge("attachment properties"))
 }
 
 fn estimated_message_payload(message: &MessageSpec) -> Result<u64, WriterError> {
@@ -2069,6 +2150,19 @@ fn attachment_metadata_bytes(attachment: &AttachmentSpec) -> Result<u64, WriterE
                 .map_err(|_| WriterError::ValueTooLarge("attachment properties"))?
                 .checked_mul(4)
                 .ok_or(WriterError::ValueTooLarge("attachment properties"))?,
+            )
+            .ok_or(WriterError::ValueTooLarge("attachment properties"))?;
+    }
+    for property in &attachment.spooled_properties {
+        bytes = bytes
+            .checked_add(property.blob.byte_len)
+            .ok_or(WriterError::ValueTooLarge("attachment properties"))?;
+    }
+    for property in &attachment.raw_properties {
+        bytes = bytes
+            .checked_add(
+                u64::try_from(raw_value_payload_len(&property.value)?)
+                    .map_err(|_| WriterError::ValueTooLarge("attachment properties"))?,
             )
             .ok_or(WriterError::ValueTooLarge("attachment properties"))?;
     }
@@ -3526,6 +3620,7 @@ fn validate_attachment_property_context_shape(
     }
     property_count = property_count
         .checked_add(attachment.raw_properties.len())
+        .and_then(|count| count.checked_add(attachment.spooled_properties.len()))
         .ok_or(WriterError::ValueTooLarge("attachment property count"))?;
     for property in &attachment.raw_properties {
         lengths.push(raw_value_payload_len(&property.value)?);
@@ -3535,7 +3630,8 @@ fn validate_attachment_property_context_shape(
         AttachmentContent::Embedded(_) => lengths.push(8),
         AttachmentContent::Binary(_)
         | AttachmentContent::Spooled(_)
-        | AttachmentContent::Reference(_) => {}
+        | AttachmentContent::Reference(_)
+        | AttachmentContent::Ole(_) => {}
     }
     validate_property_context_shape("attachment property context", property_count, &lengths)
 }
@@ -3878,6 +3974,12 @@ fn validate_message(message: &MessageSpec, depth: usize) -> Result<(), WriterErr
             AttachmentContent::Embedded(child)
                 if calendar_exception_message_class(&child.message_class)
         );
+        let binary_metadata_attachment = matches!(
+            &attachment.content,
+            AttachmentContent::Binary(_)
+                | AttachmentContent::Spooled(_)
+                | AttachmentContent::Ole(_)
+        );
         if embedded_calendar_exception
             && (!appointment_message_class(&message.message_class)
                 || !calendar_exception_attachment_has_linkage(attachment))
@@ -3888,19 +3990,32 @@ fn validate_message(message: &MessageSpec, depth: usize) -> Result<(), WriterErr
             ));
         }
         if !attachment.raw_properties.is_empty()
+            && !binary_metadata_attachment
             && (!appointment_message_class(&message.message_class) || !embedded_calendar_exception)
         {
             return Err(WriterError::InvalidStructure(
-                "calendar-exception attachment properties require an embedded exception".to_owned(),
+                "attachment raw properties require an OLE object or embedded calendar exception"
+                    .to_owned(),
             ));
         }
         if attachment.raw_properties.len() > MAX_FIDELITY_COLLECTION_ITEMS {
             return Err(WriterError::ValueTooLarge("attachment raw-property count"));
         }
+        if attachment.spooled_properties.len() > MAX_FIDELITY_COLLECTION_ITEMS {
+            return Err(WriterError::ValueTooLarge(
+                "attachment spooled-property count",
+            ));
+        }
         let mut raw_ids = attachment
             .raw_properties
             .iter()
             .map(|property| property.id)
+            .chain(
+                attachment
+                    .spooled_properties
+                    .iter()
+                    .map(|property| property.id),
+            )
             .collect::<Vec<_>>();
         raw_ids.sort_unstable();
         if raw_ids.windows(2).any(|pair| pair[0] == pair[1]) {
@@ -3908,35 +4023,61 @@ fn validate_message(message: &MessageSpec, depth: usize) -> Result<(), WriterErr
                 "duplicate attachment raw property identifier".to_owned(),
             ));
         }
-        let raw_bytes =
-            attachment
-                .raw_properties
-                .iter()
-                .try_fold(0_usize, |total, property| {
-                    if property.id == 0
-                        || property.id >= 0x8000
-                        || explicit_attachment_property(property.id)
-                        || !calendar_exception_attachment_property(property.id)
+        let raw_bytes = attachment
+            .raw_properties
+            .iter()
+            .try_fold(0_usize, |total, property| {
+                if property.id == 0
+                    || property.id >= 0x8000
+                    || explicit_attachment_property(property.id)
+                {
+                    return Err(WriterError::InvalidStructure(format!(
+                        "attachment raw property 0x{:04X} is not supported for its attachment kind",
+                        property.id
+                    )));
+                }
+                if binary_metadata_attachment {
+                    if !ole_attachment_property(property.id)
+                        || !ole_attachment_property_type_is_valid(property.id, &property.value)
                     {
                         return Err(WriterError::InvalidStructure(format!(
-                            "attachment raw property 0x{:04X} is not a supported calendar-exception property",
+                            "attachment raw property 0x{:04X} is not supported for its attachment kind",
                             property.id
                         )));
                     }
-                    if !calendar_exception_attachment_property_type_is_valid(
-                        property.id,
-                        &property.value,
-                    ) {
-                        return Err(WriterError::InvalidStructure(format!(
-                            "attachment raw property 0x{:04X} has the wrong calendar-exception type",
-                            property.id
-                        )));
-                    }
-                    validate_raw_value(&property.value)?;
-                    total.checked_add(raw_value_payload_len(&property.value)?).ok_or(
-                        WriterError::ValueTooLarge("aggregate attachment raw-property payload"),
-                    )
-                })?;
+                } else if !calendar_exception_attachment_property(property.id) {
+                    return Err(WriterError::InvalidStructure(format!(
+                        "0x{:04X} is not a supported calendar-exception property",
+                        property.id
+                    )));
+                } else if !calendar_exception_attachment_property_type_is_valid(
+                    property.id,
+                    &property.value,
+                ) {
+                    return Err(WriterError::InvalidStructure(format!(
+                        "0x{:04X} has the wrong calendar-exception type",
+                        property.id
+                    )));
+                }
+                validate_raw_value(&property.value)?;
+                total
+                    .checked_add(raw_value_payload_len(&property.value)?)
+                    .ok_or(WriterError::ValueTooLarge(
+                        "aggregate attachment raw-property payload",
+                    ))
+            })?;
+        for property in &attachment.spooled_properties {
+            if !binary_metadata_attachment
+                || !matches!(property.id, 0x3702 | 0x3709 | 0x370A)
+                || property.property_type != u16::from(PropertyType::Binary)
+            {
+                return Err(WriterError::InvalidStructure(format!(
+                    "spooled attachment property 0x{:04X} is not supported for its attachment kind",
+                    property.id
+                )));
+            }
+            validate_file_blob(&property.blob)?;
+        }
         if raw_bytes > MAX_FIDELITY_CUSTOM_PROPERTY_BYTES {
             return Err(WriterError::ValueTooLarge(
                 "aggregate attachment raw-property payload",
@@ -3953,6 +4094,21 @@ fn validate_message(message: &MessageSpec, depth: usize) -> Result<(), WriterErr
             }
             if blob.byte_len > i32::MAX as u64 {
                 return Err(WriterError::ValueTooLarge("spooled attachment payload"));
+            }
+        }
+        if let AttachmentContent::Ole(ole) = &attachment.content {
+            if ole.data.path.as_os_str().is_empty() {
+                return Err(WriterError::InvalidStructure(
+                    "OLE attachment payload path must be non-empty".to_owned(),
+                ));
+            }
+            if ole.data.byte_len > i32::MAX as u64 {
+                return Err(WriterError::ValueTooLarge("OLE attachment payload"));
+            }
+            if ole.data_kind == OleDataKind::Object && ole.data.byte_len == 0 {
+                return Err(WriterError::InvalidStructure(
+                    "OLE object payload must be non-empty".to_owned(),
+                ));
             }
         }
         if let AttachmentContent::Reference(reference) = &attachment.content {
@@ -4456,6 +4612,14 @@ fn calendar_exception_attachment_property_type_is_valid(id: u16, value: &RawProp
             | (0x7FFB | 0x7FFC, RawPropertyValue::Time(_))
             | (0x7FFE | 0x7FFF, RawPropertyValue::Boolean(_))
     )
+}
+
+fn ole_attachment_property(id: u16) -> bool {
+    matches!(id, 0x3702 | 0x3709 | 0x370A)
+}
+
+fn ole_attachment_property_type_is_valid(id: u16, value: &RawPropertyValue) -> bool {
+    ole_attachment_property(id) && matches!(value, RawPropertyValue::Binary(_))
 }
 
 fn calendar_exception_attachment_has_linkage(attachment: &AttachmentSpec) -> bool {
@@ -5400,9 +5564,20 @@ fn validate_attachment_fidelity(
                 .checked_add(index_u32)
                 .ok_or(WriterError::ValueTooLarge("attachment node"))?,
         )?;
+        let attachment_streamed_ids = expected
+            .spooled_properties
+            .iter()
+            .map(|property| property.id)
+            .collect::<Vec<_>>();
         let attachment = match &expected.content {
-            AttachmentContent::Spooled(_) | AttachmentContent::Reference(_) => {
-                UnicodeAttachment::read_metadata(top.clone(), attachment_node)
+            AttachmentContent::Spooled(_)
+            | AttachmentContent::Reference(_)
+            | AttachmentContent::Ole(_) => {
+                UnicodeAttachment::read_metadata_with_streamed_properties(
+                    top.clone(),
+                    attachment_node,
+                    &attachment_streamed_ids,
+                )
             }
             AttachmentContent::Embedded(message) => {
                 let validation_ids = validation_property_ids(message, named_identities)?;
@@ -5418,9 +5593,12 @@ fn validate_attachment_fidelity(
                     &streamed_ids,
                 )
             }
-            AttachmentContent::Binary(_) => {
-                UnicodeAttachment::read(top.clone(), attachment_node, None)
-            }
+            AttachmentContent::Binary(_) => UnicodeAttachment::read_with_streamed_properties(
+                top.clone(),
+                attachment_node,
+                None,
+                &attachment_streamed_ids,
+            ),
         }
         .map_err(|error| {
             invalid(&format!(
@@ -5500,6 +5678,19 @@ fn validate_attachment_fidelity(
                 return Err(invalid("completed store attachment raw-property mismatch"));
             }
         }
+        for property in &expected.spooled_properties {
+            if properties.streamed_property_identity(property.id)
+                != Some((
+                    property.property_type,
+                    property.blob.byte_len,
+                    property.blob.sha256,
+                ))
+            {
+                return Err(invalid(
+                    "completed store attachment streamed-property mismatch",
+                ));
+            }
+        }
         match (&expected.content, attachment.data()) {
             (AttachmentContent::Binary(expected_data), Some(AttachmentData::Binary(actual))) => {
                 let expected_size = attachment_property_size(&attachment_properties(
@@ -5509,6 +5700,10 @@ fn validate_attachment_fidelity(
                     0,
                     PropertyValue::Binary(expected_data.clone()),
                 ))?;
+                let expected_size = attachment_size_with_spooled_properties(
+                    expected_size,
+                    &expected.spooled_properties,
+                )?;
                 if actual.buffer() != expected_data || pc_method != 1 || pc_size != expected_size {
                     return Err(invalid("completed store binary attachment size mismatch"));
                 }
@@ -5527,11 +5722,56 @@ fn validate_attachment_fidelity(
                     ),
                     Some(blob.byte_len),
                 )?;
+                let expected_size = attachment_size_with_spooled_properties(
+                    expected_size,
+                    &expected.spooled_properties,
+                )?;
                 if pc_method != 1
                     || pc_size != expected_size
                     || attachment.streamed_data_identity() != Some((blob.byte_len, blob.sha256))
                 {
                     return Err(invalid("completed store spooled attachment size mismatch"));
+                }
+            }
+            (AttachmentContent::Ole(ole), None) => {
+                let expected_size = attachment_property_size_with_stream(
+                    &attachment_properties(
+                        expected,
+                        expected_number,
+                        6,
+                        0,
+                        ole_data_property(ole, node(NodeIdType::ListsTablesProperties, 1)?)?,
+                    ),
+                    Some(ole.data.byte_len),
+                )?;
+                let expected_size = attachment_size_with_spooled_properties(
+                    expected_size,
+                    &expected.spooled_properties,
+                )?;
+                let expected_type = match ole.data_kind {
+                    OleDataKind::Object => u16::from(PropertyType::Object),
+                    OleDataKind::Binary => u16::from(PropertyType::Binary),
+                };
+                if pc_method != 6
+                    || pc_size != expected_size
+                    || attachment.streamed_data_property_type() != Some(expected_type)
+                    || (ole.data_kind == OleDataKind::Object
+                        && attachment
+                            .streamed_data_node()
+                            .and_then(|node| node.id_type().ok())
+                            != Some(NodeIdType::OleObjectData))
+                    || attachment.streamed_data_identity()
+                        != Some((ole.data.byte_len, ole.data.sha256))
+                    || expected.spooled_properties.iter().any(|property| {
+                        properties.streamed_property_identity(property.id)
+                            != Some((
+                                property.property_type,
+                                property.blob.byte_len,
+                                property.blob.sha256,
+                            ))
+                    })
+                {
+                    return Err(invalid("completed store OLE attachment mismatch"));
                 }
             }
             (
@@ -5878,9 +6118,10 @@ fn validate_embedded_message(
             }
             AttachmentContent::Binary(_)
             | AttachmentContent::Spooled(_)
-            | AttachmentContent::Reference(_) => None,
+            | AttachmentContent::Reference(_)
+            | AttachmentContent::Ole(_) => None,
         };
-        let streamed_ids = match &expected_attachment.content {
+        let embedded_streamed_ids = match &expected_attachment.content {
             AttachmentContent::Embedded(message) => message
                 .spooled_properties
                 .iter()
@@ -5888,15 +6129,25 @@ fn validate_embedded_message(
                 .collect::<Vec<_>>(),
             AttachmentContent::Binary(_)
             | AttachmentContent::Spooled(_)
-            | AttachmentContent::Reference(_) => Vec::new(),
+            | AttachmentContent::Reference(_)
+            | AttachmentContent::Ole(_) => Vec::new(),
         };
+        let attachment_streamed_ids = expected_attachment
+            .spooled_properties
+            .iter()
+            .map(|property| property.id)
+            .collect::<Vec<_>>();
         let attachment = actual
             .clone()
             .read_attachment(
                 attachment_node,
                 validation_ids.as_deref(),
-                &streamed_ids,
-                !matches!(&expected_attachment.content, AttachmentContent::Spooled(_)),
+                &attachment_streamed_ids,
+                &embedded_streamed_ids,
+                !matches!(
+                    &expected_attachment.content,
+                    AttachmentContent::Spooled(_) | AttachmentContent::Ole(_)
+                ),
             )
             .map_err(|error| {
                 invalid(&format!(
@@ -5975,6 +6226,19 @@ fn validate_embedded_message(
                 ));
             }
         }
+        for property in &expected_attachment.spooled_properties {
+            if properties.streamed_property_identity(property.id)
+                != Some((
+                    property.property_type,
+                    property.blob.byte_len,
+                    property.blob.sha256,
+                ))
+            {
+                return Err(invalid(
+                    "completed store nested attachment streamed-property mismatch",
+                ));
+            }
+        }
         match (&expected_attachment.content, attachment.data()) {
             (AttachmentContent::Binary(expected), Some(AttachmentData::Binary(actual))) => {
                 let expected_size = attachment_property_size(&attachment_properties(
@@ -5984,6 +6248,10 @@ fn validate_embedded_message(
                     0,
                     PropertyValue::Binary(expected.clone()),
                 ))?;
+                let expected_size = attachment_size_with_spooled_properties(
+                    expected_size,
+                    &expected_attachment.spooled_properties,
+                )?;
                 if actual.buffer() != expected || pc_method != 1 || pc_size != expected_size {
                     return Err(invalid(
                         "completed store nested binary attachment size mismatch",
@@ -6004,6 +6272,10 @@ fn validate_embedded_message(
                     ),
                     Some(expected.byte_len),
                 )?;
+                let expected_size = attachment_size_with_spooled_properties(
+                    expected_size,
+                    &expected_attachment.spooled_properties,
+                )?;
                 if pc_method != 1
                     || pc_size != expected_size
                     || attachment.streamed_data_identity()
@@ -6012,6 +6284,50 @@ fn validate_embedded_message(
                     return Err(invalid(
                         "completed store nested spooled attachment size mismatch",
                     ));
+                }
+            }
+            (AttachmentContent::Ole(ole), None) => {
+                let expected_size = attachment_property_size_with_stream(
+                    &attachment_properties(
+                        expected_attachment,
+                        expected_number,
+                        6,
+                        0,
+                        ole_data_property(ole, node(NodeIdType::ListsTablesProperties, 1)?)?,
+                    ),
+                    Some(ole.data.byte_len),
+                )?;
+                let expected_size = attachment_size_with_spooled_properties(
+                    expected_size,
+                    &expected_attachment.spooled_properties,
+                )?;
+                let expected_type = match ole.data_kind {
+                    OleDataKind::Object => u16::from(PropertyType::Object),
+                    OleDataKind::Binary => u16::from(PropertyType::Binary),
+                };
+                if pc_method != 6
+                    || pc_size != expected_size
+                    || attachment.streamed_data_property_type() != Some(expected_type)
+                    || (ole.data_kind == OleDataKind::Object
+                        && attachment
+                            .streamed_data_node()
+                            .and_then(|node| node.id_type().ok())
+                            != Some(NodeIdType::OleObjectData))
+                    || attachment.streamed_data_identity()
+                        != Some((ole.data.byte_len, ole.data.sha256))
+                    || expected_attachment
+                        .spooled_properties
+                        .iter()
+                        .any(|property| {
+                            properties.streamed_property_identity(property.id)
+                                != Some((
+                                    property.property_type,
+                                    property.blob.byte_len,
+                                    property.blob.sha256,
+                                ))
+                        })
+                {
+                    return Err(invalid("completed store nested OLE attachment mismatch"));
                 }
             }
             (
@@ -6154,7 +6470,9 @@ fn collect_named_identities(message: &MessageSpec) -> Vec<NamedIdentity> {
                         identities.insert((NamedPropertySet::Guid(PSETID_ATTACHMENT), name));
                     }
                 }
-                AttachmentContent::Binary(_) | AttachmentContent::Spooled(_) => {}
+                AttachmentContent::Binary(_)
+                | AttachmentContent::Spooled(_)
+                | AttachmentContent::Ole(_) => {}
             }
         }
     }
@@ -6787,6 +7105,20 @@ fn attachment_properties(
     properties
 }
 
+fn ole_data_property(
+    ole: &OleAttachmentSpec,
+    value_node: NodeId,
+) -> Result<PropertyValue, WriterError> {
+    match ole.data_kind {
+        OleDataKind::Object => Ok(PropertyValue::Object(
+            value_node,
+            u32::try_from(ole.data.byte_len)
+                .map_err(|_| WriterError::ValueTooLarge("OLE attachment object"))?,
+        )),
+        OleDataKind::Binary => Ok(PropertyValue::External(PropertyType::Binary, value_node)),
+    }
+}
+
 fn attachment_properties_mapped(
     attachment: &AttachmentSpec,
     attachment_number: i32,
@@ -6924,6 +7256,22 @@ fn attachment_property_size_with_stream(
     i32::try_from(size).map_err(|_| WriterError::ValueTooLarge("attachment properties"))
 }
 
+fn attachment_size_with_spooled_properties(
+    size: i32,
+    properties: &[SpooledPropertySpec],
+) -> Result<i32, WriterError> {
+    let size = properties
+        .iter()
+        .try_fold(i64::from(size), |total, property| {
+            let byte_len = i64::try_from(property.blob.byte_len)
+                .map_err(|_| WriterError::ValueTooLarge("attachment properties"))?;
+            total
+                .checked_add(byte_len)
+                .ok_or(WriterError::ValueTooLarge("attachment properties"))
+        })?;
+    i32::try_from(size).map_err(|_| WriterError::ValueTooLarge("attachment properties"))
+}
+
 fn set_attachment_size(
     properties: &mut [(u16, PropertyValue)],
     attachment_size: i32,
@@ -6935,6 +7283,47 @@ fn set_attachment_size(
             WriterError::InvalidStructure("attachment size property is missing".to_owned())
         })?;
     *value = PropertyValue::Integer32(attachment_size);
+    Ok(())
+}
+
+fn validate_file_blob(blob: &FileBlobSpec) -> Result<(), WriterError> {
+    if blob.path.as_os_str().is_empty() || blob.byte_len == 0 {
+        return Err(WriterError::InvalidStructure(
+            "streamed property blob must be non-empty".to_owned(),
+        ));
+    }
+    if blob.byte_len > i32::MAX as u64 {
+        return Err(WriterError::ValueTooLarge("streamed property blob"));
+    }
+    Ok(())
+}
+
+fn verify_empty_file_blob(blob: &FileBlobSpec) -> Result<(), WriterError> {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    if blob.byte_len != 0 {
+        return Err(WriterError::InvalidStructure(
+            "empty blob verification requires a zero-byte range".to_owned(),
+        ));
+    }
+    let nofollow = i32::try_from(rustix::fs::OFlags::NOFOLLOW.bits())
+        .map_err(|_| WriterError::ValueTooLarge("open flags"))?;
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(nofollow)
+        .open(&blob.path)?;
+    let metadata = file.metadata()?;
+    if !metadata.file_type().is_file() || metadata.len() < blob.offset {
+        return Err(WriterError::InvalidStructure(
+            "empty blob identity mismatch".to_owned(),
+        ));
+    }
+    let empty_hash: [u8; 32] = Sha256::digest([]).into();
+    if blob.sha256 != empty_hash {
+        return Err(WriterError::InvalidStructure(
+            "empty blob hash mismatch".to_owned(),
+        ));
+    }
     Ok(())
 }
 
@@ -9773,6 +10162,7 @@ mod tests {
             rendering_position: None,
             flags: 0,
             raw_properties: Vec::new(),
+            spooled_properties: Vec::new(),
             content: AttachmentContent::Spooled(FileBlobSpec {
                 path: PathBuf::from("/dev/null"),
                 offset: 0,
@@ -9966,6 +10356,7 @@ mod tests {
             rendering_position: None,
             flags: 0,
             raw_properties: Vec::new(),
+            spooled_properties: Vec::new(),
             content: AttachmentContent::Spooled(FileBlobSpec {
                 path: source,
                 offset: 0,
@@ -10606,7 +10997,8 @@ mod tests {
             AttachmentContent::Binary(value) => value,
             AttachmentContent::Embedded(_)
             | AttachmentContent::Spooled(_)
-            | AttachmentContent::Reference(_) => {
+            | AttachmentContent::Reference(_)
+            | AttachmentContent::Ole(_) => {
                 return Err("expected binary attachment".into());
             }
         };
@@ -11147,6 +11539,7 @@ mod tests {
                 rendering_position: None,
                 flags: 0,
                 raw_properties: Vec::new(),
+                spooled_properties: Vec::new(),
                 content: AttachmentContent::Binary(vec![1]),
             });
         }
@@ -11172,7 +11565,8 @@ mod tests {
             }
             AttachmentContent::Binary(_)
             | AttachmentContent::Spooled(_)
-            | AttachmentContent::Reference(_) => {
+            | AttachmentContent::Reference(_)
+            | AttachmentContent::Ole(_) => {
                 return Err("expected embedded fixture".into());
             }
         };
@@ -11187,6 +11581,7 @@ mod tests {
                 rendering_position: None,
                 flags: 0,
                 raw_properties: Vec::new(),
+                spooled_properties: Vec::new(),
                 content: AttachmentContent::Embedded(Box::new(child)),
             });
             child = parent;
@@ -11362,6 +11757,7 @@ mod tests {
                 rendering_position: None,
                 flags: 0,
                 raw_properties: Vec::new(),
+                spooled_properties: Vec::new(),
                 content: AttachmentContent::Binary(Vec::new()),
             })
             .collect();
@@ -11473,7 +11869,8 @@ mod tests {
             }
             AttachmentContent::Binary(_)
             | AttachmentContent::Spooled(_)
-            | AttachmentContent::Reference(_) => {
+            | AttachmentContent::Reference(_)
+            | AttachmentContent::Ole(_) => {
                 return Err("expected embedded fixture".into());
             }
         }
@@ -11482,7 +11879,8 @@ mod tests {
             AttachmentContent::Embedded(message) => message,
             AttachmentContent::Binary(_)
             | AttachmentContent::Spooled(_)
-            | AttachmentContent::Reference(_) => {
+            | AttachmentContent::Reference(_)
+            | AttachmentContent::Ole(_) => {
                 return Err("expected embedded fixture".into());
             }
         };
@@ -11825,6 +12223,7 @@ mod tests {
             rendering_position: None,
             flags: 0,
             raw_properties: Vec::new(),
+            spooled_properties: Vec::new(),
             content: AttachmentContent::Reference(AttachmentReferenceSpec {
                 method,
                 long_pathname: long_pathname.to_owned(),
@@ -11861,6 +12260,7 @@ mod tests {
                 rendering_position: None,
                 flags: 0,
                 raw_properties: Vec::new(),
+                spooled_properties: Vec::new(),
                 content: AttachmentContent::Reference(AttachmentReferenceSpec {
                     method: AttachmentReferenceMethod::ByWebReference,
                     long_pathname: "https://example.invalid/recovery/web-reference.docx".to_owned(),
@@ -11896,6 +12296,121 @@ mod tests {
             validate_spec(&invalid),
             Err(WriterError::InvalidStructure(detail))
                 if detail.contains("permission")
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn ole_attachment_representations_and_metadata_round_trip()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let object_payload = b"\xD0\xCF\x11\xE0\xA1\xB1\x1A\xE1OLE2 checkpoint";
+        let binary_payload = b"OLE1 native checkpoint";
+        let object_path = directory.path().join("ole2.bin");
+        let binary_path = directory.path().join("ole1.bin");
+        let empty_path = directory.path().join("empty-ole1.bin");
+        let rendition_path = directory.path().join("rendition.wmf");
+        let rendition = vec![0x5A; 20 * 1024];
+        std::fs::write(&object_path, object_payload)?;
+        std::fs::write(&binary_path, binary_payload)?;
+        std::fs::write(&empty_path, [])?;
+        std::fs::write(&rendition_path, &rendition)?;
+        let blob = |path: PathBuf, payload: &[u8]| -> Result<FileBlobSpec, WriterError> {
+            Ok(FileBlobSpec {
+                path,
+                offset: 0,
+                byte_len: u64::try_from(payload.len()).map_err(|_| {
+                    WriterError::InputRejected("test OLE payload length is out of range".to_owned())
+                })?,
+                sha256: Sha256::digest(payload).into(),
+            })
+        };
+        let attachment =
+            |filename: &str,
+             data: FileBlobSpec,
+             data_kind: OleDataKind,
+             raw_properties: Vec<RawProperty>| AttachmentSpec {
+                filename: filename.to_owned(),
+                mime_type: None,
+                content_id: None,
+                content_location: None,
+                rendering_position: Some(-1),
+                flags: 0,
+                raw_properties,
+                spooled_properties: Vec::new(),
+                content: AttachmentContent::Ole(OleAttachmentSpec { data, data_kind }),
+            };
+
+        let mut spec = FidelityStore::default();
+        spec.message.attachments = vec![
+            attachment(
+                "ole2-object.bin",
+                blob(object_path, object_payload)?,
+                OleDataKind::Object,
+                vec![
+                    RawProperty {
+                        id: 0x3702,
+                        value: RawPropertyValue::Binary(vec![0x01, 0x02]),
+                    },
+                    RawProperty {
+                        id: 0x370A,
+                        value: RawPropertyValue::Binary(vec![
+                            0x2A, 0x86, 0x48, 0x86, 0xF7, 0x14, 0x03, 0x0A, 0x03, 0x02, 0x01,
+                        ]),
+                    },
+                ],
+            ),
+            attachment(
+                "ole1-binary.bin",
+                blob(binary_path, binary_payload)?,
+                OleDataKind::Binary,
+                vec![RawProperty {
+                    id: 0x3709,
+                    value: RawPropertyValue::Binary(Vec::new()),
+                }],
+            ),
+            attachment(
+                "empty-ole1-binary.bin",
+                blob(empty_path, &[])?,
+                OleDataKind::Binary,
+                Vec::new(),
+            ),
+        ];
+        spec.message.attachments[0]
+            .spooled_properties
+            .push(SpooledPropertySpec {
+                id: 0x3709,
+                property_type: u16::from(PropertyType::Binary),
+                blob: blob(rendition_path, &rendition)?,
+            });
+        create_fidelity_store(directory.path().join("ole-attachments.pst"), &spec)?;
+
+        let mut size_attachment = spec.message.attachments[0].clone();
+        let baseline_metadata = attachment_metadata_bytes(&size_attachment)?;
+        let AttachmentContent::Ole(ole) = &mut size_attachment.content else {
+            return Err("expected OLE attachment".into());
+        };
+        ole.data.byte_len = (i32::MAX as u64)
+            .checked_sub(baseline_metadata)
+            .ok_or("test attachment sizing underflow")?;
+        size_attachment.raw_properties.push(RawProperty {
+            id: 0x3709,
+            value: RawPropertyValue::Binary(vec![0x33; 64 * 1024]),
+        });
+        let mut oversized_message = FidelityStore::default().message;
+        oversized_message.attachments = vec![size_attachment];
+        assert!(matches!(
+            validate_message_size_bound(&oversized_message),
+            Err(WriterError::ValueTooLarge("attachment properties"))
+        ));
+
+        let mut wrong_metadata = spec;
+        wrong_metadata.message.attachments[0].raw_properties[0].value =
+            RawPropertyValue::Unicode("invalid".to_owned());
+        assert!(matches!(
+            validate_spec(&wrong_metadata),
+            Err(WriterError::InvalidStructure(detail))
+                if detail.contains("attachment raw property")
         ));
         Ok(())
     }

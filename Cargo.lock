@@ -1196,6 +1196,7 @@ name = "xtask"
 version = "0.4.2"
 dependencies = [
  "base64",
+ "cfb",
  "libpff-sys",
  "pstforge-core",
  "pstforge-pst",

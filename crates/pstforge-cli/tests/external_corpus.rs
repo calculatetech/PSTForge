@@ -826,6 +826,7 @@ impl CatalogSink for IndependentMessageSink {
                                 | 0x3705
                                 | 0x3708
                                 | 0x3709
+                                | 0x370a
                                 | 0x370b
                                 | 0x370d
                                 | 0x370e
@@ -2727,6 +2728,245 @@ fn milestone_0_4_2_reference_attachments_roundtrip_through_libpff()
     }
     if pstforge_core::SourceFile::open(&case.path)?.identity() != &identity {
         return Err("reference attachment source identity changed during the split".into());
+    }
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires the external v042-ole-attachments-source corpus case"]
+fn milestone_0_4_2_ole_attachments_roundtrip_through_libpff()
+-> Result<(), Box<dyn std::error::Error>> {
+    let manifest_path = std::env::var_os("PSTFORGE_CORPUS_MANIFEST")
+        .ok_or("PSTFORGE_CORPUS_MANIFEST is required")?;
+    let manifest: Manifest = toml::from_str(&fs::read_to_string(&manifest_path)?)?;
+    let case = manifest
+        .cases
+        .iter()
+        .find(|case| case.name == "v042-ole-attachments-source")
+        .ok_or("manifest has no v042-ole-attachments-source case")?;
+    let identity = pstforge_core::SourceFile::open(&case.path)?
+        .identity()
+        .clone();
+    if identity.sha256 != case.sha256 {
+        return Err("OLE attachment source SHA-256 does not match its manifest".into());
+    }
+
+    let source_messages = independent_messages(&case.path)?;
+    let source = source_messages
+        .first()
+        .ok_or("OLE attachment source has no message")?;
+    let method_hash: [u8; 32] = Sha256::digest(6_i32.to_le_bytes()).into();
+    if source_messages.len() != 1
+        || source.content.subject.as_deref() != Some("OLE attachment fidelity checkpoint")
+        || source.content.attachments.len() != 2
+        || !source.complete
+        || source
+            .content
+            .attachments
+            .iter()
+            .enumerate()
+            .any(|(index, attachment)| {
+                let expected_type = if index == 0 { 0x000D } else { 0x0102 };
+                attachment.streamed_size == 0
+                    || attachment.declared_size != Some(attachment.streamed_size)
+                    || !attachment.rendering_properties.iter().any(|property| {
+                        property.id == 0x3701 && property.value_type == Some(expected_type)
+                    })
+                    || !attachment.rendering_properties.iter().any(|property| {
+                        property.id == 0x3705
+                            && property.value_type == Some(0x0003)
+                            && property.sha256 == method_hash
+                    })
+            })
+    {
+        return Err(format!(
+            "OLE attachment source does not match the method/data contract: {source:?}"
+        )
+        .into());
+    }
+    let first = &source.content.attachments[0];
+    if ![0x3702, 0x3709, 0x370A].into_iter().all(|id| {
+        first
+            .rendering_properties
+            .iter()
+            .any(|property| property.id == id && property.value_type == Some(0x0102))
+    }) {
+        return Err(
+            format!("OLE2 attachment source is missing optional metadata: {first:?}").into(),
+        );
+    }
+    let second = &source.content.attachments[1];
+    if !second.rendering_properties.iter().any(|property| {
+        property.id == 0x3709 && property.value_type == Some(0x0102) && property.byte_len == 0
+    }) {
+        return Err(format!(
+            "OLE1 attachment source lost the explicitly empty rendering property: {second:?}"
+        )
+        .into());
+    }
+    let directory = tempfile::tempdir()?;
+    let job = directory.path().join("job");
+    let output = Command::new(env!("CARGO_BIN_EXE_pstforge"))
+        .arg("split")
+        .arg(&case.path)
+        .arg("--output")
+        .arg(&job)
+        .arg("--max-pst-size")
+        .arg("4GiB")
+        .arg("--json")
+        .arg("--color")
+        .arg("never")
+        .output()?;
+    if output.stdout.is_empty() {
+        return Err(format!(
+            "OLE attachment split failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        )
+        .into());
+    }
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+    let generated = job.join("parts/part-0001.pst");
+    let generated_messages = independent_messages(&generated)?;
+    verify_exact_message_fidelity(source_messages, generated_messages)?;
+    if report["partial"].as_bool() != Some(false)
+        || !output.status.success()
+        || report["written_candidates"].as_u64() != Some(1)
+        || report["parts"].as_array().map(Vec::len) != Some(1)
+        || report["parts"][0]["omitted_properties"].as_u64() != Some(0)
+        || report["parts"][0]["omitted_attachments"].as_u64() != Some(0)
+    {
+        return Err(
+            format!("OLE attachment split did not report complete preservation: {report}").into(),
+        );
+    }
+    if pstforge_core::SourceFile::open(&case.path)?.identity() != &identity {
+        return Err("OLE attachment source identity changed during the split".into());
+    }
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires the external v042-outlook-ole-object-source corpus case"]
+fn milestone_0_4_2_outlook_ole_objects_roundtrip_through_libpff()
+-> Result<(), Box<dyn std::error::Error>> {
+    let manifest_path = std::env::var_os("PSTFORGE_CORPUS_MANIFEST")
+        .ok_or("PSTFORGE_CORPUS_MANIFEST is required")?;
+    let manifest: Manifest = toml::from_str(&fs::read_to_string(&manifest_path)?)?;
+    let case = manifest
+        .cases
+        .iter()
+        .find(|case| case.name == "v042-outlook-ole-object-source")
+        .ok_or("manifest has no v042-outlook-ole-object-source case")?;
+    let identity = pstforge_core::SourceFile::open(&case.path)?
+        .identity()
+        .clone();
+    if identity.sha256 != case.sha256 {
+        return Err("Outlook OLE source SHA-256 does not match its manifest".into());
+    }
+
+    let source_messages = independent_messages(&case.path)?;
+    let source = source_messages
+        .first()
+        .ok_or("Outlook OLE source has no message")?;
+    let method_hash: [u8; 32] = Sha256::digest(6_i32.to_le_bytes()).into();
+    if source_messages.len() != 1
+        || source.content.attachments.len() != 5
+        || !source.complete
+        || source.content.attachments.iter().any(|attachment| {
+            attachment.streamed_size == 0
+                || !attachment
+                    .rendering_properties
+                    .iter()
+                    .any(|property| property.id == 0x3701 && property.value_type == Some(0x000D))
+                || !attachment.rendering_properties.iter().any(|property| {
+                    property.id == 0x3705
+                        && property.value_type == Some(0x0003)
+                        && property.sha256 == method_hash
+                })
+        })
+    {
+        return Err(format!(
+            "Outlook OLE source does not match the five-object contract: {source:?}"
+        )
+        .into());
+    }
+
+    let directory = tempfile::tempdir()?;
+    let job = directory.path().join("job");
+    let output = Command::new(env!("CARGO_BIN_EXE_pstforge"))
+        .arg("split")
+        .arg(&case.path)
+        .arg("--output")
+        .arg(&job)
+        .arg("--max-pst-size")
+        .arg("4GiB")
+        .arg("--json")
+        .arg("--color")
+        .arg("never")
+        .output()?;
+    if output.stdout.is_empty() {
+        return Err(format!(
+            "Outlook OLE split failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        )
+        .into());
+    }
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+    let generated = job.join("parts/part-0001.pst");
+    let generated_messages = independent_messages(&generated)?;
+    let generated_message = generated_messages
+        .first()
+        .ok_or("generated Outlook OLE output has no message")?;
+    let source_rtf = source
+        .content
+        .body_properties
+        .iter()
+        .find(|property| property.id == 0x1009)
+        .ok_or("Outlook OLE source has no compressed RTF body")?;
+    let generated_rtf = generated_message
+        .content
+        .body_properties
+        .iter()
+        .find(|property| property.id == 0x1009)
+        .ok_or("generated Outlook OLE output lost its compressed RTF body")?;
+    if generated_rtf != source_rtf {
+        return Err("Outlook OLE compressed RTF body changed".into());
+    }
+    let ole_contract = |attachments: &[AttachmentFingerprint]| {
+        attachments
+            .iter()
+            .map(|attachment| {
+                (
+                    attachment.index,
+                    attachment.streamed_size,
+                    attachment.sha256,
+                    attachment
+                        .rendering_properties
+                        .iter()
+                        .filter(|property| {
+                            matches!(property.id, 0x3701 | 0x3702 | 0x3705 | 0x3709 | 0x370A)
+                        })
+                        .cloned()
+                        .collect::<Vec<_>>(),
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+    if ole_contract(&generated_message.content.attachments)
+        != ole_contract(&source.content.attachments)
+    {
+        return Err("Outlook OLE method, type, metadata, or payload changed".into());
+    }
+    if report["written_candidates"].as_u64() != Some(1)
+        || report["parts"].as_array().map(Vec::len) != Some(1)
+        || report["parts"][0]["omitted_attachments"].as_u64() != Some(0)
+    {
+        return Err(
+            format!("Outlook OLE split did not preserve every attachment: {report}").into(),
+        );
+    }
+    if pstforge_core::SourceFile::open(&case.path)?.identity() != &identity {
+        return Err("Outlook OLE source identity changed during the split".into());
     }
     Ok(())
 }

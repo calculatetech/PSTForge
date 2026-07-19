@@ -2,12 +2,14 @@
 
 use std::{collections::BTreeMap, io, rc::Rc};
 
+use sha2::{Digest, Sha256};
+
 use super::{message::*, read_write::*, *};
 use crate::{
     AnsiPstFile, PstFile, PstFileLock, UnicodePstFile,
     ltp::{
         heap::HeapNode,
-        prop_context::{BinaryValue, PropertyContext, PropertyValue},
+        prop_context::{BinaryValue, PropertyContext, PropertyValue, PropertyValueRecord},
         prop_type::PropertyType,
         read_write::*,
     },
@@ -25,6 +27,7 @@ use crate::{
 #[derive(Default, Debug)]
 pub struct AttachmentProperties {
     properties: BTreeMap<u16, PropertyValue>,
+    streamed_properties: BTreeMap<u16, (u16, u64, [u8; 32])>,
 }
 
 impl AttachmentProperties {
@@ -34,6 +37,10 @@ impl AttachmentProperties {
 
     pub fn iter(&self) -> impl Iterator<Item = (&u16, &PropertyValue)> {
         self.properties.iter()
+    }
+
+    pub fn streamed_property_identity(&self, id: u16) -> Option<(u16, u64, [u8; 32])> {
+        self.streamed_properties.get(&id).copied()
     }
 
     pub fn attachment_size(&self) -> io::Result<i32> {
@@ -168,6 +175,8 @@ pub trait Attachment {
     fn properties(&self) -> &AttachmentProperties;
     fn data(&self) -> Option<&AttachmentData>;
     fn streamed_data_identity(&self) -> Option<(u64, [u8; 32])>;
+    fn streamed_data_property_type(&self) -> Option<u16>;
+    fn streamed_data_node(&self) -> Option<NodeId>;
 }
 
 struct AttachmentInner<Pst>
@@ -178,6 +187,8 @@ where
     properties: AttachmentProperties,
     data: Option<AttachmentData>,
     streamed_data_identity: Option<(u64, [u8; 32])>,
+    streamed_data_property_type: Option<u16>,
+    streamed_data_node: Option<NodeId>,
 }
 
 impl<Pst> AttachmentInner<Pst>
@@ -229,6 +240,7 @@ where
         sub_node: NodeId,
         prop_ids: Option<&[u16]>,
         materialize_data: bool,
+        attachment_streamed_ids: &[u16],
         embedded_streamed_ids: &[u16],
     ) -> io::Result<Self> {
         let node_id_type = sub_node.id_type()?;
@@ -245,7 +257,14 @@ where
         let header = pst.header();
         let root = header.root();
 
-        let (properties, data, embedded_node, streamed_data_identity) = {
+        let (
+            properties,
+            data,
+            embedded_node,
+            streamed_data_identity,
+            streamed_data_property_type,
+            streamed_data_node,
+        ) = {
             let mut file = pst
                 .reader()
                 .lock()
@@ -285,21 +304,89 @@ where
             >>::new(node, tree);
             let mut properties = BTreeMap::new();
             let mut streamed_data_identity = None;
+            let mut streamed_data_property_type = None;
+            let mut streamed_object = None;
+            let mut streamed_data_node = None;
+            let mut streamed_properties = BTreeMap::new();
             for (prop_id, record) in prop_context.properties()? {
                 if !materialize_data && prop_id == 0x3701 {
-                    if record.prop_type() != PropertyType::Binary {
-                        return Err(
-                            MessagingError::InvalidMessageObjectData(record.prop_type()).into()
-                        );
+                    match record.prop_type() {
+                        PropertyType::Binary => {
+                            let (property_type, byte_len, sha256) =
+                                if matches!(record.value(), PropertyValueRecord::Node(_)) {
+                                    prop_context.stream_property_identity(
+                                        file,
+                                        encoding,
+                                        &block_btree,
+                                        &mut page_cache,
+                                        record,
+                                    )?
+                                } else {
+                                    let value = prop_context.read_property(
+                                        file,
+                                        encoding,
+                                        &block_btree,
+                                        &mut page_cache,
+                                        record,
+                                        Some(&mut *property_budget.borrow_mut()),
+                                    )?;
+                                    let (byte_len, sha256) = match value {
+                                        PropertyValue::Binary(value) => (
+                                            u64::try_from(value.buffer().len()).map_err(|_| {
+                                                io::Error::new(
+                                                    io::ErrorKind::InvalidData,
+                                                    "inline attachment length does not fit u64",
+                                                )
+                                            })?,
+                                            Sha256::digest(value.buffer()).into(),
+                                        ),
+                                        PropertyValue::Null => (0, Sha256::digest([]).into()),
+                                        _ => {
+                                            return Err(MessagingError::InvalidMessageObjectData(
+                                                record.prop_type(),
+                                            )
+                                            .into());
+                                        }
+                                    };
+                                    (u16::from(PropertyType::Binary), byte_len, sha256)
+                                };
+                            streamed_data_identity = Some((byte_len, sha256));
+                            streamed_data_property_type = Some(property_type);
+                        }
+                        PropertyType::Object => {
+                            let value = prop_context.read_property(
+                                file,
+                                encoding,
+                                &block_btree,
+                                &mut page_cache,
+                                record,
+                                Some(&mut *property_budget.borrow_mut()),
+                            )?;
+                            let PropertyValue::Object(value) = value else {
+                                return Err(MessagingError::InvalidMessageObjectData(
+                                    record.prop_type(),
+                                )
+                                .into());
+                            };
+                            streamed_data_node = Some(value.node());
+                            streamed_object = Some(value);
+                            streamed_data_property_type = Some(u16::from(PropertyType::Object));
+                        }
+                        invalid => {
+                            return Err(MessagingError::InvalidMessageObjectData(invalid).into());
+                        }
                     }
-                    let (_, byte_len, sha256) = prop_context.stream_property_identity(
+                    continue;
+                }
+                if attachment_streamed_ids.contains(&prop_id) {
+                    let identity = prop_context.stream_property_identity(
                         file,
                         encoding,
                         &block_btree,
                         &mut page_cache,
                         record,
                     )?;
-                    streamed_data_identity = Some((byte_len, sha256));
+                    streamed_properties.insert(prop_id, identity);
                     continue;
                 }
                 let value = prop_context.read_property(
@@ -312,10 +399,77 @@ where
                 )?;
                 properties.insert(prop_id, value);
             }
-            let properties = AttachmentProperties { properties };
+            let properties = AttachmentProperties {
+                properties,
+                streamed_properties,
+            };
             let attachment_size = declared_attachment_size(&properties)?;
             let attachment_method = AttachmentMethod::try_from(properties.attachment_method()?)?;
             let data = if !materialize_data {
+                if let (AttachmentMethod::Storage, Some(object_data)) =
+                    (attachment_method, streamed_object)
+                {
+                    let sub_node = object_data.node();
+                    let root = node
+                        .sub_node()
+                        .ok_or(MessagingError::AttachmentSubNodeNotFound(sub_node))?;
+                    let block = block_btree.find_entry(file, root.search_key(), &mut page_cache)?;
+                    let tree = SubNodeTree::<Pst>::read(file, &block)?;
+                    let node = tree.find_leaf_entry_bounded(
+                        file,
+                        &block_btree,
+                        sub_node,
+                        &mut page_cache,
+                    )?;
+                    let block =
+                        block_btree.find_entry(file, node.block().search_key(), &mut page_cache)?;
+                    let block = DataTree::read(file, encoding, &block)?;
+                    let mut cache = Default::default();
+                    let mut reader =
+                        block.reader(file, encoding, &block_btree, &mut page_cache, &mut cache)?;
+                    let mut hasher = Sha256::new();
+                    let mut byte_len = 0_u64;
+                    let mut buffer = [0_u8; 8192];
+                    loop {
+                        let read = reader.read(&mut buffer)?;
+                        if read == 0 {
+                            break;
+                        }
+                        hasher.update(&buffer[..read]);
+                        byte_len = byte_len
+                            .checked_add(u64::try_from(read).map_err(|_| {
+                                io::Error::new(
+                                    io::ErrorKind::InvalidData,
+                                    "OLE attachment length overflow",
+                                )
+                            })?)
+                            .ok_or_else(|| {
+                                io::Error::new(
+                                    io::ErrorKind::InvalidData,
+                                    "OLE attachment length overflow",
+                                )
+                            })?;
+                    }
+                    validate_object_content_size(
+                        object_data.size(),
+                        usize::try_from(byte_len).map_err(|_| {
+                            io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                "OLE attachment length does not fit memory index",
+                            )
+                        })?,
+                    )?;
+                    validate_attachment_content_size(
+                        attachment_size,
+                        usize::try_from(byte_len).map_err(|_| {
+                            io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                "OLE attachment length does not fit memory index",
+                            )
+                        })?,
+                    )?;
+                    streamed_data_identity = Some((byte_len, hasher.finalize().into()));
+                }
                 (None, None)
             } else {
                 match attachment_method {
@@ -426,7 +580,14 @@ where
                 }
             };
 
-            (properties, data.0, data.1, streamed_data_identity)
+            (
+                properties,
+                data.0,
+                data.1,
+                streamed_data_identity,
+                streamed_data_property_type,
+                streamed_data_node,
+            )
         };
         let data = match embedded_node {
             Some((node, attachment_size, object_size)) => {
@@ -458,6 +619,8 @@ where
             properties,
             data,
             streamed_data_identity,
+            streamed_data_property_type,
+            streamed_data_node,
         })
     }
 }
@@ -477,7 +640,44 @@ impl UnicodeAttachment {
 
     /// Read attachment metadata without materializing its by-value payload.
     pub fn read_metadata(message: Rc<UnicodeMessage>, sub_node: NodeId) -> io::Result<Rc<Self>> {
-        let inner = AttachmentInner::read(message, sub_node, None, false, &[])?;
+        let inner = AttachmentInner::read(message, sub_node, None, false, &[], &[])?;
+        Ok(Rc::new(Self { inner }))
+    }
+
+    pub fn read_metadata_with_streamed_properties(
+        message: Rc<UnicodeMessage>,
+        sub_node: NodeId,
+        streamed_ids: &[u16],
+    ) -> io::Result<Rc<Self>> {
+        let inner = AttachmentInner::read(message, sub_node, None, false, streamed_ids, &[])?;
+        Ok(Rc::new(Self { inner }))
+    }
+
+    pub fn read_with_streamed_properties(
+        message: Rc<UnicodeMessage>,
+        sub_node: NodeId,
+        prop_ids: Option<&[u16]>,
+        streamed_ids: &[u16],
+    ) -> io::Result<Rc<Self>> {
+        let inner = AttachmentInner::read(message, sub_node, prop_ids, true, streamed_ids, &[])?;
+        Ok(Rc::new(Self { inner }))
+    }
+
+    pub fn read_with_all_streamed_properties(
+        message: Rc<UnicodeMessage>,
+        sub_node: NodeId,
+        prop_ids: Option<&[u16]>,
+        attachment_streamed_ids: &[u16],
+        embedded_streamed_ids: &[u16],
+    ) -> io::Result<Rc<Self>> {
+        let inner = AttachmentInner::read(
+            message,
+            sub_node,
+            prop_ids,
+            true,
+            attachment_streamed_ids,
+            embedded_streamed_ids,
+        )?;
         Ok(Rc::new(Self { inner }))
     }
 
@@ -487,12 +687,20 @@ impl UnicodeAttachment {
         prop_ids: Option<&[u16]>,
         streamed_ids: &[u16],
     ) -> io::Result<Rc<Self>> {
-        let inner = AttachmentInner::read(message, sub_node, prop_ids, true, streamed_ids)?;
+        let inner = AttachmentInner::read(message, sub_node, prop_ids, true, &[], streamed_ids)?;
         Ok(Rc::new(Self { inner }))
     }
 
     pub fn streamed_data_identity(&self) -> Option<(u64, [u8; 32])> {
         self.inner.streamed_data_identity
+    }
+
+    pub fn streamed_data_property_type(&self) -> Option<u16> {
+        self.inner.streamed_data_property_type
+    }
+
+    pub fn streamed_data_node(&self) -> Option<NodeId> {
+        self.inner.streamed_data_node
     }
 }
 
@@ -512,6 +720,14 @@ impl Attachment for UnicodeAttachment {
     fn streamed_data_identity(&self) -> Option<(u64, [u8; 32])> {
         self.inner.streamed_data_identity
     }
+
+    fn streamed_data_property_type(&self) -> Option<u16> {
+        self.inner.streamed_data_property_type
+    }
+
+    fn streamed_data_node(&self) -> Option<NodeId> {
+        self.inner.streamed_data_node
+    }
 }
 
 impl AttachmentReadWrite<UnicodePstFile> for UnicodeAttachment {
@@ -520,7 +736,7 @@ impl AttachmentReadWrite<UnicodePstFile> for UnicodeAttachment {
         sub_node: NodeId,
         prop_ids: Option<&[u16]>,
     ) -> io::Result<Rc<Self>> {
-        let inner = AttachmentInner::read(message, sub_node, prop_ids, true, &[])?;
+        let inner = AttachmentInner::read(message, sub_node, prop_ids, true, &[], &[])?;
         Ok(Rc::new(Self { inner }))
     }
 }
@@ -540,7 +756,7 @@ impl AnsiAttachment {
 
     /// Read attachment metadata without materializing its by-value payload.
     pub fn read_metadata(message: Rc<AnsiMessage>, sub_node: NodeId) -> io::Result<Rc<Self>> {
-        let inner = AttachmentInner::read(message, sub_node, None, false, &[])?;
+        let inner = AttachmentInner::read(message, sub_node, None, false, &[], &[])?;
         Ok(Rc::new(Self { inner }))
     }
 
@@ -565,6 +781,14 @@ impl Attachment for AnsiAttachment {
     fn streamed_data_identity(&self) -> Option<(u64, [u8; 32])> {
         self.inner.streamed_data_identity
     }
+
+    fn streamed_data_property_type(&self) -> Option<u16> {
+        self.inner.streamed_data_property_type
+    }
+
+    fn streamed_data_node(&self) -> Option<NodeId> {
+        self.inner.streamed_data_node
+    }
 }
 
 impl AttachmentReadWrite<AnsiPstFile> for AnsiAttachment {
@@ -573,7 +797,7 @@ impl AttachmentReadWrite<AnsiPstFile> for AnsiAttachment {
         sub_node: NodeId,
         prop_ids: Option<&[u16]>,
     ) -> io::Result<Rc<Self>> {
-        let inner = AttachmentInner::read(message, sub_node, prop_ids, true, &[])?;
+        let inner = AttachmentInner::read(message, sub_node, prop_ids, true, &[], &[])?;
         Ok(Rc::new(Self { inner }))
     }
 }
@@ -591,6 +815,7 @@ mod tests {
     fn attachment_size_validation_rejects_negative_and_undersized_values() {
         let negative = AttachmentProperties {
             properties: BTreeMap::from([(0x0E20, PropertyValue::Integer32(-1))]),
+            streamed_properties: BTreeMap::new(),
         };
         assert!(declared_attachment_size(&negative).is_err());
         assert!(validate_attachment_content_size(4, 5).is_err());

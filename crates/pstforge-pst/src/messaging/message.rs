@@ -142,6 +142,7 @@ pub trait Message {
         self: Rc<Self>,
         node: NodeId,
         property_ids: Option<&[u16]>,
+        attachment_streamed_ids: &[u16],
         embedded_streamed_ids: &[u16],
         materialize: bool,
     ) -> io::Result<Rc<dyn attachment::Attachment>>;
@@ -450,20 +451,26 @@ impl Message for UnicodeMessage {
         self: Rc<Self>,
         node: NodeId,
         property_ids: Option<&[u16]>,
+        attachment_streamed_ids: &[u16],
         embedded_streamed_ids: &[u16],
         materialize: bool,
     ) -> io::Result<Rc<dyn attachment::Attachment>> {
         if materialize {
-            attachment::UnicodeAttachment::read_with_streamed_embedded_properties(
+            attachment::UnicodeAttachment::read_with_all_streamed_properties(
                 self,
                 node,
                 property_ids,
+                attachment_streamed_ids,
                 embedded_streamed_ids,
             )
             .map(|attachment| attachment as Rc<dyn attachment::Attachment>)
         } else {
-            attachment::UnicodeAttachment::read_metadata(self, node)
-                .map(|attachment| attachment as Rc<dyn attachment::Attachment>)
+            attachment::UnicodeAttachment::read_metadata_with_streamed_properties(
+                self,
+                node,
+                attachment_streamed_ids,
+            )
+            .map(|attachment| attachment as Rc<dyn attachment::Attachment>)
         }
     }
 }
@@ -579,6 +586,7 @@ impl Message for AnsiMessage {
         self: Rc<Self>,
         node: NodeId,
         property_ids: Option<&[u16]>,
+        _attachment_streamed_ids: &[u16],
         _embedded_streamed_ids: &[u16],
         materialize: bool,
     ) -> io::Result<Rc<dyn attachment::Attachment>> {

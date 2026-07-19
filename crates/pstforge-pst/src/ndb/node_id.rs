@@ -33,6 +33,8 @@ pub enum NodeIdType {
     SearchCriteria = 0x07,
     /// `NID_TYPE_ASSOC_MESSAGE`: Folder associated information (FAI) Message object (PC)
     AssociatedMessage = 0x08,
+    /// Outlook OLE `PtypObject` data subnode; reserved by the published MS-PST enum.
+    OleObjectData = 0x09,
     /// `NID_TYPE_CONTENTS_TABLE_INDEX`: Internal, persisted view-related
     ContentsTableIndex = 0x0A,
     /// `NID_TYPE_RECEIVE_FOLDER_TABLE`: Receive Folder object (Inbox)
@@ -84,6 +86,7 @@ impl TryFrom<u8> for NodeIdType {
             0x06 => Ok(NodeIdType::SearchUpdateQueue),
             0x07 => Ok(NodeIdType::SearchCriteria),
             0x08 => Ok(NodeIdType::AssociatedMessage),
+            0x09 => Ok(NodeIdType::OleObjectData),
             0x0A => Ok(NodeIdType::ContentsTableIndex),
             0x0B => Ok(NodeIdType::ReceiveFolderTable),
             0x0C => Ok(NodeIdType::OutgoingQueueTable),

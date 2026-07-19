@@ -259,6 +259,7 @@ fn run() -> Result<(), String> {
             Some("pim-items") => qualify_pim_items(&root, Path::new(&output)),
             Some("distribution-list") => qualify_distribution_list(&root, Path::new(&output)),
             Some("document-object") => qualify_document_object(&root, Path::new(&output)),
+            Some("ole-attachments") => qualify_ole_attachments(&root, Path::new(&output)),
             Some("reference-attachments") => {
                 qualify_reference_attachments(&root, Path::new(&output))
             }
@@ -266,7 +267,7 @@ fn run() -> Result<(), String> {
                 qualify_calendar_exceptions(&root, Path::new(&output))
             }
             Some("associated-data") => qualify_associated_data(&root, Path::new(&output)),
-            _ => Err("unknown qualification checkpoint; expected embedded-attachments, named-properties, empty-folders, contacts, appointments, meetings, pim-items, distribution-list, document-object, reference-attachments, calendar-exceptions, or associated-data".to_owned()),
+            _ => Err("unknown qualification checkpoint; expected embedded-attachments, named-properties, empty-folders, contacts, appointments, meetings, pim-items, distribution-list, document-object, ole-attachments, reference-attachments, calendar-exceptions, or associated-data".to_owned()),
         };
     }
     if command != std::ffi::OsStr::new("gate") {
@@ -298,7 +299,7 @@ fn run() -> Result<(), String> {
 }
 
 fn usage() -> String {
-    "usage: cargo xtask gate <fast|full|release> | qualify <embedded-attachments|named-properties|empty-folders|contacts|appointments|meetings|pim-items|distribution-list|document-object|reference-attachments|calendar-exceptions|associated-data> <output>"
+    "usage: cargo xtask gate <fast|full|release> | qualify <embedded-attachments|named-properties|empty-folders|contacts|appointments|meetings|pim-items|distribution-list|document-object|ole-attachments|reference-attachments|calendar-exceptions|associated-data> <output>"
         .to_owned()
 }
 
@@ -314,7 +315,8 @@ fn qualify_embedded_attachments(root: &Path, output: &Path) -> Result<(), String
             AttachmentContent::Embedded(message) => Some(message.as_mut()),
             AttachmentContent::Binary(_)
             | AttachmentContent::Spooled(_)
-            | AttachmentContent::Reference(_) => None,
+            | AttachmentContent::Reference(_)
+            | AttachmentContent::Ole(_) => None,
         })
         .ok_or_else(|| "writer fixture has no embedded message".to_owned())?;
     let mut nested = embedded.clone();
@@ -328,6 +330,7 @@ fn qualify_embedded_attachments(root: &Path, output: &Path) -> Result<(), String
         rendering_position: Some(42),
         flags: 7,
         raw_properties: Vec::new(),
+        spooled_properties: Vec::new(),
         content: AttachmentContent::Binary(b"nested payload checkpoint".to_vec()),
     });
     embedded.attachments.push(AttachmentSpec {
@@ -338,6 +341,7 @@ fn qualify_embedded_attachments(root: &Path, output: &Path) -> Result<(), String
         rendering_position: None,
         flags: 0,
         raw_properties: Vec::new(),
+        spooled_properties: Vec::new(),
         content: AttachmentContent::Binary(b"embedded payload checkpoint".to_vec()),
     });
     embedded.attachments.push(AttachmentSpec {
@@ -348,6 +352,7 @@ fn qualify_embedded_attachments(root: &Path, output: &Path) -> Result<(), String
         rendering_position: None,
         flags: 0,
         raw_properties: Vec::new(),
+        spooled_properties: Vec::new(),
         content: AttachmentContent::Embedded(Box::new(nested)),
     });
     publish_fidelity_qualification(root, output, &fixture, 3)
@@ -1088,6 +1093,7 @@ fn qualify_document_object(root: &Path, output: &Path) -> Result<(), String> {
         rendering_position: Some(-1),
         flags: 0,
         raw_properties: Vec::new(),
+        spooled_properties: Vec::new(),
         content: AttachmentContent::Binary(document),
     }];
     let spec = MailStoreSpec {
@@ -1169,6 +1175,7 @@ fn qualify_reference_attachments(root: &Path, output: &Path) -> Result<(), Strin
         rendering_position: Some(-1),
         flags: 0,
         raw_properties: Vec::new(),
+        spooled_properties: Vec::new(),
         content: AttachmentContent::Reference(AttachmentReferenceSpec {
             method,
             long_pathname: long_pathname.to_owned(),
@@ -1205,6 +1212,7 @@ fn qualify_reference_attachments(root: &Path, output: &Path) -> Result<(), Strin
             rendering_position: Some(-1),
             flags: 0,
             raw_properties: Vec::new(),
+            spooled_properties: Vec::new(),
             content: AttachmentContent::Reference(AttachmentReferenceSpec {
                 method: AttachmentReferenceMethod::ByWebReference,
                 long_pathname: "https://example.invalid/recovery/web-reference.docx".to_owned(),
@@ -1230,6 +1238,110 @@ fn qualify_reference_attachments(root: &Path, output: &Path) -> Result<(), Strin
     publish_qualification(root, output, 1, |part| {
         pstforge_pst::writer::create_mail_store(part, &spec)
     })
+}
+
+fn qualify_ole_attachments(root: &Path, output: &Path) -> Result<(), String> {
+    use std::io::{Cursor, Write as _};
+
+    use pstforge_pst::writer::{
+        AttachmentContent, AttachmentSpec, FidelityStore, FileBlobSpec, MinimalStore,
+        OleAttachmentSpec, OleDataKind, RawProperty, RawPropertyValue, SpooledPropertySpec,
+    };
+
+    let parent = output
+        .parent()
+        .filter(|path| path.is_dir())
+        .ok_or_else(|| "qualification output parent must already exist".to_owned())?;
+    let payloads = tempfile::tempdir_in(parent)
+        .map_err(|error| format!("cannot create OLE payload staging directory: {error}"))?;
+    let mut compound =
+        cfb::CompoundFile::create_with_version(cfb::Version::V3, Cursor::new(Vec::new()))
+            .map_err(|error| format!("cannot create OLE2 compound file: {error}"))?;
+    compound
+        .create_storage("/PSTForge")
+        .map_err(|error| format!("cannot create OLE2 storage: {error}"))?;
+    compound
+        .create_stream("/PSTForge/Contents")
+        .and_then(|mut stream| stream.write_all(b"PSTForge OLE2 recovery checkpoint"))
+        .map_err(|error| format!("cannot create OLE2 content stream: {error}"))?;
+    let ole2 = compound.into_inner().into_inner();
+    cfb::CompoundFile::open_strict(Cursor::new(ole2.clone()))
+        .map_err(|error| format!("generated OLE2 fixture is invalid: {error}"))?;
+    let ole1 = b"PSTForge OLE1 native recovery checkpoint".to_vec();
+    let rendition = vec![0x5A; 20 * 1024];
+    let spool = |name: &str, bytes: &[u8]| -> Result<FileBlobSpec, String> {
+        let path = payloads.path().join(name);
+        fs::write(&path, bytes)
+            .map_err(|error| format!("cannot write OLE fixture payload: {error}"))?;
+        Ok(FileBlobSpec {
+            path,
+            offset: 0,
+            byte_len: u64::try_from(bytes.len())
+                .map_err(|_| "OLE fixture payload length is out of range".to_owned())?,
+            sha256: Sha256::digest(bytes).into(),
+        })
+    };
+    let attachment = |filename: &str,
+                      data: FileBlobSpec,
+                      data_kind: OleDataKind,
+                      raw_properties: Vec<RawProperty>| AttachmentSpec {
+        filename: filename.to_owned(),
+        mime_type: None,
+        content_id: None,
+        content_location: None,
+        rendering_position: Some(-1),
+        flags: 0,
+        raw_properties,
+        spooled_properties: Vec::new(),
+        content: AttachmentContent::Ole(OleAttachmentSpec { data, data_kind }),
+    };
+
+    let mut fixture = FidelityStore::from(&MinimalStore {
+        store_name: "PSTForge OLE source".to_owned(),
+        folder_name: "OLE Attachments".to_owned(),
+        subject: "OLE attachment fidelity checkpoint".to_owned(),
+        body: "Both documented ATTACH_OLE payload representations are present.".to_owned(),
+        sender_name: "PSTForge".to_owned(),
+        sender_email: "sender@example.com".to_owned(),
+        recipient: "recipient@example.com".to_owned(),
+        record_key: *b"PSTForgeOleAtt01",
+    });
+    fixture.message.attachments = vec![
+        attachment(
+            "ole2-storage.bin",
+            spool("ole2-storage.bin", &ole2)?,
+            OleDataKind::Object,
+            vec![
+                RawProperty {
+                    id: 0x3702,
+                    value: RawPropertyValue::Binary(vec![0x01, 0x00]),
+                },
+                RawProperty {
+                    id: 0x370A,
+                    value: RawPropertyValue::Binary(vec![
+                        0x2A, 0x86, 0x48, 0x86, 0xF7, 0x14, 0x03, 0x0A, 0x03, 0x02, 0x01,
+                    ]),
+                },
+            ],
+        ),
+        attachment(
+            "ole1-native.bin",
+            spool("ole1-native.bin", &ole1)?,
+            OleDataKind::Binary,
+            vec![RawProperty {
+                id: 0x3709,
+                value: RawPropertyValue::Binary(Vec::new()),
+            }],
+        ),
+    ];
+    fixture.message.attachments[0]
+        .spooled_properties
+        .push(SpooledPropertySpec {
+            id: 0x3709,
+            property_type: 0x0102,
+            blob: spool("ole2-rendition.wmf", &rendition)?,
+        });
+    publish_fidelity_qualification(root, output, &fixture, 1)
 }
 
 fn qualify_calendar_exceptions(root: &Path, output: &Path) -> Result<(), String> {
@@ -1301,6 +1413,7 @@ fn qualify_calendar_exceptions(root: &Path, output: &Path) -> Result<(), String>
                 value: RawPropertyValue::Boolean(false),
             },
         ],
+        spooled_properties: Vec::new(),
         content: AttachmentContent::Embedded(Box::new(exception)),
     });
 

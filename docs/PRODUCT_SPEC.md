@@ -220,6 +220,20 @@ omits only that attachment and makes the result partial. If damaged source
 metadata asserts both a reference method and a readable by-value content
 property, the reference relationship wins and the conflicting content
 property is counted as an explicit omission, including when it is zero bytes.
+OLE attachments preserve method `6`, the exact complete payload bytes, and
+the source `PtypObject` or `PtypBinary` relationship. Readable attach-tag,
+encoding, and static-rendition properties remain byte-exact when present;
+PSTForge does not invent a rendition when it is absent. PSTForge never
+instantiates, executes, repairs, converts, or dereferences an OLE object. A
+complete zero-byte `PtypBinary` payload remains an exact readable source value.
+A zero-byte `PtypObject` is malformed because its object descriptor cannot
+reference a valid empty PST data block. A missing, incomplete, oversized, or
+malformed required payload omits only that attachment and makes the result
+partial. Malformed optional OLE metadata is omitted alone with explicit partial
+accounting.
+Readable binary attach-tag, encoding, and rendering metadata is also preserved
+on complete by-value attachments when present; these properties are not
+treated as method-6-only merely because they are commonly used by OLE objects.
 PSTForge preserves a nonempty source attachment MIME type. When that property
 is absent on a complete by-value attachment, PSTForge may derive a type from
 an exact leading signature or a bounded structural parse under the confidence

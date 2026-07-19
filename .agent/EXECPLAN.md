@@ -1943,9 +1943,130 @@ work. Hash and identity evidence show that the source was not modified.
         regressions. A fresh final-state clean-context review returned `CLEAN`.
         The owner reports that the r2 candidate works, satisfying the
         ScanPST-first Outlook interoperability gate.
-    - [ ] Checkpoint 11c: OLE attachments. Preserve source object/binary data,
+    - [x] Checkpoint 11c: OLE attachments. Preserve source object/binary data,
       attach tag, static rendition, and method relationship without converting
-      or executing the object.
+      or executing the object. Method `6` preserves `0x3701` as `PtypObject`
+      for OLE 2 storage or `PtypBinary` for OLE 1 OLESTREAM data, selected only
+      from the readable source property type. Preserve optional `0x370A`
+      attach-tag, `0x3702` encoding, and `0x3709` static-rendition bytes exactly
+      when present, including an explicitly empty rendition. Never infer,
+      synthesize, execute, repair, convert, or dereference object content.
+      Preserve a complete zero-byte `PtypBinary` payload as an exact readable
+      source value. Treat zero-byte `PtypObject` as malformed because its object
+      descriptor cannot reference a valid empty PST data block. Missing,
+      incomplete, oversized, or malformed required payloads omit only that
+      attachment and report partial; malformed optional metadata is omitted
+      alone. Advance the job schema from 18 to 19 so resumed jobs
+      cannot mix pre-OLE and OLE-aware output semantics. Prove exact method,
+      property type, payload, tag, encoding, rendition, and absence semantics
+      with one bounded external fixture, independently validate its OLE 2
+      payload as Compound File Binary, then stop for ScanPST-first Outlook
+      verification before commit.
+      - [x] (2026-07-19) Located and recorded the normative method-6,
+        `PidTagAttachDataObject`, attach-tag, encoding, and static-rendition
+        relationships in CLS-12. The recovery boundary preserves source facts
+        without making OLE content validity a prerequisite for salvage.
+      - [x] (2026-07-19) Added typed method-6 object/binary writer input,
+        exact streamed serialization, chunked completed-store hashing, libpff
+        object-subnode traversal, streamed optional binary metadata, and schema
+        19.
+        Missing, incomplete, oversized, or wrongly typed required payloads
+        omit only their attachment; malformed optional metadata omits only
+        that property.
+      - [x] (2026-07-19) The bounded
+        `v042-ole-attachments-source` fixture uses both documented `0x3701`
+        representations. Its OLE 2 payload is created and reopened by the
+        independent `cfb` parser. Exact libpff source/output comparison covers
+        method, type, payload hash, tag, encoding, rendition, and explicitly
+        empty rendition with zero omissions and unchanged source identity.
+        `pffinfo` accepts the source and candidate, and `readpst` completes for
+        both. The corrected fast gate passed at
+        `.agent/test-results/1784467894-fast`; the complete combined-manifest
+        gate passed at `.agent/test-results/1784468121-full`, including every
+        earlier 0.4.2 checkpoint and exact retention of a real method-1 JPEG
+        attach tag.
+        The first candidate reported zero omissions but failed ScanPST because
+        its `PtypObject` data subnode used raw-LTP NID type `31`. ScanPST then
+        invalidated `PR_ATTACH_SIZE` and cascaded through the attachment and
+        contents rows; its repaired reference deleted the OLE 2 attachment
+        instead of preserving or relabeling it. The r2 candidate changed the
+        object subnode to internal NID type `1`, but ScanPST rejected that type
+        as well and its repair again discarded the 2,560-byte object payload.
+        A ScanPST-clean Outlook-authored comparison PST resolves the previously
+        undocumented relationship: all five method-6 `PtypObject` descriptors
+        reference object-data subnodes with reserved NID type `0x09`.
+        PSTForge will reproduce that observed Outlook encoding and completed-
+        store validation will assert it. The clean-context review also found
+        that reference and embedded attachment branches counted streamed
+        optional metadata as omitted without removing it from writer input,
+        allowing one value above 16 KiB to reject the entire message. That
+        containment defect is included in the remediation. The former
+        16-KiB optional-metadata materialization bound could omit valid WMF
+        renditions; values above that threshold now remain in the immutable
+        spool and are streamed and hash-validated. Focused regressions cover a
+        20-KiB rendition.
+        The initial clean-context review found two medium issues: complete
+        zero-byte method-6 data had no evidence-based disposition, and
+        preflight sizing omitted inline raw attachment-property payloads. A
+        zero-byte PST data block then failed independent reader validation with
+        `BLOCKTRAILER cb = 0`; PSTForge therefore preserves complete empty
+        `PtypBinary` inline and contains empty `PtypObject` as malformed.
+        Preflight sizing now counts raw plus streamed metadata before writing.
+        Focused regressions pass, and the pre-r2 combined-manifest full gate
+        passes at `.agent/test-results/1784470289-full`. The Outlook specimen
+        has SHA-256
+        `99fc6e28ca18900f54c9411cbbcd5ef6a29fa2e6e1c5b0fd2e0b573411c15f48`;
+        `libpff`, `pffinfo`, and PSTForge accept it, and the owner reports
+        ScanPST clean. The Outlook-source roundtrip now preserves all five
+        attachment payload hashes plus the exact method, `PtypObject`,
+        attach-tag, and encoding fingerprints with no omitted attachments.
+        Its enclosing message remains partial for 50 already-visible non-OLE
+        property gaps, which are outside this focused writer correction. The
+        final clean-context review identified one additional containment gap:
+        a near-2-GiB OLE payload could pass translation before its retained
+        metadata pushed the aggregate attachment property size over the signed
+        PST limit and rejected the parent message. Canonical translation now
+        uses the writer's authoritative aggregate-size calculation and omits
+        only that attachment. The replacement candidate
+        `qualification-v042-ole-r3/parts/part-0001.pst` is 271,360 bytes with
+        SHA-256
+        `0e46a4a7b0c21b91da9bfd3c5b1df0b4f01d92871e25ea87ffe5d78bd5ac8c76`
+        and reports zero omissions. It contains the type-`0x09` object-data
+        relationship and a 20-KiB streamed rendition. `pffinfo`, `readpst`,
+        `pffexport`, and exact libpff source/output comparison accept it; both
+        OLE payloads and the complete optional-metadata fingerprints remain
+        exact. The corrected focused tests, fast gate
+        `.agent/test-results/1784473337-fast`, and combined-manifest full gate
+        `.agent/test-results/1784473375-full` pass. A fresh clean-context review
+        found one medium header-counter concern, but the proposed change
+        conflicts with the ScanPST-clean Outlook source: its five type-`0x09`
+        subnodes advance `rgnid[0x09]` to the same subnode-index high-water
+        convention used by PSTForge. The owner reports candidate r3 clean in
+        ScanPST, but Outlook could not open its synthetic OLE payloads. That
+        fixture intentionally contained a generic CFB storage and arbitrary
+        OLE1 bytes, so it remains structural evidence rather than an
+        application-openability oracle.
+        A real-source r4 roundtrip retained all five exact OLE payloads and
+        passed ScanPST, but Outlook displayed an empty draft. Independent
+        `pffexport` comparison showed the source's 56,139-byte decoded RTF body
+        was absent from r4. Its valid compressed container declares a
+        56,138-byte `RAWSIZE` including a final NUL; the decoder removes that
+        terminator and returns 56,137 code units. PSTForge's validator required
+        equality and therefore omitted the RTF plus its `\objattph` display
+        relationships. Validation now accepts exactly one stripped terminal
+        NUL while retaining header, CRC, end-run, and size bounds. The real
+        Outlook roundtrip regression now requires exact compressed-RTF length
+        and hash in addition to the five OLE contracts. The focused regression,
+        fast gate `.agent/test-results/1784474293-fast`, and combined-manifest
+        full gate `.agent/test-results/1784474319-full` pass. A fresh
+        clean-context review returned `CLEAN`. The real-source replacement r5
+        candidate is 271,360 bytes with SHA-256
+        `6c56871aaf0aed122c3e43516b0afd358ac0178207bcd030a7b6001d12b3744e`;
+        `pffinfo`, `readpst`, and `pffexport` accept it, with the 56,139-byte
+        decoded RTF and all five exact OLE payload sizes present. The owner
+        reports ScanPST clean and confirms Outlook preserves the original
+        rendered state exactly. This satisfies the checkpoint interoperability
+        gate.
   - [ ] Run the complete 19 GB split once after all focused checkpoints pass
     and reconcile discovered unique items against written plus explicitly
     unwritten items across every part.
@@ -1956,6 +2077,69 @@ work. Hash and identity evidence show that the source was not modified.
 - [ ] Milestone 1.0.0: MailPlus-Ready Release.
 
 ## Surprises & Discoveries
+
+- Observation: Classic Outlook compressed RTF can include a final NUL in the
+  header's `RAWSIZE`. The `compressed-rtf` decoder deliberately removes that
+  terminator, so comparing the decoded code-unit count directly to `RAWSIZE`
+  rejects valid Outlook data. Accepting an exact one-code-unit difference is
+  bounded: any earlier NUL would leave a larger difference. Omitting this RTF
+  left its method-6 OLE payloads structurally present but removed the
+  `\objattph` body relationships Outlook needs to display them.
+  Evidence: Outlook-authored `embedded email.pst`, source `PR_RTF_COMPRESSED`
+  length 15,844 with `RAWSIZE` 56,138, decoded size 56,137, source
+  `pffexport` RTF output, and the failed ScanPST-clean r4 Outlook acceptance
+  on 2026-07-19.
+
+- Observation: ScanPST rejects NID types `31` and `1` for the raw-data subnode
+  referenced by a method-6 `PidTagAttachDataObject`, even though MS-PST defines
+  the object descriptor only as a subnode NID and does not publish a dedicated
+  type relationship. Both repairs deleted the OLE 2 attachment rather than
+  providing a corrected type. A ScanPST-clean classic-Outlook specimen contains
+  five method-6 `PtypObject` attachments whose descriptors all use reserved
+  NID type `0x09`, making that repeated real-writer behavior the narrowest
+  supported interoperability rule.
+  Evidence: `qualification-v042-ole-r1`, `qualification-v042-ole-r2`, their
+  logs and repaired PSTs, plus Outlook-authored `embedded email.pst` SHA-256
+  `99fc6e28ca18900f54c9411cbbcd5ef6a29fa2e6e1c5b0fd2e0b573411c15f48`
+  and the owner's clean ScanPST result on 2026-07-19.
+
+- Observation: `PidTagAttachRendering` is WMF data and has no documented
+  16-KiB ceiling. Applying the small-property materialization bound to
+  `0x3709`, `0x3702`, and `0x370A` caused avoidable omission of readable
+  metadata above that size.
+  Evidence: checkpoint-11c clean-context review and the 20-KiB streamed
+  rendition regression on 2026-07-19.
+
+- Observation: A zero-length leaf data block is not a valid way to externalize
+  an empty OLE value; the independent PST reader rejects its block trailer with
+  `cb = 0`. `PtypBinary` can retain the exact empty value inline, while a
+  `PtypObject` descriptor has no valid empty data subnode to reference.
+  Evidence: the checkpoint-11c empty-payload regression and independent
+  completed-store validation on 2026-07-19.
+
+- Observation: libpff exposes a method-6 `PtypObject` property descriptor
+  separately from the attachment payload. The property stream itself can be
+  empty while the object descriptor points to a data subnode whose logical
+  bytes are returned through the attachment data API. Treating the empty
+  property stream as the payload would silently lose a valid OLE 2 object.
+  Evidence: the bounded `v042-ole-attachments-source` libpff catalog and exact
+  source/output payload hashes on 2026-07-19.
+
+- Observation: `PidTagAttachTag` is not method-6-only in real data. The public
+  split corpus contains a method-1 JPEG with a readable nine-byte binary attach
+  tag. Adding `0x370A` to the exact external fingerprint exposed PSTForge's
+  prior omission; preserving `0x3702`, `0x3709`, and `0x370A` on complete
+  by-value attachments restored the exact public source/output comparison.
+  Evidence: `.agent/test-results/1784467959-full` and the corrected focused
+  `milestone_0_4_real_pst_splits_deterministically_without_mutation` run.
+
+- Observation: `PidTagAttachDataObject` type validation must occur only after
+  method `6` dispatch. Embedded-message attachments can expose a writer-managed
+  `0x3701` relationship without a scalar property type in synthetic canonical
+  input; validating it eagerly marked an otherwise clean embedded message
+  partial. The fast gate caught the regression.
+  Evidence: `reports_invalid_filetimes_and_clean_embedded_mail_are_contained`
+  and `.agent/test-results/1784467707-fast`.
 
 - Observation: libpff's attachment convenience APIs recognize method `2` as a
   reference but reject methods `3`, `4`, and `7`, then attempt to stream data
@@ -3358,6 +3542,47 @@ work. Hash and identity evidence show that the source was not modified.
   available for later analysis.
   Date/Author: 2026-07-18 / human owner approval to use the correct extension
   when possible.
+
+- Decision: Preserve method-6 OLE attachments from the readable source
+  relationship: keep `0x3701` as `PtypObject` or `PtypBinary`, stream its exact
+  complete bytes, and retain readable `0x370A`, `0x3702`, and `0x3709` binary
+  values including an explicitly empty rendition. Preserve those same readable
+  binary metadata properties on complete by-value attachments. Do not require
+  the payload to parse as a valid OLE container and never instantiate, execute,
+  repair, convert, infer, or dereference it.
+  Rationale: The property type is the normative distinction between OLE 2
+  storage and OLE 1 OLESTREAM data. Container validity is useful fixture
+  evidence but making it a recovery prerequisite would discard precisely the
+  damaged objects PSTForge is intended to salvage. Bounded streaming and exact
+  hashes preserve source facts without interpreting hostile content.
+  Date/Author: 2026-07-19 / implementation decision from Microsoft OXCMSG and
+  canonical-property contracts, pending human interoperability acceptance.
+
+- Decision: Encode a method-6 `PtypObject` data subnode with the reserved
+  Outlook-observed NID type `0x09`, and stream readable attachment encoding, rendering, and
+  attach-tag properties when they exceed the small-property materialization
+  threshold.
+  Rationale: MS-PST requires an object descriptor to reference a subnode but
+  does not publish a dedicated NID type for generic OLE data. ScanPST rejects
+  both raw-LTP type `31` and internal type `1`, and its repairs delete the
+  attachment payload. A ScanPST-clean classic-Outlook PST uses type `0x09` for
+  each of five independently stored object payloads. The owner approved
+  observed reality when the published specification is silent. WMF rendition
+  data has no documented 16-KiB ceiling, so a memory convenience bound cannot
+  become a data-recovery loss policy.
+  Date/Author: 2026-07-19 / ScanPST r1/r2 evidence, Outlook-authored comparison,
+  and human approval to proceed.
+
+- Decision: Preserve a complete zero-byte method-6 `PtypBinary` inline, contain
+  zero-byte `PtypObject` data as malformed, and include every inline raw
+  attachment-property payload in aggregate preflight sizing.
+  Rationale: Empty binary is an exact source value and has a valid inline PST
+  encoding. A zero-length external data block fails independent PST validation,
+  so an object descriptor cannot truthfully reference it. Counting all raw
+  metadata prevents near-limit attachments from passing preflight and failing
+  later during whole-message construction.
+  Date/Author: 2026-07-19 / clean-context review followed by focused writer
+  regression and independent completed-store evidence.
 
 ## Outcomes & Retrospective
 

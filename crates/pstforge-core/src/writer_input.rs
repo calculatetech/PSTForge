@@ -8,8 +8,9 @@ use pstforge_job::{
 use pstforge_pst::writer::{
     AttachmentContent, AttachmentReferenceMethod, AttachmentReferenceSpec, AttachmentSpec,
     FileBlobSpec, MailFolderLocation, MailFolderRole, MailFolderSpec, MailStoreSpec, MessageSpec,
-    NamedProperty, NamedPropertyName, NamedPropertySet, NativeBody, RawProperty, RawPropertyValue,
-    RecipientKind, RecipientSpec, SpooledPropertySpec, UnsupportedProperty,
+    NamedProperty, NamedPropertyName, NamedPropertySet, NativeBody, OleAttachmentSpec, OleDataKind,
+    RawProperty, RawPropertyValue, RecipientKind, RecipientSpec, SpooledPropertySpec,
+    UnsupportedProperty, attachment_logical_size,
 };
 use sha2::{Digest, Sha256};
 use thiserror::Error;
@@ -1009,6 +1010,9 @@ fn translate_attachment(
     let mut provider_type = None;
     let mut original_permission = None;
     let mut permission = None;
+    let mut attachment_data_type = None;
+    let mut binary_attachment_metadata = Vec::new();
+    let mut spooled_attachment_metadata = Vec::new();
     let mut raw_properties = Vec::new();
     let mut omitted_properties = 0_u64;
     let mut mapped_property_ids = BTreeSet::new();
@@ -1065,6 +1069,11 @@ fn translate_attachment(
             continue;
         }
         match property_id {
+            0x3701 => {
+                attachment_data_type = property
+                    .value_type
+                    .and_then(|value| u16::try_from(value).ok());
+            }
             0x3705 => {
                 if attachment.embedded.is_none() {
                     attachment_method =
@@ -1159,6 +1168,45 @@ fn translate_attachment(
                     omitted_properties = omitted_properties.saturating_add(1);
                 }
             }
+            id if matches!(id, 0x3702 | 0x3709 | 0x370A) => {
+                let Some(property_type) = omit_malformed(
+                    checked_property_type(mail, property),
+                    &mut omitted_properties,
+                )?
+                else {
+                    continue;
+                };
+                if property_type != 0x0102 {
+                    omitted_properties = omitted_properties.saturating_add(1);
+                    continue;
+                }
+                let id = u16::try_from(id).map_err(|_| CanonicalWriteError::InvalidProperty {
+                    item_key: mail.durable_item_key.clone(),
+                    property_id: id,
+                    detail: "attachment metadata identifier is out of range".to_owned(),
+                })?;
+                if property.blob.byte_len <= 16 * 1024 {
+                    let Some(value) = omit_malformed(
+                        read_blob(job, mail, property, 16 * 1024),
+                        &mut omitted_properties,
+                    )?
+                    else {
+                        continue;
+                    };
+                    binary_attachment_metadata.push(RawProperty {
+                        id,
+                        value: RawPropertyValue::Binary(value),
+                    });
+                } else if property.blob.byte_len <= i32::MAX as u64 {
+                    spooled_attachment_metadata.push(SpooledPropertySpec {
+                        id,
+                        property_type: 0x0102,
+                        blob: file_blob(job, &property.blob)?,
+                    });
+                } else {
+                    omitted_properties = omitted_properties.saturating_add(1);
+                }
+            }
             _ => omitted_properties = omitted_properties.saturating_add(1),
         }
     }
@@ -1169,10 +1217,70 @@ fn translate_attachment(
         child_partial,
         child_omitted_properties,
         child_omitted_attachments,
-    ) = if let Some(method) = attachment_method
+    ) = if attachment_method == Some(6) {
+        let Some(data) = attachment
+            .data
+            .as_ref()
+            .filter(|_| attachment.data_complete)
+            .filter(|data| data.byte_len <= i32::MAX as u64)
+        else {
+            return Ok(Some(TranslatedAttachment {
+                attachment: None,
+                item_keys: Vec::new(),
+                unsupported_item_keys: Vec::new(),
+                partial: true,
+                omitted_properties,
+                omitted_attachments: 1,
+                reconstructions,
+            }));
+        };
+        let data_kind = match attachment_data_type {
+            Some(0x000D) => OleDataKind::Object,
+            Some(0x0102) => OleDataKind::Binary,
+            _ => {
+                return Ok(Some(TranslatedAttachment {
+                    attachment: None,
+                    item_keys: Vec::new(),
+                    unsupported_item_keys: Vec::new(),
+                    partial: true,
+                    omitted_properties,
+                    omitted_attachments: 1,
+                    reconstructions,
+                }));
+            }
+        };
+        if data_kind == OleDataKind::Object && data.byte_len == 0 {
+            return Ok(Some(TranslatedAttachment {
+                attachment: None,
+                item_keys: Vec::new(),
+                unsupported_item_keys: Vec::new(),
+                partial: true,
+                omitted_properties,
+                omitted_attachments: 1,
+                reconstructions,
+            }));
+        }
+        raw_properties.extend(binary_attachment_metadata);
+        (
+            AttachmentContent::Ole(OleAttachmentSpec {
+                data: file_blob(job, data)?,
+                data_kind,
+            }),
+            Vec::new(),
+            Vec::new(),
+            false,
+            0,
+            0,
+        )
+    } else if let Some(method) = attachment_method
         .and_then(reference_attachment_method)
         .filter(|_| attachment.reference_complete)
     {
+        omitted_properties = omitted_properties
+            .saturating_add(u64::try_from(binary_attachment_metadata.len()).unwrap_or(u64::MAX))
+            .saturating_add(u64::try_from(spooled_attachment_metadata.len()).unwrap_or(u64::MAX));
+        binary_attachment_metadata.clear();
+        spooled_attachment_metadata.clear();
         let Some(long_pathname) = long_pathname else {
             return Ok(Some(TranslatedAttachment {
                 attachment: None,
@@ -1214,6 +1322,11 @@ fn translate_attachment(
             0,
         )
     } else if let Some(embedded) = &attachment.embedded {
+        omitted_properties = omitted_properties
+            .saturating_add(u64::try_from(binary_attachment_metadata.len()).unwrap_or(u64::MAX))
+            .saturating_add(u64::try_from(spooled_attachment_metadata.len()).unwrap_or(u64::MAX));
+        binary_attachment_metadata.clear();
+        spooled_attachment_metadata.clear();
         let message_class = embedded.message_class.as_deref().unwrap_or("IPM.Note");
         let calendar_exception = calendar_exception_message_class(message_class);
         if !supported_message_class(message_class)
@@ -1245,6 +1358,7 @@ fn translate_attachment(
     } else if !attachment.data_complete {
         return Ok(None);
     } else if let Some(data) = &attachment.data {
+        raw_properties.extend(binary_attachment_metadata);
         if data.byte_len > 2_147_483_647 {
             return Ok(None);
         }
@@ -1263,7 +1377,9 @@ fn translate_attachment(
         .clone()
         .filter(|value| !value.is_empty());
     let reference_attachment = matches!(content, AttachmentContent::Reference(_));
+    let ole_attachment = matches!(content, AttachmentContent::Ole(_));
     let detected_mime = if !reference_attachment
+        && !ole_attachment
         && attachment.embedded.is_none()
         && (source_mime.is_none() || source_filename.is_none())
     {
@@ -1306,17 +1422,30 @@ fn translate_attachment(
     if !flags_observed {
         reconstructions.record_generated(ReconstructedField::AttachmentFlags);
     }
+    let writer_attachment = AttachmentSpec {
+        filename,
+        mime_type,
+        content_id,
+        content_location,
+        rendering_position,
+        flags,
+        raw_properties,
+        spooled_properties: spooled_attachment_metadata,
+        content,
+    };
+    if ole_attachment && !ole_attachment_fits_pst_size(&writer_attachment) {
+        return Ok(Some(TranslatedAttachment {
+            attachment: None,
+            item_keys: Vec::new(),
+            unsupported_item_keys: Vec::new(),
+            partial: true,
+            omitted_properties,
+            omitted_attachments: 1,
+            reconstructions,
+        }));
+    }
     Ok(Some(TranslatedAttachment {
-        attachment: Some(AttachmentSpec {
-            filename,
-            mime_type,
-            content_id,
-            content_location,
-            rendering_position,
-            flags,
-            raw_properties,
-            content,
-        }),
+        attachment: Some(writer_attachment),
         item_keys,
         unsupported_item_keys,
         partial: (!reference_attachment
@@ -1330,6 +1459,13 @@ fn translate_attachment(
         omitted_attachments: child_omitted_attachments,
         reconstructions,
     }))
+}
+
+fn ole_attachment_fits_pst_size(attachment: &AttachmentSpec) -> bool {
+    matches!(
+        attachment_logical_size(attachment),
+        Ok(size) if size <= i32::MAX as u64
+    )
 }
 
 fn collect_message_item_keys(message: &CanonicalMail, item_keys: &mut Vec<String>) {
@@ -1982,8 +2118,15 @@ fn valid_compressed_rtf_container(bytes: &[u8]) -> bool {
     {
         return false;
     }
-    compressed_rtf::decompress_rtf(bytes)
-        .is_ok_and(|decoded| u64::try_from(decoded.encode_utf16().count()).ok() == Some(raw_size))
+    compressed_rtf::decompress_rtf(bytes).is_ok_and(|decoded| {
+        let Some(decoded_size) = u64::try_from(decoded.encode_utf16().count()).ok() else {
+            return false;
+        };
+        decoded_size == raw_size
+            // Outlook includes the terminating NUL in RAWSIZE. The decoder
+            // strips that terminator, so exactly one missing code unit is valid.
+            || decoded_size.checked_add(1) == Some(raw_size)
+    })
 }
 
 fn compressed_rtf_has_end_run(payload: &[u8], raw_size: u64) -> bool {
@@ -2397,6 +2540,7 @@ mod tests {
         RecoveryUnit,
     };
     use pstforge_job::{DurableCatalogSink, ReconstructedField, ReconstructionCounts, SpooledBlob};
+    use sha2::{Digest, Sha256};
     use tempfile::tempdir;
 
     use super::{
@@ -2418,7 +2562,7 @@ mod tests {
     };
     use pstforge_pst::writer::{
         AttachmentContent, AttachmentReferenceMethod, MailFolderRole, NamedProperty,
-        NamedPropertyName, NamedPropertySet, NativeBody, RawPropertyValue,
+        NamedPropertyName, NamedPropertySet, NativeBody, OleDataKind, RawPropertyValue,
         validate_mail_store_input,
     };
 
@@ -2942,6 +3086,7 @@ mod tests {
         let directory = tempdir()?;
         let mut job = DurableCatalogSink::create(&directory.path().join("job"))?;
         let unit = RecoveryUnit::Recovered { index: 0 };
+        let large_rendition = vec![0xA5; 20 * 1024];
         send(&mut job, CatalogEvent::UnitStart(unit))?;
         send(
             &mut job,
@@ -2990,6 +3135,7 @@ mod tests {
             }
             if index == 1 {
                 property(&mut job, 11, index, 2, 0x3701, 0x0102, b"")?;
+                property(&mut job, 11, index, 3, 0x3709, 0x0102, &large_rendition)?;
             }
             send(
                 &mut job,
@@ -3029,8 +3175,13 @@ mod tests {
         )?;
         assert!(input.partial);
         assert_eq!(input.omitted_attachments, 2);
-        assert_eq!(input.omitted_properties, 1);
+        assert_eq!(input.omitted_properties, 2);
         assert_eq!(input.store.folders[0].messages[0].attachments.len(), 1);
+        assert!(
+            input.store.folders[0].messages[0].attachments[0]
+                .spooled_properties
+                .is_empty()
+        );
         assert!(matches!(
             &input.store.folders[0].messages[0].attachments[0].content,
             AttachmentContent::Reference(reference)
@@ -3038,6 +3189,228 @@ mod tests {
                     && reference.long_pathname
                         == r"\\unreachable.invalid\recovery\preserved.txt"
         ));
+        Ok(())
+    }
+
+    #[test]
+    fn ole_attachment_failures_are_contained_to_the_attachment()
+    -> Result<(), Box<dyn std::error::Error>> {
+        fn send(
+            sink: &mut DurableCatalogSink,
+            event: CatalogEvent<'_>,
+        ) -> Result<(), std::io::Error> {
+            CatalogSink::event(sink, event).map_err(std::io::Error::other)
+        }
+
+        fn property(
+            sink: &mut DurableCatalogSink,
+            message_id: u32,
+            attachment_index: u32,
+            entry_index: u32,
+            property_id: u32,
+            value_type: u32,
+            bytes: &[u8],
+        ) -> Result<(), Box<dyn std::error::Error>> {
+            let descriptor = PropertyDescriptor {
+                owner: PropertyOwner::Attachment {
+                    message_id,
+                    index: attachment_index,
+                },
+                record_set_index: 0,
+                entry_index,
+                entry_type: Some(property_id),
+                value_type: Some(value_type),
+                data_size: u64::try_from(bytes.len())?,
+            };
+            send(sink, CatalogEvent::PropertyStart(descriptor))?;
+            send(sink, CatalogEvent::PropertyData { descriptor, bytes })?;
+            send(sink, CatalogEvent::PropertyEnd(descriptor))?;
+            Ok(())
+        }
+
+        let directory = tempdir()?;
+        let mut job = DurableCatalogSink::create(&directory.path().join("job"))?;
+        let unit = RecoveryUnit::Recovered { index: 0 };
+        send(&mut job, CatalogEvent::UnitStart(unit))?;
+        send(
+            &mut job,
+            CatalogEvent::MessageStart {
+                id: 12,
+                provenance: CatalogProvenance::Recovered,
+                recovery_index: Some(0),
+                folder_id: None,
+                parent_message_id: None,
+                parent_attachment_index: None,
+                embedded_path: Vec::new(),
+                associated: false,
+                item_type: None,
+                message_class: Some("IPM.Note".to_owned()),
+                subject: Some("OLE containment".to_owned()),
+                sender_name: None,
+                sender_email: None,
+                submit_filetime: Some(1),
+                delivery_filetime: Some(1),
+                supported: true,
+            },
+        )?;
+        let large_rendition = vec![0xA5; 20 * 1024];
+        for index in 0..5 {
+            let payload = if index == 4 {
+                String::new()
+            } else {
+                format!("OLE payload {index}")
+            };
+            send(
+                &mut job,
+                CatalogEvent::AttachmentStart {
+                    message_id: 12,
+                    index,
+                    attachment_type: Some(i32::from(b'd')),
+                    data_size: Some(u64::try_from(payload.len())?),
+                    filename: Some(format!("ole-{index}.bin")),
+                },
+            )?;
+            property(&mut job, 12, index, 0, 0x3705, 0x0003, &6_i32.to_le_bytes())?;
+            let data_type = match index {
+                0 => 0x000D,
+                1 | 2 | 4 => 0x0102,
+                _ => 0x001F,
+            };
+            property(&mut job, 12, index, 1, 0x3701, data_type, &[])?;
+            if index == 0 {
+                property(&mut job, 12, index, 2, 0x370A, 0x0102, b"storage-tag")?;
+                property(&mut job, 12, index, 3, 0x3709, 0x0102, &large_rendition)?;
+            }
+            if index == 1 {
+                property(&mut job, 12, index, 2, 0x3709, 0x001F, b"bad type")?;
+            }
+            send(
+                &mut job,
+                CatalogEvent::AttachmentData {
+                    message_id: 12,
+                    index,
+                    bytes: payload.as_bytes(),
+                },
+            )?;
+            send(
+                &mut job,
+                if index == 2 {
+                    CatalogEvent::AttachmentAbort {
+                        message_id: 12,
+                        index,
+                    }
+                } else {
+                    CatalogEvent::AttachmentEnd {
+                        message_id: 12,
+                        index,
+                    }
+                },
+            )?;
+        }
+        send(
+            &mut job,
+            CatalogEvent::MessageEnd {
+                id: 12,
+                complete: true,
+            },
+        )?;
+        send(&mut job, CatalogEvent::UnitEnd(unit))?;
+
+        let mail = load_canonical_mail(&job)?;
+        let input = build_part_writer_input(
+            &job,
+            &mail.iter().collect::<Vec<_>>(),
+            &"0".repeat(64),
+            "balanced",
+            4_294_967_296,
+            1,
+        )?;
+        assert!(input.partial);
+        assert_eq!(input.omitted_attachments, 2);
+        assert_eq!(input.omitted_properties, 1);
+        let attachments = &input.store.folders[0].messages[0].attachments;
+        assert_eq!(attachments.len(), 3);
+        assert!(matches!(
+            attachments[0].content,
+            AttachmentContent::Ole(ref ole) if ole.data_kind == OleDataKind::Object
+        ));
+        assert!(matches!(
+            attachments[1].content,
+            AttachmentContent::Ole(ref ole) if ole.data_kind == OleDataKind::Binary
+        ));
+        assert!(
+            attachments[0]
+                .raw_properties
+                .iter()
+                .any(|property| property.id == 0x370A)
+        );
+        let expected_rendition_hash: [u8; 32] = Sha256::digest(&large_rendition).into();
+        assert!(attachments[0].spooled_properties.iter().any(|property| {
+            property.id == 0x3709
+                && property.property_type == 0x0102
+                && property.blob.byte_len == 20 * 1024
+                && property.blob.sha256 == expected_rendition_hash
+        }));
+        assert!(attachments[1].raw_properties.is_empty());
+        assert!(matches!(
+            attachments[2].content,
+            AttachmentContent::Ole(ref ole)
+                if ole.data_kind == OleDataKind::Binary && ole.data.byte_len == 0
+        ));
+
+        let mut near_limit = attachments[0].clone();
+        let AttachmentContent::Ole(ole) = &mut near_limit.content else {
+            return Err("missing translated OLE object".into());
+        };
+        ole.data.byte_len = i32::MAX as u64;
+        assert!(!super::ole_attachment_fits_pst_size(&near_limit));
+
+        let mut embedded_parent = mail[0].clone();
+        embedded_parent.attachments.clear();
+        let mut embedded_child = embedded_parent.clone();
+        embedded_child.durable_item_key = "recovered:-:0:embedded".to_owned();
+        embedded_child.key.occurrence = 1;
+        embedded_child.attachments.clear();
+        let large_metadata = mail[0].attachments[0]
+            .properties
+            .iter()
+            .find(|property| property.property_id == Some(0x3709))
+            .ok_or("missing large attachment metadata")?
+            .clone();
+        embedded_parent.attachments.push(CanonicalAttachment {
+            index: 0,
+            attachment_type: Some(i32::from(b'i')),
+            filename: Some("embedded.msg".to_owned()),
+            declared_size: None,
+            data: None,
+            data_complete: true,
+            reference_complete: false,
+            properties: vec![large_metadata],
+            embedded: Some(Box::new(embedded_child)),
+        });
+        let embedded_input = build_part_writer_input(
+            &job,
+            &[&embedded_parent],
+            &"0".repeat(64),
+            "balanced",
+            4_294_967_296,
+            1,
+        )?;
+        assert!(embedded_input.partial);
+        assert_eq!(embedded_input.omitted_properties, 1);
+        assert_eq!(embedded_input.item_keys.len(), 2);
+        assert_eq!(
+            embedded_input.store.folders[0].messages[0]
+                .attachments
+                .len(),
+            1
+        );
+        assert!(
+            embedded_input.store.folders[0].messages[0].attachments[0]
+                .spooled_properties
+                .is_empty()
+        );
+        pstforge_pst::writer::validate_mail_store_input(&embedded_input.store)?;
         Ok(())
     }
 
@@ -4014,6 +4387,8 @@ mod tests {
 
         let valid_rtf = compressed_rtf::compress_rtf("{\\rtf1 contained}")?;
         assert!(valid_compressed_rtf_container(&valid_rtf));
+        let outlook_terminated_rtf = compressed_rtf::compress_rtf("{\\rtf1 contained}\0")?;
+        assert!(valid_compressed_rtf_container(&outlook_terminated_rtf));
         let mut wrong_raw_size = valid_rtf;
         let declared = u32::from_le_bytes(wrong_raw_size[4..8].try_into()?);
         wrong_raw_size[4..8].copy_from_slice(&declared.saturating_add(1).to_le_bytes());
