@@ -2258,6 +2258,130 @@ fn milestone_0_4_2_distribution_list_roundtrip_through_libpff()
 }
 
 #[test]
+#[ignore = "requires the external v042-document-source corpus case"]
+fn milestone_0_4_2_document_object_roundtrip_through_libpff()
+-> Result<(), Box<dyn std::error::Error>> {
+    let manifest_path = std::env::var_os("PSTFORGE_CORPUS_MANIFEST")
+        .ok_or("PSTFORGE_CORPUS_MANIFEST is required")?;
+    let manifest: Manifest = toml::from_str(&fs::read_to_string(&manifest_path)?)?;
+    let case = manifest
+        .cases
+        .iter()
+        .find(|case| case.name == "v042-document-source")
+        .ok_or("manifest has no v042-document-source case")?;
+    let identity = pstforge_core::SourceFile::open(&case.path)?
+        .identity()
+        .clone();
+    if identity.sha256 != case.sha256 {
+        return Err("Document source SHA-256 does not match its manifest".into());
+    }
+
+    let source_messages = independent_messages(&case.path)?;
+    let source = source_messages
+        .first()
+        .ok_or("Document source has no message")?;
+    if source_messages.len() != 1
+        || source.folder_path != ["Documents"]
+        || source.content.message_class.as_deref() != Some("IPM.Document.Word.Document.12")
+        || source.content.subject.as_deref() != Some("PSTForge document checkpoint.docx")
+        || source.content.sender_name.is_some()
+        || source.content.sender_email.is_some()
+        || !source.content.recipients.is_empty()
+        || source.content.attachments.len() != 1
+        || source.content.attachments[0].attachment_type != Some(100)
+        || source.content.attachments[0].filename.as_deref()
+            != Some("PSTForge document checkpoint.docx")
+        || source.content.attachments[0].streamed_size == 0
+        || lower_hex(&source.content.attachments[0].sha256)
+            != "6189ada04b0f10ed91272485315c5d4d5b90e8a6589fabc145a5b33af8181b33"
+        || !source.complete
+    {
+        return Err(format!("Document source does not match the item contract: {source:?}").into());
+    }
+
+    let source_named = independent_named_properties(&case.path)?;
+    let expected = [
+        ("Comments", 0x001F),
+        ("Keywords", 0x101F),
+        ("PageCount", 0x0003),
+        ("Title", 0x001F),
+    ];
+    let public_strings = [
+        0x29, 0x03, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0xC0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x46,
+    ];
+    if source_named.len() != expected.len()
+        || !expected.iter().all(|(name, property_type)| {
+            source_named.iter().any(|property| {
+                property.owner.message_class.as_deref() == Some("IPM.Document.Word.Document.12")
+                    && property.owner.subject.as_deref()
+                        == Some("PSTForge document checkpoint.docx")
+                    && property.identity.guid == public_strings
+                    && property.identity.name == NamedPropertyName::String((*name).to_owned())
+                    && property.value_type == Some(*property_type)
+                    && property.byte_len > 0
+            })
+        })
+    {
+        return Err(format!("Document named-property contract changed: {source_named:?}").into());
+    }
+    if independent_folder_classes(&case.path)?
+        .get(&vec!["Documents".to_owned()])
+        .map(String::as_str)
+        != Some("IPF.Note")
+    {
+        return Err("Document source folder is not IPF.Note".into());
+    }
+
+    let directory = tempfile::tempdir()?;
+    let job = directory.path().join("job");
+    let output = Command::new(env!("CARGO_BIN_EXE_pstforge"))
+        .arg("split")
+        .arg(&case.path)
+        .arg("--output")
+        .arg(&job)
+        .arg("--max-pst-size")
+        .arg("4GiB")
+        .arg("--json")
+        .arg("--color")
+        .arg("never")
+        .output()?;
+    if !output.status.success() {
+        return Err(format!(
+            "Document split failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        )
+        .into());
+    }
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+    if report["partial"].as_bool() != Some(false)
+        || report["written_candidates"].as_u64() != Some(1)
+        || report["parts"].as_array().map(Vec::len) != Some(1)
+        || report["parts"][0]["omitted_folders"].as_u64() != Some(0)
+        || report["parts"][0]["omitted_properties"].as_u64() != Some(0)
+        || report["parts"][0]["omitted_attachments"].as_u64() != Some(0)
+    {
+        return Err("Document split did not report complete preservation".into());
+    }
+    let generated = job.join("parts/part-0001.pst");
+    verify_exact_message_fidelity(source_messages, independent_messages(&generated)?)?;
+    if independent_named_properties(&generated)? != source_named {
+        return Err("Document named-property identity or payload changed".into());
+    }
+    if independent_folder_classes(&generated)?
+        .get(&vec!["Documents".to_owned()])
+        .map(String::as_str)
+        != Some("IPF.Note")
+    {
+        return Err("generated Document folder is not IPF.Note".into());
+    }
+    if pstforge_core::SourceFile::open(&case.path)?.identity() != &identity {
+        return Err("Document source identity changed during the split".into());
+    }
+    Ok(())
+}
+
+#[test]
 #[ignore = "requires the external v042-calendar-exception-source corpus case"]
 fn milestone_0_4_2_calendar_exceptions_roundtrip_through_libpff()
 -> Result<(), Box<dyn std::error::Error>> {

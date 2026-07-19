@@ -258,11 +258,12 @@ fn run() -> Result<(), String> {
             Some("meetings") => qualify_meetings(&root, Path::new(&output)),
             Some("pim-items") => qualify_pim_items(&root, Path::new(&output)),
             Some("distribution-list") => qualify_distribution_list(&root, Path::new(&output)),
+            Some("document-object") => qualify_document_object(&root, Path::new(&output)),
             Some("calendar-exceptions") => {
                 qualify_calendar_exceptions(&root, Path::new(&output))
             }
             Some("associated-data") => qualify_associated_data(&root, Path::new(&output)),
-            _ => Err("unknown qualification checkpoint; expected embedded-attachments, named-properties, empty-folders, contacts, appointments, meetings, pim-items, distribution-list, calendar-exceptions, or associated-data".to_owned()),
+            _ => Err("unknown qualification checkpoint; expected embedded-attachments, named-properties, empty-folders, contacts, appointments, meetings, pim-items, distribution-list, document-object, calendar-exceptions, or associated-data".to_owned()),
         };
     }
     if command != std::ffi::OsStr::new("gate") {
@@ -294,7 +295,7 @@ fn run() -> Result<(), String> {
 }
 
 fn usage() -> String {
-    "usage: cargo xtask gate <fast|full|release> | qualify <embedded-attachments|named-properties|empty-folders|contacts|appointments|meetings|pim-items|distribution-list|calendar-exceptions|associated-data> <output>"
+    "usage: cargo xtask gate <fast|full|release> | qualify <embedded-attachments|named-properties|empty-folders|contacts|appointments|meetings|pim-items|distribution-list|document-object|calendar-exceptions|associated-data> <output>"
         .to_owned()
 }
 
@@ -1013,6 +1014,129 @@ fn qualify_distribution_list(root: &Path, output: &Path) -> Result<(), String> {
     publish_qualification(root, output, 1, |part| {
         pstforge_pst::writer::create_mail_store(part, &spec)
     })
+}
+
+fn qualify_document_object(root: &Path, output: &Path) -> Result<(), String> {
+    use pstforge_pst::writer::{
+        AttachmentContent, AttachmentSpec, FidelityStore, MailFolderLocation, MailFolderRole,
+        MailFolderSpec, MailStoreSpec, MinimalStore, NamedProperty, NamedPropertyName,
+        NamedPropertySet, RawProperty, RawPropertyValue,
+    };
+
+    let document = document_checkpoint_payload()?;
+    let display_name = "PSTForge document checkpoint.docx";
+    let mut fixture = FidelityStore::from(&MinimalStore {
+        store_name: "PSTForge Document source".to_owned(),
+        folder_name: "Documents".to_owned(),
+        subject: display_name.to_owned(),
+        body: String::new(),
+        sender_name: String::new(),
+        sender_email: String::new(),
+        recipient: String::new(),
+        record_key: *b"PSTForgeDocument",
+    });
+    fixture.message.message_class = "IPM.Document.Word.Document.12".to_owned();
+    fixture.message.sender_name.clear();
+    fixture.message.sender_email.clear();
+    fixture.message.recipients.clear();
+    fixture.message.body_text = None;
+    fixture.message.body_html = None;
+    fixture.message.body_rtf = None;
+    fixture.message.native_body = None;
+    fixture.message.raw_properties = vec![RawProperty {
+        id: 0x3001,
+        value: RawPropertyValue::Unicode(display_name.to_owned()),
+    }];
+    fixture.message.named_properties = vec![
+        NamedProperty {
+            set: NamedPropertySet::PublicStrings,
+            name: NamedPropertyName::String("Title".to_owned()),
+            value: RawPropertyValue::Unicode("PSTForge document checkpoint".to_owned()),
+        },
+        NamedProperty {
+            set: NamedPropertySet::PublicStrings,
+            name: NamedPropertyName::String("Keywords".to_owned()),
+            value: RawPropertyValue::MultipleUnicode(vec![
+                "recovery".to_owned(),
+                "checkpoint".to_owned(),
+                "Unicode \u{4E16}\u{754C}".to_owned(),
+            ]),
+        },
+        NamedProperty {
+            set: NamedPropertySet::PublicStrings,
+            name: NamedPropertyName::String("Comments".to_owned()),
+            value: RawPropertyValue::Unicode("Document metadata checkpoint".to_owned()),
+        },
+        NamedProperty {
+            set: NamedPropertySet::PublicStrings,
+            name: NamedPropertyName::String("PageCount".to_owned()),
+            value: RawPropertyValue::Integer32(1),
+        },
+    ];
+    fixture.message.attachments = vec![AttachmentSpec {
+        filename: display_name.to_owned(),
+        mime_type: Some(
+            "application/vnd.openxmlformats-officedocument.wordprocessingml.document".to_owned(),
+        ),
+        content_id: None,
+        content_location: None,
+        rendering_position: Some(-1),
+        flags: 0,
+        raw_properties: Vec::new(),
+        content: AttachmentContent::Binary(document),
+    }];
+    let spec = MailStoreSpec {
+        store_name: fixture.store_name,
+        record_key: fixture.record_key,
+        folders: vec![MailFolderSpec {
+            path: vec!["Documents".to_owned()],
+            location: MailFolderLocation::IpmSubtree,
+            role: MailFolderRole::Ordinary,
+            container_class: "IPF.Note".to_owned(),
+            messages: vec![fixture.message],
+            associated_messages: Vec::new(),
+        }],
+    };
+    publish_qualification(root, output, 1, |part| {
+        pstforge_pst::writer::create_mail_store(part, &spec)
+    })
+}
+
+fn document_checkpoint_payload() -> Result<Vec<u8>, String> {
+    use std::io::{Cursor, Write as _};
+
+    let cursor = Cursor::new(Vec::new());
+    let mut archive = zip::ZipWriter::new(cursor);
+    let options = zip::write::SimpleFileOptions::default()
+        .compression_method(zip::CompressionMethod::Deflated);
+    archive
+        .start_file("[Content_Types].xml", options)
+        .map_err(|error| format!("cannot start DOCX content-types part: {error}"))?;
+    archive
+        .write_all(
+            br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/></Types>"#,
+        )
+        .map_err(|error| format!("cannot write DOCX content-types part: {error}"))?;
+    archive
+        .start_file("_rels/.rels", options)
+        .map_err(|error| format!("cannot start DOCX package relationships: {error}"))?;
+    archive
+        .write_all(
+            br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="word/document.xml"/></Relationships>"#,
+        )
+        .map_err(|error| format!("cannot write DOCX package relationships: {error}"))?;
+    archive
+        .start_file("word/document.xml", options)
+        .map_err(|error| format!("cannot start DOCX document part: {error}"))?;
+    archive
+        .write_all(
+            br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body><w:p><w:r><w:t>PSTForge document checkpoint</w:t></w:r></w:p><w:sectPr/></w:body></w:document>"#,
+        )
+        .map_err(|error| format!("cannot write DOCX document part: {error}"))?;
+    archive
+        .finish()
+        .map_err(|error| format!("cannot finish DOCX fixture: {error}"))
+        .map(std::io::Cursor::into_inner)
 }
 
 fn qualify_calendar_exceptions(root: &Path, output: &Path) -> Result<(), String> {
@@ -1848,4 +1972,39 @@ fn sanitize(name: &str) -> String {
             }
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::{Cursor, Read as _};
+
+    use super::document_checkpoint_payload;
+
+    #[test]
+    fn document_checkpoint_is_a_complete_minimal_opc_package()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let payload = document_checkpoint_payload()?;
+        let mut archive = zip::ZipArchive::new(Cursor::new(payload))?;
+        let names = archive.file_names().map(str::to_owned).collect::<Vec<_>>();
+        assert_eq!(
+            names,
+            ["[Content_Types].xml", "_rels/.rels", "word/document.xml"]
+        );
+
+        let mut relationships = String::new();
+        archive
+            .by_name("_rels/.rels")?
+            .read_to_string(&mut relationships)?;
+        assert!(relationships.contains(
+            r#"Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument""#
+        ));
+        assert!(relationships.contains(r#"Target="word/document.xml""#));
+
+        let mut document = String::new();
+        archive
+            .by_name("word/document.xml")?
+            .read_to_string(&mut document)?;
+        assert!(document.contains("PSTForge document checkpoint"));
+        Ok(())
+    }
 }

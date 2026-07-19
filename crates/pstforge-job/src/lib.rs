@@ -23,7 +23,7 @@ use sha2::{Digest, Sha256};
 use tempfile::NamedTempFile;
 use thiserror::Error;
 
-const JOB_SCHEMA_VERSION: i64 = 16;
+const JOB_SCHEMA_VERSION: i64 = 17;
 const INLINE_BLOB_MAX_BYTES: u64 = 64 * 1024;
 const INLINE_CACHE_DIRECTORY: &str = ".pstforge-inline-cache";
 const PAYLOAD_PACK_FILENAME: &str = "payload.pack";
@@ -164,6 +164,7 @@ pub enum ReconstructedField {
     AttachmentMimeType,
     AttachmentRenderingPosition,
     AttachmentFlags,
+    DocumentAttachment,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -4534,6 +4535,20 @@ mod tests {
         let connection = Connection::open(&database)?;
         connection.execute(
             "UPDATE job_metadata SET value = '15' WHERE key = 'schema_version'",
+            [],
+        )?;
+        drop(connection);
+        assert!(matches!(
+            DurableCatalogSink::validate_resume(&job, &source, &configuration),
+            Err(JobError::ResumeMismatch("job schema version"))
+        ));
+        assert!(matches!(
+            DurableCatalogSink::open_resume(&job, &source, &configuration),
+            Err(JobError::ResumeMismatch("job schema version"))
+        ));
+        let connection = Connection::open(&database)?;
+        connection.execute(
+            "UPDATE job_metadata SET value = '16' WHERE key = 'schema_version'",
             [],
         )?;
         drop(connection);

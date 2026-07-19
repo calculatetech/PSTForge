@@ -591,6 +591,7 @@ fn reconstructed_field_label(field: ReconstructedField) -> &'static str {
         ReconstructedField::AttachmentMimeType => "Attachment MIME type",
         ReconstructedField::AttachmentRenderingPosition => "Attachment rendering position",
         ReconstructedField::AttachmentFlags => "Attachment flags",
+        ReconstructedField::DocumentAttachment => "Required Document attachment",
     }
 }
 

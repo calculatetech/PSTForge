@@ -273,6 +273,11 @@ date or protocol revision here.
 - **Section:** published revision 21.0; [personal distribution-list members 2.2.2.2.1](https://learn.microsoft.com/en-us/openspecs/exchange_server_protocols/ms-oxocntc/9604efce-a4d9-4d6c-9541-e16dc3598dc2); [one-off members 2.2.2.2.2](https://learn.microsoft.com/en-us/openspecs/exchange_server_protocols/ms-oxocntc/48d63d90-48e1-4edf-a84b-8ccbcd3afdde); [checksum 3.1.5.11](https://learn.microsoft.com/en-us/openspecs/exchange_server_protocols/ms-oxocntc/51b77be4-66d3-40a7-ae95-a56982af2d68); [WrappedEntryId 2.2.2.2.4.1.1](https://learn.microsoft.com/en-us/openspecs/exchange_server_protocols/ms-oxocntc/02656215-1cb0-4b06-a077-b07e756216be); [contacts-related folders 2.2.3](https://learn.microsoft.com/en-us/openspecs/exchange_server_protocols/ms-oxocntc/45951a5e-82b4-4d83-83e6-24abbac67947)
 - **Page date:** 2025-05-20
 
+### OXODOC
+- **Source:** [MS-OXODOC Document Object Protocol](https://learn.microsoft.com/en-us/openspecs/exchange_server_protocols/ms-oxodoc/103007c8-5066-4bed-84e3-4465907af098)
+- **Section:** revision 13.0; 2.2, 2.2.1.1-2.2.1.34, and 2.2.2.1-2.2.2.3
+- **Page date:** 2025-05-20
+
 ### OXOCAL
 - **Source:** [MS-OXOCAL Appointment and Meeting Object Protocol](https://learn.microsoft.com/en-us/openspecs/exchange_server_protocols/ms-oxocal/09861fde-c8e4-4028-9346-e7c214cfdba1)
 - **Section:** published revision 22.1
@@ -538,6 +543,16 @@ PSTForge to invent class semantics that were absent from the source.
 - **Implementation:** `multiple_binary_property`, `contain_distribution_list_properties`, `validate_distribution_list_properties`, `RawPropertyValue::MultipleBinary`, `PropertyValue::variable_bytes`
 - **Focused tests:** bounded offset/count parser; exact variable-MV encoding and roundtrip; missing, synchronized, mismatched, malformed, and oversized distribution-list property cases
 - **Independent evidence:** Exact source/output libpff property fingerprints, `pffinfo`, and `readpst` pass; ScanPST reports clean and Outlook displays the Contacts-folder list name and both members correctly.
+
+### CLS-10
+- **Status:** Verified
+- **Class family:** dotted descendants of `IPM.Document`; the undotted root is not a Document object
+- **Sources:** OXODOC sections 2.2, 2.2.1.1-2.2.1.34, and 2.2.2.1-2.2.2.3; OXCMSG attachment properties; PST-MV-VARIABLE
+- **Required relationships:** `PidTagMessageClass` begins `IPM.Document.` and includes a source-owned file-type suffix. A Document object has at least one attachment and should not have more than one. `PidTagDisplayName` should contain the attachment name. The 34 document-specific named properties are optional and retain their documented types; `PidNameKeywords` and `PidNameDocumentParts` are `PtypMultipleString`.
+- **Recovery behavior:** Preserve every readable attachment, including additional attachments rather than enforcing the non-mandatory one-attachment recommendation. Preserve the exact source class suffix, display name, attachment names/data, and document-specific properties. Do not derive document metadata from attachment content or filename. A malformed optional property is omitted alone and reported partial. A damaged Document object with no readable attachment retains its message metadata but is reported partial because the required relationship cannot be recovered. Reference and OLE attachment methods remain separate checkpoints.
+- **Implementation:** `RawPropertyValue::MultipleUnicode`, `PropertyValue::MultipleUnicode`, `multiple_unicode_bytes`, `decode_multiple_unicode`, `public_keywords_are_valid`, `document_message_class`, `ReconstructedField::DocumentAttachment`, and job schema 17
+- **Focused tests:** `every_supported_raw_value_round_trips`; `multiple_unicode_offsets_and_utf16_are_bounded_and_exact`; `public_keywords_limit_counts_utf16_units`; `document_class_requires_a_dotted_suffix_and_reports_missing_attachment`; `milestone_0_4_2_document_object_roundtrip_through_libpff`
+- **Independent evidence:** The bounded by-value DOCX source/output pair passes exact libpff comparison for class, folder, attachment payload/metadata, and all named-property identities, types, and payloads with zero reported omissions. The external test binds the attachment to the corrected payload SHA-256. `pffexport` extracts byte-identical DOCX payloads from source and output; `unzip -t` verifies ZIP integrity and readable content-types, relationship, and document parts; the focused fixture test asserts the officeDocument relationship type and target. `pffinfo` accepts the candidate and `readpst` completes while intentionally skipping the non-mail Document object. ScanPST reports clean, Outlook displays the Document object, and Word opens the DOCX normally.
 
 ## Template And Outlook-Maintained Output
 

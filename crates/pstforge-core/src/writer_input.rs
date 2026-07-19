@@ -409,8 +409,10 @@ fn translate_message(
             let is_distribution_list_members =
                 matches!(distribution_list_lid, Some(0x8054 | 0x8055));
             let is_distribution_list_checksum = distribution_list_lid == Some(0x804C);
+            let is_public_keywords = set == NamedPropertySet::PublicStrings
+                && name == NamedPropertyName::String("Keywords".to_owned());
             let omissions_before_value = omitted_properties;
-            let value = if (is_distribution_list_members && property_type != 0x1102)
+            let mut value = if (is_distribution_list_members && property_type != 0x1102)
                 || (is_distribution_list_checksum && property_type != 0x0003)
             {
                 None
@@ -422,6 +424,10 @@ fn translate_message(
                     0x0102 if property.blob.byte_len <= 1_048_576 => Some(
                         RawPropertyValue::Binary(read_blob(job, mail, property, 1_048_576)?),
                     ),
+                    0x101F => omit_malformed(
+                        multiple_unicode_property(job, mail, property, transient_id, 16 * 1024),
+                        &mut omitted_properties,
+                    )?,
                     0x1102 => omit_malformed(
                         multiple_binary_property(
                             job,
@@ -444,6 +450,15 @@ fn translate_message(
                     _ => scalar_property(job, mail, property, transient_id, property_type)?,
                 }
             };
+            if is_public_keywords
+                && matches!(
+                    &value,
+                    Some(RawPropertyValue::MultipleUnicode(values))
+                        if !public_keywords_are_valid(values)
+                )
+            {
+                value = None;
+            }
             if let Some(value) = value {
                 named_properties.push(NamedProperty { set, name, value });
             } else {
@@ -829,6 +844,10 @@ fn translate_message(
         reconstructions.record_generated(ReconstructedField::MessageClass);
         "IPM.Note".to_owned()
     });
+    if document_message_class(&message_class) && attachments.is_empty() {
+        partial = true;
+        reconstructions.record_generated(ReconstructedField::DocumentAttachment);
+    }
     if !supported_message_class(&message_class)
         || (calendar_exception_message_class(&message_class) && !allow_calendar_exception)
     {
@@ -1282,6 +1301,66 @@ fn multiple_binary_property(
 }
 
 fn decode_multiple_binary(bytes: &[u8]) -> Result<Vec<Vec<u8>>, &'static str> {
+    decode_variable_width_values(bytes)
+        .map(|values| values.into_iter().map(ToOwned::to_owned).collect())
+}
+
+fn multiple_unicode_property(
+    job: &TranslationSource<'_>,
+    mail: &CanonicalMail,
+    property: &CanonicalProperty,
+    id: u16,
+    maximum_bytes: u64,
+) -> Result<RawPropertyValue, CanonicalWriteError> {
+    if property.blob.byte_len > maximum_bytes {
+        return Err(CanonicalWriteError::InvalidProperty {
+            item_key: mail.durable_item_key.clone(),
+            property_id: u32::from(id),
+            detail: format!(
+                "PtypMultipleString has {} bytes, limit is {maximum_bytes}",
+                property.blob.byte_len
+            ),
+        });
+    }
+    let bytes = read_blob(job, mail, property, maximum_bytes)?;
+    decode_multiple_unicode(&bytes)
+        .map(RawPropertyValue::MultipleUnicode)
+        .map_err(|detail| CanonicalWriteError::InvalidProperty {
+            item_key: mail.durable_item_key.clone(),
+            property_id: u32::from(id),
+            detail: detail.to_owned(),
+        })
+}
+
+fn decode_multiple_unicode(bytes: &[u8]) -> Result<Vec<String>, &'static str> {
+    decode_variable_width_values(bytes)?
+        .into_iter()
+        .map(|value| {
+            if value.len() % 2 != 0 {
+                return Err("PtypMultipleString value has odd byte length");
+            }
+            let mut units = value
+                .chunks_exact(2)
+                .map(|unit| u16::from_le_bytes([unit[0], unit[1]]))
+                .collect::<Vec<_>>();
+            if let Some(end) = units.iter().position(|unit| *unit == 0) {
+                if units[end + 1..].iter().any(|unit| *unit != 0) {
+                    return Err("PtypMultipleString has data after its terminator");
+                }
+                units.truncate(end);
+            }
+            String::from_utf16(&units).map_err(|_| "PtypMultipleString value is invalid UTF-16")
+        })
+        .collect()
+}
+
+fn public_keywords_are_valid(values: &[String]) -> bool {
+    values
+        .iter()
+        .all(|value| value.encode_utf16().count() < 256)
+}
+
+fn decode_variable_width_values(bytes: &[u8]) -> Result<Vec<&[u8]>, &'static str> {
     let count_bytes = bytes
         .get(..4)
         .ok_or("PtypMultipleBinary count is truncated")?;
@@ -1340,7 +1419,6 @@ fn decode_multiple_binary(bytes: &[u8]) -> Result<Vec<Vec<u8>>, &'static str> {
             let end = offsets.get(index + 1).copied().unwrap_or(bytes.len());
             bytes
                 .get(*start..end)
-                .map(ToOwned::to_owned)
                 .ok_or("PtypMultipleBinary value range is invalid")
         })
         .collect()
@@ -1664,6 +1742,10 @@ fn contact_message_class(value: &str) -> bool {
 
 fn distribution_list_message_class(value: &str) -> bool {
     class_is_or_descends_from(value, "IPM.DistList")
+}
+
+fn document_message_class(value: &str) -> bool {
+    class_descends_from(value, "IPM.Document")
 }
 
 fn appointment_message_class(value: &str) -> bool {
@@ -2176,8 +2258,9 @@ mod tests {
         CanonicalWriteError, PartBuildOptions, attachment_property_type_is_preservable,
         build_part_writer_input, build_part_writer_input_with_folders_interruptible,
         contain_body_metadata, contain_distribution_list_properties, decode_multiple_binary,
-        default_container_class, extension_for_mime, named_property_set,
-        normalize_associated_display_name, recipient_property_value_matches,
+        decode_multiple_unicode, default_container_class, document_message_class,
+        extension_for_mime, named_property_set, normalize_associated_display_name,
+        public_keywords_are_valid, recipient_property_value_matches,
         record_internet_codepage_provenance, supported_message_class,
         valid_compressed_rtf_container, valid_utf8_stream, valid_utf16_stream,
         writer_stream_type_is_supported,
@@ -2210,6 +2293,177 @@ mod tests {
         assert!(decode_multiple_binary(&[0, 0, 0, 0, 1]).is_err());
         assert!(decode_multiple_binary(&[1, 0, 0, 0, 7, 0, 0, 0]).is_err());
         assert!(decode_multiple_binary(&[2, 0, 0, 0, 12, 0, 0, 0, 11, 0, 0, 0,]).is_err());
+    }
+
+    #[test]
+    fn multiple_unicode_offsets_and_utf16_are_bounded_and_exact() {
+        let bytes = [
+            2, 0, 0, 0, 12, 0, 0, 0, 14, 0, 0, 0, b'A', 0, 0xAC, 0x20, 0x16, 0x4E, 0x4C, 0x75,
+        ];
+        assert_eq!(
+            decode_multiple_unicode(&bytes),
+            Ok(vec!["A".to_owned(), "\u{20AC}\u{4E16}\u{754C}".to_owned()])
+        );
+        assert_eq!(decode_multiple_unicode(&[0, 0, 0, 0]), Ok(Vec::new()));
+        assert!(decode_multiple_unicode(&[1, 0, 0, 0, 8, 0, 0, 0, b'A']).is_err());
+        assert!(decode_multiple_unicode(&[1, 0, 0, 0, 8, 0, 0, 0, 0x3D, 0xD8]).is_err());
+        assert!(decode_multiple_unicode(&[1, 0, 0, 0, 7, 0, 0, 0]).is_err());
+        assert_eq!(
+            decode_multiple_unicode(&[1, 0, 0, 0, 8, 0, 0, 0, b'A', 0, 0, 0]),
+            Ok(vec!["A".to_owned()])
+        );
+        assert!(
+            decode_multiple_unicode(&[1, 0, 0, 0, 8, 0, 0, 0, b'A', 0, 0, 0, b'B', 0,]).is_err()
+        );
+    }
+
+    #[test]
+    fn public_keywords_limit_counts_utf16_units() {
+        let valid = "\u{1F600}".repeat(127);
+        let invalid = "\u{1F600}".repeat(128);
+        assert!(public_keywords_are_valid(&[valid]));
+        assert!(!public_keywords_are_valid(&[invalid]));
+    }
+
+    #[test]
+    fn document_class_requires_a_dotted_suffix_and_reports_missing_attachment()
+    -> Result<(), Box<dyn std::error::Error>> {
+        fn mail(class: &str, key: &str) -> CanonicalMail {
+            CanonicalMail {
+                durable_item_key: key.to_owned(),
+                key: ItemKey {
+                    provenance: RecoveryProvenance::Recovered,
+                    source_node_id: None,
+                    recovery_index: Some(0),
+                    occurrence: 0,
+                },
+                folder_path: vec!["Documents".to_owned()],
+                folder_location: CanonicalFolderLocation::IpmSubtree,
+                folder_role: CanonicalFolderRole::Ordinary,
+                placement: CanonicalMessagePlacement::Normal,
+                message_class: Some(class.to_owned()),
+                subject: Some("Document containment checkpoint".to_owned()),
+                sender_name: None,
+                sender_email: None,
+                submit_filetime: None,
+                delivery_filetime: None,
+                recipients: Vec::new(),
+                attachments: Vec::new(),
+                properties: Vec::new(),
+                completeness: ContentCompleteness::Complete,
+                spooled_bytes: 0,
+            }
+        }
+
+        fn attachment(index: u32, data_complete: bool) -> CanonicalAttachment {
+            CanonicalAttachment {
+                index,
+                attachment_type: Some(i32::from(b'd')),
+                filename: Some(format!("document-{index}.bin")),
+                declared_size: Some(0),
+                data: data_complete.then(|| SpooledBlob {
+                    sha256: "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+                        .to_owned(),
+                    byte_len: 0,
+                    pack_offset: Some(0),
+                }),
+                data_complete,
+                properties: Vec::new(),
+                embedded: None,
+            }
+        }
+
+        assert!(!document_message_class("IPM.Document"));
+        assert!(document_message_class("IPM.Document.Word.Document.12"));
+        assert!(document_message_class("ipm.document.txtfile"));
+        assert!(!document_message_class("IPM.Documentary"));
+
+        let directory = tempdir()?;
+        let job = DurableCatalogSink::create(&directory.path().join("job"))?;
+        let document = mail("IPM.Document.Word.Document.12", "recovered:-:0:0");
+        let input = build_part_writer_input(
+            &job,
+            &[&document],
+            &"0".repeat(64),
+            "balanced",
+            4_294_967_296,
+            1,
+        )?;
+        assert!(input.partial);
+        assert_eq!(
+            input
+                .reconstructions
+                .generated
+                .get(&ReconstructedField::DocumentAttachment),
+            Some(&1)
+        );
+
+        let root = mail("IPM.Document", "recovered:-:0:1");
+        let root_input = build_part_writer_input(
+            &job,
+            &[&root],
+            &"0".repeat(64),
+            "balanced",
+            4_294_967_296,
+            1,
+        )?;
+        assert!(!root_input.partial);
+        assert!(
+            !root_input
+                .reconstructions
+                .generated
+                .contains_key(&ReconstructedField::DocumentAttachment)
+        );
+
+        let mut multiple = mail("IPM.Document.Word.Document.12", "recovered:-:0:2");
+        multiple.attachments = vec![attachment(0, true), attachment(1, true)];
+        let multiple_input = build_part_writer_input(
+            &job,
+            &[&multiple],
+            &"0".repeat(64),
+            "balanced",
+            4_294_967_296,
+            1,
+        )?;
+        assert!(!multiple_input.partial);
+        assert_eq!(
+            multiple_input.store.folders[0].messages[0]
+                .attachments
+                .len(),
+            2
+        );
+        assert!(
+            !multiple_input
+                .reconstructions
+                .generated
+                .contains_key(&ReconstructedField::DocumentAttachment)
+        );
+
+        let mut unreadable = mail("IPM.Document.Word.Document.12", "recovered:-:0:3");
+        unreadable.attachments = vec![attachment(0, false)];
+        let unreadable_input = build_part_writer_input(
+            &job,
+            &[&unreadable],
+            &"0".repeat(64),
+            "balanced",
+            4_294_967_296,
+            1,
+        )?;
+        assert!(unreadable_input.partial);
+        assert_eq!(unreadable_input.omitted_attachments, 1);
+        assert!(
+            unreadable_input.store.folders[0].messages[0]
+                .attachments
+                .is_empty()
+        );
+        assert_eq!(
+            unreadable_input
+                .reconstructions
+                .generated
+                .get(&ReconstructedField::DocumentAttachment),
+            Some(&1)
+        );
+        Ok(())
     }
 
     #[test]

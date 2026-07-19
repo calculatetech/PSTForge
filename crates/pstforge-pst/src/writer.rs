@@ -199,6 +199,7 @@ pub enum RawPropertyValue {
     MultipleInteger32(Vec<i32>),
     MultipleInteger64(Vec<i64>),
     MultipleGuid(Vec<[u8; 16]>),
+    MultipleUnicode(Vec<String>),
     MultipleBinary(Vec<Vec<u8>>),
 }
 
@@ -604,6 +605,7 @@ enum PropertyValue {
     MultipleInteger32(Vec<i32>),
     MultipleInteger64(Vec<i64>),
     MultipleGuid(Vec<[u8; 16]>),
+    MultipleUnicode(Vec<String>),
     MultipleBinary(Vec<Vec<u8>>),
     Object(NodeId, u32),
     External(PropertyType, NodeId),
@@ -629,6 +631,7 @@ impl PropertyValue {
             Self::MultipleInteger32(_) => PropertyType::MultipleInteger32,
             Self::MultipleInteger64(_) => PropertyType::MultipleInteger64,
             Self::MultipleGuid(_) => PropertyType::MultipleGuid,
+            Self::MultipleUnicode(_) => PropertyType::MultipleUnicode,
             Self::MultipleBinary(_) => PropertyType::MultipleBinary,
             Self::Object(_, _) => PropertyType::Object,
             Self::External(kind, _) => *kind,
@@ -675,6 +678,7 @@ impl PropertyValue {
                 bytes.extend(values.iter().flatten().copied());
                 bytes
             }
+            Self::MultipleUnicode(values) => multiple_unicode_bytes(values)?,
             Self::MultipleBinary(values) => multiple_binary_bytes(values)?,
             Self::Object(node, size) => {
                 let mut bytes = Vec::with_capacity(8);
@@ -4051,6 +4055,12 @@ fn validate_raw_value(value: &RawPropertyValue) -> Result<(), WriterError> {
             "typed variable raw properties must be non-empty".to_owned(),
         ));
     }
+    if matches!(value, RawPropertyValue::MultipleUnicode(values) if values.iter().any(|value| value.contains('\0')))
+    {
+        return Err(WriterError::InvalidStructure(
+            "multi-valued Unicode properties cannot contain NUL".to_owned(),
+        ));
+    }
     validate_payload_len("raw property", raw_value_payload_len(value)?)
 }
 
@@ -4085,6 +4095,7 @@ fn raw_value_payload_len(value: &RawPropertyValue) -> Result<usize, WriterError>
             .len()
             .checked_mul(16)
             .ok_or(WriterError::ValueTooLarge("multi-valued property"))?,
+        RawPropertyValue::MultipleUnicode(values) => multiple_unicode_payload_len(values)?,
         RawPropertyValue::MultipleBinary(values) => multiple_binary_payload_len(values)?,
     };
     Ok(encoded_len)
@@ -4101,6 +4112,75 @@ fn multiple_binary_payload_len(values: &[Vec<u8>]) -> Result<usize, WriterError>
                 .try_fold(header, |total, value| total.checked_add(value.len()))
         })
         .ok_or(WriterError::ValueTooLarge("multi-valued binary property"))
+}
+
+fn multiple_unicode_payload_len(values: &[String]) -> Result<usize, WriterError> {
+    values
+        .len()
+        .checked_add(1)
+        .and_then(|count| count.checked_mul(4))
+        .and_then(|header| {
+            values.iter().try_fold(header, |total, value| {
+                value
+                    .encode_utf16()
+                    .count()
+                    .checked_mul(2)
+                    .and_then(|bytes| total.checked_add(bytes))
+            })
+        })
+        .ok_or(WriterError::ValueTooLarge("multi-valued Unicode property"))
+}
+
+fn multiple_unicode_bytes(values: &[String]) -> io::Result<Vec<u8>> {
+    let encoded_len = multiple_unicode_payload_len(values)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
+    let count = u32::try_from(values.len()).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "multi-valued Unicode property has too many values",
+        )
+    })?;
+    let mut bytes = Vec::with_capacity(encoded_len);
+    bytes.extend_from_slice(&count.to_le_bytes());
+    let mut offset = values
+        .len()
+        .checked_add(1)
+        .and_then(|count| count.checked_mul(4))
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "multi-valued Unicode property offset overflow",
+            )
+        })?;
+    for value in values {
+        bytes.extend_from_slice(
+            &u32::try_from(offset)
+                .map_err(|_| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "multi-valued Unicode property offset is too large",
+                    )
+                })?
+                .to_le_bytes(),
+        );
+        offset = value
+            .encode_utf16()
+            .count()
+            .checked_mul(2)
+            .and_then(|size| offset.checked_add(size))
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "multi-valued Unicode property offset overflow",
+                )
+            })?;
+    }
+    for value in values {
+        for code_unit in value.encode_utf16() {
+            bytes.extend_from_slice(&code_unit.to_le_bytes());
+        }
+    }
+    Ok(bytes)
 }
 
 fn multiple_binary_bytes(values: &[Vec<u8>]) -> io::Result<Vec<u8>> {
@@ -5010,6 +5090,13 @@ fn raw_value_matches(
                     .zip(right)
                     .all(|(left, right)| *left == right.to_le_bytes())
         }
+        (RawPropertyValue::MultipleUnicode(left), ReadValue::MultipleUnicode(right)) => {
+            left.len() == right.len()
+                && left
+                    .iter()
+                    .zip(right)
+                    .all(|(left, right)| left == &right.to_string())
+        }
         (RawPropertyValue::MultipleBinary(left), ReadValue::MultipleBinary(right)) => {
             left.len() == right.len()
                 && left
@@ -5023,6 +5110,7 @@ fn raw_value_matches(
         (RawPropertyValue::MultipleInteger32(value), ReadValue::Null) => value.is_empty(),
         (RawPropertyValue::MultipleInteger64(value), ReadValue::Null) => value.is_empty(),
         (RawPropertyValue::MultipleGuid(value), ReadValue::Null) => value.is_empty(),
+        (RawPropertyValue::MultipleUnicode(value), ReadValue::Null) => value.is_empty(),
         (RawPropertyValue::MultipleBinary(value), ReadValue::Null) => value.is_empty(),
         _ => false,
     }
@@ -6030,6 +6118,7 @@ fn raw_property_value(value: &RawPropertyValue) -> PropertyValue {
             PropertyValue::MultipleInteger64(value.clone())
         }
         RawPropertyValue::MultipleGuid(value) => PropertyValue::MultipleGuid(value.clone()),
+        RawPropertyValue::MultipleUnicode(value) => PropertyValue::MultipleUnicode(value.clone()),
         RawPropertyValue::MultipleBinary(value) => PropertyValue::MultipleBinary(value.clone()),
     }
 }
@@ -7236,6 +7325,7 @@ fn write_external_table_value(
         | PropertyValue::MultipleInteger32(_)
         | PropertyValue::MultipleInteger64(_)
         | PropertyValue::MultipleGuid(_)
+        | PropertyValue::MultipleUnicode(_)
         | PropertyValue::MultipleBinary(_)
         | PropertyValue::Object(_, _) => {
             let data = table_variable_bytes(value)?.ok_or_else(|| {
@@ -7294,6 +7384,7 @@ fn write_table_value(
         | PropertyValue::MultipleInteger32(_)
         | PropertyValue::MultipleInteger64(_)
         | PropertyValue::MultipleGuid(_)
+        | PropertyValue::MultipleUnicode(_)
         | PropertyValue::MultipleBinary(_)
         | PropertyValue::Object(_, _) => {
             let data = table_variable_bytes(value)?.ok_or_else(|| {
@@ -11209,9 +11300,27 @@ mod tests {
                     vec![3, 4, 5, 6],
                 ]),
             },
+            RawProperty {
+                id: 0x1113,
+                value: RawPropertyValue::MultipleUnicode(vec![
+                    "first".to_owned(),
+                    String::new(),
+                    "euro: \u{20AC}, world: \u{4E16}\u{754C}".to_owned(),
+                ]),
+            },
         ];
         let directory = tempfile::tempdir()?;
         create_fidelity_store(directory.path().join("raw-values.pst"), &spec)?;
+
+        spec.message
+            .raw_properties
+            .last_mut()
+            .ok_or("missing multi-valued Unicode fixture")?
+            .value = RawPropertyValue::MultipleUnicode(vec!["bad\0tail".to_owned()]);
+        assert!(matches!(
+            validate_spec(&spec),
+            Err(WriterError::InvalidStructure(detail)) if detail.contains("cannot contain NUL")
+        ));
         Ok(())
     }
 

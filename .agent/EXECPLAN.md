@@ -1869,6 +1869,47 @@ work. Hash and identity evidence show that the source was not modified.
       the non-mail Contact object. The owner reports ScanPST and Outlook
       acceptance fully green, including the Contacts-folder list name and both
       members.
+    - [x] Checkpoint 11a: By-value Document objects. Admit only dotted
+      `IPM.Document.*` descendants under MS-OXODOC. Preserve every readable
+      attachment even though the protocol recommends no more than one, and
+      report a Document object with no readable attachment as partial without
+      discarding its message metadata. Preserve the exact source file-type
+      suffix, `PidTagDisplayName`, attachment metadata and payload, and all
+      representable document-specific named properties without deriving them
+      from the filename or file contents. Add bounded `PtypMultipleString`
+      preservation for `PidNameKeywords` and `PidNameDocumentParts`, contain
+      malformed offsets or UTF-16 to the affected property, and advance the
+      job schema from 16 to 17. Prove exact source/output message, named
+      property, and attachment fingerprints using one bounded DOCX fixture,
+      then stop for ScanPST-first Outlook acceptance before commit.
+      Implementation now preserves the Document class suffix, display name,
+      every readable by-value attachment, and representable Document named
+      properties. Bounded multivalue-Unicode decoding rejects malformed
+      offsets, invalid UTF-16, and non-NUL data after a terminator; the writer
+      uses checked counts, offsets, and lengths. Focused tests cover terminal
+      NUL containment, the Public Strings keyword limit, zero/one/multiple
+      attachments, and an unreadable sole attachment. The exact external
+      libpff source/output comparison reports no omissions and the source
+      identity remains unchanged. The combined-manifest full gate passed at
+      `.agent/test-results/1784427024-full`, and the fresh final-state
+      adversarial review returned `CLEAN`. Candidate
+      `qualification-v042-document-r2/parts/part-0001.pst` is 271,360 bytes
+      with SHA-256
+      `d48b7eebc4936ffd60c739dc5642ab05f5db7734ce14fe0d81614f6483aeb0d7`.
+      `pffinfo` accepts it and `readpst` completes while intentionally skipping
+      the non-mail Document object. `pffexport` extracts the DOCX from both the
+      immutable source fixture and split output with identical SHA-256
+      `6189ada04b0f10ed91272485315c5d4d5b90e8a6589fabc145a5b33af8181b33`;
+      `unzip -t` verifies ZIP integrity and readability of all three parts,
+      while the focused fixture test asserts the package relationship type and
+      target. The owner reports ScanPST clean, Outlook displays the Document
+      object, and Word opens the DOCX normally.
+    - [ ] Checkpoint 11b: By-reference and web-reference attachments. Preserve
+      documented method/path or URL relationships without fetching external
+      content or converting a reference into by-value data.
+    - [ ] Checkpoint 11c: OLE attachments. Preserve source object/binary data,
+      attach tag, static rendition, and method relationship without converting
+      or executing the object.
   - [ ] Run the complete 19 GB split once after all focused checkpoints pass
     and reconcile discovered unique items against written plus explicitly
     unwritten items across every part.
@@ -1879,6 +1920,14 @@ work. Hash and identity evidence show that the source was not modified.
 - [ ] Milestone 1.0.0: MailPlus-Ready Release.
 
 ## Surprises & Discoveries
+
+- Observation: The first by-value Document candidate preserved its attachment
+  byte-for-byte, but the synthetic DOCX was itself invalid because its OPC ZIP
+  omitted the package-level `_rels/.rels` relationship. ScanPST correctly
+  passed because this was payload validity, not PST corruption. The replacement
+  fixture includes the normative officeDocument relationship, has a focused
+  package-structure test, and exports with the same payload hash before and
+  after splitting.
 
 - Observation: The original durable-spool design performed one file publish,
   file sync, directory sync, and later rehash per property. A 19 GB corrupt
