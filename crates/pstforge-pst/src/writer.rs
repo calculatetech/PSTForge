@@ -146,9 +146,11 @@ pub enum NativeBody {
 pub enum AttachmentContent {
     Binary(Vec<u8>),
     Spooled(FileBlobSpec),
+    Direct(DirectBlobSpec),
     Embedded(Box<MessageSpec>),
     Reference(AttachmentReferenceSpec),
     Ole(OleAttachmentSpec),
+    DirectOle(DirectOleAttachmentSpec),
 }
 
 /// A data-less MAPI reference attachment.
@@ -177,6 +179,36 @@ pub enum AttachmentReferenceMethod {
 pub struct OleAttachmentSpec {
     pub data: FileBlobSpec,
     pub data_kind: OleDataKind,
+}
+
+/// A live bounded payload identified by the recovery supervisor.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DirectBlobSpec {
+    pub id: u64,
+    pub byte_len: u64,
+    pub sha256: Option<[u8; 32]>,
+}
+
+/// A live OLE payload whose source property type remains authoritative.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DirectOleAttachmentSpec {
+    pub data: DirectBlobSpec,
+    pub data_kind: OleDataKind,
+}
+
+/// A direct payload hash observed only for a fully accepted private message.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DirectBlobCompletion {
+    pub id: u64,
+    pub sha256: [u8; 32],
+}
+
+/// Supplies one bounded direct payload as a readable stream.
+pub trait DirectBlobSource {
+    fn open_blob<'a>(
+        &'a mut self,
+        blob: &DirectBlobSpec,
+    ) -> Result<Box<dyn std::io::Read + 'a>, WriterError>;
 }
 
 /// The two documented property representations for an ATTACH_OLE payload.
@@ -210,6 +242,14 @@ pub struct SpooledPropertySpec {
     pub blob: FileBlobSpec,
 }
 
+/// A raw encoded MAPI property streamed from the live recovery channel.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DirectPropertySpec {
+    pub id: u16,
+    pub property_type: u16,
+    pub blob: DirectBlobSpec,
+}
+
 /// A by-value file or embedded-message attachment.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AttachmentSpec {
@@ -221,6 +261,7 @@ pub struct AttachmentSpec {
     pub flags: i32,
     pub raw_properties: Vec<RawProperty>,
     pub spooled_properties: Vec<SpooledPropertySpec>,
+    pub direct_properties: Vec<DirectPropertySpec>,
     pub content: AttachmentContent,
 }
 
@@ -324,6 +365,7 @@ pub struct MessageSpec {
     pub named_properties: Vec<NamedProperty>,
     pub raw_properties: Vec<RawProperty>,
     pub spooled_properties: Vec<SpooledPropertySpec>,
+    pub direct_properties: Vec<DirectPropertySpec>,
     pub unsupported_properties: Vec<UnsupportedProperty>,
 }
 
@@ -459,6 +501,7 @@ impl From<&MinimalStore> for FidelityStore {
                 named_properties: Vec::new(),
                 raw_properties: Vec::new(),
                 spooled_properties: Vec::new(),
+                direct_properties: Vec::new(),
                 unsupported_properties: Vec::new(),
             },
         }
@@ -505,6 +548,7 @@ impl Default for FidelityStore {
                 value: RawPropertyValue::MultipleInteger32(vec![7, 11]),
             }],
             spooled_properties: Vec::new(),
+            direct_properties: Vec::new(),
             unsupported_properties: Vec::new(),
         };
         Self {
@@ -550,6 +594,7 @@ impl Default for FidelityStore {
                         flags: 4,
                         raw_properties: Vec::new(),
                         spooled_properties: Vec::new(),
+                        direct_properties: Vec::new(),
                         content: AttachmentContent::Binary(
                             (0..16 * 1024)
                                 .map(|index| b'A' + (index % 26) as u8)
@@ -565,6 +610,7 @@ impl Default for FidelityStore {
                         flags: 0,
                         raw_properties: Vec::new(),
                         spooled_properties: Vec::new(),
+                        direct_properties: Vec::new(),
                         content: AttachmentContent::Embedded(Box::new(embedded)),
                     },
                 ],
@@ -598,6 +644,7 @@ impl Default for FidelityStore {
                     },
                 ],
                 spooled_properties: Vec::new(),
+                direct_properties: Vec::new(),
                 unsupported_properties: Vec::new(),
             },
         }
@@ -798,6 +845,7 @@ struct BlockSpec {
 
 enum BlockPayload {
     Data(Vec<u8>),
+    ProjectedData(usize),
     Subnode(Vec<UnicodeLeafSubNodeTreeEntry>),
     IntermediateSubnode {
         level: u8,
@@ -814,6 +862,7 @@ impl BlockPayload {
     fn logical_size(&self) -> usize {
         match self {
             Self::Data(data) => data.len(),
+            Self::ProjectedData(size) => *size,
             Self::Subnode(entries) => 8_usize.saturating_add(entries.len().saturating_mul(24)),
             Self::IntermediateSubnode { entries, .. } => {
                 8_usize.saturating_add(entries.len().saturating_mul(16))
@@ -827,6 +876,7 @@ impl BlockPayload {
     fn message_size_contribution(&self) -> usize {
         match self {
             Self::Data(data) => data.len(),
+            Self::ProjectedData(size) => *size,
             Self::Subnode(_) | Self::IntermediateSubnode { .. } | Self::DataTree { .. } => 0,
         }
     }
@@ -840,7 +890,7 @@ struct WrittenBlock {
 }
 
 struct BlockStream<'a> {
-    file: &'a mut std::fs::File,
+    file: Option<&'a mut std::fs::File>,
     cursor: &'a mut u64,
     written: &'a mut Vec<WrittenBlock>,
     interrupted: &'a AtomicBool,
@@ -901,6 +951,31 @@ impl MessageAppendCheckpoint {
         top_nodes: &mut Vec<TopMessageNode>,
     ) -> Result<(), WriterError> {
         file.set_len(self.file_len)?;
+        self.restore(
+            allocation_cursor,
+            next_block_index,
+            next_value_node,
+            written,
+            streamed_subnodes,
+            contents_rows,
+            associated_rows,
+            top_nodes,
+        );
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn restore(
+        self,
+        allocation_cursor: &mut u64,
+        next_block_index: &mut u64,
+        next_value_node: &mut u32,
+        written: &mut Vec<WrittenBlock>,
+        streamed_subnodes: &mut Vec<NodeId>,
+        contents_rows: &mut Vec<TableRowSpec>,
+        associated_rows: &mut Vec<TableRowSpec>,
+        top_nodes: &mut Vec<TopMessageNode>,
+    ) {
         *allocation_cursor = self.allocation_cursor;
         *next_block_index = self.next_block_index;
         *next_value_node = self.next_value_node;
@@ -909,18 +984,27 @@ impl MessageAppendCheckpoint {
         contents_rows.truncate(self.contents_rows_len);
         associated_rows.truncate(self.associated_rows_len);
         top_nodes.truncate(self.top_nodes_len);
-        Ok(())
     }
 }
 
 impl BlockStream<'_> {
     fn emit(&mut self, block: BlockSpec) -> Result<(), WriterError> {
-        self.written.extend(write_blocks(
-            self.file,
-            &[block],
-            self.cursor,
-            self.interrupted,
-        )?);
+        if let Some(file) = self.file.as_deref_mut() {
+            self.written
+                .extend(write_blocks(file, &[block], self.cursor, self.interrupted)?);
+        } else {
+            check_interrupted(self.interrupted)?;
+            let size = u16::try_from(block.payload.logical_size())
+                .map_err(|_| WriterError::ValueTooLarge("data block"))?;
+            let physical_size = u64::from(block_size(size.saturating_add(16))?);
+            let offset = allocate_extent(self.cursor, physical_size, SLOT_SIZE)?;
+            self.written.push(WrittenBlock {
+                id: block.id,
+                offset,
+                size,
+                ref_count: block.ref_count,
+            });
+        }
         Ok(())
     }
 }
@@ -1201,8 +1285,145 @@ fn append_spooled_data_tree(
         ));
     }
     file.seek(std::io::SeekFrom::Start(blob.offset))?;
+    let (root, logical_size, _) = append_reader_data_tree(
+        &mut file,
+        blob.byte_len,
+        Some(blob.sha256),
+        false,
+        next_block_index,
+        stream,
+    )?;
+    Ok((root, logical_size))
+}
 
+fn append_direct_data_tree(
+    blob: &DirectBlobSpec,
+    source: &mut dyn DirectBlobSource,
+    next_block_index: &mut u64,
+    stream: &mut BlockStream<'_>,
+) -> Result<(UnicodeBlockId, usize, [u8; 32]), WriterError> {
+    let (root, logical_size, sha256) = {
+        let mut reader = source.open_blob(blob)?;
+        let (root, logical_size, sha256) = append_reader_data_tree(
+            reader.as_mut(),
+            blob.byte_len,
+            blob.sha256,
+            true,
+            next_block_index,
+            stream,
+        )?;
+        (root, logical_size, sha256)
+    };
+    Ok((root, logical_size, sha256))
+}
+
+fn append_declared_data_tree(
+    blob: &DirectBlobSpec,
+    next_block_index: &mut u64,
+    stream: &mut BlockStream<'_>,
+) -> Result<(UnicodeBlockId, usize), WriterError> {
     let mut remaining = blob.byte_len;
+    let mut leaves = Vec::with_capacity(MAX_DATA_TREE_ENTRIES);
+    let mut xblocks = Vec::new();
+    let logical_size = usize::try_from(blob.byte_len)
+        .map_err(|_| WriterError::ValueTooLarge("direct payload size"))?;
+    while remaining > 0 {
+        let length = usize::try_from(remaining.min(MAX_DATA_BLOCK_PAYLOAD as u64))
+            .map_err(|_| WriterError::ValueTooLarge("direct payload chunk"))?;
+        let id = take_block_id(next_block_index, false)?;
+        stream.emit(BlockSpec {
+            id,
+            payload: BlockPayload::ProjectedData(length),
+            ref_count: 2,
+        })?;
+        leaves.push((id, length));
+        remaining -= u64::try_from(length)
+            .map_err(|_| WriterError::ValueTooLarge("direct payload chunk"))?;
+        if leaves.len() == MAX_DATA_TREE_ENTRIES && remaining > 0 {
+            let total_size = leaves.iter().try_fold(0_u32, |total, (_, size)| {
+                total.checked_add(u32::try_from(*size).ok()?)
+            });
+            let total_size = total_size.ok_or(WriterError::ValueTooLarge("direct data tree"))?;
+            let id = take_block_id(next_block_index, true)?;
+            stream.emit(BlockSpec {
+                id,
+                payload: BlockPayload::DataTree {
+                    level: 1,
+                    total_size,
+                    entries: leaves
+                        .iter()
+                        .map(|(block, _)| UnicodeDataTreeEntry::from(*block))
+                        .collect(),
+                },
+                ref_count: 2,
+            })?;
+            xblocks.push((id, total_size));
+            leaves.clear();
+        }
+    }
+    if leaves.is_empty() {
+        return Err(WriterError::InvalidStructure(
+            "direct payload must not be empty".to_owned(),
+        ));
+    }
+    if xblocks.is_empty() && leaves.len() == 1 {
+        return Ok((leaves[0].0, logical_size));
+    }
+    if !leaves.is_empty() {
+        let total_size = leaves.iter().try_fold(0_u32, |total, (_, size)| {
+            total.checked_add(u32::try_from(*size).ok()?)
+        });
+        let total_size = total_size.ok_or(WriterError::ValueTooLarge("direct data tree"))?;
+        let id = take_block_id(next_block_index, true)?;
+        stream.emit(BlockSpec {
+            id,
+            payload: BlockPayload::DataTree {
+                level: 1,
+                total_size,
+                entries: leaves
+                    .iter()
+                    .map(|(block, _)| UnicodeDataTreeEntry::from(*block))
+                    .collect(),
+            },
+            ref_count: 2,
+        })?;
+        xblocks.push((id, total_size));
+    }
+    if xblocks.len() == 1 {
+        return Ok((xblocks[0].0, logical_size));
+    }
+    if xblocks.len() > MAX_DATA_TREE_ENTRIES {
+        return Err(WriterError::ValueTooLarge("direct XXBLOCK entry count"));
+    }
+    let total_size = xblocks
+        .iter()
+        .try_fold(0_u32, |total, (_, size)| total.checked_add(*size))
+        .ok_or(WriterError::ValueTooLarge("direct XXBLOCK size"))?;
+    let id = take_block_id(next_block_index, true)?;
+    stream.emit(BlockSpec {
+        id,
+        payload: BlockPayload::DataTree {
+            level: 2,
+            total_size,
+            entries: xblocks
+                .iter()
+                .map(|(block, _)| UnicodeDataTreeEntry::from(*block))
+                .collect(),
+        },
+        ref_count: 2,
+    })?;
+    Ok((id, logical_size))
+}
+
+fn append_reader_data_tree(
+    reader: &mut dyn Read,
+    byte_len: u64,
+    expected_sha256: Option<[u8; 32]>,
+    require_eof: bool,
+    next_block_index: &mut u64,
+    stream: &mut BlockStream<'_>,
+) -> Result<(UnicodeBlockId, usize, [u8; 32]), WriterError> {
+    let mut remaining = byte_len;
     let mut leaves = Vec::with_capacity(MAX_DATA_TREE_ENTRIES);
     let mut xblocks = Vec::new();
     let mut logical_size = 0_usize;
@@ -1211,7 +1432,7 @@ fn append_spooled_data_tree(
         let length = usize::try_from(remaining.min(MAX_DATA_BLOCK_PAYLOAD as u64))
             .map_err(|_| WriterError::ValueTooLarge("spooled attachment chunk"))?;
         let mut chunk = vec![0_u8; length];
-        file.read_exact(&mut chunk)?;
+        reader.read_exact(&mut chunk)?;
         hasher.update(&chunk);
         let id = take_block_id(next_block_index, false)?;
         let block = BlockSpec {
@@ -1253,9 +1474,15 @@ fn append_spooled_data_tree(
         }
     }
     let actual_hash: [u8; 32] = hasher.finalize().into();
-    if actual_hash != blob.sha256 {
+    if expected_sha256.is_some_and(|expected| actual_hash != expected) {
         return Err(WriterError::InvalidStructure(
-            "spooled attachment hash mismatch".to_owned(),
+            "streamed payload hash mismatch".to_owned(),
+        ));
+    }
+    let mut trailing = [0_u8; 1];
+    if require_eof && reader.read(&mut trailing)? != 0 {
+        return Err(WriterError::InvalidStructure(
+            "streamed payload exceeds its declared length".to_owned(),
         ));
     }
     if leaves.is_empty() {
@@ -1269,10 +1496,10 @@ fn append_spooled_data_tree(
             .checked_add(block.payload.message_size_contribution())
             .ok_or(WriterError::ValueTooLarge("spooled attachment size"))?;
         stream.emit(block)?;
-        return Ok((id, logical_size));
+        return Ok((id, logical_size, actual_hash));
     }
     if xblocks.is_empty() && leaves.len() == 1 {
-        return Ok((leaves[0].0, logical_size));
+        return Ok((leaves[0].0, logical_size, actual_hash));
     }
 
     if !leaves.is_empty() {
@@ -1300,7 +1527,7 @@ fn append_spooled_data_tree(
         xblocks.push((id, total_size));
     }
     if xblocks.len() == 1 {
-        return Ok((xblocks[0].0, logical_size));
+        return Ok((xblocks[0].0, logical_size, actual_hash));
     }
     if xblocks.len() > MAX_DATA_TREE_ENTRIES {
         return Err(WriterError::ValueTooLarge("spooled XXBLOCK entry count"));
@@ -1326,7 +1553,7 @@ fn append_spooled_data_tree(
         .checked_add(block.payload.message_size_contribution())
         .ok_or(WriterError::ValueTooLarge("spooled attachment size"))?;
     stream.emit(block)?;
-    Ok((id, logical_size))
+    Ok((id, logical_size, actual_hash))
 }
 
 fn append_spooled_properties(
@@ -1350,6 +1577,71 @@ fn append_spooled_properties(
             .checked_add(1)
             .ok_or(WriterError::ValueTooLarge("streamed property value node"))?;
         let (root, size) = append_spooled_data_tree(&spec.blob, next_block_index, stream)?;
+        logical_size = logical_size
+            .checked_add(size)
+            .ok_or(WriterError::ValueTooLarge("message size"))?;
+        subnodes.push(UnicodeLeafSubNodeTreeEntry::new(value_node, root, None));
+        properties.push((spec.id, PropertyValue::External(property_type, value_node)));
+    }
+    Ok(logical_size)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn append_direct_properties(
+    specs: &[DirectPropertySpec],
+    properties: &mut Vec<(u16, PropertyValue)>,
+    subnodes: &mut Vec<UnicodeLeafSubNodeTreeEntry>,
+    next_block_index: &mut u64,
+    next_value_node: &mut u32,
+    stream: &mut BlockStream<'_>,
+    source: &mut dyn DirectBlobSource,
+    completed: &mut Vec<(DirectBlobSpec, [u8; 32])>,
+) -> Result<usize, WriterError> {
+    let mut logical_size = 0_usize;
+    for spec in specs {
+        let property_type = PropertyType::try_from(spec.property_type).map_err(|_| {
+            WriterError::InvalidStructure(format!(
+                "unsupported direct property type: 0x{:04X}",
+                spec.property_type
+            ))
+        })?;
+        let value_node = node(NodeIdType::ListsTablesProperties, *next_value_node)?;
+        *next_value_node = next_value_node
+            .checked_add(1)
+            .ok_or(WriterError::ValueTooLarge("direct property value node"))?;
+        let (root, size, sha256) =
+            append_direct_data_tree(&spec.blob, source, next_block_index, stream)?;
+        completed.push((spec.blob.clone(), sha256));
+        logical_size = logical_size
+            .checked_add(size)
+            .ok_or(WriterError::ValueTooLarge("message size"))?;
+        subnodes.push(UnicodeLeafSubNodeTreeEntry::new(value_node, root, None));
+        properties.push((spec.id, PropertyValue::External(property_type, value_node)));
+    }
+    Ok(logical_size)
+}
+
+fn append_declared_properties(
+    specs: &[DirectPropertySpec],
+    properties: &mut Vec<(u16, PropertyValue)>,
+    subnodes: &mut Vec<UnicodeLeafSubNodeTreeEntry>,
+    next_block_index: &mut u64,
+    next_value_node: &mut u32,
+    stream: &mut BlockStream<'_>,
+) -> Result<usize, WriterError> {
+    let mut logical_size = 0_usize;
+    for spec in specs {
+        let property_type = PropertyType::try_from(spec.property_type).map_err(|_| {
+            WriterError::InvalidStructure(format!(
+                "unsupported direct property type: 0x{:04X}",
+                spec.property_type
+            ))
+        })?;
+        let value_node = node(NodeIdType::ListsTablesProperties, *next_value_node)?;
+        *next_value_node = next_value_node
+            .checked_add(1)
+            .ok_or(WriterError::ValueTooLarge("direct property value node"))?;
+        let (root, size) = append_declared_data_tree(&spec.blob, next_block_index, stream)?;
         logical_size = logical_size
             .checked_add(size)
             .ok_or(WriterError::ValueTooLarge("message size"))?;
@@ -1545,14 +1837,47 @@ fn collect_subnode_ids(blocks: &[BlockSpec], output: &mut Vec<NodeId>) {
 
 fn message_requires_streaming(message: &MessageSpec) -> bool {
     !message.spooled_properties.is_empty()
+        || !message.direct_properties.is_empty()
         || message.attachments.iter().any(|attachment| {
             !attachment.spooled_properties.is_empty()
+                || !attachment.direct_properties.is_empty()
                 || match &attachment.content {
-                    AttachmentContent::Spooled(_) | AttachmentContent::Ole(_) => true,
+                    AttachmentContent::Spooled(_)
+                    | AttachmentContent::Direct(_)
+                    | AttachmentContent::Ole(_)
+                    | AttachmentContent::DirectOle(_) => true,
                     AttachmentContent::Embedded(message) => message_requires_streaming(message),
                     AttachmentContent::Binary(_) | AttachmentContent::Reference(_) => false,
                 }
         })
+}
+
+fn message_contains_spooled_values(message: &MessageSpec) -> bool {
+    !message.spooled_properties.is_empty()
+        || message.attachments.iter().any(|attachment| {
+            !attachment.spooled_properties.is_empty()
+                || match &attachment.content {
+                    AttachmentContent::Spooled(_) | AttachmentContent::Ole(_) => true,
+                    AttachmentContent::Embedded(message) => {
+                        message_contains_spooled_values(message)
+                    }
+                    AttachmentContent::Binary(_)
+                    | AttachmentContent::Direct(_)
+                    | AttachmentContent::Reference(_)
+                    | AttachmentContent::DirectOle(_) => false,
+                }
+        })
+}
+
+fn message_has_streamed_property(message: &MessageSpec, id: u16) -> bool {
+    message
+        .spooled_properties
+        .iter()
+        .any(|property| property.id == id)
+        || message
+            .direct_properties
+            .iter()
+            .any(|property| property.id == id)
 }
 
 struct FolderPlan<'a> {
@@ -1789,6 +2114,9 @@ fn build_message_blocks(
     next_block_index: &mut u64,
     next_value_node: &mut u32,
     mut block_stream: Option<&mut BlockStream<'_>>,
+    direct_source: &mut Option<&mut dyn DirectBlobSource>,
+    project_direct: bool,
+    direct_completions: &mut Vec<(DirectBlobSpec, [u8; 32])>,
 ) -> Result<MessageBlocks, WriterError> {
     let recipient_columns = recipient_columns()?;
     let attachment_columns = attachment_columns()?;
@@ -1876,6 +2204,40 @@ fn build_message_blocks(
                     Some(PropertyValue::External(PropertyType::Binary, value_node)),
                 )
             }
+            AttachmentContent::Direct(blob) => {
+                let value_node = node(NodeIdType::ListsTablesProperties, *next_value_node)?;
+                *next_value_node = next_value_node
+                    .checked_add(1)
+                    .ok_or(WriterError::ValueTooLarge("attachment value node"))?;
+                let stream = block_stream.as_deref_mut().ok_or_else(|| {
+                    WriterError::InvalidStructure(
+                        "direct attachment requires streaming output".to_owned(),
+                    )
+                })?;
+                let (root, logical_size) = if project_direct {
+                    append_declared_data_tree(blob, next_block_index, stream)?
+                } else {
+                    let source = direct_source.as_deref_mut().ok_or_else(|| {
+                        WriterError::InvalidStructure(
+                            "direct attachment source is unavailable".to_owned(),
+                        )
+                    })?;
+                    let (root, size, sha256) =
+                        append_direct_data_tree(blob, source, next_block_index, stream)?;
+                    direct_completions.push((blob.clone(), sha256));
+                    (root, size)
+                };
+                streamed_logical_size = streamed_logical_size
+                    .checked_add(logical_size)
+                    .ok_or(WriterError::ValueTooLarge("message size"))?;
+                attachment_local_subnodes
+                    .push(UnicodeLeafSubNodeTreeEntry::new(value_node, root, None));
+                streamed_size = Some(blob.byte_len);
+                (
+                    1,
+                    Some(PropertyValue::External(PropertyType::Binary, value_node)),
+                )
+            }
             AttachmentContent::Embedded(embedded) => {
                 let embedded_node = node(
                     NodeIdType::NormalMessage,
@@ -1897,6 +2259,9 @@ fn build_message_blocks(
                     next_block_index,
                     next_value_node,
                     block_stream.as_deref_mut(),
+                    direct_source,
+                    project_direct,
+                    direct_completions,
                 )?;
                 streamed_logical_size = streamed_logical_size
                     .checked_add(embedded_blocks.streamed_logical_size)
@@ -1976,6 +2341,58 @@ fn build_message_blocks(
                 };
                 (6, Some(data))
             }
+            AttachmentContent::DirectOle(ole)
+                if ole.data_kind == OleDataKind::Binary && ole.data.byte_len == 0 =>
+            {
+                streamed_size = Some(0);
+                (6, Some(PropertyValue::Binary(Vec::new())))
+            }
+            AttachmentContent::DirectOle(ole) => {
+                let value_node_type = match ole.data_kind {
+                    OleDataKind::Object => NodeIdType::OleObjectData,
+                    OleDataKind::Binary => NodeIdType::ListsTablesProperties,
+                };
+                let value_node = node(value_node_type, *next_value_node)?;
+                *next_value_node = next_value_node
+                    .checked_add(1)
+                    .ok_or(WriterError::ValueTooLarge("OLE attachment value node"))?;
+                let stream = block_stream.as_deref_mut().ok_or_else(|| {
+                    WriterError::InvalidStructure(
+                        "direct OLE attachment requires streaming output".to_owned(),
+                    )
+                })?;
+                let (root, logical_size) = if project_direct {
+                    append_declared_data_tree(&ole.data, next_block_index, stream)?
+                } else {
+                    let source = direct_source.as_deref_mut().ok_or_else(|| {
+                        WriterError::InvalidStructure(
+                            "direct OLE attachment source is unavailable".to_owned(),
+                        )
+                    })?;
+                    let (root, size, sha256) =
+                        append_direct_data_tree(&ole.data, source, next_block_index, stream)?;
+                    direct_completions.push((ole.data.clone(), sha256));
+                    (root, size)
+                };
+                streamed_logical_size = streamed_logical_size
+                    .checked_add(logical_size)
+                    .ok_or(WriterError::ValueTooLarge("message size"))?;
+                attachment_local_subnodes
+                    .push(UnicodeLeafSubNodeTreeEntry::new(value_node, root, None));
+                streamed_size = Some(ole.data.byte_len);
+                let data = match ole.data_kind {
+                    OleDataKind::Object => PropertyValue::Object(
+                        value_node,
+                        u32::try_from(ole.data.byte_len).map_err(|_| {
+                            WriterError::ValueTooLarge("direct OLE attachment object")
+                        })?,
+                    ),
+                    OleDataKind::Binary => {
+                        PropertyValue::External(PropertyType::Binary, value_node)
+                    }
+                };
+                (6, Some(data))
+            }
         };
         let attachment_number =
             i32::try_from(index).map_err(|_| WriterError::ValueTooLarge("attachment number"))?;
@@ -2005,6 +2422,43 @@ fn build_message_blocks(
                 )?)
                 .ok_or(WriterError::ValueTooLarge("message size"))?;
             size = attachment_size_with_spooled_properties(size, &attachment.spooled_properties)?;
+        }
+        if !attachment.direct_properties.is_empty() {
+            let stream = block_stream.as_deref_mut().ok_or_else(|| {
+                WriterError::InvalidStructure(
+                    "direct attachment property requires streaming output".to_owned(),
+                )
+            })?;
+            let direct_size = if project_direct {
+                append_declared_properties(
+                    &attachment.direct_properties,
+                    &mut properties,
+                    &mut attachment_local_subnodes,
+                    next_block_index,
+                    next_value_node,
+                    stream,
+                )?
+            } else {
+                let source = direct_source.as_deref_mut().ok_or_else(|| {
+                    WriterError::InvalidStructure(
+                        "direct attachment property source is unavailable".to_owned(),
+                    )
+                })?;
+                append_direct_properties(
+                    &attachment.direct_properties,
+                    &mut properties,
+                    &mut attachment_local_subnodes,
+                    next_block_index,
+                    next_value_node,
+                    stream,
+                    source,
+                    direct_completions,
+                )?
+            };
+            streamed_logical_size = streamed_logical_size
+                .checked_add(direct_size)
+                .ok_or(WriterError::ValueTooLarge("message size"))?;
+            size = attachment_size_with_direct_properties(size, &attachment.direct_properties)?;
         }
         set_attachment_size(&mut properties, size)?;
         attachment_rows.push(attachment_table_row(
@@ -2048,7 +2502,7 @@ fn build_message_blocks(
     let mut top_properties =
         message_properties(message_spec, associated, named_identities, record_key, 0)?;
     if !message_spec.spooled_properties.is_empty() {
-        let stream = block_stream.ok_or_else(|| {
+        let stream = block_stream.as_deref_mut().ok_or_else(|| {
             WriterError::InvalidStructure("spooled property requires streaming output".to_owned())
         })?;
         streamed_logical_size = streamed_logical_size
@@ -2060,6 +2514,38 @@ fn build_message_blocks(
                 next_value_node,
                 stream,
             )?)
+            .ok_or(WriterError::ValueTooLarge("message size"))?;
+    }
+    if !message_spec.direct_properties.is_empty() {
+        let stream = block_stream.ok_or_else(|| {
+            WriterError::InvalidStructure("direct property requires streaming output".to_owned())
+        })?;
+        let direct_size = if project_direct {
+            append_declared_properties(
+                &message_spec.direct_properties,
+                &mut top_properties,
+                &mut message_subnodes,
+                next_block_index,
+                next_value_node,
+                stream,
+            )?
+        } else {
+            let source = direct_source.as_deref_mut().ok_or_else(|| {
+                WriterError::InvalidStructure("direct property source is unavailable".to_owned())
+            })?;
+            append_direct_properties(
+                &message_spec.direct_properties,
+                &mut top_properties,
+                &mut message_subnodes,
+                next_block_index,
+                next_value_node,
+                stream,
+                source,
+                direct_completions,
+            )?
+        };
+        streamed_logical_size = streamed_logical_size
+            .checked_add(direct_size)
             .ok_or(WriterError::ValueTooLarge("message size"))?;
     }
     externalize_large_properties(
@@ -2380,6 +2866,11 @@ fn validate_message_size_bound(message: &MessageSpec) -> Result<(), WriterError>
             .checked_add(property.blob.byte_len)
             .ok_or(WriterError::ValueTooLarge("message size"))?;
     }
+    for property in &message.direct_properties {
+        bytes = bytes
+            .checked_add(property.blob.byte_len)
+            .ok_or(WriterError::ValueTooLarge("message size"))?;
+    }
     for attachment in &message.attachments {
         bytes = bytes
             .checked_add(ATTACHMENT_OVERHEAD)
@@ -2407,9 +2898,11 @@ pub fn attachment_logical_size(attachment: &AttachmentSpec) -> Result<u64, Write
         AttachmentContent::Binary(data) => u64::try_from(data.len())
             .map_err(|_| WriterError::ValueTooLarge("attachment properties"))?,
         AttachmentContent::Spooled(blob) => blob.byte_len,
+        AttachmentContent::Direct(blob) => blob.byte_len,
         AttachmentContent::Embedded(embedded) => estimated_message_payload(embedded)?,
         AttachmentContent::Reference(_) => 0,
         AttachmentContent::Ole(ole) => ole.data.byte_len,
+        AttachmentContent::DirectOle(ole) => ole.data.byte_len,
     };
     content_bytes
         .checked_add(attachment_metadata_bytes(attachment)?)
@@ -2421,6 +2914,18 @@ fn estimated_message_payload(message: &MessageSpec) -> Result<u64, WriterError> 
     for property in &message.spooled_properties {
         bytes = bytes
             .checked_add(property.blob.byte_len)
+            .ok_or(WriterError::ValueTooLarge("embedded message size"))?;
+    }
+    for property in &message.direct_properties {
+        bytes = bytes
+            .checked_add(property.blob.byte_len)
+            .ok_or(WriterError::ValueTooLarge("embedded message size"))?;
+    }
+    for attachment in &message.attachments {
+        let attachment_bytes = attachment_logical_size(attachment)?;
+        bytes = bytes
+            .checked_add(64_u64 * 1024)
+            .and_then(|total| total.checked_add(attachment_bytes))
             .ok_or(WriterError::ValueTooLarge("embedded message size"))?;
     }
     Ok(bytes)
@@ -2478,6 +2983,11 @@ fn attachment_metadata_bytes(attachment: &AttachmentSpec) -> Result<u64, WriterE
             .checked_add(property.blob.byte_len)
             .ok_or(WriterError::ValueTooLarge("attachment properties"))?;
     }
+    for property in &attachment.direct_properties {
+        bytes = bytes
+            .checked_add(property.blob.byte_len)
+            .ok_or(WriterError::ValueTooLarge("attachment properties"))?;
+    }
     for property in &attachment.raw_properties {
         bytes = bytes
             .checked_add(
@@ -2523,7 +3033,6 @@ impl MessageStreamState {
             top_nodes: Vec::with_capacity(message_capacity),
         }
     }
-
     fn message_count(&self) -> usize {
         self.top_nodes.len()
     }
@@ -2554,7 +3063,9 @@ impl MessageStreamState {
         contents_columns: &[TableColumnDescriptor],
         associated_columns: &[TableColumnDescriptor],
         interrupted: &AtomicBool,
-    ) -> Result<MessageAppendCheckpoint, WriterError> {
+        direct_source: Option<&mut dyn DirectBlobSource>,
+        project_direct: bool,
+    ) -> Result<(MessageAppendCheckpoint, Vec<DirectBlobCompletion>), WriterError> {
         check_interrupted(interrupted)?;
         let checkpoint = self.checkpoint();
         let index = u32::try_from(self.message_count())
@@ -2585,11 +3096,13 @@ impl MessageStreamState {
             )
         };
         let mut stream = BlockStream {
-            file,
+            file: (!project_direct).then_some(file),
             cursor: &mut self.allocation_cursor,
             written: &mut self.written,
             interrupted,
         };
+        let mut direct_source = direct_source;
+        let mut direct_completions = Vec::new();
         let message = build_message_blocks(
             message_spec,
             associated,
@@ -2601,6 +3114,9 @@ impl MessageStreamState {
             &mut self.next_block_index,
             &mut self.next_value_node,
             Some(&mut stream),
+            &mut direct_source,
+            project_direct,
+            &mut direct_completions,
         )?;
         if associated {
             self.associated_rows.push(associated_message_table_row(
@@ -2639,7 +3155,16 @@ impl MessageStreamState {
             stream.emit(block)?;
         }
         self.file_len = self.file_len.max(self.allocation_cursor);
-        Ok(checkpoint)
+        Ok((
+            checkpoint,
+            direct_completions
+                .into_iter()
+                .map(|(blob, sha256)| DirectBlobCompletion {
+                    id: blob.id,
+                    sha256,
+                })
+                .collect(),
+        ))
     }
 
     #[allow(dead_code)]
@@ -2661,6 +3186,20 @@ impl MessageStreamState {
         )?;
         self.file_len = checkpoint.file_len;
         Ok(())
+    }
+
+    fn restore_projected_message(&mut self, checkpoint: MessageAppendCheckpoint) {
+        checkpoint.restore(
+            &mut self.allocation_cursor,
+            &mut self.next_block_index,
+            &mut self.next_value_node,
+            &mut self.written,
+            &mut self.streamed_subnodes,
+            &mut self.contents_rows,
+            &mut self.associated_rows,
+            &mut self.top_nodes,
+        );
+        self.file_len = checkpoint.file_len;
     }
 }
 
@@ -3227,9 +3766,164 @@ impl TransactionalMailStoreWriter {
         message: MessageSpec,
         interrupted: &AtomicBool,
     ) -> Result<(), WriterError> {
+        self.append_message_deferred_from(location, path, associated, message, interrupted, None)
+            .map(|_| ())
+    }
+
+    /// Append a message whose external values come from one bounded live source.
+    fn append_message_direct(
+        &mut self,
+        location: MailFolderLocation,
+        path: &[String],
+        associated: bool,
+        message: MessageSpec,
+        interrupted: &AtomicBool,
+        source: &mut dyn DirectBlobSource,
+    ) -> Result<Vec<DirectBlobCompletion>, WriterError> {
+        self.append_message_deferred_from(
+            location,
+            path,
+            associated,
+            message,
+            interrupted,
+            Some(source),
+        )
+    }
+
+    /// Calculate the exact finalized size after a direct append without opening payload streams.
+    pub fn project_message_direct_eof(
+        &mut self,
+        location: MailFolderLocation,
+        path: &[String],
+        associated: bool,
+        message: &MessageSpec,
+        interrupted: &AtomicBool,
+    ) -> Result<u64, WriterError> {
+        check_interrupted(interrupted)?;
+        validate_aggregate_properties(message)?;
+        validate_message(message, 0)?;
+        validate_message_size_bound(message)?;
+        if message_contains_spooled_values(message) {
+            return Err(WriterError::InvalidStructure(
+                "direct projection cannot consume spooled values".to_owned(),
+            ));
+        }
+        let order = (location, path.to_vec(), associated);
+        if self
+            .last_order
+            .as_ref()
+            .is_some_and(|previous| previous > &order)
+        {
+            return Err(WriterError::InvalidStructure(
+                "transactional messages are not in canonical folder and placement order".to_owned(),
+            ));
+        }
+        let message_identities = collect_named_identities(message);
+        if message_identities
+            .iter()
+            .any(|identity| self.named_identities.binary_search(identity).is_err())
+        {
+            return Err(WriterError::InvalidStructure(
+                "transactional named-property catalog is incomplete".to_owned(),
+            ));
+        }
+        let folder_index = self
+            .spec
+            .folders
+            .iter()
+            .position(|folder| folder.location == location && folder.path == path)
+            .ok_or_else(|| {
+                WriterError::InvalidStructure(
+                    "transactional message folder is absent from the layout".to_owned(),
+                )
+            })?;
+        let checkpoint = self.message_stream.checkpoint();
+        if associated {
+            self.spec.folders[folder_index]
+                .associated_messages
+                .push(message.clone());
+        } else {
+            self.spec.folders[folder_index]
+                .messages
+                .push(message.clone());
+        }
+        let result = (|| {
+            let parent = transaction_folder_node(
+                &self.spec.folders,
+                location,
+                path,
+                self.preserve_empty_folders,
+            )?;
+            let contents_columns = contents_columns()?;
+            let associated_columns = associated_columns()?;
+            self.message_stream.append_message(
+                &mut self.temporary.file,
+                message,
+                parent,
+                associated,
+                self.spec.record_key,
+                &self.named_identities,
+                &contents_columns,
+                &associated_columns,
+                interrupted,
+                None,
+                true,
+            )?;
+            self.projected_file_eof(interrupted)
+        })();
+        if associated {
+            self.spec.folders[folder_index].associated_messages.pop();
+        } else {
+            self.spec.folders[folder_index].messages.pop();
+        }
+        self.message_stream.restore_projected_message(checkpoint);
+        result
+    }
+
+    /// Append a preflighted direct message and reject any allocation divergence.
+    #[allow(clippy::too_many_arguments)]
+    pub fn append_message_direct_preflighted(
+        &mut self,
+        location: MailFolderLocation,
+        path: &[String],
+        associated: bool,
+        message: MessageSpec,
+        expected_projected_file_eof: u64,
+        interrupted: &AtomicBool,
+        source: &mut dyn DirectBlobSource,
+    ) -> Result<Vec<DirectBlobCompletion>, WriterError> {
+        let checkpoint = self.begin_batch();
+        let completions =
+            self.append_message_direct(location, path, associated, message, interrupted, source)?;
+        let actual = match self.projected_file_eof(interrupted) {
+            Ok(actual) => actual,
+            Err(error) => {
+                self.rollback_batch(checkpoint)?;
+                return Err(error);
+            }
+        };
+        if actual != expected_projected_file_eof {
+            self.rollback_batch(checkpoint)?;
+            return Err(WriterError::InvalidStructure(format!(
+                "direct append allocation diverged from preflight: expected {expected_projected_file_eof}, got {actual}"
+            )));
+        }
+        Ok(completions)
+    }
+
+    fn append_message_deferred_from(
+        &mut self,
+        location: MailFolderLocation,
+        path: &[String],
+        associated: bool,
+        message: MessageSpec,
+        interrupted: &AtomicBool,
+        mut direct_source: Option<&mut dyn DirectBlobSource>,
+    ) -> Result<Vec<DirectBlobCompletion>, WriterError> {
         check_interrupted(interrupted)?;
         validate_aggregate_properties(&message)?;
         validate_message(&message, 0)?;
+        validate_message_size_bound(&message)?;
         let order = (location, path.to_vec(), associated);
         if self
             .last_order
@@ -3267,6 +3961,7 @@ impl TransactionalMailStoreWriter {
             self.spec.folders[folder_index].messages.push(message);
         }
 
+        let stream_checkpoint = self.message_stream.checkpoint();
         let result = (|| {
             let parent = transaction_folder_node(
                 &self.spec.folders,
@@ -3286,7 +3981,7 @@ impl TransactionalMailStoreWriter {
             })?;
             let contents_columns = contents_columns()?;
             let associated_columns = associated_columns()?;
-            self.message_stream.append_message(
+            let (_, completions) = self.message_stream.append_message(
                 &mut self.temporary.file,
                 message,
                 parent,
@@ -3296,20 +3991,28 @@ impl TransactionalMailStoreWriter {
                 &contents_columns,
                 &associated_columns,
                 interrupted,
+                direct_source.take(),
+                false,
             )?;
-            Ok(())
+            Ok(completions)
         })();
 
-        if result.is_err() {
-            if associated {
-                self.spec.folders[folder_index].associated_messages.pop();
-            } else {
-                self.spec.folders[folder_index].messages.pop();
+        match result {
+            Ok(completions) => {
+                self.last_order = Some(order);
+                Ok(completions)
             }
-        } else {
-            self.last_order = Some(order);
+            Err(error) => {
+                if associated {
+                    self.spec.folders[folder_index].associated_messages.pop();
+                } else {
+                    self.spec.folders[folder_index].messages.pop();
+                }
+                self.message_stream
+                    .rollback_message(&mut self.temporary.file, stream_checkpoint)?;
+                Err(error)
+            }
         }
-        result
     }
 
     /// Calculate the exact byte length that finalization would publish.
@@ -3763,6 +4466,8 @@ fn create_flat_store(
             },
             MESSAGE_INDEX,
         )?;
+        let mut direct_source = None;
+        let mut direct_completions = Vec::new();
         let message = build_message_blocks(
             message_spec,
             associated,
@@ -3774,6 +4479,9 @@ fn create_flat_store(
             &mut message_stream.next_block_index,
             &mut message_stream.next_value_node,
             None,
+            &mut direct_source,
+            false,
+            &mut direct_completions,
         )?;
         if associated {
             message_stream
@@ -3818,6 +4526,8 @@ fn create_flat_store(
                 &contents_columns,
                 &associated_columns,
                 interrupted,
+                None,
+                false,
             )?;
         }
     }
@@ -4780,6 +5490,7 @@ fn validate_attachment_property_context_shape(
     property_count = property_count
         .checked_add(attachment.raw_properties.len())
         .and_then(|count| count.checked_add(attachment.spooled_properties.len()))
+        .and_then(|count| count.checked_add(attachment.direct_properties.len()))
         .ok_or(WriterError::ValueTooLarge("attachment property count"))?;
     for property in &attachment.raw_properties {
         lengths.push(raw_value_payload_len(&property.value)?);
@@ -4789,8 +5500,10 @@ fn validate_attachment_property_context_shape(
         AttachmentContent::Embedded(_) => lengths.push(8),
         AttachmentContent::Binary(_)
         | AttachmentContent::Spooled(_)
+        | AttachmentContent::Direct(_)
         | AttachmentContent::Reference(_)
-        | AttachmentContent::Ole(_) => {}
+        | AttachmentContent::Ole(_)
+        | AttachmentContent::DirectOle(_) => {}
     }
     validate_property_context_shape("attachment property context", property_count, &lengths)
 }
@@ -4839,11 +5552,7 @@ fn validate_message_property_context_shape(message: &MessageSpec) -> Result<(), 
     if let Some(body) = &message.body_rtf {
         property_count += 2;
         lengths.push(rtf_container_len(body.len())?);
-    } else if message
-        .spooled_properties
-        .iter()
-        .any(|property| property.id == 0x1009)
-    {
+    } else if message_has_streamed_property(message, 0x1009) {
         property_count += 1;
     }
     if message.native_body.is_some() {
@@ -4880,6 +5589,7 @@ fn validate_message_property_context_shape(message: &MessageSpec) -> Result<(), 
         .checked_add(message.named_properties.len())
         .and_then(|count| count.checked_add(message.raw_properties.len()))
         .and_then(|count| count.checked_add(message.spooled_properties.len()))
+        .and_then(|count| count.checked_add(message.direct_properties.len()))
         .ok_or(WriterError::ValueTooLarge("message property count"))?;
     for value in message
         .named_properties
@@ -4938,12 +5648,7 @@ fn validate_message(message: &MessageSpec, depth: usize) -> Result<(), WriterErr
         validate_unicode("recipient display name", &recipient.display_name)?;
         validate_unicode("recipient email address", &recipient.email_address)?;
     }
-    let has_streamed = |id| {
-        message
-            .spooled_properties
-            .iter()
-            .any(|property| property.id == id)
-    };
+    let has_streamed = |id| message_has_streamed_property(message, id);
     if message.body_rtf.is_none() && !has_streamed(0x1009) && message.rtf_in_sync {
         return Err(WriterError::InvalidStructure(
             "RTF cannot be marked synchronized when no RTF body is present".to_owned(),
@@ -5054,6 +5759,58 @@ fn validate_message(message: &MessageSpec, depth: usize) -> Result<(), WriterErr
             return Err(WriterError::ValueTooLarge("streamed property blob"));
         }
     }
+    for property in &message.direct_properties {
+        let property_type = PropertyType::try_from(property.property_type).map_err(|_| {
+            WriterError::InvalidStructure(format!(
+                "unsupported direct property type: 0x{:04X}",
+                property.property_type
+            ))
+        })?;
+        if matches!(
+            property_type,
+            PropertyType::Null
+                | PropertyType::Integer16
+                | PropertyType::Integer32
+                | PropertyType::Floating32
+                | PropertyType::ErrorCode
+                | PropertyType::Boolean
+                | PropertyType::Object
+        ) {
+            return Err(WriterError::InvalidStructure(
+                "direct property type must use external storage".to_owned(),
+            ));
+        }
+        if property.id >= 0x8000
+            || !streamed_ids.insert(property.id)
+            || message
+                .raw_properties
+                .iter()
+                .any(|raw| raw.id == property.id)
+        {
+            return Err(WriterError::InvalidStructure(
+                "direct property identifier is duplicated or reserved".to_owned(),
+            ));
+        }
+        let allowed_managed = match property.id {
+            0x007D => {
+                message.internet_headers.is_none()
+                    && matches!(property_type, PropertyType::String8 | PropertyType::Unicode)
+            }
+            0x1000 => {
+                message.body_text.is_none()
+                    && matches!(property_type, PropertyType::String8 | PropertyType::Unicode)
+            }
+            0x1009 => message.body_rtf.is_none() && property_type == PropertyType::Binary,
+            0x1013 => message.body_html.is_none() && property_type == PropertyType::Binary,
+            _ => false,
+        };
+        if explicit_message_property(property.id) && !allowed_managed {
+            return Err(WriterError::InvalidStructure(
+                "direct property collides with a writer-managed property".to_owned(),
+            ));
+        }
+        validate_direct_blob(&property.blob)?;
+    }
     for attachment in &message.attachments {
         if attachment.filename.is_empty() {
             return Err(WriterError::InvalidStructure(
@@ -5094,7 +5851,9 @@ fn validate_message(message: &MessageSpec, depth: usize) -> Result<(), WriterErr
             &attachment.content,
             AttachmentContent::Binary(_)
                 | AttachmentContent::Spooled(_)
+                | AttachmentContent::Direct(_)
                 | AttachmentContent::Ole(_)
+                | AttachmentContent::DirectOle(_)
         );
         if embedded_calendar_exception
             && (!appointment_message_class(&message.message_class)
@@ -5122,6 +5881,11 @@ fn validate_message(message: &MessageSpec, depth: usize) -> Result<(), WriterErr
                 "attachment spooled-property count",
             ));
         }
+        if attachment.direct_properties.len() > MAX_FIDELITY_COLLECTION_ITEMS {
+            return Err(WriterError::ValueTooLarge(
+                "attachment direct-property count",
+            ));
+        }
         let mut raw_ids = attachment
             .raw_properties
             .iter()
@@ -5129,6 +5893,12 @@ fn validate_message(message: &MessageSpec, depth: usize) -> Result<(), WriterErr
             .chain(
                 attachment
                     .spooled_properties
+                    .iter()
+                    .map(|property| property.id),
+            )
+            .chain(
+                attachment
+                    .direct_properties
                     .iter()
                     .map(|property| property.id),
             )
@@ -5194,6 +5964,18 @@ fn validate_message(message: &MessageSpec, depth: usize) -> Result<(), WriterErr
             }
             validate_file_blob(&property.blob)?;
         }
+        for property in &attachment.direct_properties {
+            if !binary_metadata_attachment
+                || !matches!(property.id, 0x3702 | 0x3709 | 0x370A)
+                || property.property_type != u16::from(PropertyType::Binary)
+            {
+                return Err(WriterError::InvalidStructure(format!(
+                    "direct attachment property 0x{:04X} is not supported for its attachment kind",
+                    property.id
+                )));
+            }
+            validate_direct_blob(&property.blob)?;
+        }
         if raw_bytes > MAX_IN_MEMORY_CUSTOM_PROPERTY_BYTES {
             return Err(WriterError::ValueTooLarge(
                 "aggregate attachment raw-property payload",
@@ -5212,6 +5994,9 @@ fn validate_message(message: &MessageSpec, depth: usize) -> Result<(), WriterErr
                 return Err(WriterError::ValueTooLarge("spooled attachment payload"));
             }
         }
+        if let AttachmentContent::Direct(blob) = &attachment.content {
+            validate_direct_blob(blob)?;
+        }
         if let AttachmentContent::Ole(ole) = &attachment.content {
             if ole.data.path.as_os_str().is_empty() {
                 return Err(WriterError::InvalidStructure(
@@ -5225,6 +6010,27 @@ fn validate_message(message: &MessageSpec, depth: usize) -> Result<(), WriterErr
                 return Err(WriterError::InvalidStructure(
                     "OLE object payload must be non-empty".to_owned(),
                 ));
+            }
+        }
+        if let AttachmentContent::DirectOle(ole) = &attachment.content {
+            if ole.data.byte_len == 0 {
+                if ole.data_kind == OleDataKind::Object {
+                    return Err(WriterError::InvalidStructure(
+                        "direct OLE object payload must be non-empty".to_owned(),
+                    ));
+                }
+                let empty_sha256: [u8; 32] = Sha256::digest([]).into();
+                if ole
+                    .data
+                    .sha256
+                    .is_some_and(|expected| expected != empty_sha256)
+                {
+                    return Err(WriterError::InvalidStructure(
+                        "empty direct OLE payload hash mismatch".to_owned(),
+                    ));
+                }
+            } else {
+                validate_direct_blob(&ole.data)?;
             }
         }
         if let AttachmentContent::Reference(reference) = &attachment.content {
@@ -5945,25 +6751,24 @@ fn validate_completed_store(
     match (&spec.message.body_text, message.properties().get(0x1000)) {
         (Some(expected), Some(ReadValue::Unicode(actual))) if actual.to_string() == *expected => {}
         (Some(expected), Some(ReadValue::Null)) if expected.is_empty() => {}
+        (None, _) if message_has_streamed_property(spec.message, 0x1000) => {}
         (None, None) => {}
         _ => return Err(invalid("completed store plain body mismatch")),
     }
     match (&spec.message.body_html, message.properties().get(0x1013)) {
         (Some(expected), Some(ReadValue::Binary(actual))) if actual.buffer() == expected => {}
+        (None, _) if message_has_streamed_property(spec.message, 0x1013) => {}
         (None, None) => {}
         _ => return Err(invalid("completed store HTML body mismatch")),
     }
     match (&spec.message.body_rtf, message.properties().get(0x1009)) {
         (Some(expected), Some(ReadValue::Binary(actual)))
             if actual.buffer() == rtf_container(expected)? => {}
+        (None, _) if message_has_streamed_property(spec.message, 0x1009) => {}
         (None, None) => {}
         _ => return Err(invalid("completed store RTF body mismatch")),
     }
-    let has_streamed_rtf = spec
-        .message
-        .spooled_properties
-        .iter()
-        .any(|property| property.id == 0x1009);
+    let has_streamed_rtf = message_has_streamed_property(spec.message, 0x1009);
     match (
         spec.message.body_rtf.is_some() || has_streamed_rtf,
         message.properties().get(0x0E1F),
@@ -6298,11 +7103,7 @@ fn validate_completed_folder_store(
                     .as_ref(),
                 &expected.recipients,
             )?;
-            if !expected
-                .spooled_properties
-                .iter()
-                .any(|property| property.id == 0x1000)
-            {
+            if !message_has_streamed_property(expected, 0x1000) {
                 match (&expected.body_text, opened.properties().get(0x1000)) {
                     (
                         Some(expected),
@@ -6422,6 +7223,17 @@ fn validate_spooled_attachment_identities(
     let invalid = |message: &str| WriterError::InvalidStructure(message.to_owned());
     let pst = Rc::new(UnicodePstFile::open(path)?);
     let store = UnicodeStore::read(pst)?;
+    let all_messages = folders
+        .iter()
+        .flat_map(|folder| {
+            folder
+                .messages
+                .iter()
+                .chain(folder.associated_messages.iter())
+        })
+        .copied()
+        .collect::<Vec<_>>();
+    let named_identities = collect_named_identities_many_refs(&all_messages);
     let mut message_index = 0_u32;
     for (message_spec, associated) in folders.iter().flat_map(|folder| {
         folder
@@ -6435,11 +7247,16 @@ fn validate_spooled_attachment_identities(
                     .map(|message| (message, true)),
             )
     }) {
-        let validate_streamed_attachments = message_index != 0;
         let streamed_ids = message_spec
             .spooled_properties
             .iter()
             .map(|property| property.id)
+            .chain(
+                message_spec
+                    .direct_properties
+                    .iter()
+                    .map(|property| property.id),
+            )
             .collect::<Vec<_>>();
         let message_node = node(
             if associated {
@@ -6460,7 +7277,7 @@ fn validate_spooled_attachment_identities(
                 crate::messaging::store::StoreRecordKey::new(record_key),
                 message_node,
             ),
-            Some(&[]),
+            None,
             &streamed_ids,
         )?;
         for property in &message_spec.spooled_properties {
@@ -6476,8 +7293,20 @@ fn validate_spooled_attachment_identities(
                 ));
             }
         }
-        if !validate_streamed_attachments {
-            continue;
+        for property in &message_spec.direct_properties {
+            let actual = message.streamed_property_identity(property.id);
+            if actual.is_none_or(|(property_type, byte_len, sha256)| {
+                property_type != property.property_type
+                    || byte_len != property.blob.byte_len
+                    || property
+                        .blob
+                        .sha256
+                        .is_some_and(|expected| expected != sha256)
+            }) {
+                return Err(invalid(
+                    "completed store direct message property identity mismatch",
+                ));
+            }
         }
         for (attachment_index, attachment_spec) in message_spec.attachments.iter().enumerate() {
             let attachment_index = u32::try_from(attachment_index)
@@ -6505,13 +7334,38 @@ fn validate_spooled_attachment_identities(
                         ));
                     }
                 }
+                AttachmentContent::Direct(expected) => {
+                    let attachment =
+                        UnicodeAttachment::read_metadata(message.clone(), attachment_node)
+                            .map_err(|error| {
+                                invalid(&format!(
+                                    "completed store direct attachment cannot be read: {error}"
+                                ))
+                            })?;
+                    let actual = attachment.streamed_data_identity();
+                    if actual.is_none_or(|(byte_len, sha256)| {
+                        byte_len != expected.byte_len
+                            || expected.sha256.is_some_and(|value| value != sha256)
+                    }) {
+                        return Err(invalid(
+                            "completed store direct attachment identity mismatch",
+                        ));
+                    }
+                }
                 AttachmentContent::Embedded(expected)
-                    if !expected.spooled_properties.is_empty() =>
+                    if !expected.spooled_properties.is_empty()
+                        || !expected.direct_properties.is_empty() =>
                 {
                     let embedded_streamed_ids = expected
                         .spooled_properties
                         .iter()
                         .map(|property| property.id)
+                        .chain(
+                            expected
+                                .direct_properties
+                                .iter()
+                                .map(|property| property.id),
+                        )
                         .collect::<Vec<_>>();
                     let attachment = UnicodeAttachment::read_with_streamed_embedded_properties(
                         message.clone(),
@@ -6535,10 +7389,32 @@ fn validate_spooled_attachment_identities(
                             ));
                         }
                     }
+                    for property in &expected.direct_properties {
+                        let identity = actual.streamed_property_identity(property.id);
+                        if identity.is_none_or(|(property_type, byte_len, sha256)| {
+                            property_type != property.property_type
+                                || byte_len != property.blob.byte_len
+                                || property
+                                    .blob
+                                    .sha256
+                                    .is_some_and(|expected| expected != sha256)
+                        }) {
+                            return Err(invalid(
+                                "completed store embedded direct property identity mismatch",
+                            ));
+                        }
+                    }
                 }
                 _ => {}
             }
         }
+        validate_embedded_message(
+            message,
+            message_spec,
+            &named_identities,
+            message_record_key(record_key, message_node),
+            associated,
+        )?;
     }
     Ok(())
 }
@@ -6750,11 +7626,19 @@ fn validate_attachment_fidelity(
             .spooled_properties
             .iter()
             .map(|property| property.id)
+            .chain(
+                expected
+                    .direct_properties
+                    .iter()
+                    .map(|property| property.id),
+            )
             .collect::<Vec<_>>();
         let attachment = match &expected.content {
             AttachmentContent::Spooled(_)
+            | AttachmentContent::Direct(_)
             | AttachmentContent::Reference(_)
-            | AttachmentContent::Ole(_) => {
+            | AttachmentContent::Ole(_)
+            | AttachmentContent::DirectOle(_) => {
                 UnicodeAttachment::read_metadata_with_streamed_properties(
                     top.clone(),
                     attachment_node,
@@ -6767,6 +7651,7 @@ fn validate_attachment_fidelity(
                     .spooled_properties
                     .iter()
                     .map(|property| property.id)
+                    .chain(message.direct_properties.iter().map(|property| property.id))
                     .collect::<Vec<_>>();
                 UnicodeAttachment::read_with_streamed_embedded_properties(
                     top.clone(),
@@ -6873,6 +7758,21 @@ fn validate_attachment_fidelity(
                 ));
             }
         }
+        for property in &expected.direct_properties {
+            let identity = properties.streamed_property_identity(property.id);
+            if identity.is_none_or(|(property_type, byte_len, sha256)| {
+                property_type != property.property_type
+                    || byte_len != property.blob.byte_len
+                    || property
+                        .blob
+                        .sha256
+                        .is_some_and(|expected| expected != sha256)
+            }) {
+                return Err(invalid(
+                    "completed store attachment direct-property mismatch",
+                ));
+            }
+        }
         match (&expected.content, attachment.data()) {
             (AttachmentContent::Binary(expected_data), Some(AttachmentData::Binary(actual))) => {
                 let expected_size = attachment_property_size(&attachment_properties(
@@ -6913,6 +7813,39 @@ fn validate_attachment_fidelity(
                     || attachment.streamed_data_identity() != Some((blob.byte_len, blob.sha256))
                 {
                     return Err(invalid("completed store spooled attachment size mismatch"));
+                }
+            }
+            (AttachmentContent::Direct(blob), None) => {
+                let expected_size = attachment_property_size_with_stream(
+                    &attachment_properties(
+                        expected,
+                        expected_number,
+                        1,
+                        0,
+                        PropertyValue::External(
+                            PropertyType::Binary,
+                            node(NodeIdType::ListsTablesProperties, 1)?,
+                        ),
+                    ),
+                    Some(blob.byte_len),
+                )?;
+                let expected_size = attachment_size_with_spooled_properties(
+                    expected_size,
+                    &expected.spooled_properties,
+                )?;
+                let expected_size = attachment_size_with_direct_properties(
+                    expected_size,
+                    &expected.direct_properties,
+                )?;
+                let identity = attachment.streamed_data_identity();
+                if pc_method != 1
+                    || pc_size != expected_size
+                    || identity.is_none_or(|(byte_len, sha256)| {
+                        byte_len != blob.byte_len
+                            || blob.sha256.is_some_and(|expected| expected != sha256)
+                    })
+                {
+                    return Err(invalid("completed store direct attachment size mismatch"));
                 }
             }
             (AttachmentContent::Ole(ole), None) => {
@@ -6956,6 +7889,46 @@ fn validate_attachment_fidelity(
                     return Err(invalid("completed store OLE attachment mismatch"));
                 }
             }
+            (AttachmentContent::DirectOle(ole), None) => {
+                let data_property = match ole.data_kind {
+                    OleDataKind::Object => PropertyValue::Object(
+                        node(NodeIdType::OleObjectData, 1)?,
+                        u32::try_from(ole.data.byte_len)
+                            .map_err(|_| WriterError::ValueTooLarge("direct OLE object"))?,
+                    ),
+                    OleDataKind::Binary => PropertyValue::External(
+                        PropertyType::Binary,
+                        node(NodeIdType::ListsTablesProperties, 1)?,
+                    ),
+                };
+                let expected_size = attachment_property_size_with_stream(
+                    &attachment_properties(expected, expected_number, 6, 0, data_property),
+                    Some(ole.data.byte_len),
+                )?;
+                let expected_size = attachment_size_with_spooled_properties(
+                    expected_size,
+                    &expected.spooled_properties,
+                )?;
+                let expected_size = attachment_size_with_direct_properties(
+                    expected_size,
+                    &expected.direct_properties,
+                )?;
+                let expected_type = match ole.data_kind {
+                    OleDataKind::Object => u16::from(PropertyType::Object),
+                    OleDataKind::Binary => u16::from(PropertyType::Binary),
+                };
+                let identity = attachment.streamed_data_identity();
+                if pc_method != 6
+                    || pc_size != expected_size
+                    || attachment.streamed_data_property_type() != Some(expected_type)
+                    || identity.is_none_or(|(byte_len, sha256)| {
+                        byte_len != ole.data.byte_len
+                            || ole.data.sha256.is_some_and(|expected| expected != sha256)
+                    })
+                {
+                    return Err(invalid("completed store direct OLE attachment mismatch"));
+                }
+            }
             (
                 AttachmentContent::Embedded(expected_message),
                 Some(AttachmentData::Message(actual)),
@@ -6989,6 +7962,7 @@ fn validate_attachment_fidelity(
                         message_record_key(spec.record_key, top_node),
                         index_u32,
                     ),
+                    false,
                 )?;
             }
             (AttachmentContent::Reference(reference), None) => {
@@ -7091,6 +8065,7 @@ fn validate_embedded_message(
     expected: &MessageSpec,
     named_identities: &[NamedIdentity],
     record_key: [u8; 16],
+    associated: bool,
 ) -> Result<(), WriterError> {
     use crate::ltp::prop_context::PropertyValue as ReadValue;
 
@@ -7120,7 +8095,7 @@ fn validate_embedded_message(
         || !matches!(properties.get(0x3007), Some(ReadValue::Time(value)) if *value == expected.creation_filetime)
         || !matches!(properties.get(0x3008), Some(ReadValue::Time(value)) if *value == expected.modification_filetime)
         || !matches!(properties.get(0x300B), Some(ReadValue::Binary(value)) if value.buffer() == record_key)
-        || !matches!(properties.get(0x0E07), Some(ReadValue::Integer32(value)) if *value == output_message_flags(expected, false))
+        || !matches!(properties.get(0x0E07), Some(ReadValue::Integer32(value)) if *value == output_message_flags(expected, associated))
         || !matches!(properties.get(0x0E1B), Some(ReadValue::Boolean(value)) if *value != expected.attachments.is_empty())
         || !matches!(properties.get(0x3FDE), Some(ReadValue::Integer32(value)) if *value == expected.internet_codepage)
     {
@@ -7129,24 +8104,24 @@ fn validate_embedded_message(
     match (&expected.body_text, properties.get(0x1000)) {
         (Some(expected), Some(ReadValue::Unicode(actual))) if actual.to_string() == *expected => {}
         (Some(expected), Some(ReadValue::Null)) if expected.is_empty() => {}
+        (None, _) if message_has_streamed_property(expected, 0x1000) => {}
         (None, None) => {}
         _ => return Err(invalid("completed store embedded text mismatch")),
     }
     match (&expected.body_html, properties.get(0x1013)) {
         (Some(expected), Some(ReadValue::Binary(actual))) if actual.buffer() == expected => {}
+        (None, _) if message_has_streamed_property(expected, 0x1013) => {}
         (None, None) => {}
         _ => return Err(invalid("completed store embedded HTML mismatch")),
     }
     match (&expected.body_rtf, properties.get(0x1009)) {
         (Some(expected), Some(ReadValue::Binary(actual)))
             if actual.buffer() == rtf_container(expected)? => {}
+        (None, _) if message_has_streamed_property(expected, 0x1009) => {}
         (None, None) => {}
         _ => return Err(invalid("completed store embedded RTF mismatch")),
     }
-    let has_streamed_rtf = expected
-        .spooled_properties
-        .iter()
-        .any(|property| property.id == 0x1009);
+    let has_streamed_rtf = message_has_streamed_property(expected, 0x1009);
     match (
         expected.body_rtf.is_some() || has_streamed_rtf,
         properties.get(0x0E1F),
@@ -7216,6 +8191,19 @@ fn validate_embedded_message(
             ));
         }
     }
+    for property in &expected.direct_properties {
+        let identity = actual.streamed_property_identity(property.id);
+        if identity.is_none_or(|(property_type, byte_len, sha256)| {
+            property_type != property.property_type
+                || byte_len != property.blob.byte_len
+                || property
+                    .blob
+                    .sha256
+                    .is_some_and(|expected| expected != sha256)
+        }) {
+            return Err(invalid("completed store embedded direct property mismatch"));
+        }
+    }
     let recipients = actual
         .recipient_table()
         .ok_or_else(|| invalid("completed store embedded recipient table is missing"))?;
@@ -7245,24 +8233,35 @@ fn validate_embedded_message(
             }
             AttachmentContent::Binary(_)
             | AttachmentContent::Spooled(_)
+            | AttachmentContent::Direct(_)
             | AttachmentContent::Reference(_)
-            | AttachmentContent::Ole(_) => None,
+            | AttachmentContent::Ole(_)
+            | AttachmentContent::DirectOle(_) => None,
         };
         let embedded_streamed_ids = match &expected_attachment.content {
             AttachmentContent::Embedded(message) => message
                 .spooled_properties
                 .iter()
                 .map(|property| property.id)
+                .chain(message.direct_properties.iter().map(|property| property.id))
                 .collect::<Vec<_>>(),
             AttachmentContent::Binary(_)
             | AttachmentContent::Spooled(_)
+            | AttachmentContent::Direct(_)
             | AttachmentContent::Reference(_)
-            | AttachmentContent::Ole(_) => Vec::new(),
+            | AttachmentContent::Ole(_)
+            | AttachmentContent::DirectOle(_) => Vec::new(),
         };
         let attachment_streamed_ids = expected_attachment
             .spooled_properties
             .iter()
             .map(|property| property.id)
+            .chain(
+                expected_attachment
+                    .direct_properties
+                    .iter()
+                    .map(|property| property.id),
+            )
             .collect::<Vec<_>>();
         let attachment = actual
             .clone()
@@ -7273,7 +8272,10 @@ fn validate_embedded_message(
                 &embedded_streamed_ids,
                 !matches!(
                     &expected_attachment.content,
-                    AttachmentContent::Spooled(_) | AttachmentContent::Ole(_)
+                    AttachmentContent::Spooled(_)
+                        | AttachmentContent::Direct(_)
+                        | AttachmentContent::Ole(_)
+                        | AttachmentContent::DirectOle(_)
                 ),
             )
             .map_err(|error| {
@@ -7366,6 +8368,21 @@ fn validate_embedded_message(
                 ));
             }
         }
+        for property in &expected_attachment.direct_properties {
+            let identity = properties.streamed_property_identity(property.id);
+            if identity.is_none_or(|(property_type, byte_len, sha256)| {
+                property_type != property.property_type
+                    || byte_len != property.blob.byte_len
+                    || property
+                        .blob
+                        .sha256
+                        .is_some_and(|expected| expected != sha256)
+            }) {
+                return Err(invalid(
+                    "completed store nested attachment direct-property mismatch",
+                ));
+            }
+        }
         match (&expected_attachment.content, attachment.data()) {
             (AttachmentContent::Binary(expected), Some(AttachmentData::Binary(actual))) => {
                 let expected_size = attachment_property_size(&attachment_properties(
@@ -7413,6 +8430,41 @@ fn validate_embedded_message(
                     ));
                 }
             }
+            (AttachmentContent::Direct(expected), None) => {
+                let expected_size = attachment_property_size_with_stream(
+                    &attachment_properties(
+                        expected_attachment,
+                        expected_number,
+                        1,
+                        0,
+                        PropertyValue::External(
+                            PropertyType::Binary,
+                            node(NodeIdType::ListsTablesProperties, 1)?,
+                        ),
+                    ),
+                    Some(expected.byte_len),
+                )?;
+                let expected_size = attachment_size_with_spooled_properties(
+                    expected_size,
+                    &expected_attachment.spooled_properties,
+                )?;
+                let expected_size = attachment_size_with_direct_properties(
+                    expected_size,
+                    &expected_attachment.direct_properties,
+                )?;
+                let identity = attachment.streamed_data_identity();
+                if pc_method != 1
+                    || pc_size != expected_size
+                    || identity.is_none_or(|(byte_len, sha256)| {
+                        byte_len != expected.byte_len
+                            || expected.sha256.is_some_and(|value| value != sha256)
+                    })
+                {
+                    return Err(invalid(
+                        "completed store nested direct attachment size mismatch",
+                    ));
+                }
+            }
             (AttachmentContent::Ole(ole), None) => {
                 let expected_size = attachment_property_size_with_stream(
                     &attachment_properties(
@@ -7457,6 +8509,54 @@ fn validate_embedded_message(
                     return Err(invalid("completed store nested OLE attachment mismatch"));
                 }
             }
+            (AttachmentContent::DirectOle(ole), None) => {
+                let data_property = match ole.data_kind {
+                    OleDataKind::Object => PropertyValue::Object(
+                        node(NodeIdType::OleObjectData, 1)?,
+                        u32::try_from(ole.data.byte_len)
+                            .map_err(|_| WriterError::ValueTooLarge("direct OLE object"))?,
+                    ),
+                    OleDataKind::Binary => PropertyValue::External(
+                        PropertyType::Binary,
+                        node(NodeIdType::ListsTablesProperties, 1)?,
+                    ),
+                };
+                let expected_size = attachment_property_size_with_stream(
+                    &attachment_properties(
+                        expected_attachment,
+                        expected_number,
+                        6,
+                        0,
+                        data_property,
+                    ),
+                    Some(ole.data.byte_len),
+                )?;
+                let expected_size = attachment_size_with_spooled_properties(
+                    expected_size,
+                    &expected_attachment.spooled_properties,
+                )?;
+                let expected_size = attachment_size_with_direct_properties(
+                    expected_size,
+                    &expected_attachment.direct_properties,
+                )?;
+                let expected_type = match ole.data_kind {
+                    OleDataKind::Object => u16::from(PropertyType::Object),
+                    OleDataKind::Binary => u16::from(PropertyType::Binary),
+                };
+                let identity = attachment.streamed_data_identity();
+                if pc_method != 6
+                    || pc_size != expected_size
+                    || attachment.streamed_data_property_type() != Some(expected_type)
+                    || identity.is_none_or(|(byte_len, sha256)| {
+                        byte_len != ole.data.byte_len
+                            || ole.data.sha256.is_some_and(|value| value != sha256)
+                    })
+                {
+                    return Err(invalid(
+                        "completed store nested direct OLE attachment mismatch",
+                    ));
+                }
+            }
             (
                 AttachmentContent::Embedded(expected_child),
                 Some(AttachmentData::Message(actual_child)),
@@ -7489,6 +8589,7 @@ fn validate_embedded_message(
                     expected_child,
                     named_identities,
                     embedded_message_record_key(record_key, index_u32),
+                    false,
                 )?;
             }
             (AttachmentContent::Reference(reference), None) => {
@@ -7599,7 +8700,9 @@ fn collect_named_identities(message: &MessageSpec) -> Vec<NamedIdentity> {
                 }
                 AttachmentContent::Binary(_)
                 | AttachmentContent::Spooled(_)
-                | AttachmentContent::Ole(_) => {}
+                | AttachmentContent::Direct(_)
+                | AttachmentContent::Ole(_)
+                | AttachmentContent::DirectOle(_) => {}
             }
         }
     }
@@ -7795,11 +8898,7 @@ fn message_properties(
     if let Some(rtf) = &message.body_rtf {
         properties.push((0x1009, PropertyValue::Binary(rtf_container(rtf)?)));
         properties.push((0x0E1F, PropertyValue::Boolean(message.rtf_in_sync)));
-    } else if message
-        .spooled_properties
-        .iter()
-        .any(|property| property.id == 0x1009)
-    {
+    } else if message_has_streamed_property(message, 0x1009) {
         properties.push((0x0E1F, PropertyValue::Boolean(message.rtf_in_sync)));
     }
     if let Some(native_body) = message.native_body {
@@ -8574,6 +9673,22 @@ fn attachment_size_with_spooled_properties(
     i32::try_from(size).map_err(|_| WriterError::ValueTooLarge("attachment properties"))
 }
 
+fn attachment_size_with_direct_properties(
+    size: i32,
+    properties: &[DirectPropertySpec],
+) -> Result<i32, WriterError> {
+    let size = properties
+        .iter()
+        .try_fold(i64::from(size), |total, property| {
+            let byte_len = i64::try_from(property.blob.byte_len)
+                .map_err(|_| WriterError::ValueTooLarge("attachment properties"))?;
+            total
+                .checked_add(byte_len)
+                .ok_or(WriterError::ValueTooLarge("attachment properties"))
+        })?;
+    i32::try_from(size).map_err(|_| WriterError::ValueTooLarge("attachment properties"))
+}
+
 fn set_attachment_size(
     properties: &mut [(u16, PropertyValue)],
     attachment_size: i32,
@@ -8596,6 +9711,18 @@ fn validate_file_blob(blob: &FileBlobSpec) -> Result<(), WriterError> {
     }
     if blob.byte_len > i32::MAX as u64 {
         return Err(WriterError::ValueTooLarge("streamed property blob"));
+    }
+    Ok(())
+}
+
+fn validate_direct_blob(blob: &DirectBlobSpec) -> Result<(), WriterError> {
+    if blob.byte_len == 0 {
+        return Err(WriterError::InvalidStructure(
+            "direct payload must be non-empty".to_owned(),
+        ));
+    }
+    if blob.byte_len > i32::MAX as u64 {
+        return Err(WriterError::ValueTooLarge("direct payload"));
     }
     Ok(())
 }
@@ -9687,6 +10814,11 @@ fn write_blocks(
     let mut written = Vec::with_capacity(blocks.len());
     for block in blocks {
         check_interrupted(interrupted)?;
+        if matches!(block.payload, BlockPayload::ProjectedData(_)) {
+            return Err(WriterError::InvalidStructure(
+                "projected data block reached physical output".to_owned(),
+            ));
+        }
         let size = u16::try_from(block.payload.logical_size())
             .map_err(|_| WriterError::ValueTooLarge("data block"))?;
         let physical_size = u64::from(block_size(size.saturating_add(16))?);
@@ -9731,6 +10863,11 @@ fn write_blocks(
                 UnicodeDataBlock::new(NdbCryptMethod::Permute, data.clone(), trailer)
                     .map_err(|error| WriterError::InvalidStructure(error.to_string()))?
                     .write(file)?;
+            }
+            BlockPayload::ProjectedData(_) => {
+                return Err(WriterError::InvalidStructure(
+                    "projected data block reached physical output".to_owned(),
+                ));
             }
             BlockPayload::IntermediateSubnode { level, entries } => {
                 UnicodeIntermediateSubNodeTreeBlock::new(
@@ -10483,6 +11620,847 @@ mod tests {
         open_store,
     };
     use std::fs::OpenOptions;
+    use std::io::Cursor;
+    use std::os::unix::fs::MetadataExt;
+
+    struct MemoryDirectSource {
+        blobs: BTreeMap<u64, Vec<u8>>,
+        opened: Vec<u64>,
+    }
+
+    impl MemoryDirectSource {
+        fn one(id: u64, bytes: Vec<u8>) -> Self {
+            Self {
+                blobs: BTreeMap::from([(id, bytes)]),
+                opened: Vec::new(),
+            }
+        }
+    }
+
+    impl DirectBlobSource for MemoryDirectSource {
+        fn open_blob<'a>(
+            &'a mut self,
+            blob: &DirectBlobSpec,
+        ) -> Result<Box<dyn Read + 'a>, WriterError> {
+            self.opened.push(blob.id);
+            let bytes = self.blobs.get(&blob.id).ok_or_else(|| {
+                WriterError::InvalidStructure("direct test blob is absent".to_owned())
+            })?;
+            Ok(Box::new(Cursor::new(bytes.as_slice())))
+        }
+    }
+
+    struct InterruptingReader<'a> {
+        bytes: &'a [u8],
+        position: usize,
+        interrupted: &'a AtomicBool,
+    }
+
+    impl Read for InterruptingReader<'_> {
+        fn read(&mut self, output: &mut [u8]) -> io::Result<usize> {
+            let available = &self.bytes[self.position..];
+            let count = available.len().min(output.len());
+            output[..count].copy_from_slice(&available[..count]);
+            self.position += count;
+            if count != 0 {
+                self.interrupted.store(true, Ordering::Relaxed);
+            }
+            Ok(count)
+        }
+    }
+
+    struct InterruptingDirectSource<'a> {
+        id: u64,
+        bytes: Vec<u8>,
+        interrupted: &'a AtomicBool,
+    }
+
+    impl DirectBlobSource for InterruptingDirectSource<'_> {
+        fn open_blob<'a>(
+            &'a mut self,
+            blob: &DirectBlobSpec,
+        ) -> Result<Box<dyn Read + 'a>, WriterError> {
+            if blob.id != self.id {
+                return Err(WriterError::InvalidStructure(
+                    "direct test blob is absent".to_owned(),
+                ));
+            }
+            Ok(Box::new(InterruptingReader {
+                bytes: &self.bytes,
+                position: 0,
+                interrupted: self.interrupted,
+            }))
+        }
+    }
+
+    fn direct_transaction_fixture(
+        path: &Path,
+        message: &MessageSpec,
+        fixture: &FidelityStore,
+    ) -> Result<TransactionalMailStoreWriter, WriterError> {
+        let folder = MailFolderSpec {
+            path: vec!["Inbox".to_owned()],
+            location: MailFolderLocation::IpmSubtree,
+            role: MailFolderRole::Ordinary,
+            container_class: "IPF.Note".to_owned(),
+            messages: Vec::new(),
+            associated_messages: Vec::new(),
+        };
+        let mut catalog = NamedPropertyCatalog::default();
+        catalog.observe_message(message);
+        TransactionalMailStoreWriter::begin(
+            path,
+            MailStoreSpec {
+                store_name: fixture.store_name.clone(),
+                record_key: fixture.record_key,
+                folders: vec![folder],
+            },
+            &catalog,
+            true,
+            None,
+        )
+    }
+
+    #[test]
+    fn direct_attachment_streams_across_data_tree_groups() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let directory = tempfile::tempdir()?;
+        let destination = directory.path().join("direct.pst");
+        let fixture = FidelityStore::default();
+        let mut message = fixture.message.clone();
+        let payload_len = MAX_DATA_BLOCK_PAYLOAD
+            .checked_mul(MAX_DATA_TREE_ENTRIES + 1)
+            .and_then(|value| value.checked_add(13))
+            .ok_or("direct payload length overflow")?;
+        let payload = (0..payload_len)
+            .map(|index| u8::try_from(index % 251).unwrap_or(0))
+            .collect::<Vec<_>>();
+        let sha256: [u8; 32] = Sha256::digest(&payload).into();
+        let blob = DirectBlobSpec {
+            id: 7,
+            byte_len: u64::try_from(payload.len())?,
+            sha256: Some(sha256),
+        };
+        message.attachments[0].content = AttachmentContent::Direct(blob);
+        let mut source = MemoryDirectSource::one(7, payload);
+        let mut writer = direct_transaction_fixture(&destination, &message, &fixture)?;
+        let before_projection = writer.temporary.file.metadata()?;
+        let projected_file_eof = writer.project_message_direct_eof(
+            MailFolderLocation::IpmSubtree,
+            &["Inbox".to_owned()],
+            false,
+            &message,
+            &NEVER_INTERRUPTED,
+        )?;
+        assert_eq!(writer.message_count(), 0);
+        assert_eq!(writer.private_file_eof(), INITIAL_FILE_EOF);
+        assert!(source.opened.is_empty());
+        let after_projection = writer.temporary.file.metadata()?;
+        assert_eq!(
+            (
+                before_projection.len(),
+                before_projection.mtime(),
+                before_projection.mtime_nsec(),
+                before_projection.ctime(),
+                before_projection.ctime_nsec(),
+                before_projection.blocks(),
+            ),
+            (
+                after_projection.len(),
+                after_projection.mtime(),
+                after_projection.mtime_nsec(),
+                after_projection.ctime(),
+                after_projection.ctime_nsec(),
+                after_projection.blocks(),
+            )
+        );
+        let completions = writer.append_message_direct_preflighted(
+            MailFolderLocation::IpmSubtree,
+            &["Inbox".to_owned()],
+            false,
+            message,
+            projected_file_eof,
+            &NEVER_INTERRUPTED,
+            &mut source,
+        )?;
+        assert_eq!(source.opened, [7]);
+        assert_eq!(completions, [DirectBlobCompletion { id: 7, sha256 }]);
+        writer.finalize(&NEVER_INTERRUPTED)?;
+        assert_eq!(destination.metadata()?.len(), projected_file_eof);
+        assert!(projected_file_eof > u64::try_from(payload_len)?);
+        Ok(())
+    }
+
+    #[test]
+    fn direct_stream_failures_rollback_before_reappend() -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let destination = directory.path().join("direct-rollback.pst");
+        let fixture = FidelityStore::default();
+        let mut message = fixture.message.clone();
+        let payload = vec![0x5a; MAX_DATA_BLOCK_PAYLOAD * 2 + 31];
+        let sha256: [u8; 32] = Sha256::digest(&payload).into();
+        message.attachments[0].content = AttachmentContent::Direct(DirectBlobSpec {
+            id: 11,
+            byte_len: u64::try_from(payload.len())?,
+            sha256: Some(sha256),
+        });
+        let mut writer = direct_transaction_fixture(&destination, &message, &fixture)?;
+
+        let mut short = MemoryDirectSource::one(11, payload[..payload.len() - 1].to_vec());
+        assert!(
+            writer
+                .append_message_direct(
+                    MailFolderLocation::IpmSubtree,
+                    &["Inbox".to_owned()],
+                    false,
+                    message.clone(),
+                    &NEVER_INTERRUPTED,
+                    &mut short,
+                )
+                .is_err()
+        );
+        assert_eq!(writer.message_count(), 0);
+        assert_eq!(writer.private_file_eof(), INITIAL_FILE_EOF);
+
+        let mut long = MemoryDirectSource::one(11, {
+            let mut bytes = payload.clone();
+            bytes.push(0);
+            bytes
+        });
+        assert!(
+            writer
+                .append_message_direct(
+                    MailFolderLocation::IpmSubtree,
+                    &["Inbox".to_owned()],
+                    false,
+                    message.clone(),
+                    &NEVER_INTERRUPTED,
+                    &mut long,
+                )
+                .is_err()
+        );
+        assert_eq!(writer.message_count(), 0);
+        assert_eq!(writer.private_file_eof(), INITIAL_FILE_EOF);
+
+        let projected = writer.project_message_direct_eof(
+            MailFolderLocation::IpmSubtree,
+            &["Inbox".to_owned()],
+            false,
+            &message,
+            &NEVER_INTERRUPTED,
+        )?;
+        let mut mismatched = MemoryDirectSource::one(11, payload.clone());
+        assert!(
+            writer
+                .append_message_direct_preflighted(
+                    MailFolderLocation::IpmSubtree,
+                    &["Inbox".to_owned()],
+                    false,
+                    message.clone(),
+                    projected.checked_add(1).ok_or("projection overflow")?,
+                    &NEVER_INTERRUPTED,
+                    &mut mismatched,
+                )
+                .is_err()
+        );
+        assert_eq!(writer.message_count(), 0);
+        assert_eq!(writer.private_file_eof(), INITIAL_FILE_EOF);
+
+        let mut wrong_hash_message = message.clone();
+        if let AttachmentContent::Direct(blob) = &mut wrong_hash_message.attachments[0].content {
+            blob.sha256 = Some([0_u8; 32]);
+        }
+        let mut wrong_hash = MemoryDirectSource::one(11, payload.clone());
+        assert!(
+            writer
+                .append_message_direct(
+                    MailFolderLocation::IpmSubtree,
+                    &["Inbox".to_owned()],
+                    false,
+                    wrong_hash_message,
+                    &NEVER_INTERRUPTED,
+                    &mut wrong_hash,
+                )
+                .is_err()
+        );
+        assert_eq!(writer.message_count(), 0);
+        assert_eq!(writer.private_file_eof(), INITIAL_FILE_EOF);
+        let mut correct = MemoryDirectSource::one(11, payload);
+        let completions = writer.append_message_direct(
+            MailFolderLocation::IpmSubtree,
+            &["Inbox".to_owned()],
+            false,
+            message,
+            &NEVER_INTERRUPTED,
+            &mut correct,
+        )?;
+        writer.finalize(&NEVER_INTERRUPTED)?;
+        assert_eq!(completions, [DirectBlobCompletion { id: 11, sha256 }]);
+        Ok(())
+    }
+
+    #[test]
+    fn direct_interruption_rolls_back_and_size_bounds_reject_before_open()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let destination = directory.path().join("direct-interrupted.pst");
+        let fixture = FidelityStore::default();
+        let mut message = fixture.message.clone();
+        let payload = vec![0xa5; MAX_DATA_BLOCK_PAYLOAD + 7];
+        message.attachments[0].content = AttachmentContent::Direct(DirectBlobSpec {
+            id: 29,
+            byte_len: u64::try_from(payload.len())?,
+            sha256: None,
+        });
+        let mut writer = direct_transaction_fixture(&destination, &message, &fixture)?;
+        let interrupted = AtomicBool::new(false);
+        let mut source = InterruptingDirectSource {
+            id: 29,
+            bytes: payload,
+            interrupted: &interrupted,
+        };
+        assert!(matches!(
+            writer.append_message_direct(
+                MailFolderLocation::IpmSubtree,
+                &["Inbox".to_owned()],
+                false,
+                message.clone(),
+                &interrupted,
+                &mut source,
+            ),
+            Err(WriterError::Interrupted)
+        ));
+        assert_eq!(writer.message_count(), 0);
+        assert_eq!(writer.private_file_eof(), INITIAL_FILE_EOF);
+
+        interrupted.store(false, Ordering::Relaxed);
+        if let AttachmentContent::Direct(blob) = &mut message.attachments[0].content {
+            blob.byte_len = 0;
+        }
+        let mut unopened = MemoryDirectSource::one(29, Vec::new());
+        assert!(
+            writer
+                .append_message_direct(
+                    MailFolderLocation::IpmSubtree,
+                    &["Inbox".to_owned()],
+                    false,
+                    message.clone(),
+                    &interrupted,
+                    &mut unopened,
+                )
+                .is_err()
+        );
+        assert!(unopened.opened.is_empty());
+
+        if let AttachmentContent::Direct(blob) = &mut message.attachments[0].content {
+            blob.byte_len = i32::MAX as u64 + 1;
+        }
+        assert!(
+            writer
+                .project_message_direct_eof(
+                    MailFolderLocation::IpmSubtree,
+                    &["Inbox".to_owned()],
+                    false,
+                    &message,
+                    &interrupted,
+                )
+                .is_err()
+        );
+        assert_eq!(writer.message_count(), 0);
+        assert_eq!(writer.private_file_eof(), INITIAL_FILE_EOF);
+        Ok(())
+    }
+
+    #[test]
+    fn aggregate_direct_size_rejects_before_projection_or_source_open()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let destination = directory.path().join("direct-aggregate-limit.pst");
+        let fixture = FidelityStore::default();
+        let mut message = fixture.message.clone();
+        let property_len = i32::MAX as u64 / 2 + 1;
+        message.direct_properties = vec![
+            DirectPropertySpec {
+                id: 0x4000,
+                property_type: u16::from(PropertyType::Binary),
+                blob: DirectBlobSpec {
+                    id: 51,
+                    byte_len: property_len,
+                    sha256: None,
+                },
+            },
+            DirectPropertySpec {
+                id: 0x4001,
+                property_type: u16::from(PropertyType::Binary),
+                blob: DirectBlobSpec {
+                    id: 52,
+                    byte_len: property_len,
+                    sha256: None,
+                },
+            },
+        ];
+        let mut writer = direct_transaction_fixture(&destination, &message, &fixture)?;
+        assert!(matches!(
+            writer.project_message_direct_eof(
+                MailFolderLocation::IpmSubtree,
+                &["Inbox".to_owned()],
+                false,
+                &message,
+                &NEVER_INTERRUPTED,
+            ),
+            Err(WriterError::ValueTooLarge("message size"))
+        ));
+        let mut source = MemoryDirectSource {
+            blobs: BTreeMap::new(),
+            opened: Vec::new(),
+        };
+        assert!(matches!(
+            writer.append_message_direct(
+                MailFolderLocation::IpmSubtree,
+                &["Inbox".to_owned()],
+                false,
+                message,
+                &NEVER_INTERRUPTED,
+                &mut source,
+            ),
+            Err(WriterError::ValueTooLarge("message size"))
+        ));
+        assert!(source.opened.is_empty());
+        assert_eq!(writer.message_count(), 0);
+        assert_eq!(writer.private_file_eof(), INITIAL_FILE_EOF);
+
+        let mut nested_message = fixture.message.clone();
+        let mut child = match &fixture.message.attachments[1].content {
+            AttachmentContent::Embedded(child) => child.as_ref().clone(),
+            _ => return Err("fixture embedded message is absent".into()),
+        };
+        let mut child_payload = fixture.message.attachments[0].clone();
+        child_payload.content = AttachmentContent::Direct(DirectBlobSpec {
+            id: 61,
+            byte_len: property_len,
+            sha256: None,
+        });
+        child.attachments = vec![child_payload.clone()];
+        let mut sibling = child.clone();
+        if let AttachmentContent::Direct(blob) = &mut sibling.attachments[0].content {
+            blob.id = 62;
+        }
+        let mut first_embedded = fixture.message.attachments[1].clone();
+        first_embedded.content = AttachmentContent::Embedded(Box::new(child));
+        let mut second_embedded = first_embedded.clone();
+        second_embedded.filename = "second-embedded-message.msg".to_owned();
+        second_embedded.content = AttachmentContent::Embedded(Box::new(sibling));
+        nested_message.attachments = vec![first_embedded, second_embedded];
+        let nested_destination = directory.path().join("direct-nested-aggregate-limit.pst");
+        let mut nested_writer =
+            direct_transaction_fixture(&nested_destination, &nested_message, &fixture)?;
+        let mut nested_source = MemoryDirectSource {
+            blobs: BTreeMap::new(),
+            opened: Vec::new(),
+        };
+        assert!(matches!(
+            nested_writer.append_message_direct(
+                MailFolderLocation::IpmSubtree,
+                &["Inbox".to_owned()],
+                false,
+                nested_message,
+                &NEVER_INTERRUPTED,
+                &mut nested_source,
+            ),
+            Err(WriterError::ValueTooLarge("message size"))
+        ));
+        assert!(nested_source.opened.is_empty());
+        assert_eq!(nested_writer.message_count(), 0);
+        assert_eq!(nested_writer.private_file_eof(), INITIAL_FILE_EOF);
+        Ok(())
+    }
+
+    #[test]
+    fn direct_ole_and_external_properties_share_exact_preflight()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let destination = directory.path().join("direct-ole-properties.pst");
+        let fixture = FidelityStore::default();
+        let mut message = fixture.message.clone();
+        let ole = vec![0xd0; MAX_DATA_BLOCK_PAYLOAD + 3];
+        let attachment_property = vec![0x39; 97];
+        let message_property = vec![0x44; MAX_DATA_BLOCK_PAYLOAD * 2 + 1];
+        let plain_body = unicode_bytes("Direct plain-text body.")?;
+        let html_body = b"<p>Direct HTML body.</p>".to_vec();
+        let rtf_body = rtf_container(br"{\rtf1 Direct RTF body.}")?;
+        let embedded_rtf = rtf_container(br"{\rtf1 Embedded direct RTF body.}")?;
+        message.body_text = None;
+        message.body_html = None;
+        message.body_rtf = None;
+        message.native_body = Some(NativeBody::Rtf);
+        message.rtf_in_sync = true;
+        message.attachments[0].content = AttachmentContent::DirectOle(DirectOleAttachmentSpec {
+            data: DirectBlobSpec {
+                id: 41,
+                byte_len: u64::try_from(ole.len())?,
+                sha256: Some(Sha256::digest(&ole).into()),
+            },
+            data_kind: OleDataKind::Object,
+        });
+        message.attachments[0]
+            .direct_properties
+            .push(DirectPropertySpec {
+                id: 0x3709,
+                property_type: u16::from(PropertyType::Binary),
+                blob: DirectBlobSpec {
+                    id: 42,
+                    byte_len: u64::try_from(attachment_property.len())?,
+                    sha256: None,
+                },
+            });
+        message.direct_properties.push(DirectPropertySpec {
+            id: 0x4000,
+            property_type: u16::from(PropertyType::Binary),
+            blob: DirectBlobSpec {
+                id: 43,
+                byte_len: u64::try_from(message_property.len())?,
+                sha256: None,
+            },
+        });
+        for (id, property_type, blob_id, bytes) in [
+            (0x1000, u16::from(PropertyType::Unicode), 44, &plain_body),
+            (0x1013, u16::from(PropertyType::Binary), 45, &html_body),
+            (0x1009, u16::from(PropertyType::Binary), 46, &rtf_body),
+        ] {
+            message.direct_properties.push(DirectPropertySpec {
+                id,
+                property_type,
+                blob: DirectBlobSpec {
+                    id: blob_id,
+                    byte_len: u64::try_from(bytes.len())?,
+                    sha256: None,
+                },
+            });
+        }
+        let embedded = match &mut message.attachments[1].content {
+            AttachmentContent::Embedded(embedded) => embedded.as_mut(),
+            _ => return Err("fixture embedded message is absent".into()),
+        };
+        embedded.body_rtf = None;
+        embedded.native_body = Some(NativeBody::Rtf);
+        embedded.rtf_in_sync = true;
+        embedded.direct_properties.push(DirectPropertySpec {
+            id: 0x1009,
+            property_type: u16::from(PropertyType::Binary),
+            blob: DirectBlobSpec {
+                id: 47,
+                byte_len: u64::try_from(embedded_rtf.len())?,
+                sha256: None,
+            },
+        });
+        let mut source = MemoryDirectSource {
+            blobs: BTreeMap::from([
+                (41, ole),
+                (42, attachment_property),
+                (43, message_property),
+                (44, plain_body),
+                (45, html_body),
+                (46, rtf_body),
+                (47, embedded_rtf),
+            ]),
+            opened: Vec::new(),
+        };
+        let mut writer = direct_transaction_fixture(&destination, &message, &fixture)?;
+        let projected = writer.project_message_direct_eof(
+            MailFolderLocation::IpmSubtree,
+            &["Inbox".to_owned()],
+            false,
+            &message,
+            &NEVER_INTERRUPTED,
+        )?;
+        assert!(source.opened.is_empty());
+        let mut expected = message.clone();
+        writer.append_message_direct_preflighted(
+            MailFolderLocation::IpmSubtree,
+            &["Inbox".to_owned()],
+            false,
+            message,
+            projected,
+            &NEVER_INTERRUPTED,
+            &mut source,
+        )?;
+        assert_eq!(source.opened, [41, 42, 47, 43, 44, 45, 46]);
+        writer.finalize(&NEVER_INTERRUPTED)?;
+        assert_eq!(destination.metadata()?.len(), projected);
+
+        let embedded = match &mut expected.attachments[1].content {
+            AttachmentContent::Embedded(embedded) => embedded.as_mut(),
+            _ => return Err("fixture embedded message is absent".into()),
+        };
+        embedded.direct_properties[0].blob.sha256 = Some([0_u8; 32]);
+        let expected_folders = vec![MailFolderSpec {
+            path: vec!["Inbox".to_owned()],
+            location: MailFolderLocation::IpmSubtree,
+            role: MailFolderRole::Ordinary,
+            container_class: "IPF.Note".to_owned(),
+            messages: vec![expected],
+            associated_messages: Vec::new(),
+        }];
+        let expected_messages = expected_folders
+            .iter()
+            .flat_map(|folder| folder.messages.iter())
+            .collect::<Vec<_>>();
+        let expected_plans =
+            plan_transaction_folders("Inbox", &expected_messages, &expected_folders, true)?;
+        let expected = &expected_folders[0].messages[0];
+        let expected_identities = collect_named_identities(expected);
+        let expected_input = StoreInput {
+            store_name: &fixture.store_name,
+            folder_name: "Inbox",
+            record_key: fixture.record_key,
+            message: expected,
+            associated: false,
+        };
+        let validation = validate_completed_store(
+            &destination,
+            &expected_input,
+            expected_plans[0].node,
+            &expected_identities,
+        );
+        assert!(
+            matches!(
+            &validation,
+            Err(WriterError::InvalidStructure(detail))
+                if detail.contains("embedded direct property mismatch")
+            ),
+            "unexpected validation result: {validation:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn empty_binary_direct_ole_is_inline_at_top_level_and_embedded()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let destination = directory.path().join("direct-empty-ole.pst");
+        let fixture = FidelityStore::default();
+        let mut message = fixture.message.clone();
+        message.attachments[0].content = AttachmentContent::DirectOle(DirectOleAttachmentSpec {
+            data: DirectBlobSpec {
+                id: 71,
+                byte_len: 0,
+                sha256: Some(Sha256::digest([]).into()),
+            },
+            data_kind: OleDataKind::Binary,
+        });
+        let mut nested_empty = message.attachments[0].clone();
+        if let AttachmentContent::DirectOle(ole) = &mut nested_empty.content {
+            ole.data.id = 72;
+        }
+        let embedded = match &mut message.attachments[1].content {
+            AttachmentContent::Embedded(embedded) => embedded.as_mut(),
+            _ => return Err("fixture embedded message is absent".into()),
+        };
+        embedded.attachments.push(nested_empty);
+
+        let mut wrong_top_hash = message.clone();
+        if let AttachmentContent::DirectOle(ole) = &mut wrong_top_hash.attachments[0].content {
+            ole.data.sha256 = Some([0_u8; 32]);
+        }
+        let wrong_top_destination = directory.path().join("direct-empty-ole-wrong-top.pst");
+        let mut wrong_top_writer =
+            direct_transaction_fixture(&wrong_top_destination, &wrong_top_hash, &fixture)?;
+        assert!(matches!(
+            wrong_top_writer.project_message_direct_eof(
+                MailFolderLocation::IpmSubtree,
+                &["Inbox".to_owned()],
+                false,
+                &wrong_top_hash,
+                &NEVER_INTERRUPTED,
+            ),
+            Err(WriterError::InvalidStructure(detail))
+                if detail.contains("empty direct OLE payload hash mismatch")
+        ));
+
+        let mut wrong_embedded_hash = message.clone();
+        let wrong_embedded = match &mut wrong_embedded_hash.attachments[1].content {
+            AttachmentContent::Embedded(embedded) => embedded.as_mut(),
+            _ => return Err("fixture embedded message is absent".into()),
+        };
+        if let AttachmentContent::DirectOle(ole) = &mut wrong_embedded.attachments[0].content {
+            ole.data.sha256 = Some([0_u8; 32]);
+        }
+        let wrong_embedded_destination =
+            directory.path().join("direct-empty-ole-wrong-embedded.pst");
+        let mut wrong_embedded_writer = direct_transaction_fixture(
+            &wrong_embedded_destination,
+            &wrong_embedded_hash,
+            &fixture,
+        )?;
+        assert!(matches!(
+            wrong_embedded_writer.project_message_direct_eof(
+                MailFolderLocation::IpmSubtree,
+                &["Inbox".to_owned()],
+                false,
+                &wrong_embedded_hash,
+                &NEVER_INTERRUPTED,
+            ),
+            Err(WriterError::InvalidStructure(detail))
+                if detail.contains("empty direct OLE payload hash mismatch")
+        ));
+
+        let mut writer = direct_transaction_fixture(&destination, &message, &fixture)?;
+        let projected = writer.project_message_direct_eof(
+            MailFolderLocation::IpmSubtree,
+            &["Inbox".to_owned()],
+            false,
+            &message,
+            &NEVER_INTERRUPTED,
+        )?;
+        let mut source = MemoryDirectSource {
+            blobs: BTreeMap::new(),
+            opened: Vec::new(),
+        };
+        let completions = writer.append_message_direct_preflighted(
+            MailFolderLocation::IpmSubtree,
+            &["Inbox".to_owned()],
+            false,
+            message,
+            projected,
+            &NEVER_INTERRUPTED,
+            &mut source,
+        )?;
+        assert!(source.opened.is_empty());
+        assert!(completions.is_empty());
+        writer.finalize(&NEVER_INTERRUPTED)?;
+        assert_eq!(destination.metadata()?.len(), projected);
+        Ok(())
+    }
+
+    #[test]
+    fn recursive_identity_validation_covers_first_associated_and_later_nested_direct()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let fixture = FidelityStore::default();
+
+        let associated_destination = directory.path().join("direct-associated-first.pst");
+        let mut associated = fixture.message.clone();
+        let associated_payload = vec![0x81; 257];
+        associated.attachments[0].content = AttachmentContent::Direct(DirectBlobSpec {
+            id: 81,
+            byte_len: u64::try_from(associated_payload.len())?,
+            sha256: Some(Sha256::digest(&associated_payload).into()),
+        });
+        let mut associated_writer =
+            direct_transaction_fixture(&associated_destination, &associated, &fixture)?;
+        let associated_projection = associated_writer.project_message_direct_eof(
+            MailFolderLocation::IpmSubtree,
+            &["Inbox".to_owned()],
+            true,
+            &associated,
+            &NEVER_INTERRUPTED,
+        )?;
+        let mut associated_source = MemoryDirectSource::one(81, associated_payload);
+        associated_writer.append_message_direct_preflighted(
+            MailFolderLocation::IpmSubtree,
+            &["Inbox".to_owned()],
+            true,
+            associated.clone(),
+            associated_projection,
+            &NEVER_INTERRUPTED,
+            &mut associated_source,
+        )?;
+        associated_writer.finalize(&NEVER_INTERRUPTED)?;
+        if let AttachmentContent::Direct(blob) = &mut associated.attachments[0].content {
+            blob.sha256 = Some([0_u8; 32]);
+        }
+        let associated_folders = vec![MailFolderSpec {
+            path: vec!["Inbox".to_owned()],
+            location: MailFolderLocation::IpmSubtree,
+            role: MailFolderRole::Ordinary,
+            container_class: "IPF.Note".to_owned(),
+            messages: Vec::new(),
+            associated_messages: vec![associated],
+        }];
+        let associated_messages = associated_folders
+            .iter()
+            .flat_map(|folder| folder.associated_messages.iter())
+            .collect::<Vec<_>>();
+        let associated_plans =
+            plan_transaction_folders("Inbox", &associated_messages, &associated_folders, true)?;
+        assert!(
+            validate_completed_folder_store(
+                &associated_destination,
+                fixture.record_key,
+                &associated_plans
+            )
+            .is_err()
+        );
+
+        let nested_destination = directory.path().join("direct-later-nested.pst");
+        let first = fixture.message.clone();
+        let mut second = fixture.message.clone();
+        second.subject = "Second direct message".to_owned();
+        let nested_payload = vec![0x91; 521];
+        let nested = match &mut second.attachments[1].content {
+            AttachmentContent::Embedded(nested) => nested.as_mut(),
+            _ => return Err("fixture embedded message is absent".into()),
+        };
+        let mut nested_attachment = fixture.message.attachments[0].clone();
+        nested_attachment.content = AttachmentContent::Direct(DirectBlobSpec {
+            id: 91,
+            byte_len: u64::try_from(nested_payload.len())?,
+            sha256: Some(Sha256::digest(&nested_payload).into()),
+        });
+        nested.attachments.push(nested_attachment);
+        let mut nested_writer = direct_transaction_fixture(&nested_destination, &second, &fixture)?;
+        nested_writer.append_message_deferred(
+            MailFolderLocation::IpmSubtree,
+            &["Inbox".to_owned()],
+            false,
+            first.clone(),
+            &NEVER_INTERRUPTED,
+        )?;
+        let nested_projection = nested_writer.project_message_direct_eof(
+            MailFolderLocation::IpmSubtree,
+            &["Inbox".to_owned()],
+            false,
+            &second,
+            &NEVER_INTERRUPTED,
+        )?;
+        let mut nested_source = MemoryDirectSource::one(91, nested_payload);
+        nested_writer.append_message_direct_preflighted(
+            MailFolderLocation::IpmSubtree,
+            &["Inbox".to_owned()],
+            false,
+            second.clone(),
+            nested_projection,
+            &NEVER_INTERRUPTED,
+            &mut nested_source,
+        )?;
+        nested_writer.finalize(&NEVER_INTERRUPTED)?;
+        let nested = match &mut second.attachments[1].content {
+            AttachmentContent::Embedded(nested) => nested.as_mut(),
+            _ => return Err("fixture embedded message is absent".into()),
+        };
+        if let AttachmentContent::Direct(blob) = &mut nested.attachments[0].content {
+            blob.sha256 = Some([0_u8; 32]);
+        }
+        let nested_folders = vec![MailFolderSpec {
+            path: vec!["Inbox".to_owned()],
+            location: MailFolderLocation::IpmSubtree,
+            role: MailFolderRole::Ordinary,
+            container_class: "IPF.Note".to_owned(),
+            messages: vec![first, second],
+            associated_messages: Vec::new(),
+        }];
+        let nested_messages = nested_folders
+            .iter()
+            .flat_map(|folder| folder.messages.iter())
+            .collect::<Vec<_>>();
+        let nested_plans =
+            plan_transaction_folders("Inbox", &nested_messages, &nested_folders, true)?;
+        assert!(
+            validate_completed_folder_store(&nested_destination, fixture.record_key, &nested_plans)
+                .is_err()
+        );
+        Ok(())
+    }
 
     #[test]
     fn message_append_rollback_restores_the_exact_private_writer_boundary()
@@ -10512,8 +12490,10 @@ mod tests {
             &contents_columns,
             &associated_columns,
             &NEVER_INTERRUPTED,
+            None,
+            false,
         )?;
-        let checkpoint = state.append_message(
+        let (checkpoint, _) = state.append_message(
             &mut file,
             &spec.message,
             parent,
@@ -10523,6 +12503,8 @@ mod tests {
             &contents_columns,
             &associated_columns,
             &NEVER_INTERRUPTED,
+            None,
+            false,
         )?;
         let expected_cursor = state.allocation_cursor;
         let expected_written = state.written.len();
@@ -10540,6 +12522,8 @@ mod tests {
             &contents_columns,
             &associated_columns,
             &NEVER_INTERRUPTED,
+            None,
+            false,
         )?;
         assert_eq!(state.allocation_cursor, expected_cursor);
         assert_eq!(state.written.len(), expected_written);
@@ -12117,6 +14101,7 @@ mod tests {
             flags: 0,
             raw_properties: Vec::new(),
             spooled_properties: Vec::new(),
+            direct_properties: Vec::new(),
             content: AttachmentContent::Spooled(FileBlobSpec {
                 path: PathBuf::from("/dev/null"),
                 offset: 0,
@@ -12399,6 +14384,7 @@ mod tests {
             flags: 0,
             raw_properties: Vec::new(),
             spooled_properties: Vec::new(),
+            direct_properties: Vec::new(),
             content: AttachmentContent::Spooled(FileBlobSpec {
                 path: source,
                 offset: 0,
@@ -13050,8 +15036,10 @@ mod tests {
             AttachmentContent::Binary(value) => value,
             AttachmentContent::Embedded(_)
             | AttachmentContent::Spooled(_)
+            | AttachmentContent::Direct(_)
             | AttachmentContent::Reference(_)
-            | AttachmentContent::Ole(_) => {
+            | AttachmentContent::Ole(_)
+            | AttachmentContent::DirectOle(_) => {
                 return Err("expected binary attachment".into());
             }
         };
@@ -13621,6 +15609,7 @@ mod tests {
                 flags: 0,
                 raw_properties: Vec::new(),
                 spooled_properties: Vec::new(),
+                direct_properties: Vec::new(),
                 content: AttachmentContent::Binary(vec![1]),
             });
         }
@@ -13646,8 +15635,10 @@ mod tests {
             }
             AttachmentContent::Binary(_)
             | AttachmentContent::Spooled(_)
+            | AttachmentContent::Direct(_)
             | AttachmentContent::Reference(_)
-            | AttachmentContent::Ole(_) => {
+            | AttachmentContent::Ole(_)
+            | AttachmentContent::DirectOle(_) => {
                 return Err("expected embedded fixture".into());
             }
         };
@@ -13663,6 +15654,7 @@ mod tests {
                 flags: 0,
                 raw_properties: Vec::new(),
                 spooled_properties: Vec::new(),
+                direct_properties: Vec::new(),
                 content: AttachmentContent::Embedded(Box::new(child)),
             });
             child = parent;
@@ -14041,6 +16033,7 @@ mod tests {
                 flags: 0,
                 raw_properties: Vec::new(),
                 spooled_properties: Vec::new(),
+                direct_properties: Vec::new(),
                 content: AttachmentContent::Binary(Vec::new()),
             })
             .collect();
@@ -14164,8 +16157,10 @@ mod tests {
             }
             AttachmentContent::Binary(_)
             | AttachmentContent::Spooled(_)
+            | AttachmentContent::Direct(_)
             | AttachmentContent::Reference(_)
-            | AttachmentContent::Ole(_) => {
+            | AttachmentContent::Ole(_)
+            | AttachmentContent::DirectOle(_) => {
                 return Err("expected embedded fixture".into());
             }
         }
@@ -14174,8 +16169,10 @@ mod tests {
             AttachmentContent::Embedded(message) => message,
             AttachmentContent::Binary(_)
             | AttachmentContent::Spooled(_)
+            | AttachmentContent::Direct(_)
             | AttachmentContent::Reference(_)
-            | AttachmentContent::Ole(_) => {
+            | AttachmentContent::Ole(_)
+            | AttachmentContent::DirectOle(_) => {
                 return Err("expected embedded fixture".into());
             }
         };
@@ -14519,6 +16516,7 @@ mod tests {
             flags: 0,
             raw_properties: Vec::new(),
             spooled_properties: Vec::new(),
+            direct_properties: Vec::new(),
             content: AttachmentContent::Reference(AttachmentReferenceSpec {
                 method,
                 long_pathname: long_pathname.to_owned(),
@@ -14556,6 +16554,7 @@ mod tests {
                 flags: 0,
                 raw_properties: Vec::new(),
                 spooled_properties: Vec::new(),
+                direct_properties: Vec::new(),
                 content: AttachmentContent::Reference(AttachmentReferenceSpec {
                     method: AttachmentReferenceMethod::ByWebReference,
                     long_pathname: "https://example.invalid/recovery/web-reference.docx".to_owned(),
@@ -14633,6 +16632,7 @@ mod tests {
                 flags: 0,
                 raw_properties,
                 spooled_properties: Vec::new(),
+                direct_properties: Vec::new(),
                 content: AttachmentContent::Ole(OleAttachmentSpec { data, data_kind }),
             };
 

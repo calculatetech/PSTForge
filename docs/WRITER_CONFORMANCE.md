@@ -326,8 +326,14 @@ overview reference is replaced by a section-specific reference.
 - **Status:** Verified: nonempty leaf/XBLOCK/XXBLOCK levels, 8,176-byte payloads, 1,021-entry limits, `lcbTotal`, ordering, and streamed hashing match. Empty binary/Unicode values use the inline empty-value path; a zero-byte spool descriptor is rejected in preflight and can no longer create the prohibited zero-length NDB block.
 - **Requirement:** Data trees and extended blocks represent bounded and streamed values without truncation
 - **Sources:** [MS-PST 2.2.2.8.3.1 Data Blocks](https://learn.microsoft.com/en-us/openspecs/office_file_formats/ms-pst/d0e6fbaf-00e3-4d4d-bea8-8ab3cdb4fde6); [MS-PST 2.2.2.8.3.2.1 XBLOCK](https://learn.microsoft.com/en-us/openspecs/office_file_formats/ms-pst/5b7a6935-e83d-4917-9f62-6ce3707f09e0); [MS-PST 2.2.2.8.3.2.2 XXBLOCK](https://learn.microsoft.com/en-us/openspecs/office_file_formats/ms-pst/061b6ac4-d1da-468c-b75d-0303a0a8f468)
-- **Implementation:** `append_data_tree*`, `append_spooled_data_tree`, `externalize_large_properties`, `validate_message`
-- **Evidence:** `spooled_attachment_streams_across_data_tree_groups`, empty-value/preflight and boundary tests; `pffinfo`
+- **Implementation:** `append_data_tree*`, `append_spooled_data_tree`, the
+  0.4.5 direct-source data-tree path, `externalize_large_properties`, and
+  `validate_message`
+- **Evidence:** `spooled_attachment_streams_across_data_tree_groups`; 0.4.5
+  direct-source chunk-boundary, declared-length, interruption, and exact-hash
+  tests; recursive aggregate over-limit rejection before source open;
+  direct-body and embedded direct-body tests; spooled and direct inline-empty
+  binary OLE tests; empty-value, preflight, and boundary tests; `pffinfo`
 
 ### NDB-04
 - **Status:** Verified: sorted local NIDs, entry widths, data/subnode BIDs, nonempty SLBLOCKs, level-0 leaves, and the single permitted level-1 SIBLOCK agree. The exact 340-by-510 capacity is checked before mutation, so 173,401 entries return a bounded error instead of emitting an invalid level-2 SIBLOCK.
@@ -361,8 +367,18 @@ overview reference is replaced by a section-specific reference.
 - **Status:** Verified; the transactional writer emits each accepted message block once before final NBT, BBT, allocation-map, and header construction. Bounded private batches amortize exact finalized-size projection while exact replay fixes every part boundary.
 - **Requirement:** Transactional construction may append complete message nodes and their referenced blocks before finalization, provided final NBT and BBT entries remain sorted and complete, allocation maps cover exactly retained extents, the header references only the final roots and high-water marks, and no pre-finalized file is published. Folder hierarchy and metadata validation is independent of any recovered message, so an unrepresentable candidate cannot suppress otherwise valid or empty source folders. A provisional batch may defer finalized-size projection; its primary bound scales from the requested part size and the bytes actually allocated in the private PST, with a message-count ceiling only to bound latency for very small items. The batch is accepted only after one exact projection. If that projection exceeds the part limit, the complete batch is rolled back to its byte-for-byte private checkpoint and replayed one message at a time with exact projection so the published part remains at the last fitting message.
 - **Sources:** NDB-01 through NDB-07; MS-PST 2.2.2.1 defines the NDB as nodes and blocks addressed through the NBT and BBT, and PST-INT 2.6 requires the final database relationships and allocation state to be internally consistent
-- **Implementation:** `validate_mail_store_layout`, `TransactionalMailStoreWriter::begin`, `begin_batch`, `append_message_deferred`, `projected_file_eof`, `rollback_batch`, `append_message`, and `finalize`; `write_bbt`, `write_nbt`, `write_fixed_pages`, `write_header`, and the NDB-07 publication path remain authoritative
-- **Evidence:** focused append, batch rollback, exact-boundary, and byte-comparison tests; independent `pffinfo` and `readpst`; all five 19 GB qualification parts pass ScanPST and open in Outlook
+- **Implementation:** `validate_mail_store_layout`,
+  `TransactionalMailStoreWriter::begin`, `begin_batch`,
+  `append_message_deferred`, the 0.4.5 direct-source append API,
+  `projected_file_eof`, `rollback_batch`, `append_message`, and `finalize`;
+  `write_bbt`, `write_nbt`, `write_fixed_pages`, `write_header`, and the NDB-07
+  publication path remain authoritative
+- **Evidence:** focused append, direct-source failure rollback/reappend, batch
+  rollback, exact and mismatched direct projection, message-atomic direct
+  completion, projection metadata immutability, recursive normal/associated
+  identity rejection, exact-boundary, and byte-comparison tests; independent
+  `pffinfo` and `readpst`; all five 19 GB qualification parts pass ScanPST and
+  open in Outlook
 
 ## LTP Structures
 

@@ -315,8 +315,10 @@ fn qualify_embedded_attachments(root: &Path, output: &Path) -> Result<(), String
             AttachmentContent::Embedded(message) => Some(message.as_mut()),
             AttachmentContent::Binary(_)
             | AttachmentContent::Spooled(_)
+            | AttachmentContent::Direct(_)
             | AttachmentContent::Reference(_)
-            | AttachmentContent::Ole(_) => None,
+            | AttachmentContent::Ole(_)
+            | AttachmentContent::DirectOle(_) => None,
         })
         .ok_or_else(|| "writer fixture has no embedded message".to_owned())?;
     let mut nested = embedded.clone();
@@ -331,6 +333,7 @@ fn qualify_embedded_attachments(root: &Path, output: &Path) -> Result<(), String
         flags: 7,
         raw_properties: Vec::new(),
         spooled_properties: Vec::new(),
+        direct_properties: Vec::new(),
         content: AttachmentContent::Binary(b"nested payload checkpoint".to_vec()),
     });
     embedded.attachments.push(AttachmentSpec {
@@ -342,6 +345,7 @@ fn qualify_embedded_attachments(root: &Path, output: &Path) -> Result<(), String
         flags: 0,
         raw_properties: Vec::new(),
         spooled_properties: Vec::new(),
+        direct_properties: Vec::new(),
         content: AttachmentContent::Binary(b"embedded payload checkpoint".to_vec()),
     });
     embedded.attachments.push(AttachmentSpec {
@@ -353,6 +357,7 @@ fn qualify_embedded_attachments(root: &Path, output: &Path) -> Result<(), String
         flags: 0,
         raw_properties: Vec::new(),
         spooled_properties: Vec::new(),
+        direct_properties: Vec::new(),
         content: AttachmentContent::Embedded(Box::new(nested)),
     });
     publish_fidelity_qualification(root, output, &fixture, 3)
@@ -1094,6 +1099,7 @@ fn qualify_document_object(root: &Path, output: &Path) -> Result<(), String> {
         flags: 0,
         raw_properties: Vec::new(),
         spooled_properties: Vec::new(),
+        direct_properties: Vec::new(),
         content: AttachmentContent::Binary(document),
     }];
     let spec = MailStoreSpec {
@@ -1176,6 +1182,7 @@ fn qualify_reference_attachments(root: &Path, output: &Path) -> Result<(), Strin
         flags: 0,
         raw_properties: Vec::new(),
         spooled_properties: Vec::new(),
+        direct_properties: Vec::new(),
         content: AttachmentContent::Reference(AttachmentReferenceSpec {
             method,
             long_pathname: long_pathname.to_owned(),
@@ -1213,6 +1220,7 @@ fn qualify_reference_attachments(root: &Path, output: &Path) -> Result<(), Strin
             flags: 0,
             raw_properties: Vec::new(),
             spooled_properties: Vec::new(),
+            direct_properties: Vec::new(),
             content: AttachmentContent::Reference(AttachmentReferenceSpec {
                 method: AttachmentReferenceMethod::ByWebReference,
                 long_pathname: "https://example.invalid/recovery/web-reference.docx".to_owned(),
@@ -1293,6 +1301,7 @@ fn qualify_ole_attachments(root: &Path, output: &Path) -> Result<(), String> {
         flags: 0,
         raw_properties,
         spooled_properties: Vec::new(),
+        direct_properties: Vec::new(),
         content: AttachmentContent::Ole(OleAttachmentSpec { data, data_kind }),
     };
 
@@ -1414,6 +1423,7 @@ fn qualify_calendar_exceptions(root: &Path, output: &Path) -> Result<(), String>
             },
         ],
         spooled_properties: Vec::new(),
+        direct_properties: Vec::new(),
         content: AttachmentContent::Embedded(Box::new(exception)),
     });
 

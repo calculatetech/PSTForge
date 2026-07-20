@@ -1020,6 +1020,7 @@ fn translate_message(
             named_properties,
             raw_properties,
             spooled_properties,
+            direct_properties: Vec::new(),
             unsupported_properties,
         },
         item_keys,
@@ -1510,6 +1511,7 @@ fn translate_attachment(
         flags,
         raw_properties,
         spooled_properties: spooled_attachment_metadata,
+        direct_properties: Vec::new(),
         content,
     };
     if ole_attachment && !ole_attachment_fits_pst_size(&writer_attachment) {

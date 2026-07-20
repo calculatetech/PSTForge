@@ -2511,13 +2511,54 @@ not modified.
     legacy missing-mode interpretation, and an actual 0.4.4 ledger reopen.
     Clean-context review found and resolved the skipped 0.4.4 schema fallback;
     final clean-context review reported no blocker or high finding.
-  - [ ] Checkpoint 2: add documented writer primitives for a preflighted
+  - [x] Checkpoint 2: added documented writer primitives for a preflighted
     streamed external value. Derive physical allocation from declared property
     and attachment lengths plus PST block/table framing before consuming
     payload bytes; stream chunks directly into the active message transaction;
     hash and length-check at end; and roll back the exact message transaction
     on abort. Add boundary, empty, huge, interrupted, malformed-length, and
-    rollback/reappend writer tests plus conformance references.
+    rollback/reappend writer tests plus conformance references. Direct
+    projection now runs the writer's real block-allocation and final-index
+    calculation without opening a payload stream or modifying the private
+    file. The subsequent append requires an identical projected final EOF.
+    Direct hashes are returned as one message-atomic completion result only
+    after the actual finalized EOF matches the preflight token; the source
+    interface has no completion callback that could release data before
+    acceptance. Aggregate message-size bounds are checked before projection or
+    opening any direct stream. Any read, length, hash, projection, or
+    interruption failure restores the exact private checkpoint. Focused tests
+    cover XBLOCK/XXBLOCK boundaries, direct OLE, message and attachment
+    properties, empty and
+    over-limit declarations, aggregate over-limit messages, short/long streams,
+    bad hashes, mid-stream interruption, exact and mismatched projections, and
+    rollback/reappend. The complete writer suite passed 96 tests with its
+    existing multi-gigabyte test ignored. The
+    first fast gate exposed and corrected an adjacent-range spool regression.
+    A clean-context review then found premature per-blob completion and a
+    missing aggregate direct-message bound; both were corrected as described
+    above. A second clean-context review found that the bound omitted nested
+    attachment payloads and that native-body checks recognized only spooled
+    body properties. Recursive attachment accounting and shared
+    spooled/direct plain-text, HTML, RTF, and RTF-sync handling now cover top
+    and embedded messages, with zero-open nested-overflow and direct-body
+    regressions. A third clean-context review found direct/spooled parity gaps
+    for inline empty binary OLE and recursive completed-store identity checks.
+    Direct mode now emits empty binary OLE inline without opening a stream at
+    both top and embedded levels, and recursive validation verifies direct
+    property type, length, and hash. A negative embedded-identity regression
+    proves a mismatch blocks validation. A fourth clean-context review found
+    that an inline empty direct OLE descriptor could declare a contradictory
+    hash; preflight now requires an optional hash to equal SHA-256 of empty
+    content, with top-level and embedded negative regressions. The post-fix
+    state was reviewed again: projection rollback still issued a same-length
+    `ftruncate`, and completed identity validation was not recursive for every
+    normal and associated message. Projection now restores only in-memory
+    state and a metadata regression proves no file timestamp, allocation, or
+    length change. One recursive validator now covers every accepted message;
+    negative tests cover a first associated direct attachment and a later
+    message's nested direct attachment. The complete writer suite passes 97
+    tests with its existing multi-gigabyte test ignored. The post-fix fast gate
+    passed at `.agent/test-results/1784523711-fast`.
   - [ ] Checkpoint 3: implement the direct supervisor/sink. Perform bounded
     per-item structural preflight, select the destination part before payload
     streaming, translate parser events without a payload pack, and keep only
@@ -2552,13 +2593,15 @@ not modified.
     aggregate results and independently valid outputs. Direct mode must show
     no mailbox-sized payload-pack allocation; restartable mode must improve or
     at least not regress the accepted 9:30.47 cold baseline.
-  - [ ] Make direct output the default `split` mode. Feed parser output through
-    bounded backpressure into canonical translation and the transactional PST
-    writer without first creating a mailbox-sized payload pack. Retain a
-    compact metadata ledger with source/configuration identity, bounded
-    per-candidate status and completeness, part assignments, manifests,
-    aggregate omission/reconstruction counts, and terminal job state so
-    `report` and exact reconciliation remain reproducible.
+  - [ ] Make direct output the default for every supported PST-output recovery
+    policy. Feed parser output through bounded backpressure into canonical
+    translation and the transactional PST writer without first creating a
+    mailbox-sized payload pack. Balanced and aggressive continue to select
+    recovery breadth, not persistence. Retain a compact metadata ledger with
+    source/configuration identity, bounded per-candidate status and
+    completeness, part assignments, manifests, aggregate
+    omission/reconstruction counts, and terminal job state so `report` and
+    exact reconciliation remain reproducible.
   - [ ] Keep the current durable ledger/payload-spool implementation behind an
     explicit `--restartable` flag. Permit `--resume` and `--keep-work` only in
     restartable mode and refuse incompatible combinations before creating the
@@ -3305,8 +3348,9 @@ not modified.
   Date/Author: 2026-07-19 / project owner and Codex; performance target
   clarified by the owner after final 0.4.4 qualification.
 
-- Decision: Version 0.4.5 makes low-write direct splitting the default and
-  keeps restartable persistence behind explicit `--restartable`.
+- Decision: Version 0.4.5 makes low-write direct writing the default for every
+  supported PST-output recovery policy and keeps restartable persistence
+  behind explicit `--restartable`.
   `--resume` and `--keep-work` require that flag. Direct mode keeps a compact
   metadata ledger and manifests for exact accounting and `report`, but never a
   recovered-payload pack. If interrupted, its published parts and reporting
