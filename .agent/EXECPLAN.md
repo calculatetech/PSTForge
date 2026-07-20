@@ -2691,6 +2691,20 @@ not modified.
       both payloads. Reduced-key collisions remain terminal. The complete core
       suite passes and a fresh clean-context rereview found no blocker or high
       issue.
+    - [x] Aligned damaged embedded-item acquisition across the two direct
+      passes without violating the metadata ledger's flat event contract. The
+      r4 writer passed the former identity failure, wrote a 656 MiB active PST,
+      then found a nested child that the source-order metadata pass had omitted
+      after attachment-property decoding left its embedded parent partial.
+      Direct metadata now uses a third `EmbeddedFirst` traversal policy: obtain
+      and queue the child before decoding attachment properties, close the
+      parent attachment and message, then emit the queued child. The full
+      writer pass remains recursive and restartable recovery retains source
+      order. Readable attachment properties are still attempted exactly once
+      before every contained attachment abort. The libpff and core suites pass,
+      the canonical fast gate passed at
+      `.agent/test-results/1784534926-fast`, and final clean-context review
+      found no blocker or high issue.
   - [ ] Checkpoint 4: complete direct publication and failure behavior. Keep
     one same-filesystem active PST temporary, independently validate and fsync
     it, atomically rename it into `parts/`, preserve finalized parts on
@@ -2779,6 +2793,19 @@ not modified.
   provenance, not the embedded node ID, while retaining collision rejection.
   Evidence: r2/r3 ledger comparison and
   `.agent/test-results/1784533130-v045-direct-single-r3/stderr.log`.
+
+- Observation: Direct metadata and payload traversal need the same native
+  embedded-item acquisition order, but not the same event nesting. On r4,
+  source-order metadata committed nested parent `normal:283401542:-:0` as
+  partial with no attachment events, while all three writer-order passes found
+  its child under attachment zero after the active PST had reached 656 MiB.
+  Recursive metadata events cannot be sent to the single-active durable sink.
+  Acquiring and queueing the child before attachment-property decoding, then
+  emitting it only after the parent closes, preserves both readability and the
+  flat transactional catalog.
+  Evidence:
+  `.agent/test-results/1784533900-v045-direct-single-r4/stderr.log`, read-only
+  r4 ledger inspection, and focused clean-context reviews on 2026-07-20.
 
 - Observation: The 0.4.2 fidelity expansion regressed a cold 19 GB split from
   approximately ten minutes in 0.4.1 to more than 57 minutes without

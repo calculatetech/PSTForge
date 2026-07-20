@@ -276,6 +276,7 @@ pub enum PayloadRequest {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TraversalOrder {
     Source,
+    EmbeddedFirst,
     Writer,
 }
 
@@ -1212,24 +1213,11 @@ fn stream_attachments(
                     value: u64::MAX,
                     limit: u64::MAX - 1,
                 })?;
-        let writer_order = sink.traversal_order() == TraversalOrder::Writer;
-        if !writer_order {
-            if let Err(error) = stream_item_properties(
-                &attachment,
-                PropertyOwner::Attachment {
-                    message_id,
-                    index: index_u32,
-                },
-                sink,
-                catalog,
-            ) {
-                record_attachment_issue(
-                    catalog,
-                    Some(message_id),
-                    "stream attachment properties",
-                    error,
-                )?;
-            }
+        let traversal_order = sink.traversal_order();
+        let writer_order = traversal_order == TraversalOrder::Writer;
+        let embedded_first = traversal_order != TraversalOrder::Source;
+        if !embedded_first {
+            stream_attachment_properties(&attachment, message_id, index_u32, sink, catalog)?;
         }
         let embedded_attachment = attachment_type == Some(i32::from(b'i'));
         if !embedded_attachment && !reference_attachment {
@@ -1245,6 +1233,15 @@ fn stream_attachments(
                 Ok(actual) => actual,
                 Err(error @ PffError::Sink { .. }) => return Err(error),
                 Err(error) => {
+                    if embedded_first {
+                        stream_attachment_properties(
+                            &attachment,
+                            message_id,
+                            index_u32,
+                            sink,
+                            catalog,
+                        )?;
+                    }
                     emit(
                         sink,
                         "attachment abort",
@@ -1284,6 +1281,15 @@ fn stream_attachments(
                 Ok(embedded) => embedded,
                 Err(error @ PffError::Sink { .. }) => return Err(error),
                 Err(error) => {
+                    if embedded_first {
+                        stream_attachment_properties(
+                            &attachment,
+                            message_id,
+                            index_u32,
+                            sink,
+                            catalog,
+                        )?;
+                    }
                     emit(
                         sink,
                         "attachment abort",
@@ -1329,6 +1335,15 @@ fn stream_attachments(
                 }
                 Ok(embedded_work) => pending.push(embedded_work),
                 Err(error) => {
+                    if embedded_first {
+                        stream_attachment_properties(
+                            &attachment,
+                            message_id,
+                            index_u32,
+                            sink,
+                            catalog,
+                        )?;
+                    }
                     emit(
                         sink,
                         "attachment abort",
@@ -1347,23 +1362,8 @@ fn stream_attachments(
                 }
             }
         }
-        if writer_order {
-            if let Err(error) = stream_item_properties(
-                &attachment,
-                PropertyOwner::Attachment {
-                    message_id,
-                    index: index_u32,
-                },
-                sink,
-                catalog,
-            ) {
-                record_attachment_issue(
-                    catalog,
-                    Some(message_id),
-                    "stream attachment properties",
-                    error,
-                )?;
-            }
+        if embedded_first {
+            stream_attachment_properties(&attachment, message_id, index_u32, sink, catalog)?;
         }
         emit(
             sink,
@@ -1372,6 +1372,29 @@ fn stream_attachments(
                 message_id,
                 index: index_u32,
             },
+        )?;
+    }
+    Ok(())
+}
+
+fn stream_attachment_properties(
+    attachment: &PffItem,
+    message_id: u32,
+    index: u32,
+    sink: &mut dyn CatalogSink,
+    catalog: &mut RawCatalog,
+) -> Result<(), PffError> {
+    if let Err(error) = stream_item_properties(
+        attachment,
+        PropertyOwner::Attachment { message_id, index },
+        sink,
+        catalog,
+    ) {
+        record_attachment_issue(
+            catalog,
+            Some(message_id),
+            "stream attachment properties",
+            error,
         )?;
     }
     Ok(())

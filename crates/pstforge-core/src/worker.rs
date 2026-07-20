@@ -958,6 +958,8 @@ impl CatalogSink for ProtocolSink<'_> {
     fn traversal_order(&self) -> TraversalOrder {
         if self.writer_order {
             TraversalOrder::Writer
+        } else if self.metadata_only {
+            TraversalOrder::EmbeddedFirst
         } else {
             TraversalOrder::Source
         }
@@ -1815,24 +1817,31 @@ mod tests {
     #[test]
     fn metadata_worker_bounds_payloads_and_writer_order_is_explicit() {
         let mut bytes = Vec::new();
-        let sink = ProtocolSink::start(&mut bytes, true, true).expect("start protocol");
-        let descriptor = PropertyDescriptor {
-            owner: libpff_sys::PropertyOwner::Message(7),
-            record_set_index: 0,
-            entry_index: 0,
-            entry_type: Some(0x1000),
-            value_type: Some(0x0102),
-            data_size: METADATA_PROPERTY_PREFIX_BYTES + 1,
-        };
-        assert_eq!(
-            sink.property_payload(descriptor),
-            PayloadRequest::Prefix(METADATA_PROPERTY_PREFIX_BYTES)
-        );
-        assert_eq!(
-            sink.attachment_payload(7, 0, Some(METADATA_ATTACHMENT_PREFIX_BYTES + 1)),
-            PayloadRequest::Prefix(METADATA_ATTACHMENT_PREFIX_BYTES)
-        );
-        assert_eq!(sink.traversal_order(), TraversalOrder::Writer);
+        {
+            let sink = ProtocolSink::start(&mut bytes, true, false).expect("start protocol");
+            let descriptor = PropertyDescriptor {
+                owner: libpff_sys::PropertyOwner::Message(7),
+                record_set_index: 0,
+                entry_index: 0,
+                entry_type: Some(0x1000),
+                value_type: Some(0x0102),
+                data_size: METADATA_PROPERTY_PREFIX_BYTES + 1,
+            };
+            assert_eq!(
+                sink.property_payload(descriptor),
+                PayloadRequest::Prefix(METADATA_PROPERTY_PREFIX_BYTES)
+            );
+            assert_eq!(
+                sink.attachment_payload(7, 0, Some(METADATA_ATTACHMENT_PREFIX_BYTES + 1)),
+                PayloadRequest::Prefix(METADATA_ATTACHMENT_PREFIX_BYTES)
+            );
+            assert_eq!(sink.traversal_order(), TraversalOrder::EmbeddedFirst);
+        }
+
+        let mut writer_bytes = Vec::new();
+        let writer =
+            ProtocolSink::start(&mut writer_bytes, false, true).expect("start writer protocol");
+        assert_eq!(writer.traversal_order(), TraversalOrder::Writer);
     }
 
     #[test]
