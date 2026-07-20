@@ -165,6 +165,16 @@ pub struct DirectTopLevelCandidate {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DirectEmbeddedCandidate {
+    pub item_key: String,
+    pub provenance: CatalogProvenance,
+    pub source_node_id: Option<u32>,
+    pub recovery_index: Option<u64>,
+    pub parent_item_key: String,
+    pub parent_attachment_index: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SpooledCandidateTree {
     pub candidates: Vec<SpooledCandidate>,
     pub ownerships: Vec<CandidateOwnership>,
@@ -1418,6 +1428,63 @@ impl DurableCatalogSink {
             },
         )
         .transpose()
+    }
+
+    pub fn direct_embedded_candidates_interruptible(
+        &self,
+        root_item_key: &str,
+        interrupted: &AtomicBool,
+    ) -> Result<Vec<DirectEmbeddedCandidate>, JobError> {
+        check_job_interrupted(Some(interrupted))?;
+        let mut statement = self.connection.prepare(
+            "WITH RECURSIVE tree(item_key) AS (\
+                SELECT item_key FROM candidates \
+                WHERE item_key = ?1 AND parent_item_key IS NULL \
+                  AND status IN ('spooled', 'written', 'unsupported') \
+                UNION \
+                SELECT child.item_key FROM candidates child \
+                JOIN tree parent ON child.parent_item_key = parent.item_key \
+                WHERE child.status IN ('spooled', 'written', 'unsupported')\
+             ) \
+             SELECT child.item_key, child.provenance, child.source_node_id, \
+                    child.recovery_index, child.parent_item_key, \
+                    child.parent_attachment_index \
+             FROM tree member JOIN candidates child ON child.item_key = member.item_key \
+             WHERE child.parent_item_key IS NOT NULL \
+             ORDER BY child.embedded_path_json, child.item_key",
+        )?;
+        let mut query = statement.query([root_item_key])?;
+        let mut candidates = Vec::new();
+        while let Some(row) = query.next()? {
+            check_job_interrupted(Some(interrupted))?;
+            candidates.push(DirectEmbeddedCandidate {
+                item_key: row.get(0)?,
+                provenance: parse_provenance(&row.get::<_, String>(1)?)?,
+                source_node_id: row
+                    .get::<_, Option<i64>>(2)?
+                    .map(|value| checked_u32(value, "candidate source node id"))
+                    .transpose()?,
+                recovery_index: row
+                    .get::<_, Option<i64>>(3)?
+                    .map(|value| checked_u64(value, "candidate recovery index"))
+                    .transpose()?,
+                parent_item_key: row.get::<_, Option<String>>(4)?.ok_or_else(|| {
+                    JobError::Integrity(
+                        "direct embedded candidate has no parent item key".to_owned(),
+                    )
+                })?,
+                parent_attachment_index: row
+                    .get::<_, Option<i64>>(5)?
+                    .map(|value| checked_u32(value, "parent attachment index"))
+                    .transpose()?
+                    .ok_or_else(|| {
+                        JobError::Integrity(
+                            "direct embedded candidate has no parent attachment index".to_owned(),
+                        )
+                    })?,
+            });
+        }
+        Ok(candidates)
     }
 
     pub fn record_worker_event(
@@ -5268,11 +5335,11 @@ mod tests {
     use sha2::{Digest, Sha256};
 
     use super::{
-        CANDIDATE_CHECKPOINT_BATCH, CandidateRejectionCategory, DurableCatalogSink,
-        INLINE_BLOB_MAX_BYTES, INLINE_CACHE_DIRECTORY, JobConfiguration, JobError,
-        JobSourceIdentity, PAYLOAD_PACK_FILENAME, PartSidecar, PublishedPart, WorkerEvent,
-        digest_hex, private_state_attributes_valid, run_sql_interruptible, validate_blob_store,
-        write_hashed, write_sidecar_partial,
+        CANDIDATE_CHECKPOINT_BATCH, CandidateRejectionCategory, DirectEmbeddedCandidate,
+        DurableCatalogSink, INLINE_BLOB_MAX_BYTES, INLINE_CACHE_DIRECTORY, JobConfiguration,
+        JobError, JobSourceIdentity, PAYLOAD_PACK_FILENAME, PartSidecar, PublishedPart,
+        WorkerEvent, digest_hex, private_state_attributes_valid, run_sql_interruptible,
+        validate_blob_store, write_hashed, write_sidecar_partial,
     };
 
     struct PrefixThenError {
@@ -6169,6 +6236,29 @@ mod tests {
             &interrupted,
         )?;
         assert!(end.tree.candidates.is_empty());
+
+        sink.connection.execute(
+            "UPDATE candidates SET status = 'written' WHERE item_key = 'normal:1:-:0'",
+            [],
+        )?;
+        sink.connection.execute(
+            "UPDATE candidates SET status = 'unsupported' \
+             WHERE item_key = 'normal:2000:-:0'",
+            [],
+        )?;
+        let embedded =
+            sink.direct_embedded_candidates_interruptible("normal:1:-:0", &interrupted)?;
+        assert_eq!(
+            embedded,
+            vec![DirectEmbeddedCandidate {
+                item_key: "normal:2000:-:0".to_owned(),
+                provenance: CatalogProvenance::Normal,
+                source_node_id: Some(2_000),
+                recovery_index: None,
+                parent_item_key: "normal:1:-:0".to_owned(),
+                parent_attachment_index: 0,
+            }]
+        );
         Ok(())
     }
 

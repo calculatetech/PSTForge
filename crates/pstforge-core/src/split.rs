@@ -1115,6 +1115,25 @@ fn register_direct_mail_streams(
     Ok(())
 }
 
+fn register_direct_embedded_bindings(
+    job: &DurableCatalogSink,
+    source: &mut DirectProtocolSource<'_>,
+    root_item_key: &str,
+    interrupted: &AtomicBool,
+) -> Result<(), SplitError> {
+    for candidate in job.direct_embedded_candidates_interruptible(root_item_key, interrupted)? {
+        source.register_embedded_message(
+            &candidate.parent_item_key,
+            candidate.parent_attachment_index,
+            &candidate.item_key,
+            candidate.provenance,
+            candidate.source_node_id,
+            candidate.recovery_index,
+        )?;
+    }
+    Ok(())
+}
+
 fn projection_batch_byte_target(maximum_pst_bytes: u64, private_file_eof: u64) -> u64 {
     let finalization_reserve = (maximum_pst_bytes / 16).max(1);
     if private_file_eof >= maximum_pst_bytes.saturating_sub(finalization_reserve) {
@@ -1260,6 +1279,12 @@ fn split_direct_recovered_job(
                         job.checkpoint()?;
                         return Ok(true);
                     }
+                    register_direct_embedded_bindings(
+                        job,
+                        &mut protocol,
+                        &durable_key,
+                        interrupted,
+                    )?;
                     if job.candidate_is_terminal(&durable_key)? {
                         protocol.finish_top_level_message()?;
                         continue;

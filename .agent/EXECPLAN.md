@@ -2666,6 +2666,19 @@ not modified.
       passed at `.agent/test-results/1784531283-fast`. A final fresh
       clean-context adversarial review found no blocker or high
       milestone-relevant issue.
+    - [x] Corrected the first 19 GB direct qualification failure without
+      retaining payload data. The metadata pass cataloged all readable
+      candidates in about three minutes with roughly 260 MiB worker RSS and a
+      zero-byte payload pack, but every full-payload attempt stopped because an
+      unsupported embedded child was absent from the old spooled-only binding
+      tree. Direct binding now traverses the durable catalog beneath the
+      current top-level item for spooled, written, and unsupported descendants,
+      and registers those bindings before a terminal root is drained on retry.
+      A focused regression covers an unsupported child beneath an
+      already-written root. The job and core suites pass (53 and 83 tests), the
+      canonical fast gate passed at
+      `.agent/test-results/1784532127-fast`, and a fresh clean-context review
+      found no blocker or high milestone-relevant issue.
   - [ ] Checkpoint 4: complete direct publication and failure behavior. Keep
     one same-filesystem active PST temporary, independently validate and fsync
     it, atomically rename it into `parts/`, preserve finalized parts on
@@ -2731,6 +2744,19 @@ not modified.
 - [ ] Milestone 1.0.0: MailPlus-Ready Release.
 
 ## Surprises & Discoveries
+
+- Observation: The first default-direct 19 GB qualification reached the full
+  writer pass with no mailbox-sized payload spool, but all three attempts
+  failed with `direct worker message has no embedded catalog identity`.
+  Unsupported embedded descendants remained valid protocol ownership facts
+  even though they were intentionally excluded from PST output; the previous
+  spooled-tree read model omitted them. Retry also requires the same binding
+  facts beneath an already-written top-level root before its replay is drained.
+  A dedicated durable-catalog traversal supplies both cases without loading
+  mailbox-wide identity state.
+  Evidence: `.agent/test-results/1784531559-v045-direct-single-19gb`,
+  focused terminal-state regression, and the clean-context review completed on
+  2026-07-20.
 
 - Observation: The 0.4.2 fidelity expansion regressed a cold 19 GB split from
   approximately ten minutes in 0.4.1 to more than 57 minutes without
