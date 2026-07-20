@@ -547,6 +547,7 @@ fn translate_message(
             continue;
         }
         if property.direct_id.is_some()
+            && property.blob.byte_len < property.declared_byte_len
             && (matches!(id, 0x0E07 | 0x0E1F | 0x1016 | 0x3007 | 0x3008 | 0x3FDE)
                 || mail.placement == CanonicalMessagePlacement::Associated && id == 0x3001)
         {
@@ -689,7 +690,10 @@ fn translate_message(
             omitted_properties = omitted_properties.saturating_add(1);
             continue;
         }
-        if let Some(direct_id) = property.direct_id {
+        if let Some(direct_id) = property
+            .direct_id
+            .filter(|_| property.blob.byte_len < property.declared_byte_len)
+        {
             if writer_stream_type_is_supported(property_type)
                 && property.declared_byte_len <= i32::MAX as u64
                 && body_type_is_valid(id, property_type)
@@ -976,6 +980,7 @@ fn translate_message(
         rtf_in_sync_observed,
         body_text.is_some(),
         &spooled_properties,
+        &direct_properties,
         &mut partial,
         &mut omitted_properties,
     );
@@ -1196,6 +1201,7 @@ fn translate_attachment(
             continue;
         }
         if property.direct_id.is_some()
+            && property.blob.byte_len < property.declared_byte_len
             && (attachment_named_property_name(property).is_some()
                 || matches!(
                     property_id,
@@ -2519,16 +2525,21 @@ fn valid_utf16_word(word: u16, pending_high_surrogate: &mut bool) -> bool {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn contain_body_metadata(
     native_body: &mut Option<NativeBody>,
     rtf_in_sync: &mut bool,
     rtf_in_sync_observed: bool,
     body_text_present: bool,
-    properties: &[SpooledPropertySpec],
+    spooled_properties: &[SpooledPropertySpec],
+    direct_properties: &[DirectPropertySpec],
     partial: &mut bool,
     omitted_properties: &mut u64,
 ) {
-    let has_property = |id| properties.iter().any(|value| value.id == id);
+    let has_property = |id| {
+        spooled_properties.iter().any(|value| value.id == id)
+            || direct_properties.iter().any(|value| value.id == id)
+    };
     if rtf_in_sync_observed && !has_property(0x1009) {
         *rtf_in_sync = false;
         *partial = true;
@@ -2812,9 +2823,9 @@ mod tests {
         attachment_mime::flat_signature as mime_from_signature, load_canonical_mail,
     };
     use pstforge_pst::writer::{
-        AttachmentContent, AttachmentReferenceMethod, DirectBlobSpec, MailFolderRole,
-        NamedProperty, NamedPropertyName, NamedPropertySet, NativeBody, OleDataKind,
-        RawPropertyValue, validate_mail_store_input,
+        AttachmentContent, AttachmentReferenceMethod, DirectBlobSpec, DirectPropertySpec,
+        MailFolderRole, NamedProperty, NamedPropertyName, NamedPropertySet, NativeBody,
+        OleDataKind, RawPropertyValue, validate_mail_store_input,
     };
 
     #[test]
@@ -4959,6 +4970,7 @@ mod tests {
             true,
             false,
             &[],
+            &[],
             &mut body_partial,
             &mut body_omissions,
         );
@@ -4977,11 +4989,39 @@ mod tests {
             true,
             false,
             &[],
+            &[],
             &mut false_sync_partial,
             &mut false_sync_omissions,
         );
         assert!(false_sync_partial);
         assert_eq!(false_sync_omissions, 1);
+
+        let mut direct_native_body = Some(NativeBody::Rtf);
+        let mut direct_sync = true;
+        let mut direct_partial = false;
+        let mut direct_omissions = 0;
+        contain_body_metadata(
+            &mut direct_native_body,
+            &mut direct_sync,
+            true,
+            false,
+            &[],
+            &[DirectPropertySpec {
+                id: 0x1009,
+                property_type: 0x0102,
+                blob: DirectBlobSpec {
+                    id: 1,
+                    byte_len: 16,
+                    sha256: None,
+                },
+            }],
+            &mut direct_partial,
+            &mut direct_omissions,
+        );
+        assert_eq!(direct_native_body, Some(NativeBody::Rtf));
+        assert!(direct_sync);
+        assert!(!direct_partial);
+        assert_eq!(direct_omissions, 0);
 
         assert!(valid_utf16_stream(&mut Cursor::new([
             0x3D, 0xD8, 0x00, 0xDE, 0, 0,

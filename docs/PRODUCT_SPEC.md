@@ -133,6 +133,11 @@ finalized parts, manifests, compact ledger, and `recovery.log` remain valid and
 `report` can inspect them, but the job cannot resume. Rerunning direct recovery
 requires a new empty output directory. This avoids duplicating candidates
 across already published parts without reintroducing restartable payload state.
+The full-payload parser receives at most three clean attempts. A later attempt
+drains candidates already assigned to finalized parts and rebuilds only the
+unpublished active part. Exhausting those attempts produces a typed
+`failed-partial` result with the same non-resumable retained-state contract;
+it never reports an unfinished candidate as written.
 
 PSTForge owns only ledger-tracked output names. It ignores and preserves
 untracked files placed in the public `parts/` directory, including human

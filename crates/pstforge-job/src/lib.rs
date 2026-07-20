@@ -156,6 +156,15 @@ pub struct CandidateOwnership {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DirectTopLevelCandidate {
+    pub rowid: i64,
+    pub item_key: String,
+    pub provenance: CatalogProvenance,
+    pub source_node_id: Option<u32>,
+    pub recovery_index: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SpooledCandidateTree {
     pub candidates: Vec<SpooledCandidate>,
     pub ownerships: Vec<CandidateOwnership>,
@@ -816,6 +825,19 @@ impl DurableCatalogSink {
         sync_directory(&self.private_root)
     }
 
+    pub fn reconcile_pending_publications(&mut self) -> Result<(), JobError> {
+        self.commit_candidate_batch()?;
+        reconcile_publications(
+            &mut self.connection,
+            &self._partial_directory,
+            &self._manifests_directory,
+            &self.partial,
+            &self.parts,
+            &self.manifests,
+            None,
+        )
+    }
+
     fn begin_candidate(&self) -> Result<(), JobError> {
         if !self.batch_open.get() {
             self.connection.execute_batch("BEGIN IMMEDIATE")?;
@@ -1211,6 +1233,25 @@ impl DurableCatalogSink {
         Ok(())
     }
 
+    pub fn record_direct_terminal_failure(&self, category: &str) -> Result<(), JobError> {
+        if self.active.is_some()
+            || !matches!(
+                category,
+                "worker_crash" | "worker_stall" | "worker_protocol"
+            )
+        {
+            return Err(JobError::EventSequence(
+                "cannot record invalid direct terminal failure".to_owned(),
+            ));
+        }
+        self.connection.execute(
+            "INSERT OR REPLACE INTO job_metadata(key, value) \
+             VALUES ('direct_terminal_failure', ?1)",
+            [category],
+        )?;
+        Ok(())
+    }
+
     pub fn worker_supervision(&self) -> Result<(u32, u32), JobError> {
         let attempts = read_optional_metadata_u32(&self.connection, "worker_attempts")?;
         let failures = read_optional_metadata_u32(&self.connection, "worker_failures")?;
@@ -1318,6 +1359,65 @@ impl DurableCatalogSink {
                 })
             })
             .collect()
+    }
+
+    pub fn candidate_is_terminal(&self, item_key: &str) -> Result<bool, JobError> {
+        let status = self
+            .connection
+            .query_row(
+                "SELECT status FROM candidates WHERE item_key = ?1 \
+                 AND status IN ('spooled', 'written', 'unsupported')",
+                [item_key],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?
+            .ok_or_else(|| {
+                JobError::Integrity(format!(
+                    "direct worker candidate {item_key} is absent from the catalog"
+                ))
+            })?;
+        Ok(matches!(status.as_str(), "written" | "unsupported"))
+    }
+
+    pub fn next_direct_top_level_candidate(
+        &self,
+        after_rowid: i64,
+    ) -> Result<Option<DirectTopLevelCandidate>, JobError> {
+        let row = self
+            .connection
+            .query_row(
+                "SELECT rowid, item_key, provenance, source_node_id, recovery_index \
+                 FROM candidates WHERE rowid > ?1 AND parent_item_key IS NULL \
+                 AND status IN ('spooled', 'written', 'unsupported') \
+                 ORDER BY rowid LIMIT 1",
+                [after_rowid],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, Option<i64>>(3)?,
+                        row.get::<_, Option<i64>>(4)?,
+                    ))
+                },
+            )
+            .optional()?;
+        row.map(
+            |(rowid, item_key, provenance, source_node_id, recovery_index)| {
+                Ok(DirectTopLevelCandidate {
+                    rowid,
+                    item_key,
+                    provenance: parse_provenance(&provenance)?,
+                    source_node_id: source_node_id
+                        .map(|value| checked_u32(value, "candidate source node id"))
+                        .transpose()?,
+                    recovery_index: recovery_index
+                        .map(|value| checked_u64(value, "candidate recovery index"))
+                        .transpose()?,
+                })
+            },
+        )
+        .transpose()
     }
 
     pub fn record_worker_event(
@@ -2589,7 +2689,12 @@ impl DurableCatalogSink {
         if active.record {
             let captured_size = self.captured_property_bytes(descriptor.data_size);
             let blob = self.finish_blob(active.blob, Some(captured_size))?;
-            let direct_id = (captured_size < descriptor.data_size)
+            let stream_type = descriptor
+                .value_type
+                .is_some_and(|value| matches!(value, 0x001E | 0x001F | 0x0102));
+            let direct_id = (matches!(self.capture_mode, CatalogCaptureMode::Bounded { .. })
+                && (captured_size < descriptor.data_size
+                    || (active.named_property.is_none() && stream_type)))
                 .then(|| self.take_direct_blob_id())
                 .transpose()?;
             let mut metadata = property_json(descriptor, active.named_property.as_ref());
@@ -2624,7 +2729,9 @@ impl DurableCatalogSink {
                 }
             });
             let blob = self.finish_blob(blob, captured_expected)?;
-            let direct_id = if complete && active.expected.is_some_and(|expected| actual < expected)
+            let direct_id = if matches!(self.capture_mode, CatalogCaptureMode::Bounded { .. })
+                && complete
+                && active.expected != Some(0)
             {
                 Some(self.take_direct_blob_id()?)
             } else {

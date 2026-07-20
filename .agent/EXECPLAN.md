@@ -2594,6 +2594,78 @@ not modified.
       Focused tests cover transactional inline capture, logical-size
       accounting, direct descriptor identity, named-property containment,
       retry continuity, and zero payload-pack growth.
+    - [x] Added the bounded second-pass protocol reader. It reconstructs the
+      same durable message identities as the metadata pass, skips payload
+      streams the writer did not select, exposes a requested stream as a
+      bounded `Read`, and stops exactly at the next protocol control frame.
+      The transactional writer no longer assumes messages arrive grouped by
+      folder: normal and associated contents rows retain their explicit parent
+      folder node and finalization groups them by that relationship. Completed
+      validation obtains message node IDs from the emitted table rows rather
+      than predicting IDs from folder iteration. Focused regressions cover
+      omitted-stream skipping and interleaved `A, B, A` source traversal with
+      normal and associated messages; the complete writer and core suites pass
+      (98 writer tests plus one ignored multi-gigabyte case, and 82 core
+      tests).
+    - [x] Connected the default direct path for both balanced and aggressive
+      PST output. The bounded metadata pass fixes the folder and named-property
+      catalogs; the supervised writer-order pass registers each selected
+      direct stream, projects exact final EOF before opening it, streams it
+      once into the active transactional PST, and publishes through the
+      existing independent-validation and atomic-ledger path. Direct output
+      refreshes the worker watchdog during payload and discard chunks, refuses
+      a requested stream that is absent before the current top-level message
+      ends, requires protocol EOF, and rechecks filesystem capacity against
+      exact incremental PST growth. Fully captured metadata remains inline;
+      replay-required properties and attachments use direct IDs without
+      changing native-body containment. Real external document, named
+      property, OLE, and reference-attachment cases are byte-identical to
+      restartable output and have complete accounting. The public Enron and
+      focused PIM fixtures cannot serve as boundary evidence because both the
+      accepted restartable path and direct path hit the same pre-existing deep
+      embedded validation failures before publication; no milestone conclusion
+      is drawn from those cases. The complete job/core/writer suites pass, and
+      the fast gate passed at `.agent/test-results/1784528600-fast`.
+    - [x] Closed the direct-stream supervision review findings. The full-payload
+      pass now binds every embedded message through its durable parent item key
+      and attachment index, while top-level duplicates retain their cataloged
+      occurrence; it no longer reconstructs embedded keys from traversal
+      order. The watchdog remains active until the child is reaped, so a worker
+      that emits completion and then hangs is still killed. Direct parsing gets
+      at most three clean attempts: later attempts drain already-written and
+      already-unsupported top-level candidates, rebuild only the unpublished
+      active part, and retain atomically published parts. Exhaustion is a typed
+      `failed-partial` terminal result with a retained compact ledger and
+      recovery log, not an opaque error or a resumable state. A one-time
+      injected abort on the external document case recovered on the second
+      metadata pass and second direct pass, wrote its sole candidate exactly
+      once, and completed without omissions. A direct-only abort on every
+      attempt stopped after three failures with zero published candidates,
+      exit status 1, unchanged source identity, and
+      `Terminal failure: worker_protocol` in `recovery.log`. A follow-up
+      clean-context review found that raw pipe EOF inside an opened payload
+      escaped as an ordinary writer I/O error and that all-candidate identity
+      maps were retained unnecessarily. Worker payload I/O now carries a typed
+      marker into the retry classifier. An injected abort one byte into a real
+      OLE payload failed the first full-payload pass, rebuilt the unpublished
+      part, and completed on the second pass with one exact candidate, no
+      omissions, and no terminal failure. Top-level identity is resolved
+      incrementally from an indexed, scalar SQLite row cursor; ledger terminal
+      status is queried by durable key, and embedded/message stream bindings
+      are registered only for the current top-level tree and cleared when it
+      drains. No all-candidate identity, terminal-key, or occurrence map remains
+      in supervisor RAM. A staged-file cleanup guard removes the unpublished
+      active PST on retry, exhaustion, interruption, or any other unwind;
+      every-attempt failure evidence retains only compact ledger state and a
+      zero-byte payload pack. Ledger interruption during publication now
+      reconciles the intent and rename state before building the terminal
+      interrupted snapshot, so an atomically published part cannot be omitted
+      from the report or assigned twice.
+      The affected suites pass (83 core, 53 job, 98 writer plus the intentional
+      ignored multi-gigabyte case, and 8 CLI tests), and the canonical fast gate
+      passed at `.agent/test-results/1784531283-fast`. A final fresh
+      clean-context adversarial review found no blocker or high
+      milestone-relevant issue.
   - [ ] Checkpoint 4: complete direct publication and failure behavior. Keep
     one same-filesystem active PST temporary, independently validate and fsync
     it, atomically rename it into `parts/`, preserve finalized parts on
@@ -4322,6 +4394,25 @@ not modified.
   Date/Author: 2026-07-19 / clean-context review followed by focused writer
   regression and independent completed-store evidence.
 
+- Observation: Parser traversal order is not a durable message identity.
+  Metadata traversal may defer embedded messages while writer traversal emits
+  them recursively, so occurrence counts over a mixed traversal can bind a
+  corrupt duplicate to the wrong payload. Direct streaming now resolves a
+  child from its already-resolved durable parent plus attachment index and
+  source identity; only top-level duplicates use their stable catalog
+  occurrence.
+  Date/Author: 2026-07-20 / clean-context adversarial review and focused
+  duplicate-parent protocol regression.
+
+- Observation: `Read` errors from a worker pipe and I/O errors writing the
+  destination PST share the writer's public I/O error variant. Without a typed
+  inner marker, a mid-payload native crash bypasses parser retry while a broad
+  retry rule would incorrectly retry disk failures. Direct payload readers now
+  wrap only worker-stream I/O with a private typed marker; output I/O remains a
+  terminal output failure.
+  Date/Author: 2026-07-20 / clean-context adversarial review and injected OLE
+  payload abort.
+
 - Decision: Make low-write non-restartable streaming the default PST-output
   execution mode for every supported recovery policy. Balanced and aggressive
   select source-recovery breadth, not persistence. Add `--restartable` as the
@@ -4348,6 +4439,18 @@ not modified.
   retained-job write amplification; clarified 2026-07-20 for every supported
   recovery policy. The first scale acceptance is one direct PST from the 19 GB
   source with exact 1:1 content accounting and clean ScanPST/Outlook results.
+
+- Decision: A direct full-payload worker failure receives at most three clean
+  parser attempts. Finalized parts and terminal candidate classifications are
+  drained on a later attempt; the unpublished active part is discarded and
+  rebuilt. If all attempts fail, preserve finalized output and compact ledger
+  state, emit a typed `failed-partial` report and recovery log, refuse resume,
+  and require a new empty output directory.
+  Rationale: Direct mode deliberately avoids mailbox-sized restart state, but
+  native parser faults must remain contained and observable. Replaying only
+  the current unpublished part gives bounded fault recovery without duplicating
+  published candidates or reintroducing payload-spool write amplification.
+  Date/Author: 2026-07-20 / clean-context adversarial review.
 
 - Decision: Hash the complete source once at invocation open, match that hash
   before trusting resume state, and use held-descriptor/path identity including

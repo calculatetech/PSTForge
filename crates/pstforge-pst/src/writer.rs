@@ -457,7 +457,6 @@ pub enum TransactionAppend {
 pub struct TransactionBatchCheckpoint {
     message_stream: MessageAppendCheckpoint,
     folder_lengths: Vec<(usize, usize)>,
-    last_order: Option<(MailFolderLocation, Vec<String>, bool)>,
 }
 
 struct StoreInput<'a> {
@@ -946,8 +945,8 @@ impl MessageAppendCheckpoint {
         next_value_node: &mut u32,
         written: &mut Vec<WrittenBlock>,
         streamed_subnodes: &mut Vec<NodeId>,
-        contents_rows: &mut Vec<TableRowSpec>,
-        associated_rows: &mut Vec<TableRowSpec>,
+        contents_rows: &mut Vec<(NodeId, TableRowSpec)>,
+        associated_rows: &mut Vec<(NodeId, TableRowSpec)>,
         top_nodes: &mut Vec<TopMessageNode>,
     ) -> Result<(), WriterError> {
         file.set_len(self.file_len)?;
@@ -972,8 +971,8 @@ impl MessageAppendCheckpoint {
         next_value_node: &mut u32,
         written: &mut Vec<WrittenBlock>,
         streamed_subnodes: &mut Vec<NodeId>,
-        contents_rows: &mut Vec<TableRowSpec>,
-        associated_rows: &mut Vec<TableRowSpec>,
+        contents_rows: &mut Vec<(NodeId, TableRowSpec)>,
+        associated_rows: &mut Vec<(NodeId, TableRowSpec)>,
         top_nodes: &mut Vec<TopMessageNode>,
     ) {
         *allocation_cursor = self.allocation_cursor;
@@ -1009,6 +1008,7 @@ impl BlockStream<'_> {
     }
 }
 
+#[derive(Clone)]
 struct TableRowSpec {
     id: NodeId,
     values: Vec<(u16, PropertyValue)>,
@@ -3014,8 +3014,8 @@ struct MessageStreamState {
     streamed_subnodes: Vec<NodeId>,
     next_block_index: u64,
     next_value_node: u32,
-    contents_rows: Vec<TableRowSpec>,
-    associated_rows: Vec<TableRowSpec>,
+    contents_rows: Vec<(NodeId, TableRowSpec)>,
+    associated_rows: Vec<(NodeId, TableRowSpec)>,
     top_nodes: Vec<TopMessageNode>,
 }
 
@@ -3119,20 +3119,22 @@ impl MessageStreamState {
             &mut direct_completions,
         )?;
         if associated {
-            self.associated_rows.push(associated_message_table_row(
-                message_node,
-                message_spec,
-                associated_columns,
+            self.associated_rows.push((
+                parent,
+                associated_message_table_row(message_node, message_spec, associated_columns),
             ));
         } else {
-            self.contents_rows.push(message_table_row(
-                message_node,
-                message_spec,
-                store_record_key,
-                message.record_key,
-                message.message_size,
-                contents_columns,
-            )?);
+            self.contents_rows.push((
+                parent,
+                message_table_row(
+                    message_node,
+                    message_spec,
+                    store_record_key,
+                    message.record_key,
+                    message.message_size,
+                    contents_columns,
+                )?,
+            ));
         }
         self.top_nodes.push(TopMessageNode {
             node: message_node,
@@ -3239,8 +3241,6 @@ fn build_finalization_plan(
     let mut next_block_index = message_stream.next_block_index;
     let mut folder_blocks = Vec::new();
     let mut top_folders = Vec::with_capacity(folder_plans.len());
-    let mut row_start = 0_usize;
-    let mut associated_row_start = 0_usize;
     for (index, folder) in folder_plans.iter().enumerate() {
         check_interrupted(interrupted)?;
         let unread_count = folder_unread_count(&folder.messages)?;
@@ -3299,11 +3299,10 @@ fn build_finalization_plan(
             block
         };
 
-        let row_end = row_start
-            .checked_add(folder.messages.len())
-            .ok_or(WriterError::ValueTooLarge("folder row range"))?;
-        let rows = &contents_rows[row_start..row_end];
-        row_start = row_end;
+        let rows = contents_rows
+            .iter()
+            .filter_map(|(parent, row)| (*parent == folder.node).then_some((*row).clone()))
+            .collect::<Vec<_>>();
         let (contents_block, contents_subnode) = if rows.is_empty() {
             (leaf_bid(5)?, None)
         } else if rows.len() == 1 {
@@ -3312,7 +3311,7 @@ fn build_finalization_plan(
             } else {
                 take_block_id(&mut next_block_index, false)?
             };
-            match table_context(contents_columns, rows) {
+            match table_context(contents_columns, &rows) {
                 Ok(table) => {
                     folder_blocks.push(BlockSpec {
                         id: block,
@@ -3323,7 +3322,7 @@ fn build_finalization_plan(
                 }
                 Err(WriterError::ValueTooLarge("heap page")) => {
                     let contents =
-                        table_context_external(contents_columns, rows, &mut next_block_index)?;
+                        table_context_external(contents_columns, &rows, &mut next_block_index)?;
                     let data = contents.data_block;
                     let subnode = contents.subnode_block;
                     folder_blocks.extend(contents.blocks);
@@ -3332,22 +3331,21 @@ fn build_finalization_plan(
                 Err(error) => return Err(error),
             }
         } else {
-            let contents = table_context_external(contents_columns, rows, &mut next_block_index)?;
+            let contents = table_context_external(contents_columns, &rows, &mut next_block_index)?;
             let data = contents.data_block;
             let subnode = contents.subnode_block;
             folder_blocks.extend(contents.blocks);
             (data, Some(subnode))
         };
-        let associated_row_end = associated_row_start
-            .checked_add(folder.associated_messages.len())
-            .ok_or(WriterError::ValueTooLarge("associated folder row range"))?;
-        let rows = &associated_rows[associated_row_start..associated_row_end];
-        associated_row_start = associated_row_end;
+        let rows = associated_rows
+            .iter()
+            .filter_map(|(parent, row)| (*parent == folder.node).then_some((*row).clone()))
+            .collect::<Vec<_>>();
         let (associated_block, associated_subnode) = if rows.is_empty() {
             (leaf_bid(13)?, None)
         } else if rows.len() == 1 {
             let block = take_block_id(&mut next_block_index, false)?;
-            match table_context(associated_columns, rows) {
+            match table_context(associated_columns, &rows) {
                 Ok(table) => {
                     folder_blocks.push(BlockSpec {
                         id: block,
@@ -3358,7 +3356,7 @@ fn build_finalization_plan(
                 }
                 Err(WriterError::ValueTooLarge("heap page")) => {
                     let associated =
-                        table_context_external(associated_columns, rows, &mut next_block_index)?;
+                        table_context_external(associated_columns, &rows, &mut next_block_index)?;
                     let data = associated.data_block;
                     let subnode = associated.subnode_block;
                     folder_blocks.extend(associated.blocks);
@@ -3368,7 +3366,7 @@ fn build_finalization_plan(
             }
         } else {
             let associated =
-                table_context_external(associated_columns, rows, &mut next_block_index)?;
+                table_context_external(associated_columns, &rows, &mut next_block_index)?;
             let data = associated.data_block;
             let subnode = associated.subnode_block;
             folder_blocks.extend(associated.blocks);
@@ -3671,7 +3669,6 @@ pub struct TransactionalMailStoreWriter {
     spec: MailStoreSpec,
     named_identities: Vec<NamedIdentity>,
     message_stream: MessageStreamState,
-    last_order: Option<(MailFolderLocation, Vec<String>, bool)>,
     preserve_empty_folders: bool,
     validator_supervisor: Option<PathBuf>,
 }
@@ -3715,7 +3712,6 @@ impl TransactionalMailStoreWriter {
             spec: layout,
             named_identities: named_properties.identities.iter().cloned().collect(),
             message_stream: MessageStreamState::new(0),
-            last_order: None,
             preserve_empty_folders,
             validator_supervisor: validator_supervisor.map(Path::to_path_buf),
         })
@@ -3731,7 +3727,6 @@ impl TransactionalMailStoreWriter {
                 .iter()
                 .map(|folder| (folder.messages.len(), folder.associated_messages.len()))
                 .collect(),
-            last_order: self.last_order.clone(),
         }
     }
 
@@ -3753,7 +3748,6 @@ impl TransactionalMailStoreWriter {
             folder.messages.truncate(messages);
             folder.associated_messages.truncate(associated_messages);
         }
-        self.last_order = checkpoint.last_order;
         Ok(())
     }
 
@@ -3806,16 +3800,6 @@ impl TransactionalMailStoreWriter {
         if message_contains_spooled_values(message) {
             return Err(WriterError::InvalidStructure(
                 "direct projection cannot consume spooled values".to_owned(),
-            ));
-        }
-        let order = (location, path.to_vec(), associated);
-        if self
-            .last_order
-            .as_ref()
-            .is_some_and(|previous| previous > &order)
-        {
-            return Err(WriterError::InvalidStructure(
-                "transactional messages are not in canonical folder and placement order".to_owned(),
             ));
         }
         let message_identities = collect_named_identities(message);
@@ -3924,16 +3908,6 @@ impl TransactionalMailStoreWriter {
         validate_aggregate_properties(&message)?;
         validate_message(&message, 0)?;
         validate_message_size_bound(&message)?;
-        let order = (location, path.to_vec(), associated);
-        if self
-            .last_order
-            .as_ref()
-            .is_some_and(|previous| previous > &order)
-        {
-            return Err(WriterError::InvalidStructure(
-                "transactional messages are not in canonical folder and placement order".to_owned(),
-            ));
-        }
         let message_identities = collect_named_identities(&message);
         if message_identities
             .iter()
@@ -3998,10 +3972,7 @@ impl TransactionalMailStoreWriter {
         })();
 
         match result {
-            Ok(completions) => {
-                self.last_order = Some(order);
-                Ok(completions)
-            }
+            Ok(completions) => Ok(completions),
             Err(error) => {
                 if associated {
                     self.spec.folders[folder_index].associated_messages.pop();
@@ -4159,7 +4130,6 @@ impl TransactionalMailStoreWriter {
             spec,
             named_identities,
             message_stream,
-            last_order: _,
             preserve_empty_folders,
             validator_supervisor,
         } = self;
@@ -4280,6 +4250,10 @@ impl TransactionalMailStoreWriter {
             spam_search,
             interrupted,
         )?;
+        let first_message_node = message_stream
+            .contents_rows
+            .iter()
+            .find_map(|(parent, row)| (*parent == first_parent).then_some(row.id));
         let MessageStreamState {
             file_len: _,
             mut allocation_cursor,
@@ -4349,8 +4323,19 @@ impl TransactionalMailStoreWriter {
         }
         check_interrupted(interrupted)?;
         if !input.associated {
-            validate_completed_store(&validated_path, &input, first_parent, &named_identities)
-                .map_err(completed_validation_error)?;
+            let first_message_node = first_message_node.ok_or_else(|| {
+                WriterError::InvalidStructure(
+                    "transactional first normal message row was not retained".to_owned(),
+                )
+            })?;
+            validate_completed_store(
+                &validated_path,
+                &input,
+                first_parent,
+                first_message_node,
+                &named_identities,
+            )
+            .map_err(completed_validation_error)?;
         }
         check_interrupted(interrupted)?;
         validate_completed_folder_store(&validated_path, spec.record_key, &folder_plans)
@@ -4484,22 +4469,22 @@ fn create_flat_store(
             &mut direct_completions,
         )?;
         if associated {
-            message_stream
-                .associated_rows
-                .push(associated_message_table_row(
+            message_stream.associated_rows.push((
+                top_level_messages[0].1,
+                associated_message_table_row(message_node, message_spec, &associated_columns),
+            ));
+        } else {
+            message_stream.contents_rows.push((
+                top_level_messages[0].1,
+                message_table_row(
                     message_node,
                     message_spec,
-                    &associated_columns,
-                ));
-        } else {
-            message_stream.contents_rows.push(message_table_row(
-                message_node,
-                message_spec,
-                spec.record_key,
-                message.record_key,
-                message.message_size,
-                &contents_columns,
-            )?);
+                    spec.record_key,
+                    message.record_key,
+                    message.message_size,
+                    &contents_columns,
+                )?,
+            ));
         }
         message_stream.top_nodes.push(TopMessageNode {
             node: message_node,
@@ -4628,6 +4613,7 @@ fn create_flat_store(
             &validated_path,
             spec,
             top_level_messages[0].1,
+            node(NodeIdType::NormalMessage, MESSAGE_INDEX)?,
             &named_identities,
         )
         .map_err(completed_validation_error)?;
@@ -6605,6 +6591,7 @@ fn validate_completed_store(
     path: &Path,
     spec: &StoreInput<'_>,
     mail: NodeId,
+    message: NodeId,
     named_identities: &[NamedIdentity],
 ) -> Result<(), WriterError> {
     use crate::{ltp::prop_context::PropertyValue as ReadValue, messaging::store::EntryId};
@@ -6615,7 +6602,6 @@ fn validate_completed_store(
         return Err(invalid("completed store display name mismatch"));
     }
 
-    let message = node(NodeIdType::NormalMessage, MESSAGE_INDEX)?;
     let mail_entry = store.properties().make_entry_id(mail)?;
     let folder = store.open_folder(&mail_entry)?;
     let contents = folder
@@ -6787,6 +6773,7 @@ fn validate_completed_store(
         message.properties().get(0x007D),
     ) {
         (Some(expected), Some(ReadValue::Unicode(actual))) if actual.to_string() == *expected => {}
+        (None, Some(_)) if message_has_streamed_property(spec.message, 0x007D) => {}
         (None, None) => {}
         _ => return Err(invalid("completed store Internet headers mismatch")),
     }
@@ -6960,7 +6947,6 @@ fn validate_completed_folder_store(
     let root = store.open_folder(&store.properties().make_entry_id(root_node)?)?;
     let ipm_node = node(NodeIdType::NormalFolder, IPM_FOLDER_INDEX)?;
     let ipm = store.open_folder(&store.properties().make_entry_id(ipm_node)?)?;
-    let mut message_index = 0_u32;
     for folder_plan in folders {
         let actual_parent = if let Some(parent) = folder_plan.parent {
             store.open_folder(&store.properties().make_entry_id(folders[parent].node)?)?
@@ -7016,21 +7002,17 @@ fn validate_completed_folder_store(
         if contents.rows_matrix().count() != folder_plan.messages.len() {
             return Err(invalid("completed folder message count mismatch"));
         }
-        for expected in &folder_plan.messages {
-            let message = node(
-                NodeIdType::NormalMessage,
-                MESSAGE_INDEX
-                    .checked_add(message_index)
-                    .ok_or(WriterError::ValueTooLarge("message node"))?,
-            )?;
-            message_index = message_index
-                .checked_add(1)
-                .ok_or(WriterError::ValueTooLarge("message count"))?;
-            let row = contents
-                .find_row(crate::ltp::table_context::TableRowId::new(u32::from(
-                    message,
-                )))
-                .map_err(|_| invalid("completed store message is not indexed"))?;
+        for (expected, row) in folder_plan.messages.iter().zip(contents.rows_matrix()) {
+            let message = NodeId::from(u32::from(row.id()));
+            if message
+                .id_type()
+                .map_err(|_| invalid("completed store message row has an invalid node"))?
+                != NodeIdType::NormalMessage
+            {
+                return Err(invalid(
+                    "completed normal contents row is not a message node",
+                ));
+            }
             let values = row.columns(contents.context())?;
             let subject = contents
                 .context()
@@ -7124,22 +7106,22 @@ fn validate_completed_folder_store(
                 "completed folder associated message count mismatch",
             ));
         }
-        for expected in &folder_plan.associated_messages {
+        for (expected, row) in folder_plan
+            .associated_messages
+            .iter()
+            .zip(associated.rows_matrix())
+        {
             let expected_display_name = associated_display_name(expected);
-            let message = node(
-                NodeIdType::AssociatedMessage,
-                MESSAGE_INDEX
-                    .checked_add(message_index)
-                    .ok_or(WriterError::ValueTooLarge("associated message node"))?,
-            )?;
-            message_index = message_index
-                .checked_add(1)
-                .ok_or(WriterError::ValueTooLarge("message count"))?;
-            let row = associated
-                .find_row(crate::ltp::table_context::TableRowId::new(u32::from(
-                    message,
-                )))
-                .map_err(|_| invalid("completed associated message is not indexed"))?;
+            let message = NodeId::from(u32::from(row.id()));
+            if message
+                .id_type()
+                .map_err(|_| invalid("completed associated row has an invalid node"))?
+                != NodeIdType::AssociatedMessage
+            {
+                return Err(invalid(
+                    "completed associated contents row is not an associated message node",
+                ));
+            }
             let values = row.columns(associated.context())?;
             let subject = associated
                 .context()
@@ -7221,6 +7203,31 @@ fn validate_spooled_attachment_identities(
     use std::rc::Rc;
 
     let invalid = |message: &str| WriterError::InvalidStructure(message.to_owned());
+    let indexed = crate::open_store(path)?;
+    let mut indexed_messages = Vec::new();
+    for folder in folders {
+        let opened = indexed.open_folder(&indexed.properties().make_entry_id(folder.node)?)?;
+        let contents = opened
+            .contents_table()
+            .ok_or_else(|| invalid("completed folder contents table is missing"))?;
+        indexed_messages.extend(
+            folder
+                .messages
+                .iter()
+                .zip(contents.rows_matrix())
+                .map(|(message, row)| (message, false, NodeId::from(u32::from(row.id())))),
+        );
+        let associated = opened
+            .associated_table()
+            .ok_or_else(|| invalid("completed folder associated table is missing"))?;
+        indexed_messages.extend(
+            folder
+                .associated_messages
+                .iter()
+                .zip(associated.rows_matrix())
+                .map(|(message, row)| (message, true, NodeId::from(u32::from(row.id())))),
+        );
+    }
     let pst = Rc::new(UnicodePstFile::open(path)?);
     let store = UnicodeStore::read(pst)?;
     let all_messages = folders
@@ -7234,19 +7241,7 @@ fn validate_spooled_attachment_identities(
         .copied()
         .collect::<Vec<_>>();
     let named_identities = collect_named_identities_many_refs(&all_messages);
-    let mut message_index = 0_u32;
-    for (message_spec, associated) in folders.iter().flat_map(|folder| {
-        folder
-            .messages
-            .iter()
-            .map(|message| (message, false))
-            .chain(
-                folder
-                    .associated_messages
-                    .iter()
-                    .map(|message| (message, true)),
-            )
-    }) {
+    for (message_spec, associated, message_node) in indexed_messages {
         let streamed_ids = message_spec
             .spooled_properties
             .iter()
@@ -7258,19 +7253,6 @@ fn validate_spooled_attachment_identities(
                     .map(|property| property.id),
             )
             .collect::<Vec<_>>();
-        let message_node = node(
-            if associated {
-                NodeIdType::AssociatedMessage
-            } else {
-                NodeIdType::NormalMessage
-            },
-            MESSAGE_INDEX
-                .checked_add(message_index)
-                .ok_or(WriterError::ValueTooLarge("message node"))?,
-        )?;
-        message_index = message_index
-            .checked_add(1)
-            .ok_or(WriterError::ValueTooLarge("message count"))?;
         let message = UnicodeMessage::read_with_streamed_properties(
             store.clone(),
             &EntryId::new(
@@ -12220,6 +12202,7 @@ mod tests {
             &destination,
             &expected_input,
             expected_plans[0].node,
+            node(NodeIdType::NormalMessage, MESSAGE_INDEX)?,
             &expected_identities,
         );
         assert!(
@@ -12715,6 +12698,68 @@ mod tests {
             Sha256::digest(std::fs::read(transaction_path)?),
             Sha256::digest(std::fs::read(expected_path)?)
         );
+        Ok(())
+    }
+
+    #[test]
+    fn transactional_source_order_keeps_interleaved_folder_and_placement_membership()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let output = directory.path().join("interleaved.pst");
+        let fixture = FidelityStore::default();
+        let mut first = fixture.message.clone();
+        first.subject = "A normal first".to_owned();
+        let mut second = fixture.message.clone();
+        second.subject = "B normal".to_owned();
+        let mut associated = fixture.message.clone();
+        associated.subject = "A associated".to_owned();
+        let mut last = fixture.message.clone();
+        last.subject = "A normal last".to_owned();
+        let folders = vec![
+            MailFolderSpec {
+                path: vec!["A".to_owned()],
+                location: MailFolderLocation::IpmSubtree,
+                role: MailFolderRole::Ordinary,
+                container_class: "IPF.Note".to_owned(),
+                messages: Vec::new(),
+                associated_messages: Vec::new(),
+            },
+            MailFolderSpec {
+                path: vec!["B".to_owned()],
+                location: MailFolderLocation::IpmSubtree,
+                role: MailFolderRole::Ordinary,
+                container_class: "IPF.Note".to_owned(),
+                messages: Vec::new(),
+                associated_messages: Vec::new(),
+            },
+        ];
+        let mut catalog = NamedPropertyCatalog::default();
+        for message in [&first, &second, &associated, &last] {
+            catalog.observe_message(message);
+        }
+        let layout = MailStoreSpec {
+            store_name: fixture.store_name,
+            record_key: fixture.record_key,
+            folders,
+        };
+        let mut writer =
+            TransactionalMailStoreWriter::begin(&output, layout, &catalog, true, None)?;
+        for (path, is_associated, message) in [
+            (&["A".to_owned()][..], false, first),
+            (&["B".to_owned()][..], false, second),
+            (&["A".to_owned()][..], true, associated),
+            (&["A".to_owned()][..], false, last),
+        ] {
+            writer.append_message_deferred(
+                MailFolderLocation::IpmSubtree,
+                path,
+                is_associated,
+                message,
+                &NEVER_INTERRUPTED,
+            )?;
+        }
+        writer.finalize(&NEVER_INTERRUPTED)?;
+        assert!(output.metadata()?.len() > 0);
         Ok(())
     }
 

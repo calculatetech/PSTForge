@@ -635,6 +635,91 @@ struct WorkerProcess {
     watchdog: AttemptWatchdog,
 }
 
+pub(crate) struct DirectWorkerProcess {
+    worker: WorkerProcess,
+}
+
+#[derive(Clone)]
+pub(crate) struct WorkerProgress {
+    sender: SyncSender<WatchdogSignal>,
+}
+
+impl WorkerProgress {
+    pub(crate) fn notify(&self) {
+        match self.sender.try_send(WatchdogSignal::Progress) {
+            Ok(()) | Err(TrySendError::Full(_)) | Err(TrySendError::Disconnected(_)) => {}
+        }
+    }
+}
+
+impl DirectWorkerProcess {
+    pub(crate) fn output(&mut self) -> &mut ChildStdout {
+        self.worker.watchdog.progress();
+        &mut self.worker.output
+    }
+
+    pub(crate) fn progress(&self) {
+        self.worker.watchdog.progress();
+    }
+
+    pub(crate) fn progress_token(&self) -> WorkerProgress {
+        WorkerProgress {
+            sender: self.worker.watchdog.sender.clone(),
+        }
+    }
+
+    pub(crate) fn finish(mut self) -> Result<(), RecoveryError> {
+        let status = self.worker.child.wait();
+        if status.is_ok() {
+            self.worker.reaped = true;
+        }
+        match self.worker.watchdog.stop() {
+            WatchdogOutcome::Stalled => {
+                self.worker.stop();
+                return Err(RecoveryError::WorkerStalled);
+            }
+            WatchdogOutcome::Interrupted => {
+                self.worker.stop();
+                return Err(RecoveryError::Interrupted);
+            }
+            WatchdogOutcome::Stopped => {}
+        }
+        let status = status.map_err(RecoveryError::WorkerSpawn)?;
+        if !status.success() {
+            return Err(RecoveryError::WorkerExit { status });
+        }
+        Ok(())
+    }
+}
+
+pub(crate) fn spawn_direct_worker(
+    worker_executable: &Path,
+    source: &SourceIdentity,
+    mode: RecoveryMode,
+    skipped_units: &HashSet<RecoveryUnit>,
+    interrupted: Arc<AtomicBool>,
+    attempt: u32,
+) -> Result<DirectWorkerProcess, RecoveryError> {
+    let expected_identity = serde_json::to_string(source).map_err(WorkerProtocolError::Json)?;
+    let controls = WorkerControls {
+        mode,
+        interrupted,
+        peak_worker_rss_bytes: Arc::new(AtomicU64::new(0)),
+        metadata_only: false,
+        writer_order: true,
+    };
+    spawn_worker(
+        worker_executable,
+        source,
+        &expected_identity,
+        skipped_units,
+        None,
+        attempt,
+        &controls,
+    )
+    .map(|worker| DirectWorkerProcess { worker })
+}
+
 impl WorkerProcess {
     fn stop(&mut self) {
         if self.reaped {
@@ -792,11 +877,26 @@ fn spawn_worker(
     if controls.writer_order {
         command.arg("--writer-order");
     }
+    if controls.writer_order
+        && attempt == 1
+        && let Some(byte_count) =
+            std::env::var_os("PSTFORGE_TEST_DIRECT_ABORT_MID_PAYLOAD_AFTER_BYTES")
+    {
+        command.env(
+            "PSTFORGE_INTERNAL_ABORT_MID_PAYLOAD_AFTER_BYTES",
+            byte_count,
+        );
+    }
     command.env(
         "PSTFORGE_INTERNAL_SUPERVISOR_PID",
         std::process::id().to_string(),
     );
-    let abort_after = std::env::var_os("PSTFORGE_TEST_ABORT_EVERY_ATTEMPT_AFTER_CANDIDATES")
+    let direct_abort_after = controls
+        .writer_order
+        .then(|| std::env::var_os("PSTFORGE_TEST_DIRECT_ABORT_EVERY_ATTEMPT_AFTER_CANDIDATES"))
+        .flatten();
+    let abort_after = direct_abort_after
+        .or_else(|| std::env::var_os("PSTFORGE_TEST_ABORT_EVERY_ATTEMPT_AFTER_CANDIDATES"))
         .or_else(|| {
             (attempt == 1)
                 .then(|| std::env::var_os("PSTFORGE_TEST_ABORT_AFTER_CANDIDATES"))

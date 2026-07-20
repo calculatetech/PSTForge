@@ -544,6 +544,9 @@ fn write_split(output: &mut dyn Write, report: &SplitReport) -> Result<(), std::
         report.metrics.peak_process_rss_bytes
     )?;
     writeln!(output, "Written candidates: {}", report.written_candidates)?;
+    if let Some(category) = report.terminal_failure {
+        writeln!(output, "Terminal failure: {category}")?;
+    }
     writeln!(output, "Parts: {}", report.parts.len())?;
     for part in &report.parts {
         writeln!(

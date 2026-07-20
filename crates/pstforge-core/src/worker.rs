@@ -9,6 +9,7 @@ use libpff_sys::{
     TraversalOrder,
 };
 use pstforge_job::ReplayCandidate;
+use pstforge_pst::writer::{DirectBlobSource, DirectBlobSpec, WriterError};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use thiserror::Error;
@@ -133,6 +134,623 @@ enum ControlFrame {
     Complete {
         catalog: WorkerCatalog,
     },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) enum DirectStreamOwner {
+    AttachmentData {
+        index: u32,
+    },
+    Property {
+        owner: &'static str,
+        owner_index: Option<u32>,
+        record_set_index: u32,
+        entry_index: u32,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) struct DirectStreamIdentity {
+    pub item_key: String,
+    pub owner: DirectStreamOwner,
+}
+
+pub(crate) struct DirectTopLevelBinding {
+    pub item_key: String,
+    pub provenance: CatalogProvenance,
+    pub source_node_id: Option<u32>,
+    pub recovery_index: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct DirectMessageBase {
+    provenance: CatalogProvenance,
+    source_node_id: Option<u32>,
+    recovery_index: Option<u64>,
+}
+
+pub(crate) struct DirectCandidateBindings {
+    embedded: HashMap<(String, u32, DirectMessageBase), String>,
+}
+
+impl DirectCandidateBindings {
+    pub(crate) fn new() -> Self {
+        Self {
+            embedded: HashMap::new(),
+        }
+    }
+}
+
+pub(crate) struct DirectProtocolSource<'a> {
+    input: &'a mut dyn Read,
+    direct_ids: HashMap<DirectStreamIdentity, u64>,
+    bindings: DirectCandidateBindings,
+    messages: Vec<(u32, String)>,
+    attachments: Vec<(u32, u32)>,
+    property: Option<PropertyDescriptor>,
+    pending: Option<ControlFrame>,
+    complete: bool,
+    progress: Option<Box<dyn FnMut() + 'a>>,
+}
+
+impl<'a> DirectProtocolSource<'a> {
+    pub(crate) fn new(
+        input: &'a mut dyn Read,
+        direct_ids: HashMap<DirectStreamIdentity, u64>,
+        bindings: DirectCandidateBindings,
+    ) -> Self {
+        Self {
+            input,
+            direct_ids,
+            bindings,
+            messages: Vec::new(),
+            attachments: Vec::new(),
+            property: None,
+            pending: None,
+            complete: false,
+            progress: None,
+        }
+    }
+
+    pub(crate) fn with_progress(mut self, progress: impl FnMut() + 'a) -> Self {
+        self.progress = Some(Box::new(progress));
+        self
+    }
+
+    pub(crate) fn next_top_level_message(
+        &mut self,
+        expected: Option<DirectTopLevelBinding>,
+    ) -> Result<Option<String>, WriterError> {
+        if !self.messages.is_empty() {
+            return Err(direct_protocol_error(
+                "previous direct message was not drained",
+            ));
+        }
+        loop {
+            let frame = self.next_control()?;
+            match frame {
+                ControlFrame::MessageStart {
+                    id,
+                    provenance,
+                    recovery_index,
+                    parent_message_id: None,
+                    ..
+                } => {
+                    let expected = expected.ok_or_else(|| {
+                        direct_protocol_error(
+                            "direct worker emitted an unexpected top-level message",
+                        )
+                    })?;
+                    let source_node_id = (id != 0).then_some(id);
+                    if expected.provenance != provenance
+                        || expected.source_node_id != source_node_id
+                        || expected.recovery_index != recovery_index
+                    {
+                        return Err(direct_protocol_error(
+                            "direct worker top-level order differs from the durable catalog",
+                        ));
+                    }
+                    let key = self.start_message(
+                        provenance,
+                        id,
+                        recovery_index,
+                        None,
+                        None,
+                        Some(expected.item_key),
+                    )?;
+                    return Ok(Some(key));
+                }
+                ControlFrame::Complete { .. } => {
+                    if expected.is_some() {
+                        return Err(direct_protocol_error(
+                            "direct worker omitted a durable top-level message",
+                        ));
+                    }
+                    self.complete = true;
+                    return Ok(None);
+                }
+                ControlFrame::Error { kind, detail } => {
+                    return Err(direct_protocol_error(format!(
+                        "worker reported {kind:?}: {detail}"
+                    )));
+                }
+                other => self.consume_control(other)?,
+            }
+        }
+    }
+
+    pub(crate) fn finish_top_level_message(&mut self) -> Result<(), WriterError> {
+        let top_level = self
+            .messages
+            .first()
+            .map(|(_, key)| key.clone())
+            .ok_or_else(|| direct_protocol_error("no active direct message"))?;
+        while self
+            .messages
+            .first()
+            .is_some_and(|(_, key)| key == &top_level)
+        {
+            let frame = self.next_control()?;
+            self.consume_control(frame)?;
+        }
+        self.direct_ids.clear();
+        self.bindings.embedded.clear();
+        Ok(())
+    }
+
+    pub(crate) fn is_complete(&self) -> bool {
+        self.complete
+    }
+
+    pub(crate) fn require_end_of_stream(&mut self) -> Result<(), WriterError> {
+        let mut trailing = [0_u8; 1];
+        match self.input.read(&mut trailing) {
+            Ok(0) => Ok(()),
+            Ok(_) => Err(direct_protocol_error(
+                "direct worker emitted trailing bytes after completion",
+            )),
+            Err(error) => Err(WriterError::Io(direct_worker_payload_io(error.kind()))),
+        }
+    }
+
+    pub(crate) fn register_stream(
+        &mut self,
+        identity: DirectStreamIdentity,
+        direct_id: u64,
+    ) -> Result<(), WriterError> {
+        match self.direct_ids.insert(identity, direct_id) {
+            None => Ok(()),
+            Some(previous) if previous == direct_id => Ok(()),
+            Some(_) => Err(direct_protocol_error(
+                "direct stream identity maps to multiple catalog identifiers",
+            )),
+        }
+    }
+
+    pub(crate) fn register_embedded_message(
+        &mut self,
+        parent_item_key: &str,
+        parent_attachment_index: u32,
+        item_key: &str,
+        provenance: CatalogProvenance,
+        source_node_id: Option<u32>,
+        recovery_index: Option<u64>,
+    ) -> Result<(), WriterError> {
+        let identity = (
+            parent_item_key.to_owned(),
+            parent_attachment_index,
+            DirectMessageBase {
+                provenance,
+                source_node_id,
+                recovery_index,
+            },
+        );
+        match self.bindings.embedded.insert(identity, item_key.to_owned()) {
+            None => Ok(()),
+            Some(previous) if previous == item_key => Ok(()),
+            Some(_) => Err(direct_protocol_error(
+                "direct embedded identity maps to multiple catalog items",
+            )),
+        }
+    }
+
+    fn start_message(
+        &mut self,
+        provenance: CatalogProvenance,
+        id: u32,
+        recovery_index: Option<u64>,
+        parent_message_id: Option<u32>,
+        parent_attachment_index: Option<u32>,
+        top_level_item_key: Option<String>,
+    ) -> Result<String, WriterError> {
+        let source_id = (id != 0).then_some(id);
+        let base = DirectMessageBase {
+            provenance,
+            source_node_id: source_id,
+            recovery_index,
+        };
+        let key = match (parent_message_id, parent_attachment_index) {
+            (None, None) => top_level_item_key.ok_or_else(|| {
+                direct_protocol_error("direct top-level message has no catalog binding")
+            })?,
+            (Some(parent_id), Some(index)) => {
+                if top_level_item_key.is_some() {
+                    return Err(direct_protocol_error(
+                        "direct embedded message has a top-level catalog binding",
+                    ));
+                }
+                let (active_parent_id, parent) = self.messages.last().ok_or_else(|| {
+                    direct_protocol_error("direct embedded message has no active parent")
+                })?;
+                if *active_parent_id != parent_id {
+                    return Err(direct_protocol_error(
+                        "direct embedded message names a non-active parent",
+                    ));
+                }
+                self.bindings
+                    .embedded
+                    .get(&(parent.clone(), index, base))
+                    .cloned()
+                    .ok_or_else(|| {
+                        direct_protocol_error(
+                            "direct worker message has no embedded catalog identity",
+                        )
+                    })?
+            }
+            _ => {
+                return Err(direct_protocol_error(
+                    "direct worker message has incomplete embedded ownership",
+                ));
+            }
+        };
+        self.messages.push((id, key.clone()));
+        Ok(key)
+    }
+
+    fn next_control(&mut self) -> Result<ControlFrame, WriterError> {
+        if let Some(progress) = self.progress.as_mut() {
+            progress();
+        }
+        match self.pending.take() {
+            Some(frame) => Ok(frame),
+            None => read_control(self.input).map_err(worker_writer_error),
+        }
+    }
+
+    fn consume_control(&mut self, frame: ControlFrame) -> Result<(), WriterError> {
+        match frame {
+            ControlFrame::MessageStart {
+                id,
+                provenance,
+                recovery_index,
+                parent_message_id,
+                parent_attachment_index,
+                ..
+            } => {
+                self.start_message(
+                    provenance,
+                    id,
+                    recovery_index,
+                    parent_message_id,
+                    parent_attachment_index,
+                    None,
+                )?;
+            }
+            ControlFrame::MessageEnd { id, .. } => {
+                let (active_id, _) = self
+                    .messages
+                    .pop()
+                    .ok_or_else(|| direct_protocol_error("worker ended an unknown message"))?;
+                if active_id != id {
+                    return Err(direct_protocol_error(
+                        "worker ended a different message than the active message",
+                    ));
+                }
+            }
+            ControlFrame::AttachmentStart {
+                message_id, index, ..
+            } => {
+                if self.messages.last().map(|(id, _)| *id) != Some(message_id) {
+                    return Err(direct_protocol_error(
+                        "worker attachment names a non-active message",
+                    ));
+                }
+                self.attachments.push((message_id, index));
+            }
+            ControlFrame::AttachmentEnd { message_id, index }
+            | ControlFrame::AttachmentAbort { message_id, index } => {
+                if self.attachments.pop() != Some((message_id, index)) {
+                    return Err(direct_protocol_error(
+                        "worker attachment boundaries are inconsistent",
+                    ));
+                }
+            }
+            ControlFrame::PropertyStart { descriptor } => {
+                self.validate_property_owner(descriptor)?;
+                if self.property.replace(descriptor).is_some() {
+                    return Err(direct_protocol_error("worker nested property streams"));
+                }
+            }
+            ControlFrame::PropertyEnd { descriptor }
+            | ControlFrame::PropertyAbort { descriptor, .. } => {
+                if self.property.take() != Some(descriptor) {
+                    return Err(direct_protocol_error(
+                        "worker property boundaries are inconsistent",
+                    ));
+                }
+            }
+            ControlFrame::AttachmentData {
+                message_id,
+                index,
+                byte_len,
+            } => {
+                if self.attachments.last() != Some(&(message_id, index)) {
+                    return Err(direct_protocol_error(
+                        "worker attachment payload has inconsistent ownership",
+                    ));
+                }
+                discard_payload(self.input, byte_len, &mut self.progress)
+                    .map_err(worker_writer_error)?;
+            }
+            ControlFrame::PropertyData {
+                descriptor,
+                byte_len,
+            } => {
+                self.validate_property_owner(descriptor)?;
+                if self.property != Some(descriptor) {
+                    return Err(direct_protocol_error(
+                        "worker property payload has inconsistent ownership",
+                    ));
+                }
+                discard_payload(self.input, byte_len, &mut self.progress)
+                    .map_err(worker_writer_error)?;
+            }
+            ControlFrame::Complete { .. } => self.complete = true,
+            ControlFrame::Error { kind, detail } => {
+                return Err(direct_protocol_error(format!(
+                    "worker reported {kind:?}: {detail}"
+                )));
+            }
+            ControlFrame::Hello { .. } => {
+                return Err(direct_protocol_error("worker repeated its protocol hello"));
+            }
+            ControlFrame::UnitStart { .. }
+            | ControlFrame::UnitEnd { .. }
+            | ControlFrame::Folder { .. }
+            | ControlFrame::Recipient { .. }
+            | ControlFrame::NamedProperty { .. } => {}
+        }
+        Ok(())
+    }
+
+    fn validate_property_owner(&self, descriptor: PropertyDescriptor) -> Result<(), WriterError> {
+        let (message_id, attachment_index) = match descriptor.owner {
+            libpff_sys::PropertyOwner::Message(message_id)
+            | libpff_sys::PropertyOwner::Recipient { message_id, .. } => (message_id, None),
+            libpff_sys::PropertyOwner::Attachment { message_id, index } => {
+                (message_id, Some(index))
+            }
+            libpff_sys::PropertyOwner::Folder(_) => {
+                return if self.messages.is_empty() && self.attachments.is_empty() {
+                    Ok(())
+                } else {
+                    Err(direct_protocol_error(
+                        "direct message stream contains a folder property",
+                    ))
+                };
+            }
+        };
+        if self.messages.last().map(|(id, _)| *id) != Some(message_id) {
+            return Err(direct_protocol_error(
+                "worker property names a non-active message",
+            ));
+        }
+        if let Some(index) = attachment_index
+            && self.attachments.last() != Some(&(message_id, index))
+        {
+            return Err(direct_protocol_error(
+                "worker property names a non-active attachment",
+            ));
+        }
+        Ok(())
+    }
+
+    fn current_data_identity(
+        &self,
+        frame: &ControlFrame,
+    ) -> Result<Option<DirectStreamIdentity>, WriterError> {
+        let Some((_, item_key)) = self.messages.last() else {
+            return Ok(None);
+        };
+        let item_key = item_key.clone();
+        let owner = match frame {
+            ControlFrame::AttachmentData {
+                message_id, index, ..
+            } => {
+                if self.attachments.last() != Some(&(*message_id, *index)) {
+                    return Err(direct_protocol_error(
+                        "worker attachment payload has inconsistent ownership",
+                    ));
+                }
+                DirectStreamOwner::AttachmentData { index: *index }
+            }
+            ControlFrame::PropertyData { descriptor, .. } => {
+                self.validate_property_owner(*descriptor)?;
+                if self.property != Some(*descriptor) {
+                    return Err(direct_protocol_error(
+                        "worker property payload has inconsistent ownership",
+                    ));
+                }
+                let (owner, owner_index) = match descriptor.owner {
+                    libpff_sys::PropertyOwner::Message(_) => ("message", None),
+                    libpff_sys::PropertyOwner::Recipient { index, .. } => {
+                        ("recipient", Some(index))
+                    }
+                    libpff_sys::PropertyOwner::Attachment { index, .. } => {
+                        ("attachment", Some(index))
+                    }
+                    libpff_sys::PropertyOwner::Folder(_) => return Ok(None),
+                };
+                DirectStreamOwner::Property {
+                    owner,
+                    owner_index,
+                    record_set_index: descriptor.record_set_index,
+                    entry_index: descriptor.entry_index,
+                }
+            }
+            _ => return Ok(None),
+        };
+        Ok(Some(DirectStreamIdentity { item_key, owner }))
+    }
+}
+
+impl DirectBlobSource for DirectProtocolSource<'_> {
+    fn open_blob<'a>(
+        &'a mut self,
+        blob: &DirectBlobSpec,
+    ) -> Result<Box<dyn Read + 'a>, WriterError> {
+        let top_level = self
+            .messages
+            .first()
+            .map(|(_, key)| key.clone())
+            .ok_or_else(|| direct_protocol_error("direct stream requested outside a message"))?;
+        loop {
+            let frame = self.next_control()?;
+            let identity = self.current_data_identity(&frame)?;
+            if identity
+                .as_ref()
+                .and_then(|identity| self.direct_ids.get(identity))
+                == Some(&blob.id)
+            {
+                let remaining = match frame {
+                    ControlFrame::AttachmentData { byte_len, .. }
+                    | ControlFrame::PropertyData { byte_len, .. } => byte_len,
+                    _ => {
+                        return Err(direct_protocol_error(
+                            "direct identity does not name a payload frame",
+                        ));
+                    }
+                };
+                return Ok(Box::new(DirectPayloadReader {
+                    source: self,
+                    identity: identity.ok_or_else(|| {
+                        direct_protocol_error("direct payload identity disappeared")
+                    })?,
+                    remaining,
+                    finished: false,
+                }));
+            }
+            self.consume_control(frame)?;
+            if self
+                .messages
+                .first()
+                .is_none_or(|(_, key)| key != &top_level)
+            {
+                return Err(direct_protocol_error(
+                    "requested direct stream was absent from its top-level message",
+                ));
+            }
+        }
+    }
+}
+
+struct DirectPayloadReader<'a, 'b> {
+    source: &'a mut DirectProtocolSource<'b>,
+    identity: DirectStreamIdentity,
+    remaining: u32,
+    finished: bool,
+}
+
+#[derive(Debug)]
+pub(crate) struct DirectWorkerPayloadIo;
+
+impl std::fmt::Display for DirectWorkerPayloadIo {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("direct worker payload stream failed")
+    }
+}
+
+impl std::error::Error for DirectWorkerPayloadIo {}
+
+fn direct_worker_payload_io(kind: std::io::ErrorKind) -> std::io::Error {
+    std::io::Error::new(kind, DirectWorkerPayloadIo)
+}
+
+impl Read for DirectPayloadReader<'_, '_> {
+    fn read(&mut self, output: &mut [u8]) -> std::io::Result<usize> {
+        if output.is_empty() || self.finished {
+            return Ok(0);
+        }
+        if self.remaining != 0 {
+            if let Some(progress) = self.source.progress.as_mut() {
+                progress();
+            }
+            let requested = output
+                .len()
+                .min(usize::try_from(self.remaining).unwrap_or(usize::MAX));
+            let read = self
+                .source
+                .input
+                .read(&mut output[..requested])
+                .map_err(|error| direct_worker_payload_io(error.kind()))?;
+            if read == 0 {
+                return Err(direct_worker_payload_io(std::io::ErrorKind::UnexpectedEof));
+            }
+            self.remaining = self
+                .remaining
+                .saturating_sub(u32::try_from(read).unwrap_or(u32::MAX));
+            return Ok(read);
+        }
+        let frame = self
+            .source
+            .next_control()
+            .map_err(|_| direct_worker_payload_io(std::io::ErrorKind::InvalidData))?;
+        let identity = self
+            .source
+            .current_data_identity(&frame)
+            .map_err(|_| direct_worker_payload_io(std::io::ErrorKind::InvalidData))?;
+        if identity.as_ref() == Some(&self.identity) {
+            self.remaining = match frame {
+                ControlFrame::AttachmentData { byte_len, .. }
+                | ControlFrame::PropertyData { byte_len, .. } => byte_len,
+                _ => 0,
+            };
+            return self.read(output);
+        }
+        self.source.pending = Some(frame);
+        self.finished = true;
+        Ok(0)
+    }
+}
+
+fn discard_payload(
+    input: &mut dyn Read,
+    byte_len: u32,
+    progress: &mut Option<Box<dyn FnMut() + '_>>,
+) -> Result<(), WorkerProtocolError> {
+    let mut remaining = u64::from(byte_len);
+    let mut buffer = [0_u8; STREAM_CHUNK_BYTES];
+    while remaining != 0 {
+        if let Some(progress) = progress.as_mut() {
+            progress();
+        }
+        let requested =
+            usize::try_from(remaining.min(u64::try_from(buffer.len()).unwrap_or(u64::MAX)))
+                .map_err(|_| {
+                    WorkerProtocolError::Invalid("payload discard exceeds usize".to_owned())
+                })?;
+        input.read_exact(&mut buffer[..requested])?;
+        remaining = remaining.saturating_sub(u64::try_from(requested).unwrap_or(u64::MAX));
+    }
+    Ok(())
+}
+
+fn worker_writer_error(error: WorkerProtocolError) -> WriterError {
+    WriterError::InvalidStructure(format!("direct worker protocol failed: {error}"))
+}
+
+fn direct_protocol_error(detail: impl Into<String>) -> WriterError {
+    WriterError::InvalidStructure(format!("direct worker protocol failed: {}", detail.into()))
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -282,6 +900,20 @@ impl ProtocolSink<'_> {
 
     fn send_data(&mut self, frame: &ControlFrame, bytes: &[u8]) -> Result<(), String> {
         self.send(frame)?;
+        if let Some(byte_count) = std::env::var("PSTFORGE_INTERNAL_ABORT_MID_PAYLOAD_AFTER_BYTES")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .filter(|_| bytes.len() >= 1024)
+        {
+            let prefix_len = byte_count.min(bytes.len());
+            self.output
+                .write_all(&bytes[..prefix_len])
+                .map_err(|error| WorkerProtocolError::Io(error).to_string())?;
+            self.output
+                .flush()
+                .map_err(|error| WorkerProtocolError::Io(error).to_string())?;
+            std::process::abort();
+        }
         self.output
             .write_all(bytes)
             .map_err(|error| WorkerProtocolError::Io(error).to_string())
@@ -1050,6 +1682,7 @@ fn require_end_of_stream(input: &mut dyn Read) -> Result<(), WorkerProtocolError
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
     use std::io::Cursor;
 
     use libpff_sys::{
@@ -1061,10 +1694,12 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        ControlFrame, METADATA_ATTACHMENT_PREFIX_BYTES, METADATA_PROPERTY_PREFIX_BYTES,
-        ProtocolSink, ReplayCatalogSink, receive_worker_catalog, receive_worker_catalog_body,
-        receive_worker_hello, write_control,
+        ControlFrame, DirectCandidateBindings, DirectProtocolSource, DirectStreamIdentity,
+        DirectStreamOwner, DirectTopLevelBinding, METADATA_ATTACHMENT_PREFIX_BYTES,
+        METADATA_PROPERTY_PREFIX_BYTES, ProtocolSink, ReplayCatalogSink, WorkerCatalog,
+        receive_worker_catalog, receive_worker_catalog_body, receive_worker_hello, write_control,
     };
+    use pstforge_pst::writer::{DirectBlobSource, DirectBlobSpec};
 
     #[derive(Default)]
     struct RecordingSink {
@@ -1189,6 +1824,354 @@ mod tests {
             PayloadRequest::Prefix(METADATA_ATTACHMENT_PREFIX_BYTES)
         );
         assert_eq!(sink.traversal_order(), TraversalOrder::Writer);
+    }
+
+    #[test]
+    fn direct_protocol_source_matches_requested_streams_and_skips_omissions()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let property = PropertyDescriptor {
+            owner: PropertyOwner::Message(7),
+            record_set_index: 0,
+            entry_index: 0,
+            entry_type: Some(0x1000),
+            value_type: Some(0x001f),
+            data_size: 4,
+        };
+        let omitted = PropertyDescriptor {
+            entry_index: 1,
+            entry_type: Some(0x8000),
+            ..property
+        };
+        let mut bytes = Vec::new();
+        write_control(
+            &mut bytes,
+            &ControlFrame::MessageStart {
+                id: 7,
+                provenance: CatalogProvenance::Normal,
+                recovery_index: None,
+                folder_id: Some(1),
+                parent_message_id: None,
+                parent_attachment_index: None,
+                embedded_path: Vec::new(),
+                associated: false,
+                item_type: Some(11),
+                message_class: Some("IPM.Note".to_owned()),
+                subject: None,
+                sender_name: None,
+                sender_email: None,
+                submit_filetime: None,
+                delivery_filetime: None,
+                supported: true,
+            },
+        )?;
+        write_control(
+            &mut bytes,
+            &ControlFrame::AttachmentStart {
+                message_id: 7,
+                index: 0,
+                attachment_type: Some(i32::from(b'f')),
+                data_size: Some(3),
+                filename: None,
+            },
+        )?;
+        write_control(
+            &mut bytes,
+            &ControlFrame::AttachmentData {
+                message_id: 7,
+                index: 0,
+                byte_len: 3,
+            },
+        )?;
+        bytes.extend_from_slice(b"abc");
+        write_control(
+            &mut bytes,
+            &ControlFrame::AttachmentEnd {
+                message_id: 7,
+                index: 0,
+            },
+        )?;
+        for (descriptor, payload) in [(omitted, b"skip".as_slice()), (property, b"body")] {
+            write_control(&mut bytes, &ControlFrame::PropertyStart { descriptor })?;
+            write_control(
+                &mut bytes,
+                &ControlFrame::PropertyData {
+                    descriptor,
+                    byte_len: u32::try_from(payload.len())?,
+                },
+            )?;
+            bytes.extend_from_slice(payload);
+            write_control(&mut bytes, &ControlFrame::PropertyEnd { descriptor })?;
+        }
+        write_control(
+            &mut bytes,
+            &ControlFrame::MessageEnd {
+                id: 7,
+                complete: true,
+            },
+        )?;
+        write_control(
+            &mut bytes,
+            &ControlFrame::Complete {
+                catalog: WorkerCatalog::default(),
+            },
+        )?;
+
+        let key = "normal:7:-:0".to_owned();
+        let direct_ids = HashMap::from([
+            (
+                DirectStreamIdentity {
+                    item_key: key.clone(),
+                    owner: DirectStreamOwner::AttachmentData { index: 0 },
+                },
+                1,
+            ),
+            (
+                DirectStreamIdentity {
+                    item_key: key.clone(),
+                    owner: DirectStreamOwner::Property {
+                        owner: "message",
+                        owner_index: None,
+                        record_set_index: 0,
+                        entry_index: 1,
+                    },
+                },
+                2,
+            ),
+            (
+                DirectStreamIdentity {
+                    item_key: key.clone(),
+                    owner: DirectStreamOwner::Property {
+                        owner: "message",
+                        owner_index: None,
+                        record_set_index: 0,
+                        entry_index: 0,
+                    },
+                },
+                3,
+            ),
+        ]);
+        let missing_bytes = bytes.clone();
+        let mut input = Cursor::new(bytes);
+        let bindings = DirectCandidateBindings::new();
+        let mut source = DirectProtocolSource::new(&mut input, direct_ids, bindings);
+        assert_eq!(
+            source.next_top_level_message(Some(DirectTopLevelBinding {
+                item_key: key.clone(),
+                provenance: CatalogProvenance::Normal,
+                source_node_id: Some(7),
+                recovery_index: None,
+            }))?,
+            Some(key)
+        );
+        let mut attachment = Vec::new();
+        source
+            .open_blob(&DirectBlobSpec {
+                id: 1,
+                byte_len: 3,
+                sha256: None,
+            })?
+            .read_to_end(&mut attachment)?;
+        assert_eq!(attachment, b"abc");
+        let mut body = Vec::new();
+        source
+            .open_blob(&DirectBlobSpec {
+                id: 3,
+                byte_len: 4,
+                sha256: None,
+            })?
+            .read_to_end(&mut body)?;
+        assert_eq!(body, b"body");
+        source.finish_top_level_message()?;
+        assert_eq!(source.next_top_level_message(None)?, None);
+        assert!(source.is_complete());
+
+        let mut missing_input = Cursor::new(missing_bytes);
+        let missing_bindings = DirectCandidateBindings::new();
+        let mut missing =
+            DirectProtocolSource::new(&mut missing_input, HashMap::new(), missing_bindings);
+        assert!(
+            missing
+                .next_top_level_message(Some(DirectTopLevelBinding {
+                    item_key: "normal:7:-:0".to_owned(),
+                    provenance: CatalogProvenance::Normal,
+                    source_node_id: Some(7),
+                    recovery_index: None,
+                }))?
+                .is_some()
+        );
+        assert!(
+            missing
+                .open_blob(&DirectBlobSpec {
+                    id: 999,
+                    byte_len: 1,
+                    sha256: None,
+                })
+                .is_err()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn direct_protocol_uses_parent_ownership_for_duplicate_embedded_ids()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut bytes = Vec::new();
+        for (top_id, child_payload) in [(10_u32, b"one".as_slice()), (10, b"two")] {
+            write_control(
+                &mut bytes,
+                &ControlFrame::MessageStart {
+                    id: top_id,
+                    provenance: CatalogProvenance::Normal,
+                    recovery_index: None,
+                    folder_id: Some(1),
+                    parent_message_id: None,
+                    parent_attachment_index: None,
+                    embedded_path: Vec::new(),
+                    associated: false,
+                    item_type: Some(11),
+                    message_class: Some("IPM.Note".to_owned()),
+                    subject: None,
+                    sender_name: None,
+                    sender_email: None,
+                    submit_filetime: None,
+                    delivery_filetime: None,
+                    supported: true,
+                },
+            )?;
+            write_control(
+                &mut bytes,
+                &ControlFrame::AttachmentStart {
+                    message_id: top_id,
+                    index: 4,
+                    attachment_type: Some(5),
+                    data_size: None,
+                    filename: None,
+                },
+            )?;
+            write_control(
+                &mut bytes,
+                &ControlFrame::MessageStart {
+                    id: 20,
+                    provenance: CatalogProvenance::Normal,
+                    recovery_index: None,
+                    folder_id: None,
+                    parent_message_id: Some(top_id),
+                    parent_attachment_index: Some(4),
+                    embedded_path: vec![4],
+                    associated: false,
+                    item_type: Some(11),
+                    message_class: Some("IPM.Note".to_owned()),
+                    subject: None,
+                    sender_name: None,
+                    sender_email: None,
+                    submit_filetime: None,
+                    delivery_filetime: None,
+                    supported: true,
+                },
+            )?;
+            write_control(
+                &mut bytes,
+                &ControlFrame::AttachmentStart {
+                    message_id: 20,
+                    index: 0,
+                    attachment_type: Some(i32::from(b'f')),
+                    data_size: Some(3),
+                    filename: None,
+                },
+            )?;
+            write_control(
+                &mut bytes,
+                &ControlFrame::AttachmentData {
+                    message_id: 20,
+                    index: 0,
+                    byte_len: 3,
+                },
+            )?;
+            bytes.extend_from_slice(child_payload);
+            write_control(
+                &mut bytes,
+                &ControlFrame::AttachmentEnd {
+                    message_id: 20,
+                    index: 0,
+                },
+            )?;
+            write_control(
+                &mut bytes,
+                &ControlFrame::MessageEnd {
+                    id: 20,
+                    complete: true,
+                },
+            )?;
+            write_control(
+                &mut bytes,
+                &ControlFrame::AttachmentEnd {
+                    message_id: top_id,
+                    index: 4,
+                },
+            )?;
+            write_control(
+                &mut bytes,
+                &ControlFrame::MessageEnd {
+                    id: top_id,
+                    complete: true,
+                },
+            )?;
+        }
+        write_control(
+            &mut bytes,
+            &ControlFrame::Complete {
+                catalog: WorkerCatalog::default(),
+            },
+        )?;
+
+        let top_a = "normal:10:-:0".to_owned();
+        let top_b = "normal:10:-:1".to_owned();
+        let child_a = "normal:20:-:0".to_owned();
+        let child_b = "normal:20:-:1".to_owned();
+        let mut input = Cursor::new(bytes);
+        let mut source =
+            DirectProtocolSource::new(&mut input, HashMap::new(), DirectCandidateBindings::new());
+        for (expected_top, child_key, direct_id, expected_payload) in [
+            (top_a, child_a, 1, b"one".as_slice()),
+            (top_b, child_b, 2, b"two"),
+        ] {
+            assert_eq!(
+                source.next_top_level_message(Some(DirectTopLevelBinding {
+                    item_key: expected_top.clone(),
+                    provenance: CatalogProvenance::Normal,
+                    source_node_id: Some(10),
+                    recovery_index: None,
+                }))?,
+                Some(expected_top.clone())
+            );
+            source.register_embedded_message(
+                &expected_top,
+                4,
+                &child_key,
+                CatalogProvenance::Normal,
+                Some(20),
+                None,
+            )?;
+            source.register_stream(
+                DirectStreamIdentity {
+                    item_key: child_key,
+                    owner: DirectStreamOwner::AttachmentData { index: 0 },
+                },
+                direct_id,
+            )?;
+            let mut payload = Vec::new();
+            source
+                .open_blob(&DirectBlobSpec {
+                    id: direct_id,
+                    byte_len: 3,
+                    sha256: None,
+                })?
+                .read_to_end(&mut payload)?;
+            assert_eq!(payload, expected_payload);
+            source.finish_top_level_message()?;
+        }
+        assert_eq!(source.next_top_level_message(None)?, None);
+        source.require_end_of_stream()?;
+        Ok(())
     }
 
     #[test]

@@ -364,8 +364,8 @@ overview reference is replaced by a section-specific reference.
 - **Evidence:** publication, timeout, retained-candidate, moved-directory, no-clobber, and validator-scratch tests
 
 ### NDB-08
-- **Status:** Verified; the transactional writer emits each accepted message block once before final NBT, BBT, allocation-map, and header construction. Bounded private batches amortize exact finalized-size projection while exact replay fixes every part boundary.
-- **Requirement:** Transactional construction may append complete message nodes and their referenced blocks before finalization, provided final NBT and BBT entries remain sorted and complete, allocation maps cover exactly retained extents, the header references only the final roots and high-water marks, and no pre-finalized file is published. Folder hierarchy and metadata validation is independent of any recovered message, so an unrepresentable candidate cannot suppress otherwise valid or empty source folders. A provisional batch may defer finalized-size projection; its primary bound scales from the requested part size and the bytes actually allocated in the private PST, with a message-count ceiling only to bound latency for very small items. The batch is accepted only after one exact projection. If that projection exceeds the part limit, the complete batch is rolled back to its byte-for-byte private checkpoint and replayed one message at a time with exact projection so the published part remains at the last fitting message.
+- **Status:** Verified; the transactional writer emits each accepted message block once before final NBT, BBT, allocation-map, and header construction. Bounded private batches amortize exact finalized-size projection while exact replay fixes every part boundary. Physical message-block order is independent of final folder-table membership and NBT order.
+- **Requirement:** Transactional construction may append complete message nodes and their referenced blocks in source traversal order before finalization, provided final NBT and BBT entries remain sorted and complete, each message row is assigned to the contents or associated-contents table of its actual parent folder, allocation maps cover exactly retained extents, the header references only the final roots and high-water marks, and no pre-finalized file is published. Folder hierarchy and metadata validation is independent of any recovered message, so an unrepresentable candidate cannot suppress otherwise valid or empty source folders. A provisional batch may defer finalized-size projection; its primary bound scales from the requested part size and the bytes actually allocated in the private PST, with a message-count ceiling only to bound latency for very small items. The batch is accepted only after one exact projection. If that projection exceeds the part limit, the complete batch is rolled back to its byte-for-byte private checkpoint and replayed one message at a time with exact projection so the published part remains at the last fitting message.
 - **Sources:** NDB-01 through NDB-07; MS-PST 2.2.2.1 defines the NDB as nodes and blocks addressed through the NBT and BBT, and PST-INT 2.6 requires the final database relationships and allocation state to be internally consistent
 - **Implementation:** `validate_mail_store_layout`,
   `TransactionalMailStoreWriter::begin`, `begin_batch`,
@@ -374,7 +374,8 @@ overview reference is replaced by a section-specific reference.
   `write_bbt`, `write_nbt`, `write_fixed_pages`, `write_header`, and the NDB-07
   publication path remain authoritative
 - **Evidence:** focused append, direct-source failure rollback/reappend, batch
-  rollback, exact and mismatched direct projection, message-atomic direct
+  rollback, interleaved source-folder and normal/associated placement,
+  exact and mismatched direct projection, message-atomic direct
   completion, projection metadata immutability, recursive normal/associated
   identity rejection, exact-boundary, and byte-comparison tests; independent
   `pffinfo` and `readpst`; all five 19 GB qualification parts pass ScanPST and
@@ -421,10 +422,10 @@ overview reference is replaced by a section-specific reference.
 
 ### MSG-02
 - **Status:** Accepted mixed conformance: normative folder relationships and ordinary counts are verified; fixed-root counts use EMP-07
-- **Requirement:** Folder PCs and hierarchy/contents/associated table nodes agree on parentage, counts, unread state, and child rows
+- **Requirement:** Folder PCs and hierarchy/contents/associated table nodes agree on parentage, counts, unread state, and child rows. Contents-table membership is derived from each message node's explicit parent folder, not from physical message serialization order.
 - **Sources:** PST-FOLDER-PC; MS-PST 2.4.4; MAPI-FOLDERS; MAPI-CONTENTS
-- **Implementation:** `plan_folders`, `folder_properties_with_unread`, `folder_table_row_with_unread`, `node_entries`
-- **Evidence:** nested/root folder tests; Outlook 19 GB parts
+- **Implementation:** `plan_folders`, `folder_properties_with_unread`, `folder_table_row_with_unread`, `MessageStreamState` parent-tagged rows, `node_entries`
+- **Evidence:** nested/root folder tests, interleaved transactional folder/placement regression; Outlook 19 GB parts
 
 ### MSG-03
 - **Status:** Verified for required Message-PC fields and recipient containment; optional empty attachment-table output is retained pending procedural audit
