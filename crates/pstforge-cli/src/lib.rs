@@ -90,6 +90,10 @@ pub enum Command {
         skipped_units: String,
         #[arg(value_enum)]
         recovery: RecoveryModeArg,
+        #[arg(long, hide = true)]
+        metadata_only: bool,
+        #[arg(long, hide = true)]
+        writer_order: bool,
     },
     #[command(name = "__validator", hide = true)]
     Validator {
@@ -301,6 +305,8 @@ pub fn execute(cli: &Cli, output: &mut dyn Write) -> Result<CommandStatus, CliEr
             expected_identity,
             skipped_units,
             recovery,
+            metadata_only,
+            writer_order,
         } => {
             let expected_identity = serde_json::from_str(expected_identity)?;
             let skipped_units = serde_json::from_str(skipped_units)?;
@@ -309,6 +315,8 @@ pub fn execute(cli: &Cli, output: &mut dyn Write) -> Result<CommandStatus, CliEr
                 &expected_identity,
                 &skipped_units,
                 (*recovery).into(),
+                *metadata_only,
+                *writer_order,
                 output,
             )?;
             Ok(CommandStatus::Complete)

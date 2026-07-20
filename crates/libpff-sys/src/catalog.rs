@@ -247,7 +247,36 @@ pub enum CatalogEvent<'a> {
 }
 
 pub trait CatalogSink {
+    fn property_payload(&self, _descriptor: PropertyDescriptor) -> PayloadRequest {
+        PayloadRequest::Full
+    }
+
+    fn attachment_payload(
+        &self,
+        _message_id: u32,
+        _index: u32,
+        _declared_size: Option<u64>,
+    ) -> PayloadRequest {
+        PayloadRequest::Full
+    }
+
+    fn traversal_order(&self) -> TraversalOrder {
+        TraversalOrder::Source
+    }
+
     fn event(&mut self, event: CatalogEvent<'_>) -> Result<(), String>;
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PayloadRequest {
+    Full,
+    Prefix(u64),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TraversalOrder {
+    Source,
+    Writer,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -964,7 +993,8 @@ fn process_message(
     }
     match work.item.attachment_count() {
         Ok(count) => {
-            if let Err(error) = stream_attachments(&work, message_id, count, pending, sink, catalog)
+            if let Err(error) =
+                stream_attachments(&work, message_id, count, pending, visited, sink, catalog)
             {
                 record_attachment_issue(catalog, Some(message_id), "stream attachments", error)?;
             }
@@ -1080,6 +1110,7 @@ fn stream_attachments(
     message_id: u32,
     count: u64,
     pending: &mut Vec<MessageWork>,
+    visited: &mut HashSet<u32>,
     sink: &mut dyn CatalogSink,
     catalog: &mut RawCatalog,
 ) -> Result<(), PffError> {
@@ -1181,21 +1212,24 @@ fn stream_attachments(
                     value: u64::MAX,
                     limit: u64::MAX - 1,
                 })?;
-        if let Err(error) = stream_item_properties(
-            &attachment,
-            PropertyOwner::Attachment {
-                message_id,
-                index: index_u32,
-            },
-            sink,
-            catalog,
-        ) {
-            record_attachment_issue(
+        let writer_order = sink.traversal_order() == TraversalOrder::Writer;
+        if !writer_order {
+            if let Err(error) = stream_item_properties(
+                &attachment,
+                PropertyOwner::Attachment {
+                    message_id,
+                    index: index_u32,
+                },
+                sink,
                 catalog,
-                Some(message_id),
-                "stream attachment properties",
-                error,
-            )?;
+            ) {
+                record_attachment_issue(
+                    catalog,
+                    Some(message_id),
+                    "stream attachment properties",
+                    error,
+                )?;
+            }
         }
         let embedded_attachment = attachment_type == Some(i32::from(b'i'));
         if !embedded_attachment && !reference_attachment {
@@ -1290,6 +1324,9 @@ fn stream_attachments(
                 })
             })();
             match embedded_work {
+                Ok(embedded_work) if writer_order => {
+                    process_message(embedded_work, pending, visited, sink, catalog)?;
+                }
                 Ok(embedded_work) => pending.push(embedded_work),
                 Err(error) => {
                     emit(
@@ -1308,6 +1345,24 @@ fn stream_attachments(
                     )?;
                     continue;
                 }
+            }
+        }
+        if writer_order {
+            if let Err(error) = stream_item_properties(
+                &attachment,
+                PropertyOwner::Attachment {
+                    message_id,
+                    index: index_u32,
+                },
+                sink,
+                catalog,
+            ) {
+                record_attachment_issue(
+                    catalog,
+                    Some(message_id),
+                    "stream attachment properties",
+                    error,
+                )?;
             }
         }
         emit(
@@ -1396,6 +1451,7 @@ fn stream_record_set(
             "property start",
             CatalogEvent::PropertyStart(descriptor),
         )?;
+        let request = sink.property_payload(descriptor);
         let actual = match entry.stream(descriptor, sink) {
             Ok(actual) => actual,
             Err(error @ PffError::Sink { .. }) => return Err(error),
@@ -1409,10 +1465,14 @@ fn stream_record_set(
                 return Err(error);
             }
         };
-        if actual != descriptor.data_size {
+        let expected = match request {
+            PayloadRequest::Full => descriptor.data_size,
+            PayloadRequest::Prefix(limit) => descriptor.data_size.min(limit),
+        };
+        if actual != expected {
             let error = PffError::StreamSizeMismatch {
                 field: "property data",
-                expected: descriptor.data_size,
+                expected,
                 actual,
             };
             emit(
@@ -1685,16 +1745,36 @@ impl PffRecordEntry {
         descriptor: PropertyDescriptor,
         sink: &mut dyn CatalogSink,
     ) -> Result<u64, PffError> {
+        let request = sink.property_payload(descriptor);
+        let limit = match request {
+            PayloadRequest::Full => descriptor.data_size,
+            PayloadRequest::Prefix(limit) => descriptor.data_size.min(limit),
+        };
         let mut total = 0_u64;
         let mut buffer = vec![0_u8; STREAM_CHUNK_BYTES];
         loop {
+            if matches!(request, PayloadRequest::Prefix(_)) && total >= limit {
+                break;
+            }
+            let requested = match request {
+                PayloadRequest::Full => buffer.len(),
+                PayloadRequest::Prefix(_) => usize::try_from(
+                    limit
+                        .saturating_sub(total)
+                        .min(u64::try_from(buffer.len()).unwrap_or(u64::MAX)),
+                )
+                .map_err(|_| PffError::InvalidValue {
+                    field: "record read size",
+                    value: i64::MAX,
+                })?,
+            };
             let mut error = ptr::null_mut();
             // SAFETY: self.raw is valid and buffer is writable for its declared size.
             let read = unsafe {
                 bindings::libpff_record_entry_read_buffer(
                     self.raw,
                     buffer.as_mut_ptr(),
-                    buffer.len(),
+                    requested,
                     &mut error,
                 )
             };
@@ -2001,6 +2081,11 @@ impl PffItem {
         expected: u64,
         sink: &mut dyn CatalogSink,
     ) -> Result<u64, PffError> {
+        let request = sink.attachment_payload(message_id, index, Some(expected));
+        let limit = match request {
+            PayloadRequest::Full => expected,
+            PayloadRequest::Prefix(limit) => expected.min(limit),
+        };
         let mut total = 0_u64;
         let mut buffer = vec![0_u8; STREAM_CHUNK_BYTES];
         let mut error = ptr::null_mut();
@@ -2012,13 +2097,28 @@ impl PffItem {
         }
         free_error(error);
         loop {
+            if matches!(request, PayloadRequest::Prefix(_)) && total >= limit {
+                break;
+            }
+            let requested = match request {
+                PayloadRequest::Full => buffer.len(),
+                PayloadRequest::Prefix(_) => usize::try_from(
+                    limit
+                        .saturating_sub(total)
+                        .min(u64::try_from(buffer.len()).unwrap_or(u64::MAX)),
+                )
+                .map_err(|_| PffError::InvalidValue {
+                    field: "attachment read size",
+                    value: i64::MAX,
+                })?,
+            };
             error = ptr::null_mut();
             // SAFETY: self.raw is valid and buffer is writable for its declared size.
             let read = unsafe {
                 bindings::libpff_attachment_data_read_buffer(
                     self.raw,
                     buffer.as_mut_ptr(),
-                    buffer.len(),
+                    requested,
                     &mut error,
                 )
             };
@@ -2048,7 +2148,7 @@ impl PffItem {
                 value: u64::MAX,
                 limit: u64::MAX - 1,
             })?;
-            let remaining = expected.saturating_sub(total);
+            let remaining = limit.saturating_sub(total);
             let emitted =
                 usize::try_from(remaining.min(read_u64)).map_err(|_| PffError::InvalidValue {
                     field: "attachment read size",
@@ -2076,20 +2176,20 @@ impl PffItem {
                         limit: u64::MAX - 1,
                     })?;
             }
-            if observed > expected {
+            if observed > limit {
                 return Err(PffError::StreamSizeMismatch {
                     field: "attachment data",
-                    expected,
+                    expected: limit,
                     actual: observed,
                 });
             }
         }
-        if total == expected {
+        if total == limit {
             Ok(total)
         } else {
             Err(PffError::StreamSizeMismatch {
                 field: "attachment data",
-                expected,
+                expected: limit,
                 actual: total,
             })
         }

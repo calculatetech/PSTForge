@@ -4,8 +4,9 @@ use std::os::fd::AsFd;
 use std::path::Path;
 
 use libpff_sys::{
-    CatalogEvent, CatalogProvenance, CatalogSink, NamedPropertyIdentity, PffError, PffFile,
-    PropertyDescriptor, RawCatalog, RecoveryMode, RecoveryUnit, STREAM_CHUNK_BYTES,
+    CatalogEvent, CatalogProvenance, CatalogSink, NamedPropertyIdentity, PayloadRequest, PffError,
+    PffFile, PropertyDescriptor, RawCatalog, RecoveryMode, RecoveryUnit, STREAM_CHUNK_BYTES,
+    TraversalOrder,
 };
 use pstforge_job::ReplayCandidate;
 use serde::{Deserialize, Serialize};
@@ -16,6 +17,8 @@ use crate::{SourceError, SourceFile};
 
 const PROTOCOL_VERSION: u32 = 3;
 const MAX_CONTROL_FRAME_BYTES: usize = 32 * 1024 * 1024;
+const METADATA_PROPERTY_PREFIX_BYTES: u64 = 64 * 1024;
+const METADATA_ATTACHMENT_PREFIX_BYTES: u64 = 16 * 1024;
 
 #[derive(Debug, Error)]
 pub enum WorkerProtocolError {
@@ -195,10 +198,16 @@ struct ProtocolSink<'a> {
     abort_at_unit_end: bool,
     stall_at_unit_end: bool,
     parser_error_at_unit_end: bool,
+    metadata_only: bool,
+    writer_order: bool,
 }
 
 impl ProtocolSink<'_> {
-    fn start(output: &mut dyn Write) -> Result<ProtocolSink<'_>, WorkerProtocolError> {
+    fn start(
+        output: &mut dyn Write,
+        metadata_only: bool,
+        writer_order: bool,
+    ) -> Result<ProtocolSink<'_>, WorkerProtocolError> {
         write_control(
             output,
             &ControlFrame::Hello {
@@ -251,6 +260,8 @@ impl ProtocolSink<'_> {
             abort_at_unit_end: false,
             stall_at_unit_end: false,
             parser_error_at_unit_end: false,
+            metadata_only,
+            writer_order,
         })
     }
 
@@ -278,6 +289,39 @@ impl ProtocolSink<'_> {
 }
 
 impl CatalogSink for ProtocolSink<'_> {
+    fn property_payload(&self, descriptor: PropertyDescriptor) -> PayloadRequest {
+        if self.metadata_only {
+            PayloadRequest::Prefix(descriptor.data_size.min(METADATA_PROPERTY_PREFIX_BYTES))
+        } else {
+            PayloadRequest::Full
+        }
+    }
+
+    fn attachment_payload(
+        &self,
+        _message_id: u32,
+        _index: u32,
+        declared_size: Option<u64>,
+    ) -> PayloadRequest {
+        if self.metadata_only {
+            PayloadRequest::Prefix(
+                declared_size
+                    .unwrap_or_default()
+                    .min(METADATA_ATTACHMENT_PREFIX_BYTES),
+            )
+        } else {
+            PayloadRequest::Full
+        }
+    }
+
+    fn traversal_order(&self) -> TraversalOrder {
+        if self.writer_order {
+            TraversalOrder::Writer
+        } else {
+            TraversalOrder::Source
+        }
+    }
+
     fn event(&mut self, event: CatalogEvent<'_>) -> Result<(), String> {
         match event {
             CatalogEvent::UnitStart(unit) => {
@@ -470,6 +514,8 @@ pub fn run_recovery_worker(
     expected_identity: &crate::SourceIdentity,
     skipped_units: &std::collections::HashSet<RecoveryUnit>,
     mode: RecoveryMode,
+    metadata_only: bool,
+    writer_order: bool,
     output: &mut dyn Write,
 ) -> Result<(), WorkerProtocolError> {
     arm_parent_death_signal()?;
@@ -503,7 +549,7 @@ pub fn run_recovery_worker(
             ),
         );
     }
-    let mut sink = ProtocolSink::start(output)?;
+    let mut sink = ProtocolSink::start(output, metadata_only, writer_order)?;
     let catalog = match file.recovery_catalog_skipping(&mut sink, skipped_units, mode) {
         Ok(catalog) => catalog,
         Err(error) => {
@@ -1008,14 +1054,16 @@ mod tests {
 
     use libpff_sys::{
         CatalogEvent, CatalogIssue, CatalogProvenance, CatalogSink, NamedPropertyIdentity,
-        NamedPropertyName, PropertyDescriptor, PropertyOwner, RawCatalog,
+        NamedPropertyName, PayloadRequest, PropertyDescriptor, PropertyOwner, RawCatalog,
+        TraversalOrder,
     };
     use pstforge_job::ReplayCandidate;
     use serde_json::json;
 
     use super::{
-        ControlFrame, ProtocolSink, ReplayCatalogSink, receive_worker_catalog,
-        receive_worker_catalog_body, receive_worker_hello, write_control,
+        ControlFrame, METADATA_ATTACHMENT_PREFIX_BYTES, METADATA_PROPERTY_PREFIX_BYTES,
+        ProtocolSink, ReplayCatalogSink, receive_worker_catalog, receive_worker_catalog_body,
+        receive_worker_hello, write_control,
     };
 
     #[derive(Default)]
@@ -1054,7 +1102,7 @@ mod tests {
     #[test]
     fn framed_protocol_round_trips_metadata_and_raw_payload() {
         let mut bytes = Vec::new();
-        let mut output = ProtocolSink::start(&mut bytes).expect("start protocol");
+        let mut output = ProtocolSink::start(&mut bytes, false, false).expect("start protocol");
         output
             .event(CatalogEvent::MessageStart {
                 id: 7,
@@ -1121,6 +1169,29 @@ mod tests {
     }
 
     #[test]
+    fn metadata_worker_bounds_payloads_and_writer_order_is_explicit() {
+        let mut bytes = Vec::new();
+        let sink = ProtocolSink::start(&mut bytes, true, true).expect("start protocol");
+        let descriptor = PropertyDescriptor {
+            owner: libpff_sys::PropertyOwner::Message(7),
+            record_set_index: 0,
+            entry_index: 0,
+            entry_type: Some(0x1000),
+            value_type: Some(0x0102),
+            data_size: METADATA_PROPERTY_PREFIX_BYTES + 1,
+        };
+        assert_eq!(
+            sink.property_payload(descriptor),
+            PayloadRequest::Prefix(METADATA_PROPERTY_PREFIX_BYTES)
+        );
+        assert_eq!(
+            sink.attachment_payload(7, 0, Some(METADATA_ATTACHMENT_PREFIX_BYTES + 1)),
+            PayloadRequest::Prefix(METADATA_ATTACHMENT_PREFIX_BYTES)
+        );
+        assert_eq!(sink.traversal_order(), TraversalOrder::Writer);
+    }
+
+    #[test]
     fn oversized_payload_header_is_rejected_before_allocation() {
         let mut bytes = Vec::new();
         write_control(&mut bytes, &ControlFrame::Hello { version: 2 }).expect("hello");
@@ -1140,7 +1211,7 @@ mod tests {
     #[test]
     fn completion_transmits_issue_counts_without_issue_text() {
         let mut bytes = Vec::new();
-        let mut output = ProtocolSink::start(&mut bytes).expect("start protocol");
+        let mut output = ProtocolSink::start(&mut bytes, false, false).expect("start protocol");
         output
             .complete(RawCatalog {
                 issues: vec![CatalogIssue {
@@ -1163,7 +1234,7 @@ mod tests {
     #[test]
     fn trailing_data_after_completion_is_rejected() {
         let mut bytes = Vec::new();
-        ProtocolSink::start(&mut bytes)
+        ProtocolSink::start(&mut bytes, false, false)
             .expect("start protocol")
             .complete(RawCatalog::default())
             .expect("complete protocol");
@@ -1176,7 +1247,7 @@ mod tests {
     fn replay_processes_gap_before_committed_candidate_with_shifted_synthetic_id() {
         let mut input = Cursor::new({
             let mut bytes = Vec::new();
-            let mut output = ProtocolSink::start(&mut bytes).expect("start protocol");
+            let mut output = ProtocolSink::start(&mut bytes, false, false).expect("start protocol");
             for id in [1, 2] {
                 let unit = libpff_sys::RecoveryUnit::Normal {
                     folder: libpff_sys::FolderAddress::root(),
@@ -1259,7 +1330,7 @@ mod tests {
     #[test]
     fn replay_rejects_colliding_identifier_with_different_metadata() {
         let mut bytes = Vec::new();
-        let mut output = ProtocolSink::start(&mut bytes).expect("start protocol");
+        let mut output = ProtocolSink::start(&mut bytes, false, false).expect("start protocol");
         output
             .event(CatalogEvent::MessageStart {
                 id: 0,
@@ -1329,7 +1400,7 @@ mod tests {
             message_index: 4,
         };
         let mut bytes = Vec::new();
-        let mut output = ProtocolSink::start(&mut bytes).expect("start protocol");
+        let mut output = ProtocolSink::start(&mut bytes, false, false).expect("start protocol");
         output
             .event(CatalogEvent::UnitStart(unit))
             .expect("unit start");
@@ -1452,7 +1523,7 @@ mod tests {
         assert_eq!(replay.len(), 1);
 
         let mut bytes = Vec::new();
-        let mut output = ProtocolSink::start(&mut bytes)?;
+        let mut output = ProtocolSink::start(&mut bytes, false, false)?;
         output.event(CatalogEvent::UnitStart(unit))?;
         output.event(CatalogEvent::MessageStart {
             id: 20,

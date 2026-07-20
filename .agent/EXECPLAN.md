@@ -2566,6 +2566,18 @@ not modified.
     arbitrary source traversal while producing deterministic folder tables
     and identifiers. A boundary decision must not require rereading or
     rewriting a completed payload.
+    The direct supervisor uses two contained parser passes. The first pass is
+    metadata-only: it emits the existing structural events, bounded values
+    required for canonical translation, declared lengths, and bounded content
+    signatures, but neither writes nor retains mailbox-sized payloads. That
+    pass fixes folder layout, named-property identities, message projections,
+    and part assignments before output allocation. The second pass emits
+    accepted payloads once in the writer's consumption order and streams them
+    through bounded protocol buffers into the already-selected active PST.
+    Restartable mode retains the existing traversal and full-payload protocol.
+    This deliberately trades a second read-only libpff traversal for removal
+    of the payload-spool write, read, allocation, and SSD wear; it does not
+    reread or rewrite a payload after that payload has been committed to a PST.
   - [ ] Checkpoint 4: complete direct publication and failure behavior. Keep
     one same-filesystem active PST temporary, independently validate and fsync
     it, atomically rename it into `parts/`, preserve finalized parts on

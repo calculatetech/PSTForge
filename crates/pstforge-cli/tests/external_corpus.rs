@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 
 use libpff_sys::{
     CatalogEvent, CatalogSink, NamedPropertyIdentity, NamedPropertyName, PropertyDescriptor,
-    PropertyOwner,
+    PropertyOwner, TraversalOrder,
 };
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
@@ -19,6 +19,114 @@ use sha2::{Digest, Sha256};
 const WRITER_MANDATORY_FOLDER_COUNT: u64 = 5;
 const NID_IPM_SUBTREE: u32 = 0x8022;
 type MatchedSourceMessages = (Vec<Vec<String>>, usize);
+
+#[derive(Default)]
+struct WriterOrderSink {
+    message_stack: Vec<u32>,
+    attachments: Vec<(u32, u32, bool)>,
+    nested_messages: u64,
+    attachment_payloads: u64,
+    attachment_properties: u64,
+    message_properties: u64,
+}
+
+impl CatalogSink for WriterOrderSink {
+    fn traversal_order(&self) -> TraversalOrder {
+        TraversalOrder::Writer
+    }
+
+    fn event(&mut self, event: CatalogEvent<'_>) -> Result<(), String> {
+        match event {
+            CatalogEvent::MessageStart {
+                id,
+                parent_message_id,
+                parent_attachment_index,
+                ..
+            } => {
+                if let (Some(parent), Some(index)) = (parent_message_id, parent_attachment_index) {
+                    if self.message_stack.last().copied() != Some(parent)
+                        || !self
+                            .attachments
+                            .last()
+                            .is_some_and(|active| active.0 == parent && active.1 == index)
+                    {
+                        return Err("embedded message is outside its parent attachment".to_owned());
+                    }
+                    self.nested_messages = self.nested_messages.saturating_add(1);
+                } else if !self.message_stack.is_empty() {
+                    return Err("top-level message was nested".to_owned());
+                }
+                self.message_stack.push(id);
+            }
+            CatalogEvent::MessageEnd { id, .. } => {
+                if self.message_stack.pop() != Some(id) {
+                    return Err("message end is not properly nested".to_owned());
+                }
+            }
+            CatalogEvent::AttachmentStart {
+                message_id, index, ..
+            } => {
+                if self.message_stack.last().copied() != Some(message_id)
+                    || self
+                        .attachments
+                        .last()
+                        .is_some_and(|active| active.0 == message_id)
+                {
+                    return Err("attachment start is outside its message".to_owned());
+                }
+                self.attachments.push((message_id, index, false));
+            }
+            CatalogEvent::AttachmentData {
+                message_id, index, ..
+            } => {
+                let Some(active) = self.attachments.last_mut() else {
+                    return Err("attachment payload has no active attachment".to_owned());
+                };
+                if active.0 != message_id || active.1 != index || active.2 {
+                    return Err("attachment payload followed attachment properties".to_owned());
+                }
+                self.attachment_payloads = self.attachment_payloads.saturating_add(1);
+            }
+            CatalogEvent::PropertyStart(descriptor) => match descriptor.owner {
+                PropertyOwner::Attachment { message_id, index } => {
+                    let Some(active) = self.attachments.last_mut() else {
+                        return Err("attachment property has no active attachment".to_owned());
+                    };
+                    if active.0 != message_id
+                        || active.1 != index
+                        || self.message_stack.last().copied() != Some(message_id)
+                    {
+                        return Err("attachment property is outside writer order".to_owned());
+                    }
+                    active.2 = true;
+                    self.attachment_properties = self.attachment_properties.saturating_add(1);
+                }
+                PropertyOwner::Message(message_id) => {
+                    if self.message_stack.last().copied() != Some(message_id)
+                        || self
+                            .attachments
+                            .last()
+                            .is_some_and(|active| active.0 == message_id)
+                    {
+                        return Err("message property preceded attachment completion".to_owned());
+                    }
+                    self.message_properties = self.message_properties.saturating_add(1);
+                }
+                _ => {}
+            },
+            CatalogEvent::AttachmentEnd { message_id, index }
+            | CatalogEvent::AttachmentAbort { message_id, index } => {
+                if self.attachments.pop().map(|active| (active.0, active.1))
+                    != Some((message_id, index))
+                {
+                    return Err("attachment end does not match its start".to_owned());
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 struct RecipientFingerprint {
@@ -4185,6 +4293,48 @@ fn milestone_0_3_sigint_and_sigterm_leave_durable_partial_jobs()
         pstforge_core::SourceFile::open(&case.path)?.identity(),
         &before
     );
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires PSTFORGE_CORPUS_MANIFEST with external real PST files"]
+fn milestone_0_4_5_writer_order_traversal_matches_direct_stream_contract()
+-> Result<(), Box<dyn std::error::Error>> {
+    let manifest_path = std::env::var_os("PSTFORGE_CORPUS_MANIFEST")
+        .ok_or("PSTFORGE_CORPUS_MANIFEST is required")?;
+    let manifest: Manifest = toml::from_str(&fs::read_to_string(&manifest_path)?)?;
+    let mut totals = WriterOrderSink::default();
+    for case in &manifest.cases {
+        let source = pstforge_core::SourceFile::open(&case.path)?;
+        if source.identity().sha256 != case.sha256 {
+            return Err(format!("{} SHA-256 does not match its manifest", case.name).into());
+        }
+        let file = fs::File::open(&case.path)?;
+        let native = libpff_sys::PffFile::open_fd(file.as_fd())?;
+        let mut sink = WriterOrderSink::default();
+        native.catalog(&mut sink)?;
+        if !sink.message_stack.is_empty() || !sink.attachments.is_empty() {
+            return Err(format!("{} left writer-order state open", case.name).into());
+        }
+        totals.nested_messages = totals.nested_messages.saturating_add(sink.nested_messages);
+        totals.attachment_payloads = totals
+            .attachment_payloads
+            .saturating_add(sink.attachment_payloads);
+        totals.attachment_properties = totals
+            .attachment_properties
+            .saturating_add(sink.attachment_properties);
+        totals.message_properties = totals
+            .message_properties
+            .saturating_add(sink.message_properties);
+        source.verify_unchanged()?;
+    }
+    if totals.nested_messages == 0
+        || totals.attachment_payloads == 0
+        || totals.attachment_properties == 0
+        || totals.message_properties == 0
+    {
+        return Err(format!("external corpus lacks writer-order coverage: nested={}, attachment_payloads={}, attachment_properties={}, message_properties={}", totals.nested_messages, totals.attachment_payloads, totals.attachment_properties, totals.message_properties).into());
+    }
     Ok(())
 }
 
