@@ -115,12 +115,12 @@ cold restart. The accepted restartable implementation retains a private
 payload spool and therefore costs approximately one extra full
 readable-payload write and temporary allocation.
 
-Restore the 19 GB cold-run ceiling to 20 minutes on the current host, target the
-previously demonstrated approximately ten-minute result, publish the first
-part within six minutes, and keep aggregate PSTForge RSS below 2 GiB. Complete
-the deferred 0.4.2 whole-job reconciliation across independently validated
-4 GiB splits before proceeding. A low-write direct-output mode remains future
-work after the newly exposed native-item data-correctness gaps are resolved.
+Restore the 19 GB cold-run ceiling to one minute per source GiB on the current
+host, target the previously demonstrated approximately ten-minute result, and
+keep aggregate PSTForge RSS below 2 GiB. Complete the deferred 0.4.2 whole-job
+reconciliation across independently validated 4 GiB splits before proceeding.
+A low-write direct-output mode remains future work after the newly exposed
+native-item data-correctness gaps are resolved.
 
 ### 11. Version 0.4.4 - Whole-Job Data Reconciliation
 
@@ -138,14 +138,37 @@ Qualify against the 19 GB source with exactly 37,402 readable candidates
 reconciled to 37,402 unique written items, then require every output part to
 pass independent readers, ScanPST, and Outlook.
 
-### 12. Version 0.5.0 - Operational UX and Debian Packaging
+The final current-code qualification completed in 9:30.47 at 323,200 KiB peak
+RSS. It wrote all 37,402 candidates exactly once across five independently
+validated parts, with no unsupported, stranded, duplicate, or unassigned item
+and an unchanged source. The owner accepted this as completing version 0.4.4.
+
+### 12. Version 0.4.5 - Direct-Write Performance
+
+Make bounded direct output the default `split` execution mode. Stream recovered
+candidates through bounded backpressure into the transactional PST writer,
+write each part to temporary storage beside its final destination, and publish
+by atomic rename after validation and `fsync`. Retain compact per-candidate and
+part metadata for reporting and exact reconciliation, but do not create a
+mailbox-sized payload spool or rewrite a finalized dataset.
+
+Retain the existing durable ledger and payload spool behind an explicit
+`--restartable` option. Only restartable mode accepts `--resume` or
+`--keep-work`. An interrupted direct job is a reportable terminal partial
+result; rerunning requires a new empty output directory. Report measured
+source, temporary, validation, and finalized I/O so SSD write amplification is
+observable. Preserve exact 0.4.4 data accounting, the
+one-minute-per-source-GiB target, bounded memory, interruption safety, and
+independently valid 4 GiB parts.
+
+### 13. Version 0.5.0 - Operational UX and Debian Packaging
 
 Finalize human and JSON reports, documented exit codes, privacy-preserving
 diagnostics, installation checks, and a reproducible Debian 13 x86_64 package.
 Verify operation with Debian's older supported `libpff` ABI as well as the
 newer Ubuntu development host package.
 
-### 13. Version 0.5.1 - GitHub CI and Private-Corpus Automation
+### 14. Version 0.5.1 - GitHub CI and Private-Corpus Automation
 
 The GitHub remote and approved documentation baseline are available. Add branch
 checks, scheduled security and fuzzing jobs, release automation, and an
@@ -153,14 +176,14 @@ explicitly invoked private self-hosted corpus runner that never uploads PST
 content or sensitive logs. This repository does not use pull requests, so
 required checks apply to milestone branches and pre-merge local gates.
 
-### 14. Version 0.6.0 - Interoperability Release Candidate
+### 15. Version 0.6.0 - Interoperability Release Candidate
 
 Freeze the candidate CLI and schemas, run the complete external corpus,
 exercise fault injection and resource limits, import generated parts into a
 test Synology MailPlus mailbox, and perform secondary Outlook checks. Resolve
 all blocker and high-severity adversarial review findings.
 
-### 15. Version 1.0.0 - MailPlus-Ready Release
+### 16. Version 1.0.0 - MailPlus-Ready Release
 
 Repeat the 50 GB recovery and MailPlus import rehearsal from a clean install,
 reproduce the Debian package, verify licenses and notices, finalize operator

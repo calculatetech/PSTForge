@@ -27,8 +27,9 @@ The primary observable command is:
 
 The command creates `parts/part-0001.pst` and subsequent parts, validates each
 before making it visible, and writes human and JSON reports accounting for all
-mail candidates. Stopping and rerunning with `--resume` continues compatible
-work. Hash and identity evidence show that the source was not modified.
+mail candidates. With `--restartable`, stopping and rerunning with `--resume`
+continues compatible work. Hash and identity evidence show that the source was
+not modified.
 
 ## Progress
 
@@ -2097,9 +2098,9 @@ work. Hash and identity evidence show that the source was not modified.
     republished all five parts in 2:45.09 versus the 7:35.21 cold r3 run,
     without restarting libpff.
   - [x] Checkpoint 4: run the retained-job benchmark, then a fresh named 19 GB
-    split. Require one serialization per normal part, first publication within
-    six minutes, completion within 20 minutes, less than 2 GiB aggregate RSS,
-    exact accounting, independent validation, and unchanged source identity.
+    split. Require one serialization per normal part, completion within one
+    minute per source GiB, less than 2 GiB aggregate RSS, exact accounting,
+    independent validation, and unchanged source identity.
     Baseline r1 completed in 11:03.95 with first publication at approximately
     6:49. Optimized r2 published part 1 in approximately 5:20 and reduced its
     private append phase from about 104 seconds to 15 seconds, but exposed and
@@ -2475,7 +2476,7 @@ work. Hash and identity evidence show that the source was not modified.
     direct/dependent attribution. The final clean-context review returned
     `CLEAN`; the canonical combined-manifest full gate passes at
     `.agent/test-results/1784515992-full`.
-  - [ ] Final gate: reconcile the 19 GB source's 37,402 readable candidate
+  - [x] Final gate: reconcile the 19 GB source's 37,402 readable candidate
     keys to exactly 37,402 unique written item keys across finalized parts,
     with zero unexplained `unsupported`, `failed`, stranded, duplicated, or
     unassigned candidates. A writer limitation is a defect, not an approved
@@ -2484,7 +2485,48 @@ work. Hash and identity evidence show that the source was not modified.
     Require the canonical full gate, independent `pffinfo`/`readpst`, ScanPST
     on every part, Outlook item/folder checks, unchanged source identity, one
     serialization per normal part, less than 2 GiB RSS, and the accepted
-    20-minute cold-run ceiling.
+    one-minute-per-source-GiB cold-run ceiling.
+    Final qualification `qualification-v044-final-r1` completed in 9:30.47
+    with 323,200 KiB maximum RSS and five one-serialization parts totaling
+    19,478,205,440 bytes. Its ledger has exactly 37,402 unique `written`
+    candidates and 37,402 unique part assignments, with zero unsupported,
+    failed, stranded, duplicate, or unassigned candidate. SQLite integrity and
+    foreign keys are clean; all five parts passed supervised `pffinfo` and
+    `readpst` before atomic publication; their hashes reverified; and source
+    identity plus SHA-256 remained unchanged. Three omitted attachments map
+    exactly to three source `attachment_missing` events rather than readable
+    payload loss. The owner accepted the existing ScanPST/Outlook evidence and
+    this final current-code reconciliation as completion of version 0.4.4.
+- [ ] Milestone 0.4.5: Direct-Write Performance.
+  - [ ] Make direct output the default `split` mode. Feed parser output through
+    bounded backpressure into canonical translation and the transactional PST
+    writer without first creating a mailbox-sized payload pack. Retain a
+    compact metadata ledger with source/configuration identity, bounded
+    per-candidate status and completeness, part assignments, manifests,
+    aggregate omission/reconstruction counts, and terminal job state so
+    `report` and exact reconciliation remain reproducible.
+  - [ ] Keep the current durable ledger/payload-spool implementation behind an
+    explicit `--restartable` flag. Permit `--resume` and `--keep-work` only in
+    restartable mode and refuse incompatible combinations before creating the
+    output directory.
+  - [ ] Write only the active PST part to a same-filesystem temporary file
+    beside its destination. Validate and `fsync` it, then publish with atomic
+    rename; never rewrite the completed dataset to move from temporary to
+    final storage, including disk-to-disk recovery paths.
+  - [ ] Bound parser-to-writer queues, candidate metadata, attachment chunks,
+    and the active transaction independently of source or attachment size.
+    Preserve finalized parts on interruption. An interrupted direct job is a
+    terminal partial result that remains reportable but cannot resume; a new
+    run requires a different empty output directory. This prevents duplicate
+    candidate publication without retaining recovered payloads.
+  - [ ] Report logical source bytes, bytes written to active PST temporaries,
+    finalized output bytes, validator read bytes where measurable, peak
+    temporary allocation, and peak RSS. Prove the default path avoids one
+    readable-mailbox-sized spool write and allocation.
+  - [ ] Preserve the 0.4.4 exact 37,402-to-37,402 reconciliation, one
+    serialization per normal part, independent readers, ScanPST/Outlook
+    interoperability, less than 2 GiB RSS, and no more than one minute per
+    source GiB on the 19 GB qualification.
 - [ ] Milestone 0.5.0: Operational UX and Debian Packaging.
 - [ ] Milestone 0.5.1: GitHub CI and Private-Corpus Automation; the remote is
   reachable, and work begins after the approved baseline is pushed.
@@ -3196,17 +3238,33 @@ work. Hash and identity evidence show that the source was not modified.
   qualification.
 
 - Decision: Treat performance and interruption behavior as release
-  correctness. On the current high-end host, a cold 19 GB split must restore
-  the accepted 20-minute ceiling and target the previously demonstrated
-  approximately ten-minute runtime, publish its first part within six minutes,
-  stay below 2 GiB aggregate RSS, and stop at a durable boundary promptly on
-  SIGINT or SIGTERM. Resuming a materially progressed job must be faster than
-  restarting it from the beginning. Qualification must measure cold and resume
-  runs and must not leave failed scratch output after evidence is retained.
+  correctness. On the current high-end host, a cold split must finish within
+  one minute per source GiB and stay below 2 GiB aggregate RSS. There is no
+  separate first-part deadline. Restartable mode must stop at a durable
+  boundary promptly on SIGINT or SIGTERM, and resuming a materially progressed
+  job must be faster than restarting it from the beginning. Qualification must
+  measure cold and resume runs and must not leave failed scratch output after
+  evidence is retained.
   Rationale: Faster hardware masks rather than fixes serial work amplification.
   A restartable design is defective when replaying its persistence state costs
   more than repeating source recovery.
-  Date/Author: 2026-07-19 / project owner and Codex.
+  Date/Author: 2026-07-19 / project owner and Codex; performance target
+  clarified by the owner after final 0.4.4 qualification.
+
+- Decision: Version 0.4.5 makes low-write direct splitting the default and
+  keeps restartable persistence behind explicit `--restartable`.
+  `--resume` and `--keep-work` require that flag. Direct mode keeps a compact
+  metadata ledger and manifests for exact accounting and `report`, but never a
+  recovered-payload pack. If interrupted, its published parts and reporting
+  state form a terminal partial job; continuing requires a new empty output
+  directory rather than risking duplicates. Each active PST temporary lives
+  beside its destination and becomes the final file by atomic rename, so
+  publication never copies or rewrites the completed part.
+  Rationale: Restart persistence is useful but imposes a mailbox-sized extra
+  write and temporary allocation. Making that SSD cost deliberate preserves
+  the recovery option without charging every run. Compact accounting remains
+  necessary for trust, privacy-safe reporting, and one-to-one reconciliation.
+  Date/Author: 2026-07-19 / project owner direction and closeout review.
 
 - Decision: Reference attachment classification comes from the readable
   `PidTagAttachMethod` property, not libpff's narrower convenience type API.
@@ -3640,9 +3698,11 @@ work. Hash and identity evidence show that the source was not modified.
   Date/Author: 2026-07-16 / project owner and Codex.
 
 - Decision: Require three times the source size as free output capacity before
-  starting a fresh split. A matching resume credits the validated allocation
-  already consumed by that job against the same conservative total. Report
-  invocation time, logical source/final output bytes,
+  starting a fresh restartable split. Direct mode excludes the absent payload
+  spool, uses a mode-specific output/active-part/validator estimate, and
+  rechecks observed allocation before each part. A matching restartable resume
+  credits the validated allocation already consumed by that job against the
+  same conservative total. Report invocation time, logical source/final output bytes,
   end-to-end throughput, and maximum sampled RSS across the supervisor and
   parser workers. Retain empty private directories and the SQLite ledger after
   cleaning spool payloads so completed jobs can be validated and resumed
@@ -3684,14 +3744,14 @@ work. Hash and identity evidence show that the source was not modified.
   conformance stages can observe it promptly.
   Date/Author: 2026-07-17 / Codex after clean-context adversarial review.
 
-- Decision: Treat 20 minutes as the operational acceptance target for the
-  owner's 19 GB qualification on this host, in addition to the existing 2 GiB
-  RSS and correctness gates. Emit phase progress during recovery so the absence
-  of finalized parts before traversal completes is distinguishable from a
-  stall.
+- Decision: Treat one minute per source GiB as the operational acceptance
+  target for qualification on this host, in addition to the existing 2 GiB RSS
+  and correctness gates. Emit phase progress during recovery so the absence of
+  finalized parts before traversal completes is distinguishable from a stall.
   Rationale: The utility is needed for immediate recovery work, and a nominal
   24-hour ceiling does not satisfy the owner's stated usable turnaround.
-  Date/Author: 2026-07-17 / project owner and Codex.
+  Date/Author: 2026-07-17 / project owner and Codex; target clarified by the
+  owner after the final 0.4.4 run.
 
 - Decision: Close 0.4.1 on the accepted r11 split and validation evidence even
   though its measured 5,317,328,896-byte peak RSS exceeds the original 2 GiB
@@ -4137,17 +4197,20 @@ work. Hash and identity evidence show that the source was not modified.
   regression and independent completed-store evidence.
 
 - Decision: Make low-write non-restartable streaming the default `split`
-  mode. Add `--restartable` as the deliberate opt-in for the durable SQLite
-  ledger and payload pack; `--resume` resumes only such a job and
-  `--keep-work` is invalid otherwise. Deleting a spool after success does not
+  mode. Add `--restartable` as the deliberate opt-in for durable payload
+  recovery; `--resume` resumes only such a job and `--keep-work` is invalid
+  otherwise. Direct mode still retains compact SQLite accounting, but no
+  payload pack. Deleting a spool after success does not
   reduce device writes and therefore is not an acceptable implementation of
   streaming mode. Both modes build each PST under a private name on the output
   filesystem, `fsync` and independently validate it, and publish it with an
   atomic no-replace rename that never falls back to a cross-filesystem copy.
   Report the selected mode plus conservative estimated and measured temporary
-  writes/disk use. Streaming may retain compact current-part indexes and
-  bounded current-item state, but it must not materialize an entire attachment,
-  PST, or mailbox in RAM or a mailbox-sized payload spool.
+  writes/disk use. Direct mode retains bounded per-candidate accounting,
+  current-part indexes, and bounded current-item state, but it must not
+  materialize an entire attachment, PST, or mailbox in RAM or a mailbox-sized
+  payload spool. An interrupted direct job is terminal and reportable; rerun
+  requires a new empty output directory.
   Rationale: Restartable spooling writes every readable payload once before
   writing it again into PST output. That recovery guarantee is useful but can
   impose roughly dataset-sized extra SSD writes and capacity, materially
@@ -4359,6 +4422,26 @@ incomplete. Version 0.4.3 immediately owns the blocking writer, memory, resume,
 and cancellation performance defects before any operational UX or packaging
 work begins.
 
+Version 0.4.4 closes the whole-job data-reconciliation gap. Five focused
+checkpoint commits preserved explicit empty bodies, scaled recipient tables
+and message property contexts, recovered every remaining readable candidate,
+and replaced empty rejection events with strict privacy-safe structural
+categories. The final current-code 19 GB run completed in 9:30.47, about
+30 seconds per source GiB, at 323,200 KiB maximum RSS. It assigned all 37,402
+unique readable candidates exactly once across five independently validated
+parts, with no unsupported, failed, stranded, duplicate, or unassigned item.
+The source SHA-256 and identity remained unchanged. The three attachment
+omissions correspond exactly to source `attachment_missing` events. The owner
+accepted the current automated reconciliation and prior ScanPST/Outlook
+evidence as completing the version.
+
+Version 0.4.5 next removes restartable persistence write amplification from the
+default workflow. Direct mode streams through bounded queues into one active
+same-filesystem PST temporary and atomically renames the validated file;
+`--restartable` deliberately selects the existing durable ledger and payload
+spool. This makes recoverability an operator choice and prevents a
+mailbox-sized private spool from being the default SSD cost.
+
 ## Context and Orientation
 
 The repository initially contains only documentation. `AGENTS.md` governs all
@@ -4412,7 +4495,7 @@ second behavior path:
     pstforge recover <source.pst> --output <job-dir> [--json]
     pstforge split <source.pst> --output <job-dir> \
       [--max-pst-size <size>] [--recovery balanced|aggressive] \
-      [--resume] [--keep-work] [--json]
+      [--restartable] [--resume] [--keep-work] [--json]
     pstforge report <job-dir> [--json]
 
 Every durable JSON object has `schema_version`. Use unsigned 64-bit integers in
@@ -4832,15 +4915,15 @@ it.
 
 Use the retained interrupted 0.4.2 job only as a temporary private performance
 fixture while developing the writer path. Once focused proof exists, perform a
-cold run against the named 19 GB manifest case. Acceptance requires a first
-part within six minutes, total completion within 20 minutes with the previous
-approximately ten-minute run as the optimization target, less than 2 GiB
-aggregate RSS, no repeated whole-part trial writes, prompt graceful
-interruption, and a materially faster resume than cold restart. Independently
-validate every part and reconcile the readable source inventory against the
-split output and explicit omission record. Delete failed private scratch after
-retaining bounded evidence. Do not begin 0.5.0 until this gate passes or the
-owner records a specific exception.
+cold run against the named 19 GB manifest case. Acceptance requires completion
+within one minute per source GiB with the previous approximately ten-minute run
+as the optimization target, less than 2 GiB aggregate RSS, no repeated
+whole-part trial writes, prompt graceful interruption, and a materially faster
+resume than cold restart. Independently validate every part and reconcile the
+readable source inventory against the split output and explicit omission
+record. Delete failed private scratch after retaining bounded evidence. Do not
+begin the next milestone until this gate passes or the owner records a specific
+exception.
 
 Implement checkpoint 1 in `crates/pstforge-pst/src/writer.rs`. Define
 `TransactionalMailStoreWriter` as the sole owner of its private temporary file,

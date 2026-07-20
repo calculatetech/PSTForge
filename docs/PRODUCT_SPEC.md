@@ -93,24 +93,40 @@ failure is `4`.
 
     --max-pst-size <SIZE>        Default: 4GiB. Accept IEC or SI suffixes.
     --recovery <MODE>            balanced (default) or aggressive.
-    --resume                     Resume a matching interrupted job.
-    --keep-work                  Retain the private spool after success.
+    --restartable                Enable the durable payload spool.
+    --resume                     Resume a matching --restartable job.
+    --keep-work                  Retain --restartable payloads after success.
     --json                       Print the final summary as JSON.
 
-`split` uses a durable SQLite ledger and private payload pack so recovery and
-writing can resume without rereading committed payloads. This restartability
-costs approximately one additional readable-payload write and corresponding
-temporary capacity. `--keep-work` retains that private state after successful
+By default, `split` streams parser output through bounded queues into the
+transactional PST writer. It retains a compact metadata ledger for reporting,
+candidate-to-part reconciliation, source identity, manifests, and aggregate
+omission accounting, but it does not create a recovered-payload pack.
+`--restartable` selects the durable payload pack so recovery and writing can
+resume without rereading committed payloads. Restartability costs
+approximately one additional readable-payload write and corresponding
+temporary capacity. `--keep-work` retains that payload state after successful
 completion; otherwise it is removed after finalized parts and accounting are
 durable.
 
-Without `--resume`, an existing nonempty job directory is an error. With
-`--resume`, the source SHA-256, source identity, job schema, recovery mode,
-part-size policy, writer format, and compatible tool major version must match.
-A mismatch is refused and neither existing parts nor state are changed. A
-fresh job retains the three-times-source conservative capacity requirement.
-On resume, validated allocation already consumed by the matching job is
-credited against the requirement.
+`--resume` and `--keep-work` require `--restartable`; incompatible combinations
+are refused before creating the output directory. Without `--resume`, an
+existing nonempty job directory is an error. With `--resume`, the source
+SHA-256, source identity, job schema, recovery mode, part-size policy, writer
+format, and compatible tool major version must match. A mismatch is refused
+and neither existing parts nor state are changed. Restartable jobs retain the
+three-times-source conservative capacity requirement. Direct jobs use a
+mode-specific estimate for final parts, the active same-filesystem temporary,
+compact metadata, independent-reader scratch, manifests, and safety margin;
+they include no payload-spool allocation. On resume, validated allocation
+already consumed by the matching restartable job is credited against the
+requirement.
+
+An interrupted direct job is a terminal partial result. Its atomically
+finalized parts, manifests, compact ledger, and `recovery.log` remain valid and
+`report` can inspect them, but the job cannot resume. Rerunning direct recovery
+requires a new empty output directory. This avoids duplicating candidates
+across already published parts without reintroducing restartable payload state.
 
 PSTForge owns only ledger-tracked output names. It ignores and preserves
 untracked files placed in the public `parts/` directory, including human
@@ -158,9 +174,11 @@ run. The source must remain safe even if a parser worker crashes, the output
 filesystem fills, or the supervisor is forcibly terminated.
 
 Before starting, `split` estimates space for output parts, the current
-temporary part, durable ledger and payload spool, independent-reader scratch,
-manifests, and safety margin. A fresh job is refused below three times the
-source size. Refinement may not weaken source or finalized-part safety.
+temporary part, compact durable metadata, independent-reader scratch,
+manifests, mode-specific payload storage, and safety margin. Restartable mode
+is refused below three times the source size. Direct mode excludes a payload
+spool from its estimate and rechecks capacity before every part using observed
+output allocation. Refinement may not weaken source or finalized-part safety.
 
 ## Recovery Model
 
@@ -323,7 +341,7 @@ The stable output structure is:
         job.sqlite3
         manifests/
           part-0001.json
-        spool/
+        spool/                  # payload pack only in --restartable mode
         partial/
 
 `recovery.log` is the bounded human recovery record. It states what was
@@ -343,28 +361,34 @@ files. CLI `--json` output remains the machine-readable summary. The JSON
 manifests, SQLite ledger, and spool are private implementation data and are not
 an interchange format.
 
-On successful completion, private spool payloads and stale partial output are
-deleted unless `--keep-work` was specified. Empty private directories and the
-ledger remain so reports and validation can be reproduced. Interrupted and
-failed jobs retain enough work to resume.
+On successful completion, restartable spool payloads and stale partial output
+are deleted unless `--keep-work` was specified. Empty private directories and
+the compact ledger remain so reports and validation can be reproduced.
+Interrupted restartable jobs retain enough payload work to resume. Interrupted
+direct jobs retain finalized parts and compact reporting state as a terminal
+partial result, but never claim to be resumable.
 
-Recovered property and attachment bytes are appended to one private,
-job-local payload pack. The ledger stores checked pack offsets, lengths, and
-SHA-256 values rather than payload copies or one file per property. The pack is
-synced before a bounded candidate batch is committed; resume truncates any
-uncommitted tail. SIGINT or SIGTERM checkpoints completed candidates in the
-current batch, while abrupt process or host failure may replay only that
-bounded batch. This private representation does not change output PST content.
+In restartable mode, recovered property and attachment bytes are appended to
+one private, job-local payload pack. The ledger stores checked pack offsets,
+lengths, and SHA-256 values rather than payload copies or one file per
+property. The pack is synced before a bounded candidate batch is committed;
+resume truncates any uncommitted tail. SIGINT or SIGTERM checkpoints completed
+candidates in the current batch, while abrupt process or host failure may
+replay only that bounded batch. Direct mode instead records only bounded
+per-candidate metadata and aggregate accounting while payload chunks flow to
+the active writer transaction. Neither representation changes output PST
+content.
 
 Candidate and event metadata are consumed in one deterministic ordered pass.
 PSTForge starts publishing validated parts from completed top-level messages
 without first reconstructing the entire recovered mailbox in memory or through
 per-candidate database queries.
 
-Without `--keep-work`, packed payloads are securely removed and the ledger is
-compacted after finalized parts and accounting are durable. Independent-reader
-extraction scratch is created only beneath `.pstforge/partial/` on the selected
-job filesystem and is removed after validation. PST construction checks for
+Without `--keep-work`, restartable packed payloads are securely removed and the
+ledger is compacted after finalized parts and accounting are durable.
+Independent-reader extraction scratch is created only beneath
+`.pstforge/partial/` on the selected job filesystem and is removed after
+validation. PST construction checks for
 interruption between streamed messages and blocks; an active independent
 validator process group is terminated when interruption is requested. A
 validator also arms parent-death containment before launching its reader, so
@@ -449,14 +473,14 @@ Any remaining unwritten item requires specific evidence that its source bytes
 cannot be read or cannot be represented safely in a Unicode PST; a generic
 writer rejection or unsupported status does not satisfy this exception.
 
-The 19 GB operational qualification has a stricter 20-minute cold-run ceiling
-on the current host, a six-minute maximum time to the first finalized part, and
-the same 2 GiB aggregate RSS limit. A normal part is serialized once; the
-implementation must not repeatedly rewrite a multi-gigabyte candidate merely
-to discover whether it fits. Resume after material progress must complete less
-work and finish faster than an equivalent cold restart. SIGINT and SIGTERM must
-be observed at bounded data-processing intervals so a CPU-bound writer can
-checkpoint and exit with status 130 promptly.
+The 19 GB operational qualification has a cold-run ceiling of one minute per
+source GiB on the current host and a 2 GiB aggregate RSS limit. A normal part
+is serialized once; the implementation must not repeatedly rewrite a
+multi-gigabyte candidate merely to discover whether it fits. Restartable mode
+after material progress must complete less work and finish faster than an
+equivalent cold restart. SIGINT and SIGTERM must be observed at bounded
+data-processing intervals so a CPU-bound writer can checkpoint and exit with
+status 130 promptly.
 
 Every output part must pass PSTForge structural checks, Ubuntu/Debian
 `pffinfo`, independent `readpst`, size and SHA-256 verification, and repeated
