@@ -4397,8 +4397,13 @@ impl TransactionalMailStoreWriter {
             .map_err(completed_validation_error)?;
         }
         check_interrupted(interrupted)?;
-        validate_completed_folder_store(&validated_path, spec.record_key, &folder_plans)
-            .map_err(completed_validation_error)?;
+        validate_completed_folder_store(
+            &validated_path,
+            spec.record_key,
+            &folder_plans,
+            &named_identities,
+        )
+        .map_err(completed_validation_error)?;
         check_interrupted(interrupted)?;
         validate_with_independent_readers(
             &validated_path,
@@ -4678,8 +4683,13 @@ fn create_flat_store(
         .map_err(completed_validation_error)?;
     }
     check_interrupted(interrupted)?;
-    validate_completed_folder_store(&validated_path, spec.record_key, &folder_plans)
-        .map_err(completed_validation_error)?;
+    validate_completed_folder_store(
+        &validated_path,
+        spec.record_key,
+        &folder_plans,
+        &named_identities,
+    )
+    .map_err(completed_validation_error)?;
     check_interrupted(interrupted)?;
     validate_with_independent_readers(
         &validated_path,
@@ -6999,6 +7009,7 @@ fn validate_completed_folder_store(
     path: &Path,
     record_key: [u8; 16],
     folders: &[FolderPlan<'_>],
+    named_identities: &[NamedIdentity],
 ) -> Result<(), WriterError> {
     let invalid = |message: &str| WriterError::InvalidStructure(message.to_owned());
     let store = crate::open_store(path)?;
@@ -7243,13 +7254,14 @@ fn validate_completed_folder_store(
             }
         }
     }
-    validate_spooled_attachment_identities(path, record_key, folders)
+    validate_spooled_attachment_identities(path, record_key, folders, named_identities)
 }
 
 fn validate_spooled_attachment_identities(
     path: &Path,
     record_key: [u8; 16],
     folders: &[FolderPlan<'_>],
+    named_identities: &[NamedIdentity],
 ) -> Result<(), WriterError> {
     use crate::{
         UnicodePstFile,
@@ -7289,17 +7301,6 @@ fn validate_spooled_attachment_identities(
     }
     let pst = Rc::new(UnicodePstFile::open(path)?);
     let store = UnicodeStore::read(pst)?;
-    let all_messages = folders
-        .iter()
-        .flat_map(|folder| {
-            folder
-                .messages
-                .iter()
-                .chain(folder.associated_messages.iter())
-        })
-        .copied()
-        .collect::<Vec<_>>();
-    let named_identities = collect_named_identities_many_refs(&all_messages);
     for (message_spec, associated, message_node) in indexed_messages {
         let streamed_ids = message_spec
             .spooled_properties
@@ -7452,9 +7453,11 @@ fn validate_spooled_attachment_identities(
         validate_embedded_message(
             message,
             message_spec,
-            &named_identities,
+            named_identities,
             message_record_key(record_key, message_node),
             associated,
+            u32::from(message_node),
+            &[],
         )?;
     }
     Ok(())
@@ -8004,6 +8007,8 @@ fn validate_attachment_fidelity(
                         index_u32,
                     ),
                     false,
+                    u32::from(top_node),
+                    &[index_u32],
                 )?;
             }
             (AttachmentContent::Reference(reference), None) => {
@@ -8107,6 +8112,8 @@ fn validate_embedded_message(
     named_identities: &[NamedIdentity],
     record_key: [u8; 16],
     associated: bool,
+    output_message_node: u32,
+    attachment_path: &[u32],
 ) -> Result<(), WriterError> {
     use crate::ltp::prop_context::PropertyValue as ReadValue;
 
@@ -8204,11 +8211,19 @@ fn validate_embedded_message(
         let id = 0x8000_u16
             .checked_add(u16::try_from(index).map_err(|_| invalid("named property overflow"))?)
             .ok_or_else(|| invalid("named property overflow"))?;
-        if !properties
-            .get(id)
-            .is_some_and(|actual| raw_value_matches(&property.value, actual))
-        {
-            return Err(invalid("completed store embedded named property mismatch"));
+        let actual = properties.get(id);
+        if !actual.is_some_and(|actual| raw_value_matches(&property.value, actual)) {
+            let expected_type = raw_property_value(&property.value).property_type() as u16;
+            let actual_type = actual.map(|actual| u16::from(PropertyType::from(actual)));
+            let actual_type = actual_type
+                .map(|property_type| format!("0x{property_type:04X}"))
+                .unwrap_or_else(|| "absent".to_owned());
+            return Err(invalid(&format!(
+                "completed store embedded named property mismatch: \
+                 output_message_node=0x{output_message_node:08X}, \
+                 attachment_path={attachment_path:?}, property_id=0x{id:04X}, \
+                 expected_type=0x{expected_type:04X}, actual_type={actual_type}"
+            )));
         }
     }
     for property in &expected.raw_properties {
@@ -8631,6 +8646,12 @@ fn validate_embedded_message(
                     named_identities,
                     embedded_message_record_key(record_key, index_u32),
                     false,
+                    output_message_node,
+                    &{
+                        let mut path = attachment_path.to_vec();
+                        path.push(index_u32);
+                        path
+                    },
                 )?;
             }
             (AttachmentContent::Reference(reference), None) => {
@@ -12500,11 +12521,13 @@ mod tests {
             .collect::<Vec<_>>();
         let associated_plans =
             plan_transaction_folders("Inbox", &associated_messages, &associated_folders, true)?;
+        let associated_identities = collect_named_identities_many_refs(&associated_messages);
         assert!(
             validate_completed_folder_store(
                 &associated_destination,
                 fixture.record_key,
-                &associated_plans
+                &associated_plans,
+                &associated_identities,
             )
             .is_err()
         );
@@ -12572,9 +12595,15 @@ mod tests {
             .collect::<Vec<_>>();
         let nested_plans =
             plan_transaction_folders("Inbox", &nested_messages, &nested_folders, true)?;
+        let nested_identities = collect_named_identities_many_refs(&nested_messages);
         assert!(
-            validate_completed_folder_store(&nested_destination, fixture.record_key, &nested_plans)
-                .is_err()
+            validate_completed_folder_store(
+                &nested_destination,
+                fixture.record_key,
+                &nested_plans,
+                &nested_identities,
+            )
+            .is_err()
         );
         Ok(())
     }
@@ -14003,6 +14032,57 @@ mod tests {
     }
 
     #[test]
+    fn transactional_validation_retains_unused_source_named_property_ids()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("unused-source-named-property.pst");
+        let base = FidelityStore::default();
+        let named_set = |first| {
+            NamedPropertySet::Guid([
+                first, 0x20, 0x06, 0x00, 0x00, 0x00, 0x00, 0x00, 0xC0, 0x00, 0x00, 0x00, 0x00,
+                0x00, 0x00, 0x46,
+            ])
+        };
+        let mut message = base.message;
+        message.named_properties = vec![NamedProperty {
+            set: named_set(0x08),
+            name: NamedPropertyName::Numeric(0x8503),
+            value: RawPropertyValue::Boolean(false),
+        }];
+        let folder_path = vec![base.folder_name];
+        let layout = MailStoreSpec {
+            store_name: base.store_name,
+            record_key: base.record_key,
+            folders: vec![MailFolderSpec {
+                path: folder_path.clone(),
+                location: MailFolderLocation::IpmSubtree,
+                role: MailFolderRole::Ordinary,
+                container_class: "IPF.Note".to_owned(),
+                messages: Vec::new(),
+                associated_messages: Vec::new(),
+            }],
+        };
+        let mut catalog = NamedPropertyCatalog::default();
+        catalog.observe(named_set(0x01), NamedPropertyName::Numeric(0x8001));
+        catalog.observe_message(&message);
+        let mut writer = TransactionalMailStoreWriter::begin(&path, layout, &catalog, true, None)?;
+        assert!(matches!(
+            writer.append_message(
+                MailFolderLocation::IpmSubtree,
+                &folder_path,
+                false,
+                message,
+                u64::MAX,
+                &NEVER_INTERRUPTED,
+            )?,
+            TransactionAppend::Appended { .. }
+        ));
+        writer.finalize(&NEVER_INTERRUPTED)?;
+        assert!(path.is_file());
+        Ok(())
+    }
+
+    #[test]
     fn contact_message_round_trips_in_contact_folder() -> Result<(), Box<dyn std::error::Error>> {
         let directory = tempfile::tempdir()?;
         let path = directory.path().join("contact.pst");
@@ -14606,8 +14686,24 @@ mod tests {
         };
         blob.sha256 = [0_u8; 32];
         let plans = plan_folders("unused", &[], Some(&spec.folders))?;
+        let messages = spec
+            .folders
+            .iter()
+            .flat_map(|folder| {
+                folder
+                    .messages
+                    .iter()
+                    .chain(folder.associated_messages.iter())
+            })
+            .collect::<Vec<_>>();
+        let named_identities = collect_named_identities_many_refs(&messages);
         assert!(matches!(
-            validate_spooled_attachment_identities(&destination, spec.record_key, &plans),
+            validate_spooled_attachment_identities(
+                &destination,
+                spec.record_key,
+                &plans,
+                &named_identities,
+            ),
             Err(WriterError::InvalidStructure(message)) if message.contains("identity mismatch")
         ));
         Ok(())

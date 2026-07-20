@@ -2789,6 +2789,30 @@ not modified.
       malformed ownership, payload EOF, trailing data, worker/watchdog failure,
       nonzero exit, missing durable candidates, and source identity changes
       remain hard failures.
+    - [x] Proved the direct single-file performance and memory targets, then
+      corrected a completed-store validator catalog mismatch exposed by the
+      full source. Qualification r9 completed one catalog pass, one exact
+      19,530,195,968-byte projection, and one payload write in 6:50.59 at
+      467,584 KiB peak RSS. Qualification r10 repeated the same work in
+      6:57.26 at 467,784 KiB peak RSS. Both kept `payload.pack` at zero bytes,
+      accepted the known parser boundary only after durable catalog
+      exhaustion, and cleaned the unpublished PST when validation failed.
+      The writer correctly used the complete source-wide NAMEID catalog,
+      including identities whose damaged or unsupported values could not be
+      serialized. The final streamed-identity validator incorrectly rebuilt a
+      smaller catalog from written values, shifted later mapped property IDs,
+      and reported an existing Boolean property as absent. Final validation
+      now receives the writer's authoritative catalog instead. A focused
+      regression reserves an unused source identity before a written named
+      property and proves transactional finalization retains the exact mapping.
+      Privacy-safe mismatch diagnostics identify only the output message node,
+      attachment index path, mapped property ID, and expected/actual MAPI
+      types. The writer suite passes 101 tests with one intentional
+      multi-gigabyte test ignored, and the core suite passes all 84 tests.
+      Evidence is retained at
+      `.agent/test-results/1784540039-v045-direct-single-r9` and
+      `.agent/test-results/1784541051-v045-direct-single-r10`; the failed job
+      directories contain no published PST and are removed after diagnosis.
   - [ ] Checkpoint 4: complete direct publication and failure behavior. Keep
     one same-filesystem active PST temporary, independently validate and fsync
     it, atomically rename it into `parts/`, preserve finalized parts on
@@ -2940,6 +2964,17 @@ not modified.
   Evidence: `.agent/test-results/1784539095-v045-direct-single-r8`, the r8
   19,530,195,968-byte exact projection, and the direct parser-boundary
   acceptance/rejection regression.
+
+- Observation: A completed-store validator must use the exact NAMEID catalog
+  used to write the store, not reconstruct it from successfully serialized
+  values. The durable source catalog intentionally retains identities whose
+  values are omitted as damaged or unsupported so every later named-property
+  ID remains stable. Reconstructing from output messages removes those
+  reserved identities and makes valid later properties appear absent or
+  mismatched. Qualification r10 isolated this at output message node
+  `0x0031AE44`; no invalid PST was published.
+  Evidence: `.agent/test-results/1784541051-v045-direct-single-r10` and
+  `transactional_validation_retains_unused_source_named_property_ids`.
 
 - Observation: The 0.4.2 fidelity expansion regressed a cold 19 GB split from
   approximately ten minutes in 0.4.1 to more than 57 minutes without
