@@ -2744,6 +2744,29 @@ not modified.
       enforcement, projection/write parity, payload isolation, memory bounds,
       cleanup, retry behavior, disk preflight, interruption, or publication
       safety.
+    - [x] Corrected the first whole-part projection failure without violating
+      the PST subnode format. Qualification r7 completed metadata capture in
+      3:45 at 340,112 KiB peak RSS with a zero-byte payload pack, then stopped
+      before payload streaming because one contents table exceeded the
+      documented 173,400-entry SLBLOCK/SIBLOCK capacity. MS-PST requires
+      `SIBLOCK.cLevel` to be exactly 1 and each SIENTRY to address an SLBLOCK,
+      so a deeper subnode tree is prohibited. The external TC writer had
+      unnecessarily assigned a subnode to every nonempty variable cell.
+      Values at or below the documented 3,580-byte HN allocation maximum now
+      use HIDs in packed continuation pages; only larger values consume
+      subnodes. TC BTH records use the same allocator, page packing reserves
+      structural fill-map space, bitmap fill levels reflect each actual page,
+      and message/attachment size properties follow the smaller exact
+      representation. A 24,800-row regression serializes 173,600 small
+      variable values that the old representation necessarily rejected. The
+      complete writer suite passes 100 tests with one intentional
+      multi-gigabyte test ignored, and the core suite passes 83 tests. The
+      canonical fast gate passed at `.agent/test-results/1784538763-fast`; a
+      fresh clean-context adversarial review found no blocker or high issue in
+      HNID selection, HID page/allocation numbering, bitmap cadence, BTH
+      references, large-value fallback, size chains, bounds, determinism, or
+      test coverage. Independent ScanPST and Outlook acceptance remains
+      pending.
   - [ ] Checkpoint 4: complete direct publication and failure behavior. Keep
     one same-filesystem active PST temporary, independently validate and fsync
     it, atomically rename it into `parts/`, preserve finalized parts on
@@ -2870,6 +2893,17 @@ not modified.
   Evidence: `.agent/test-results/1784536000-v045-direct-single-r6`, process and
   disk telemetry from that run, and the whole-part direct projection
   regression.
+
+- Observation: A valid Unicode SIBLOCK cannot be made deeper to accommodate a
+  large table: MS-PST fixes `cLevel` at 1 and defines SIENTRY as a pointer to an
+  SLBLOCK. The 19 GB single-store projection instead exposed inefficient HNID
+  selection: small contents-table strings and identifiers were all stored as
+  subnodes even though each fits a normal HN heap allocation. Using documented
+  HIDs for those values preserves the same table cells while avoiding the
+  finite subnode namespace and reducing structural/message-size overhead.
+  Evidence: `.agent/test-results/1784538080-v045-direct-single-r7`, MS-PST
+  sections 2.2.2.8.3.3.2.1, 2.2.2.8.3.3.2.2, 2.3.1, and 2.3.4.4.2, plus the
+  173,600-small-value writer regression.
 
 - Observation: The 0.4.2 fidelity expansion regressed a cold 19 GB split from
   approximately ten minutes in 0.4.1 to more than 57 minutes without

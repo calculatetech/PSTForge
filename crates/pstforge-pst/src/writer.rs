@@ -9259,13 +9259,13 @@ fn push_heap_allocation(
         let page_index = current_page_index;
         current.push(allocation);
         match heap_continuation_page_allocations(page_index, current) {
-            Ok(_) => {
+            Ok(page) if page.len().saturating_add(3) <= MAX_DATA_BLOCK_PAYLOAD => {
                 let allocation_index = u16::try_from(current.len())
                     .map_err(|_| WriterError::ValueTooLarge("heap allocation count"))?;
                 return HeapId::new(allocation_index, page_index)
                     .map_err(|error| WriterError::InvalidStructure(error.to_string()));
             }
-            Err(WriterError::ValueTooLarge("heap continuation page")) => {
+            Ok(_) | Err(WriterError::ValueTooLarge("heap continuation page")) => {
                 let allocation = current.pop().ok_or_else(|| {
                     WriterError::InvalidStructure("heap allocation rollback failed".to_owned())
                 })?;
@@ -10257,6 +10257,7 @@ fn table_context_external(
     let mut matrix = Vec::with_capacity(rows.len().saturating_mul(usize::from(end_bitmap)));
     let mut blocks = Vec::new();
     let mut subnodes = Vec::new();
+    let mut heap_allocations = Vec::new();
     for (index, row) in rows.iter().enumerate() {
         leaf.write_u32::<LittleEndian>(u32::from(row.id))?;
         leaf.write_u32::<LittleEndian>(
@@ -10274,6 +10275,7 @@ fn table_context_external(
                 columns,
                 *property_id,
                 value,
+                &mut heap_allocations,
                 &mut next_value_node,
                 next_block_index,
                 &mut blocks,
@@ -10297,19 +10299,14 @@ fn table_context_external(
     let subnode_block = append_subnode_tree(subnodes, next_block_index, &mut blocks)?;
 
     const BTH_RECORDS_PER_PAGE: usize = MAX_HEAP_ALLOCATION / 8;
-    let mut heap_pages = Vec::new();
     let mut roots = Vec::with_capacity(rows.len().div_ceil(BTH_RECORDS_PER_PAGE));
     for chunk in leaf.chunks(BTH_RECORDS_PER_PAGE * 8) {
-        let page_index = u16::try_from(heap_pages.len() + 1)
-            .map_err(|_| WriterError::ValueTooLarge("heap page index"))?;
-        let heap_id = HeapId::new(1, page_index)
-            .map_err(|error| WriterError::InvalidStructure(error.to_string()))?;
         let key = u32::from_le_bytes(
             chunk[0..4]
                 .try_into()
                 .map_err(|_| WriterError::InvalidStructure("empty BTH leaf".to_owned()))?,
         );
-        heap_pages.push(heap_continuation_page(page_index, chunk)?);
+        let heap_id = push_heap_allocation(&mut heap_allocations, chunk.to_vec())?;
         roots.push((key, heap_id));
     }
     let mut levels = 0_u8;
@@ -10324,11 +10321,7 @@ fn table_context_external(
                 entries.write_u32::<LittleEndian>(*key)?;
                 entries.write_u32::<LittleEndian>(u32::from(*next_level))?;
             }
-            let page_index = u16::try_from(heap_pages.len() + 1)
-                .map_err(|_| WriterError::ValueTooLarge("heap page index"))?;
-            let heap_id = HeapId::new(1, page_index)
-                .map_err(|error| WriterError::InvalidStructure(error.to_string()))?;
-            heap_pages.push(heap_continuation_page(page_index, &entries)?);
+            let heap_id = push_heap_allocation(&mut heap_allocations, entries)?;
             parents.push((group[0].0, heap_id));
         }
         roots = parents;
@@ -10350,7 +10343,16 @@ fn table_context_external(
     HeapTreeHeader::new(4, 4, levels, row_tree_root)
         .map_err(|error| WriterError::InvalidStructure(error.to_string()))?
         .write(&mut index)?;
-    heap_pages.insert(0, heap_page(HeapNodeType::Table, &[table, index])?);
+    let mut heap_pages = Vec::with_capacity(heap_allocations.len().saturating_add(1));
+    heap_pages.push(heap_page(HeapNodeType::Table, &[table, index])?);
+    for (index, allocations) in heap_allocations.into_iter().enumerate() {
+        let page_index =
+            u16::try_from(index + 1).map_err(|_| WriterError::ValueTooLarge("heap page index"))?;
+        heap_pages.push(heap_continuation_page_allocations(
+            page_index,
+            &allocations,
+        )?);
+    }
     let non_final = heap_pages.len().saturating_sub(1);
     for page in heap_pages.iter_mut().take(non_final) {
         fill_heap_page(page)?;
@@ -10542,6 +10544,7 @@ fn write_external_table_value(
     columns: &[TableColumnDescriptor],
     property_id: u16,
     value: &PropertyValue,
+    heap_allocations: &mut Vec<Vec<Vec<u8>>>,
     next_value_node: &mut u32,
     next_block_index: &mut u64,
     blocks: &mut Vec<BlockSpec>,
@@ -10580,6 +10583,11 @@ fn write_external_table_value(
             })?;
             if data.is_empty() {
                 write_row_bytes(row, offset, &0_u32.to_le_bytes())?;
+                return mark_column(row, columns, property_id);
+            }
+            if data.len() <= MAX_HEAP_ALLOCATION {
+                let heap_id = push_heap_allocation(heap_allocations, data)?;
+                write_row_bytes(row, offset, &u32::from(heap_id).to_le_bytes())?;
                 return mark_column(row, columns, property_id);
             }
             let value_node = node(NodeIdType::ListsTablesProperties, *next_value_node)?;
@@ -10776,10 +10784,6 @@ fn heap_page(kind: HeapNodeType, allocations: &[Vec<u8>]) -> Result<Vec<u8>, Wri
         data.write_u16::<LittleEndian>(offset)?;
     }
     Ok(data)
-}
-
-fn heap_continuation_page(page_index: u16, allocation: &[u8]) -> Result<Vec<u8>, WriterError> {
-    heap_continuation_page_allocations(page_index, &[allocation.to_vec()])
 }
 
 fn heap_continuation_page_allocations(
@@ -12951,7 +12955,7 @@ mod tests {
         };
         let mut transaction =
             TransactionalMailStoreWriter::begin(&transaction_path, layout, &catalog, true, None)?;
-        let first_projected = match transaction.append_message(
+        match transaction.append_message(
             MailFolderLocation::IpmSubtree,
             &["Inbox".to_owned()],
             false,
@@ -12959,16 +12963,29 @@ mod tests {
             u64::MAX,
             &NEVER_INTERRUPTED,
         )? {
-            TransactionAppend::Appended { projected_file_eof } => projected_file_eof,
+            TransactionAppend::Appended { .. } => {}
             TransactionAppend::PartFull { .. } => return Err("first message was rejected".into()),
-        };
+        }
+        let checkpoint = transaction.begin_batch();
+        transaction.append_message_deferred(
+            MailFolderLocation::IpmSubtree,
+            &["Inbox".to_owned()],
+            false,
+            external.clone(),
+            &NEVER_INTERRUPTED,
+        )?;
+        let second_projected = transaction.projected_file_eof(&NEVER_INTERRUPTED)?;
+        transaction.rollback_batch(checkpoint)?;
+        let rejected_limit = second_projected
+            .checked_sub(1)
+            .ok_or("second projection cannot be zero")?;
         assert!(matches!(
             transaction.append_message(
                 MailFolderLocation::IpmSubtree,
                 &["Inbox".to_owned()],
                 false,
                 external.clone(),
-                first_projected,
+                rejected_limit,
                 &NEVER_INTERRUPTED,
             )?,
             TransactionAppend::PartFull { .. }
@@ -12997,7 +13014,7 @@ mod tests {
                 .make_entry_id(node(NodeIdType::NormalMessage, MESSAGE_INDEX + 1)?)?,
             Some(&[0x0E08]),
         )?;
-        assert_eq!(message.properties().message_size()?, 140_204);
+        assert_eq!(message.properties().message_size()?, 121_936);
         let attachment = message.clone().read_attachment(
             node(NodeIdType::Attachment, 0x2_0000)?,
             None,
@@ -13005,14 +13022,14 @@ mod tests {
             &[],
             true,
         )?;
-        assert_eq!(attachment.properties().attachment_size()?, 69_862);
+        assert_eq!(attachment.properties().attachment_size()?, 60_728);
         let crate::messaging::attachment::AttachmentData::Message(embedded) = attachment
             .data()
             .ok_or("embedded attachment data is missing")?
         else {
             return Err("expected embedded message attachment".into());
         };
-        assert_eq!(embedded.properties().message_size()?, 69_742);
+        assert_eq!(embedded.properties().message_size()?, 60_608);
         Ok(())
     }
 
@@ -14859,14 +14876,15 @@ mod tests {
             })
             .ok_or("missing bitmap heap page")?;
         let bitmap_header = HeapNodeBitmapHeader::read(&mut io::Cursor::new(bitmap_data))?;
-        let full_bitmap_pages = entries.len() - 1 - 8;
+        let represented_pages = entries.len() - 8;
+        for (level, size) in bitmap_header.fill_levels()[..represented_pages]
+            .iter()
+            .zip(&child_sizes[8..])
+        {
+            assert_eq!(*level, heap_fill_level(*size)?);
+        }
         assert!(
-            bitmap_header.fill_levels()[..full_bitmap_pages]
-                .iter()
-                .all(|level| *level == HeapFillLevel::Level15)
-        );
-        assert!(
-            bitmap_header.fill_levels()[full_bitmap_pages..]
+            bitmap_header.fill_levels()[represented_pages..]
                 .iter()
                 .all(|level| *level == HeapFillLevel::Empty)
         );
@@ -14901,6 +14919,35 @@ mod tests {
                 "every non-final XBLOCK child must use the maximum payload"
             );
         }
+        Ok(())
+    }
+
+    #[test]
+    fn external_table_small_values_do_not_exhaust_the_subnode_tree()
+    -> Result<(), Box<dyn std::error::Error>> {
+        const ROW_COUNT: u32 = 24_800;
+        let columns = contents_columns()?;
+        let rows = (0..ROW_COUNT)
+            .map(|index| {
+                Ok(TableRowSpec {
+                    id: node(NodeIdType::NormalMessage, MESSAGE_INDEX + index)?,
+                    values: vec![
+                        (0x001A, PropertyValue::Unicode("IPM.Note".to_owned())),
+                        (0x0037, PropertyValue::Unicode("subject".to_owned())),
+                        (0x0042, PropertyValue::Unicode("sender".to_owned())),
+                        (0x0070, PropertyValue::Unicode("topic".to_owned())),
+                        (0x0071, PropertyValue::Binary(vec![1, 2, 3, 4])),
+                        (0x0E03, PropertyValue::Unicode("to".to_owned())),
+                        (0x0E04, PropertyValue::Unicode("cc".to_owned())),
+                    ],
+                })
+            })
+            .collect::<Result<Vec<_>, WriterError>>()?;
+        assert!(rows.len() * 7 > MAX_SUBNODE_TREE_ENTRIES);
+
+        let mut next_block = 100;
+        let external = table_context_external(&columns, &rows, &mut next_block)?;
+        assert!(!external.blocks.is_empty());
         Ok(())
     }
 
