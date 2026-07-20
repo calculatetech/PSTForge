@@ -3211,6 +3211,12 @@ struct FinalizationPlan {
     projected_file_eof: u64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DirectMessageProjection {
+    pub private_file_eof: u64,
+    pub finalized_file_eof: u64,
+}
+
 #[allow(clippy::too_many_arguments)]
 fn build_finalization_plan(
     spec: &StoreInput<'_>,
@@ -3234,8 +3240,17 @@ fn build_finalization_plan(
     spam_search: NodeId,
     interrupted: &AtomicBool,
 ) -> Result<FinalizationPlan, WriterError> {
-    let contents_rows = &message_stream.contents_rows;
-    let associated_rows = &message_stream.associated_rows;
+    let mut contents_rows = BTreeMap::<NodeId, Vec<TableRowSpec>>::new();
+    for (parent, row) in &message_stream.contents_rows {
+        contents_rows.entry(*parent).or_default().push(row.clone());
+    }
+    let mut associated_rows = BTreeMap::<NodeId, Vec<TableRowSpec>>::new();
+    for (parent, row) in &message_stream.associated_rows {
+        associated_rows
+            .entry(*parent)
+            .or_default()
+            .push(row.clone());
+    }
     let top_nodes = &message_stream.top_nodes;
     let mut next_block_index = message_stream.next_block_index;
     let mut folder_blocks = Vec::new();
@@ -3298,10 +3313,7 @@ fn build_finalization_plan(
             block
         };
 
-        let rows = contents_rows
-            .iter()
-            .filter_map(|(parent, row)| (*parent == folder.node).then_some((*row).clone()))
-            .collect::<Vec<_>>();
+        let rows = contents_rows.remove(&folder.node).unwrap_or_default();
         if rows.len() != folder.messages.len() {
             return Err(WriterError::InvalidStructure(
                 "streamed normal contents rows disagree with the final folder plan".to_owned(),
@@ -3341,10 +3353,7 @@ fn build_finalization_plan(
             folder_blocks.extend(contents.blocks);
             (data, Some(subnode))
         };
-        let rows = associated_rows
-            .iter()
-            .filter_map(|(parent, row)| (*parent == folder.node).then_some((*row).clone()))
-            .collect::<Vec<_>>();
+        let rows = associated_rows.remove(&folder.node).unwrap_or_default();
         if rows.len() != folder.associated_messages.len() {
             return Err(WriterError::InvalidStructure(
                 "streamed associated contents rows disagree with the final folder plan".to_owned(),
@@ -3398,6 +3407,11 @@ fn build_finalization_plan(
             associated_block,
             associated_subnode,
         });
+    }
+    if !contents_rows.is_empty() || !associated_rows.is_empty() {
+        return Err(WriterError::InvalidStructure(
+            "streamed contents rows reference an unplanned folder".to_owned(),
+        ));
     }
     let deleted_plan = folder_plans
         .iter()
@@ -3982,6 +3996,44 @@ impl TransactionalMailStoreWriter {
         message: &MessageSpec,
         interrupted: &AtomicBool,
     ) -> Result<u64, WriterError> {
+        Ok(self
+            .project_message_direct_extents(location, path, associated, message, interrupted)?
+            .finalized_file_eof)
+    }
+
+    /// Calculate the exact private allocation after a direct append without
+    /// constructing final folder tables or opening payload streams.
+    pub fn project_message_direct_private_eof(
+        &mut self,
+        location: MailFolderLocation,
+        path: &[String],
+        associated: bool,
+        message: &MessageSpec,
+        interrupted: &AtomicBool,
+    ) -> Result<u64, WriterError> {
+        let checkpoint = self.begin_batch();
+        let result = self
+            .append_message_direct_projection_deferred(
+                location,
+                path,
+                associated,
+                message,
+                interrupted,
+            )
+            .map(|()| self.private_file_eof());
+        self.rollback_projected_batch(checkpoint)?;
+        result
+    }
+
+    /// Calculate private and finalized extents without opening payload streams.
+    pub fn project_message_direct_extents(
+        &mut self,
+        location: MailFolderLocation,
+        path: &[String],
+        associated: bool,
+        message: &MessageSpec,
+        interrupted: &AtomicBool,
+    ) -> Result<DirectMessageProjection, WriterError> {
         let checkpoint = self.begin_batch();
         self.append_message_direct_projection_deferred(
             location,
@@ -3990,7 +4042,13 @@ impl TransactionalMailStoreWriter {
             message,
             interrupted,
         )?;
-        let result = self.projected_file_eof(interrupted);
+        let private_file_eof = self.private_file_eof();
+        let result = self
+            .projected_file_eof(interrupted)
+            .map(|finalized_file_eof| DirectMessageProjection {
+                private_file_eof,
+                finalized_file_eof,
+            });
         self.rollback_projected_batch(checkpoint)?;
         result
     }
@@ -4021,6 +4079,57 @@ impl TransactionalMailStoreWriter {
             self.rollback_batch(checkpoint)?;
             return Err(WriterError::InvalidStructure(format!(
                 "direct append allocation diverged from preflight: expected {expected_projected_file_eof}, got {actual}"
+            )));
+        }
+        Ok(completions)
+    }
+
+    /// Append a direct message whose exact private and finalized extents were preflighted.
+    #[allow(clippy::too_many_arguments)]
+    pub fn append_message_direct_preflighted_extents(
+        &mut self,
+        location: MailFolderLocation,
+        path: &[String],
+        associated: bool,
+        message: MessageSpec,
+        projection: DirectMessageProjection,
+        interrupted: &AtomicBool,
+        source: &mut dyn DirectBlobSource,
+    ) -> Result<Vec<DirectBlobCompletion>, WriterError> {
+        let checkpoint = self.begin_batch();
+        let completions =
+            self.append_message_direct(location, path, associated, message, interrupted, source)?;
+        let actual_private_file_eof = self.private_file_eof();
+        if actual_private_file_eof != projection.private_file_eof {
+            self.rollback_batch(checkpoint)?;
+            return Err(WriterError::InvalidStructure(format!(
+                "direct append allocation diverged from preflight: expected private EOF {}, got {actual_private_file_eof}",
+                projection.private_file_eof
+            )));
+        }
+        Ok(completions)
+    }
+
+    /// Append a direct message whose exact private extent was preflighted.
+    #[allow(clippy::too_many_arguments)]
+    pub fn append_message_direct_preflighted_private(
+        &mut self,
+        location: MailFolderLocation,
+        path: &[String],
+        associated: bool,
+        message: MessageSpec,
+        expected_private_file_eof: u64,
+        interrupted: &AtomicBool,
+        source: &mut dyn DirectBlobSource,
+    ) -> Result<Vec<DirectBlobCompletion>, WriterError> {
+        let checkpoint = self.begin_batch();
+        let completions =
+            self.append_message_direct(location, path, associated, message, interrupted, source)?;
+        let actual_private_file_eof = self.private_file_eof();
+        if actual_private_file_eof != expected_private_file_eof {
+            self.rollback_batch(checkpoint)?;
+            return Err(WriterError::InvalidStructure(format!(
+                "direct append allocation diverged from preflight: expected private EOF {expected_private_file_eof}, got {actual_private_file_eof}"
             )));
         }
         Ok(completions)
@@ -11969,13 +12078,21 @@ mod tests {
         let mut source = MemoryDirectSource::one(7, payload);
         let mut writer = direct_transaction_fixture(&destination, &message, &fixture)?;
         let before_projection = writer.temporary.file.metadata()?;
-        let projected_file_eof = writer.project_message_direct_eof(
+        let private_projection = writer.project_message_direct_private_eof(
             MailFolderLocation::IpmSubtree,
             &["Inbox".to_owned()],
             false,
             &message,
             &NEVER_INTERRUPTED,
         )?;
+        let projection = writer.project_message_direct_extents(
+            MailFolderLocation::IpmSubtree,
+            &["Inbox".to_owned()],
+            false,
+            &message,
+            &NEVER_INTERRUPTED,
+        )?;
+        assert_eq!(private_projection, projection.private_file_eof);
         assert_eq!(writer.message_count(), 0);
         assert_eq!(writer.private_file_eof(), INITIAL_FILE_EOF);
         assert!(source.opened.is_empty());
@@ -11998,20 +12115,62 @@ mod tests {
                 after_projection.blocks(),
             )
         );
-        let completions = writer.append_message_direct_preflighted(
+        let completions = writer.append_message_direct_preflighted_extents(
             MailFolderLocation::IpmSubtree,
             &["Inbox".to_owned()],
             false,
             message,
-            projected_file_eof,
+            projection,
             &NEVER_INTERRUPTED,
             &mut source,
         )?;
         assert_eq!(source.opened, [7]);
         assert_eq!(completions, [DirectBlobCompletion { id: 7, sha256 }]);
         writer.finalize(&NEVER_INTERRUPTED)?;
-        assert_eq!(destination.metadata()?.len(), projected_file_eof);
-        assert!(projected_file_eof > u64::try_from(payload_len)?);
+        assert_eq!(destination.metadata()?.len(), projection.finalized_file_eof);
+        assert!(projection.private_file_eof > u64::try_from(payload_len)?);
+        assert!(projection.finalized_file_eof >= projection.private_file_eof);
+        Ok(())
+    }
+
+    #[test]
+    fn direct_private_projection_is_byte_exact_and_payload_free()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let destination = directory.path().join("direct-private.pst");
+        let fixture = FidelityStore::default();
+        let mut message = fixture.message.clone();
+        let payload = vec![0x42; MAX_DATA_BLOCK_PAYLOAD + 19];
+        let sha256: [u8; 32] = Sha256::digest(&payload).into();
+        message.attachments[0].content = AttachmentContent::Direct(DirectBlobSpec {
+            id: 19,
+            byte_len: u64::try_from(payload.len())?,
+            sha256: Some(sha256),
+        });
+        let mut writer = direct_transaction_fixture(&destination, &message, &fixture)?;
+        let private_file_eof = writer.project_message_direct_private_eof(
+            MailFolderLocation::IpmSubtree,
+            &["Inbox".to_owned()],
+            false,
+            &message,
+            &NEVER_INTERRUPTED,
+        )?;
+        assert_eq!(writer.message_count(), 0);
+        assert_eq!(writer.private_file_eof(), INITIAL_FILE_EOF);
+
+        let mut source = MemoryDirectSource::one(19, payload);
+        let completions = writer.append_message_direct_preflighted_private(
+            MailFolderLocation::IpmSubtree,
+            &["Inbox".to_owned()],
+            false,
+            message,
+            private_file_eof,
+            &NEVER_INTERRUPTED,
+            &mut source,
+        )?;
+        assert_eq!(completions, [DirectBlobCompletion { id: 19, sha256 }]);
+        assert_eq!(writer.private_file_eof(), private_file_eof);
+        writer.finalize(&NEVER_INTERRUPTED)?;
         Ok(())
     }
 
@@ -12155,6 +12314,34 @@ mod tests {
                     projected.checked_add(1).ok_or("projection overflow")?,
                     &NEVER_INTERRUPTED,
                     &mut mismatched,
+                )
+                .is_err()
+        );
+        assert_eq!(writer.message_count(), 0);
+        assert_eq!(writer.private_file_eof(), INITIAL_FILE_EOF);
+
+        let mut wrong_private = writer.project_message_direct_extents(
+            MailFolderLocation::IpmSubtree,
+            &["Inbox".to_owned()],
+            false,
+            &message,
+            &NEVER_INTERRUPTED,
+        )?;
+        wrong_private.private_file_eof = wrong_private
+            .private_file_eof
+            .checked_add(1)
+            .ok_or("private projection overflow")?;
+        let mut mismatched_private = MemoryDirectSource::one(11, payload.clone());
+        assert!(
+            writer
+                .append_message_direct_preflighted_extents(
+                    MailFolderLocation::IpmSubtree,
+                    &["Inbox".to_owned()],
+                    false,
+                    message.clone(),
+                    wrong_private,
+                    &NEVER_INTERRUPTED,
+                    &mut mismatched_private,
                 )
                 .is_err()
         );

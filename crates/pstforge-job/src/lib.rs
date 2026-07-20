@@ -28,6 +28,7 @@ const INLINE_BLOB_MAX_BYTES: u64 = 64 * 1024;
 const INLINE_CACHE_DIRECTORY: &str = ".pstforge-inline-cache";
 const PAYLOAD_PACK_FILENAME: &str = "payload.pack";
 pub const CANDIDATE_CHECKPOINT_BATCH: u32 = 128;
+const DIRECT_SQLITE_CACHE_KIB: u64 = 512 * 1024;
 const MAX_RECOVERY_LOG_BYTES: usize = 4 * 1024 * 1024;
 
 #[derive(Debug, Error)]
@@ -561,6 +562,7 @@ impl DurableCatalogSink {
         )?;
         set_mode(&database, 0o600)?;
         configure(&connection)?;
+        configure_capture_mode(&connection, capture_mode)?;
         create_schema(&connection)?;
         connection.execute(
             "INSERT INTO job_metadata(key, value) VALUES ('schema_version', ?1)",
@@ -669,6 +671,7 @@ impl DurableCatalogSink {
             property_prefix_bytes,
             attachment_prefix_bytes,
         };
+        configure_capture_mode(&self.connection, self.capture_mode)?;
         Ok(())
     }
 
@@ -901,7 +904,9 @@ impl DurableCatalogSink {
         self.connection.execute_batch("RELEASE active_candidate")?;
         let candidates = self.batch_candidates.get().saturating_add(1);
         self.batch_candidates.set(candidates);
-        if candidates >= CANDIDATE_CHECKPOINT_BATCH {
+        if matches!(self.capture_mode, CatalogCaptureMode::Full)
+            && candidates >= CANDIDATE_CHECKPOINT_BATCH
+        {
             self.commit_candidate_batch()?;
         }
         Ok(())
@@ -3983,6 +3988,18 @@ fn configure(connection: &Connection) -> Result<(), JobError> {
     Ok(())
 }
 
+fn configure_capture_mode(
+    connection: &Connection,
+    capture_mode: CatalogCaptureMode,
+) -> Result<(), JobError> {
+    if matches!(capture_mode, CatalogCaptureMode::Bounded { .. }) {
+        connection.execute_batch(&format!(
+            "PRAGMA cache_size = -{DIRECT_SQLITE_CACHE_KIB}; PRAGMA cache_spill = ON;"
+        ))?;
+    }
+    Ok(())
+}
+
 fn run_sql_interruptible<T>(
     connection: &mut Connection,
     interrupted: Option<&AtomicBool>,
@@ -5455,10 +5472,10 @@ mod tests {
     use sha2::{Digest, Sha256};
 
     use super::{
-        CANDIDATE_CHECKPOINT_BATCH, CandidateRejectionCategory, DirectEmbeddedCandidate,
-        DurableCatalogSink, INLINE_BLOB_MAX_BYTES, INLINE_CACHE_DIRECTORY, JobConfiguration,
-        JobError, JobSourceIdentity, PAYLOAD_PACK_FILENAME, PartSidecar, PayloadPackMetrics,
-        PublishedPart, WorkerEvent, digest_hex, private_state_attributes_valid,
+        CANDIDATE_CHECKPOINT_BATCH, CandidateRejectionCategory, DIRECT_SQLITE_CACHE_KIB,
+        DirectEmbeddedCandidate, DurableCatalogSink, INLINE_BLOB_MAX_BYTES, INLINE_CACHE_DIRECTORY,
+        JobConfiguration, JobError, JobSourceIdentity, PAYLOAD_PACK_FILENAME, PartSidecar,
+        PayloadPackMetrics, PublishedPart, WorkerEvent, digest_hex, private_state_attributes_valid,
         run_sql_interruptible, validate_blob_store, write_hashed, write_sidecar_partial,
     };
 
@@ -7996,6 +8013,78 @@ mod tests {
             reopened.summary()?.committed_candidates,
             u64::from(CANDIDATE_CHECKPOINT_BATCH)
         );
+        Ok(())
+    }
+
+    #[test]
+    fn direct_candidates_commit_only_at_explicit_boundaries()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempdir()?;
+        let uncommitted_job = directory.path().join("uncommitted");
+        let mut sink = DurableCatalogSink::create_direct_metadata(&uncommitted_job, 4, 3)?;
+        for id in 1..=CANDIDATE_CHECKPOINT_BATCH + 1 {
+            message_start(&mut sink, id)?;
+            sink.event(CatalogEvent::MessageEnd { id, complete: true })?;
+        }
+        drop(sink);
+        assert_eq!(
+            DurableCatalogSink::open(&uncommitted_job)?
+                .summary()?
+                .committed_candidates,
+            0
+        );
+
+        let committed_job = directory.path().join("committed");
+        let mut sink = DurableCatalogSink::create_direct_metadata(&committed_job, 4, 3)?;
+        for id in 1..=CANDIDATE_CHECKPOINT_BATCH + 1 {
+            message_start(&mut sink, id)?;
+            sink.event(CatalogEvent::MessageEnd { id, complete: true })?;
+        }
+        sink.checkpoint()?;
+        drop(sink);
+        assert_eq!(
+            DurableCatalogSink::open(&committed_job)?
+                .summary()?
+                .committed_candidates,
+            u64::from(CANDIDATE_CHECKPOINT_BATCH + 1)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn direct_capture_uses_large_bounded_cache_with_spill_enabled()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempdir()?;
+        let restartable_job = directory.path().join("restartable");
+        let restartable = DurableCatalogSink::create(&restartable_job)?;
+        let restartable_spill =
+            restartable
+                .connection
+                .query_row("PRAGMA cache_spill", [], |row| row.get::<_, i64>(0))?;
+        assert_ne!(restartable_spill, 0);
+
+        let direct_job = directory.path().join("direct");
+        let direct = DurableCatalogSink::create_direct_metadata(&direct_job, 4, 3)?;
+        let direct_spill = direct
+            .connection
+            .query_row("PRAGMA cache_spill", [], |row| row.get::<_, i64>(0))?;
+        let direct_cache = direct
+            .connection
+            .query_row("PRAGMA cache_size", [], |row| row.get::<_, i64>(0))?;
+        assert_ne!(direct_spill, 0);
+        assert_eq!(direct_cache, -i64::try_from(DIRECT_SQLITE_CACHE_KIB)?);
+
+        let converted_job = directory.path().join("converted");
+        let mut converted = DurableCatalogSink::create(&converted_job)?;
+        converted.enable_direct_metadata_capture(4, 3)?;
+        let converted_spill = converted
+            .connection
+            .query_row("PRAGMA cache_spill", [], |row| row.get::<_, i64>(0))?;
+        let converted_cache = converted
+            .connection
+            .query_row("PRAGMA cache_size", [], |row| row.get::<_, i64>(0))?;
+        assert_ne!(converted_spill, 0);
+        assert_eq!(converted_cache, -i64::try_from(DIRECT_SQLITE_CACHE_KIB)?);
         Ok(())
     }
 

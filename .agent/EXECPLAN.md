@@ -3007,6 +3007,80 @@ not modified.
     aggregate results and independently valid outputs. Direct mode must show
     no mailbox-sized payload-pack allocation; restartable mode must improve or
     at least not regress the accepted 9:30.47 cold baseline.
+    - [x] The accepted r11 single-file run completed the first half of this
+      checkpoint as recorded above.
+    - [ ] The first current-code 4 GiB run
+      `qualification-v045-one-pass-direct-4g-r1` wrote all 37,413 candidates
+      once into five parts totaling 19,534,074,880 bytes, with zero unsupported
+      candidates, omitted attachments, omitted folders, or payload-pack bytes.
+      The four non-final parts were respectively 113,664, 2,653,184,
+      1,383,424, and 113,664 bytes below 4 GiB. The final remainder was
+      2,358,469,632 bytes. Source identity was unchanged and the known
+      contained libpff recovery-tail issue remained the sole parser issue.
+      This run is not accepted: it took 38:40.61, versus the 19-minute ceiling,
+      and Linux reported 64,572,559,360 supervisor filesystem write bytes.
+      Direct splitting rebuilt the complete finalization plan before and after
+      every message, creating quadratic CPU work, while non-restartable bounded
+      metadata incorrectly inherited restartable 128-candidate SQLite commits.
+      Preflight now returns exact private and finalized extents; append verifies
+      the private extent without rebuilding every final table, while finalization
+      still independently enforces the exact finalized EOF before publication.
+      Finalization groups streamed rows by parent once instead of rescanning
+      every row for every folder. Direct metadata now commits at explicit
+      worker/part/checkpoint boundaries; restartable mode retains the
+      128-candidate durability bound. Focused extent-mismatch, folder-row,
+      direct-boundary, and restartable durability tests pass, followed by the
+      fast gate at `.agent/test-results/1784567988-fast`. Qualification r2
+      was stopped after 12 minutes with two valid-size parts published because
+      part 0002 alone still required about six minutes. Removing the second
+      final-plan rebuild did not remove the first per-candidate rebuild, so the
+      split remained above the one-minute-per-GiB ceiling. Its rejected output
+      was deleted. Direct split projection now always computes the candidate's
+      exact private allocation without opening payload streams, but constructs
+      the complete final tables only in the proportional final
+      `part_size / 16` boundary region. The append verifies the private extent;
+      finalization independently recomputes the exact EOF and refuses any
+      abnormal over-limit multi-message part before publication. Focused
+      private-projection, direct-stream parity, and 64 MiB/4 GiB proportional
+      boundary tests pass, followed by the fast gate at
+      `.agent/test-results/1784569402-fast`. Qualification r3 must prove the
+      runtime, exact boundary, and physical-write corrections before human
+      ScanPST/Outlook work.
+    - [x] Qualification r3 wrote the same five exact boundaries and all 37,413
+      candidates in 9:21.78 at 328,712 KiB aggregate peak RSS. It reports zero
+      unsupported candidates, omitted attachments, omitted folders, payload
+      pack, or validator input; the sole issue is the known contained libpff
+      recovery tail, and source identity is unchanged. This meets the
+      one-minute-per-source-GiB target and reduces r1 runtime by 75.8%.
+      Telemetry nevertheless measured 47,919,583,232 supervisor filesystem
+      write bytes for 19,534,074,880 output bytes. The remaining amplification
+      comes from SQLite spilling repeatedly modified direct-catalog pages
+      during its intentionally long transaction. Bounded/direct capture now
+      uses a fixed 512 MiB SQLite cache with dirty-page spilling still enabled.
+      A first review correctly rejected disabling spill for an entire mailbox
+      because memory would grow with the catalog. A proposed coarse automatic
+      commit was also rejected: it could persist unpublished direct candidates
+      and misalign a fresh one-pass worker retry. The fixed cache instead
+      preserves the existing transaction and retry boundaries, covers roughly
+      twice the observed per-part catalog growth, and bounds the SQLite cache
+      well below the 2 GiB aggregate RSS ceiling. Explicit worker, part,
+      signal, and completion checkpoints still commit, truncate the WAL, and
+      sync the private directory. Restartable capture retains its default
+      cache and 128-candidate durability boundary. Focused cache-mode and both
+      commit-policy regressions pass. Qualification r4 then reproduced all five
+      exact r3 boundaries and all 37,413-to-37,413 candidate assignments in
+      8:37.05 with zero unsupported candidates, omitted attachments, omitted
+      folders, payload pack, or validator input. The known contained parser
+      tail remains the sole issue and source identity is unchanged. Supervisor
+      peak RSS was 1,179,557,888 bytes, below the 2 GiB ceiling even with the
+      worker, and measured supervisor filesystem writes fell to
+      44,564,631,552 bytes. This cache-only reduction is modest; eliminating
+      the remaining direct-ledger amplification requires a later catalog
+      storage redesign rather than weakening transaction/retry correctness.
+      All five r4 parts pass `pffinfo` and bounded one-part-at-a-time `readpst`
+      extraction, with decoded scratch removed after every part. The canonical
+      full gate passes at `.agent/test-results/1784571784-full`. Human
+      ScanPST-first and Outlook aggregate acceptance remain pending.
   - [ ] Make direct output the default for every supported PST-output recovery
     policy. Feed parser output through bounded backpressure into canonical
     translation and the transactional PST writer without first creating a
@@ -3958,6 +4032,23 @@ not modified.
   planning defect for the immediate single-file acceptance while leaving the
   already-qualified 4 GiB split boundary behavior unchanged.
   Date/Author: 2026-07-20 / measured r6 evidence and Codex implementation.
+
+- Decision: For default-direct splitting, use exact private allocation as the
+  per-candidate admission signal and reserve the final `part_size / 16` for
+  exact finalized-size projection. This scales the exact region to every
+  supported limit rather than hard-coding a 4 GiB batch. Each admitted append
+  must reproduce its projected private EOF. Finalization remains an independent
+  exact calculation and refuses an over-limit multi-message part before atomic
+  publication if a pathological final-index ratio exceeds the boundary
+  reserve.
+  Rationale: The rejected 4 GiB r1 and r2 runs showed that rebuilding every
+  folder table and NBT/BBT plan for each candidate is quadratic CPU work even
+  when the second rebuild is removed. The measured finalization overhead for a
+  4 GiB part is about 32 MiB, while the proportional boundary is 256 MiB.
+  Candidate-private projection uses the writer's real block allocation without
+  reading payload data. The final exact refusal preserves the hard maximum
+  without making a heuristic authoritative.
+  Date/Author: 2026-07-20 / measured r1-r2 evidence and Codex implementation.
 
 - Decision: Reference attachment classification comes from the readable
   `PidTagAttachMethod` property, not libpff's narrower convenience type API.

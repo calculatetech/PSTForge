@@ -1236,6 +1236,11 @@ fn projection_batch_byte_target(maximum_pst_bytes: u64, private_file_eof: u64) -
     }
 }
 
+fn direct_exact_projection_required(maximum_pst_bytes: u64, projected_private_eof: u64) -> bool {
+    let finalization_boundary = (maximum_pst_bytes / 16).max(1);
+    projected_private_eof >= maximum_pst_bytes.saturating_sub(finalization_boundary)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn split_direct_recovered_job(
     source: &SourceFile,
@@ -1457,21 +1462,39 @@ fn split_direct_recovered_job(
                             &mut protocol,
                         )?;
                     } else {
-                        let mut expected_eof = active
+                        let mut private_file_eof = active
                             .as_mut()
                             .ok_or(SplitError::TooManyParts)?
                             .writer
-                            .project_message_direct_eof(
+                            .project_message_direct_private_eof(
                                 location,
                                 &path,
                                 associated,
                                 &message,
                                 interrupted,
                             )?;
-                        if expected_eof > maximum_pst_bytes
-                            && active
-                                .as_ref()
-                                .is_some_and(|transaction| transaction.writer.message_count() != 0)
+                        let mut exact_projection =
+                            direct_exact_projection_required(maximum_pst_bytes, private_file_eof)
+                                .then(|| {
+                                    active
+                                        .as_mut()
+                                        .ok_or(SplitError::TooManyParts)?
+                                        .writer
+                                        .project_message_direct_extents(
+                                            location,
+                                            &path,
+                                            associated,
+                                            &message,
+                                            interrupted,
+                                        )
+                                        .map_err(SplitError::from)
+                                })
+                                .transpose()?;
+                        if exact_projection.is_some_and(|projection| {
+                            projection.finalized_file_eof > maximum_pst_bytes
+                        }) && active
+                            .as_ref()
+                            .is_some_and(|transaction| transaction.writer.message_count() != 0)
                         {
                             let completed = finalize_direct_part(
                                 job,
@@ -1495,29 +1518,68 @@ fn split_direct_recovered_job(
                                 part_index,
                                 worker_executable,
                             )?);
-                            expected_eof = active
+                            private_file_eof = active
                                 .as_mut()
                                 .ok_or(SplitError::TooManyParts)?
                                 .writer
-                                .project_message_direct_eof(
+                                .project_message_direct_private_eof(
                                     location,
                                     &path,
                                     associated,
                                     &message,
                                     interrupted,
                                 )?;
+                            exact_projection = direct_exact_projection_required(
+                                maximum_pst_bytes,
+                                private_file_eof,
+                            )
+                            .then(|| {
+                                active
+                                    .as_mut()
+                                    .ok_or(SplitError::TooManyParts)?
+                                    .writer
+                                    .project_message_direct_extents(
+                                        location,
+                                        &path,
+                                        associated,
+                                        &message,
+                                        interrupted,
+                                    )
+                                    .map_err(SplitError::from)
+                            })
+                            .transpose()?;
                         }
                         let transaction = active.as_mut().ok_or(SplitError::TooManyParts)?;
-                        direct_part_space_preflight(transaction, expected_eof)?;
-                        transaction.writer.append_message_direct_preflighted(
-                            location,
-                            &path,
-                            associated,
-                            message,
-                            expected_eof,
-                            interrupted,
-                            &mut protocol,
-                        )?;
+                        let preflight_eof = exact_projection
+                            .map_or(maximum_pst_bytes, |projection| {
+                                projection.finalized_file_eof
+                            });
+                        direct_part_space_preflight(transaction, preflight_eof)?;
+                        if let Some(projection) = exact_projection {
+                            transaction
+                                .writer
+                                .append_message_direct_preflighted_extents(
+                                    location,
+                                    &path,
+                                    associated,
+                                    message,
+                                    projection,
+                                    interrupted,
+                                    &mut protocol,
+                                )?;
+                        } else {
+                            transaction
+                                .writer
+                                .append_message_direct_preflighted_private(
+                                    location,
+                                    &path,
+                                    associated,
+                                    message,
+                                    private_file_eof,
+                                    interrupted,
+                                    &mut protocol,
+                                )?;
+                        }
                     }
                     let transaction = active.as_mut().ok_or(SplitError::TooManyParts)?;
                     transaction.stats.item_keys.append(&mut input.item_keys);
@@ -3438,11 +3500,11 @@ mod tests {
     use super::{
         AdaptiveSizeModel, DirectFailureCategory, DiskPreflight, ExecutionMetrics, LayoutEstimator,
         MAX_RECOVERY_LOG_DETAIL_LINES, PartReport, SPLIT_SCHEMA_VERSION, SplitError,
-        SplitFailureKind, SplitOptions, SplitReport, direct_required_capacity, disk_preflight,
-        extend_to_fitting_prefix, hash_file, open_restartable_resume, preflight_filesystem_path,
-        projection_batch_byte_target, published_folder_count, render_recovery_log,
-        shrink_to_fitting_prefix, source_folders_for_part, split, take_fitting_prefix,
-        translation_rejections,
+        SplitFailureKind, SplitOptions, SplitReport, direct_exact_projection_required,
+        direct_required_capacity, disk_preflight, extend_to_fitting_prefix, hash_file,
+        open_restartable_resume, preflight_filesystem_path, projection_batch_byte_target,
+        published_folder_count, render_recovery_log, shrink_to_fitting_prefix,
+        source_folders_for_part, split, take_fitting_prefix, translation_rejections,
     };
     use crate::{
         CanonicalAttachment, CanonicalFolder, CanonicalFolderRole, CanonicalMail,
@@ -3463,6 +3525,18 @@ mod tests {
             folder_path: vec!["Inbox".to_owned()],
             payload_bytes,
         }
+    }
+
+    #[test]
+    fn direct_exact_projection_boundary_scales_with_part_size() {
+        for maximum in [64_u64 * 1024 * 1024, 4_u64 * 1024 * 1024 * 1024] {
+            let boundary = maximum / 16;
+            let threshold = maximum - boundary;
+            assert!(!direct_exact_projection_required(maximum, threshold - 1));
+            assert!(direct_exact_projection_required(maximum, threshold));
+            assert!(direct_exact_projection_required(maximum, maximum));
+        }
+        assert!(direct_exact_projection_required(1, 0));
     }
 
     fn bare_mail(id: u32) -> CanonicalMail {
