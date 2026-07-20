@@ -109,6 +109,12 @@ temporary capacity. `--keep-work` retains that payload state after successful
 completion; otherwise it is removed after finalized parts and accounting are
 durable.
 
+Execution mode is independent of recovery policy. Both balanced and aggressive
+PST output use direct writing by default; `--restartable` is the only switch
+that selects the payload spool. A requested part limit larger than the complete
+recovered store produces one `part-0001.pst`, using the same direct path rather
+than a separate single-file implementation.
+
 `--resume` and `--keep-work` require `--restartable`; incompatible combinations
 are refused before creating the output directory. Without `--resume`, an
 existing nonempty job directory is an error. With `--resume`, the source

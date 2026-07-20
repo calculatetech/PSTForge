@@ -289,10 +289,16 @@ pub struct JobSourceIdentity {
 pub struct JobConfiguration {
     pub tool_compatibility_major: u64,
     pub split_schema_version: String,
+    #[serde(default = "default_execution_mode")]
+    pub execution_mode: String,
     pub recovery_mode: String,
     pub maximum_pst_bytes: u64,
     pub part_size_policy: String,
     pub writer_format: String,
+}
+
+fn default_execution_mode() -> String {
+    "restartable".to_owned()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -3276,6 +3282,9 @@ fn validate_resume_metadata(
     if stored_configuration.split_schema_version != configuration.split_schema_version {
         return Err(JobError::ResumeMismatch("split report schema version"));
     }
+    if stored_configuration.execution_mode != configuration.execution_mode {
+        return Err(JobError::ResumeMismatch("execution mode"));
+    }
     if stored_configuration.recovery_mode != configuration.recovery_mode {
         return Err(JobError::ResumeMismatch("recovery mode"));
     }
@@ -4949,6 +4958,7 @@ mod tests {
         let configuration = JobConfiguration {
             tool_compatibility_major: 0,
             split_schema_version: "0.4.4".to_owned(),
+            execution_mode: "restartable".to_owned(),
             recovery_mode: "balanced".to_owned(),
             maximum_pst_bytes: 4_294_967_296,
             part_size_policy: "hard-maximum-v1".to_owned(),
@@ -4976,6 +4986,12 @@ mod tests {
             DurableCatalogSink::open_resume(&job, &source, &mismatch),
             Err(JobError::ResumeMismatch("part-size policy"))
         ));
+        let mut mismatch = configuration.clone();
+        mismatch.execution_mode = "direct".to_owned();
+        assert!(matches!(
+            DurableCatalogSink::validate_resume(&job, &source, &mismatch),
+            Err(JobError::ResumeMismatch("execution mode"))
+        ));
         let mut wrong_source = source.clone();
         wrong_source.sha256 = "b".repeat(64);
         assert!(matches!(
@@ -4984,6 +5000,20 @@ mod tests {
         ));
         let after = Sha256::digest(std::fs::read(&database)?);
         assert_eq!(before, after);
+        Ok(())
+    }
+
+    #[test]
+    fn legacy_job_configuration_defaults_to_restartable() -> Result<(), serde_json::Error> {
+        let configuration: JobConfiguration = serde_json::from_value(serde_json::json!({
+            "tool_compatibility_major": 0,
+            "split_schema_version": "0.4.4",
+            "recovery_mode": "balanced",
+            "maximum_pst_bytes": 4_294_967_296_u64,
+            "part_size_policy": "hard-maximum-v1",
+            "writer_format": "unicode-pst-v23"
+        }))?;
+        assert_eq!(configuration.execution_mode, "restartable");
         Ok(())
     }
 
@@ -5004,6 +5034,7 @@ mod tests {
         let configuration = JobConfiguration {
             tool_compatibility_major: 0,
             split_schema_version: "0.4.4".to_owned(),
+            execution_mode: "restartable".to_owned(),
             recovery_mode: "balanced".to_owned(),
             maximum_pst_bytes: 4_294_967_296,
             part_size_policy: "hard-maximum-v1".to_owned(),
@@ -5133,6 +5164,7 @@ mod tests {
         let configuration = JobConfiguration {
             tool_compatibility_major: 0,
             split_schema_version: "0.4.4".to_owned(),
+            execution_mode: "restartable".to_owned(),
             recovery_mode: "balanced".to_owned(),
             maximum_pst_bytes: 4_294_967_296,
             part_size_policy: "hard-maximum-v1".to_owned(),
@@ -5207,6 +5239,7 @@ mod tests {
         let configuration = JobConfiguration {
             tool_compatibility_major: 0,
             split_schema_version: "0.4.4".to_owned(),
+            execution_mode: "restartable".to_owned(),
             recovery_mode: "balanced".to_owned(),
             maximum_pst_bytes: 4_294_967_296,
             part_size_policy: "hard-maximum-v1".to_owned(),

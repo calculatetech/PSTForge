@@ -33,7 +33,7 @@ use crate::{
     load_canonical_mail_interruptible,
 };
 
-pub const SPLIT_SCHEMA_VERSION: &str = "0.4.4";
+pub const SPLIT_SCHEMA_VERSION: &str = "0.4.5";
 const TOOL_COMPATIBILITY_MAJOR: u64 = 0;
 const PART_SIZE_POLICY: &str = "hard-maximum-v1";
 const WRITER_FORMAT: &str = "unicode-pst-v23";
@@ -59,6 +59,10 @@ pub enum SplitError {
     Writer(#[from] WriterError),
     #[error("maximum PST size must be greater than zero")]
     ZeroMaximumSize,
+    #[error("--resume and --keep-work require --restartable")]
+    RestartableOptionRequired,
+    #[error("direct split execution is not available in this checkpoint build; use --restartable")]
+    DirectModePending,
     #[error("packing assignment references an unknown canonical item")]
     UnknownAssignment,
     #[error("cannot access staged PST {path}: {source}")]
@@ -137,6 +141,8 @@ impl SplitError {
                 WriterError::IndependentValidatorIo { .. } | WriterError::ExecutionTerminated,
             )
             | Self::ZeroMaximumSize
+            | Self::RestartableOptionRequired
+            | Self::DirectModePending
             | Self::UnknownAssignment
             | Self::TooManyParts => SplitFailureKind::Internal,
         }
@@ -180,6 +186,7 @@ pub struct PartReport {
 pub struct SplitReport {
     pub schema_version: String,
     pub command: String,
+    pub execution_mode: String,
     pub maximum_pst_bytes: u64,
     pub resumed: bool,
     pub keep_work: bool,
@@ -192,18 +199,36 @@ pub struct SplitReport {
     pub partial: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SplitOptions {
+    pub maximum_pst_bytes: u64,
+    pub restartable: bool,
+    pub resume: bool,
+    pub keep_work: bool,
+}
+
 pub fn split(
     source_path: &Path,
     job_directory: &Path,
     worker_executable: &Path,
     mode: RecoveryMode,
-    maximum_pst_bytes: u64,
-    resume: bool,
-    keep_work: bool,
+    options: SplitOptions,
 ) -> Result<SplitReport, SplitError> {
     let started = Instant::now();
+    let SplitOptions {
+        maximum_pst_bytes,
+        restartable,
+        resume,
+        keep_work,
+    } = options;
     if maximum_pst_bytes == 0 {
         return Err(SplitError::ZeroMaximumSize);
+    }
+    if !restartable && (resume || keep_work) {
+        return Err(SplitError::RestartableOptionRequired);
+    }
+    if !restartable {
+        return Err(SplitError::DirectModePending);
     }
     let interrupt = InterruptHandler::install()?;
     let interrupt_flag = interrupt.flag();
@@ -219,6 +244,7 @@ pub fn split(
     let mut configuration = JobConfiguration {
         tool_compatibility_major: TOOL_COMPATIBILITY_MAJOR,
         split_schema_version: SPLIT_SCHEMA_VERSION.to_owned(),
+        execution_mode: "restartable".to_owned(),
         recovery_mode: recovery_mode_name(mode).to_owned(),
         maximum_pst_bytes,
         part_size_policy: PART_SIZE_POLICY.to_owned(),
@@ -233,36 +259,12 @@ pub fn split(
             modified_at: source.identity().modified_at.clone(),
             sha256: source.identity().sha256.clone(),
         };
-        let open = DurableCatalogSink::open_resume_interruptible(
+        let open = open_restartable_resume(
             job_directory,
             &source_identity,
-            &configuration,
+            &mut configuration,
             &interrupt_flag,
         );
-        let open = match open {
-            Err(JobError::ResumeMismatch("split report schema version"))
-                if SPLIT_SCHEMA_VERSION == "0.4.4" =>
-            {
-                let mut legacy_configuration = configuration.clone();
-                legacy_configuration.split_schema_version = "0.4.2".to_owned();
-                let legacy = DurableCatalogSink::open_resume_interruptible(
-                    job_directory,
-                    &source_identity,
-                    &legacy_configuration,
-                    &interrupt_flag,
-                );
-                if legacy.is_ok() {
-                    tracing::info!(
-                        stored_split_schema = "0.4.2",
-                        producer_version = SPLIT_SCHEMA_VERSION,
-                        "resuming compatible pre-performance durable recovery state"
-                    );
-                    configuration = legacy_configuration;
-                }
-                legacy
-            }
-            result => result,
-        };
         match open {
             Ok(job) => {
                 let allocated = job.allocated_bytes()?;
@@ -309,6 +311,7 @@ pub fn split(
         let report = SplitReport {
             schema_version: SPLIT_SCHEMA_VERSION.to_owned(),
             command: "split".to_owned(),
+            execution_mode: "restartable".to_owned(),
             maximum_pst_bytes,
             resumed: resume,
             keep_work,
@@ -348,6 +351,7 @@ pub fn split(
         let report = SplitReport {
             schema_version: SPLIT_SCHEMA_VERSION.to_owned(),
             command: "split".to_owned(),
+            execution_mode: "restartable".to_owned(),
             maximum_pst_bytes,
             resumed: resume,
             keep_work,
@@ -407,6 +411,7 @@ pub fn split(
     let report = SplitReport {
         schema_version: SPLIT_SCHEMA_VERSION.to_owned(),
         command: "split".to_owned(),
+        execution_mode: "restartable".to_owned(),
         maximum_pst_bytes,
         resumed: resume,
         keep_work,
@@ -420,6 +425,47 @@ pub fn split(
     };
     job.publish_recovery_log(&render_recovery_log(&report))?;
     Ok(report)
+}
+
+fn open_restartable_resume(
+    job_directory: &Path,
+    source: &JobSourceIdentity,
+    configuration: &mut JobConfiguration,
+    interrupted: &AtomicBool,
+) -> Result<DurableCatalogSink, JobError> {
+    match DurableCatalogSink::open_resume_interruptible(
+        job_directory,
+        source,
+        configuration,
+        interrupted,
+    ) {
+        Ok(job) => return Ok(job),
+        Err(JobError::ResumeMismatch("split report schema version")) => {}
+        Err(error) => return Err(error),
+    }
+    for legacy_schema in ["0.4.4", "0.4.2"] {
+        let mut legacy_configuration = configuration.clone();
+        legacy_configuration.split_schema_version = legacy_schema.to_owned();
+        match DurableCatalogSink::open_resume_interruptible(
+            job_directory,
+            source,
+            &legacy_configuration,
+            interrupted,
+        ) {
+            Ok(job) => {
+                tracing::info!(
+                    stored_split_schema = legacy_schema,
+                    producer_version = SPLIT_SCHEMA_VERSION,
+                    "resuming compatible pre-performance durable recovery state"
+                );
+                *configuration = legacy_configuration;
+                return Ok(job);
+            }
+            Err(JobError::ResumeMismatch("split report schema version")) => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Err(JobError::ResumeMismatch("split report schema version"))
 }
 
 fn durable_output_snapshot(
@@ -2335,7 +2381,8 @@ mod tests {
     use std::sync::atomic::AtomicBool;
 
     use pstforge_job::{
-        CandidateRejectionCategory, CandidateRejectionCounts, JobError, ReconstructedField,
+        CandidateRejectionCategory, CandidateRejectionCounts, DurableCatalogSink, JobConfiguration,
+        JobError, JobSourceIdentity, ReconstructedField,
     };
     use pstforge_pst::writer::WriterError;
 
@@ -2343,15 +2390,17 @@ mod tests {
 
     use super::{
         AdaptiveSizeModel, DiskPreflight, ExecutionMetrics, LayoutEstimator,
-        MAX_RECOVERY_LOG_DETAIL_LINES, PartReport, SplitError, SplitFailureKind, SplitReport,
-        disk_preflight, extend_to_fitting_prefix, hash_file, preflight_filesystem_path,
+        MAX_RECOVERY_LOG_DETAIL_LINES, PartReport, SPLIT_SCHEMA_VERSION, SplitError,
+        SplitFailureKind, SplitOptions, SplitReport, disk_preflight, extend_to_fitting_prefix,
+        hash_file, open_restartable_resume, preflight_filesystem_path,
         projection_batch_byte_target, render_recovery_log, shrink_to_fitting_prefix,
-        source_folders_for_part, take_fitting_prefix, translation_rejections,
+        source_folders_for_part, split, take_fitting_prefix, translation_rejections,
     };
     use crate::{
         CanonicalAttachment, CanonicalFolder, CanonicalFolderRole, CanonicalMail,
         CanonicalWriteError, ContentCompleteness, ItemKey, PackCandidate, PartSizeEstimator,
-        RecoveryError, RecoveryProvenance, RecoveryReport, SourceError, SourceIdentity,
+        RecoveryError, RecoveryMode, RecoveryProvenance, RecoveryReport, SourceError,
+        SourceIdentity,
     };
 
     fn packing_candidate(index: u32, payload_bytes: u64) -> PackCandidate {
@@ -2454,6 +2503,94 @@ mod tests {
     }
 
     #[test]
+    fn direct_checkpoint_refuses_before_touching_source_or_output() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let source = directory.path().join("missing-source.pst");
+        let output = directory.path().join("job");
+        let worker = directory.path().join("missing-worker");
+
+        assert!(matches!(
+            split(
+                &source,
+                &output,
+                &worker,
+                RecoveryMode::Balanced,
+                SplitOptions {
+                    maximum_pst_bytes: 4_294_967_296,
+                    restartable: false,
+                    resume: false,
+                    keep_work: false,
+                },
+            ),
+            Err(SplitError::DirectModePending)
+        ));
+        assert!(!output.exists());
+    }
+
+    #[test]
+    fn restartable_only_options_are_refused_before_output_creation() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let source = directory.path().join("missing-source.pst");
+        let output = directory.path().join("job");
+        let worker = directory.path().join("missing-worker");
+
+        assert!(matches!(
+            split(
+                &source,
+                &output,
+                &worker,
+                RecoveryMode::Balanced,
+                SplitOptions {
+                    maximum_pst_bytes: 4_294_967_296,
+                    restartable: false,
+                    resume: true,
+                    keep_work: false,
+                },
+            ),
+            Err(SplitError::RestartableOptionRequired)
+        ));
+        assert!(!output.exists());
+    }
+
+    #[test]
+    fn restartable_resume_accepts_an_explicit_0_4_4_job() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let output = directory.path().join("job");
+        let source = JobSourceIdentity {
+            canonical_path: "/external/mail.pst".to_owned(),
+            device: 1,
+            inode: 2,
+            size_bytes: 3,
+            modified_at: "2026-07-19T00:00:00Z".to_owned(),
+            sha256: "a".repeat(64),
+        };
+        let legacy = JobConfiguration {
+            tool_compatibility_major: 0,
+            split_schema_version: "0.4.4".to_owned(),
+            execution_mode: "restartable".to_owned(),
+            recovery_mode: "balanced".to_owned(),
+            maximum_pst_bytes: 4_294_967_296,
+            part_size_policy: "hard-maximum-v1".to_owned(),
+            writer_format: "unicode-pst-v23".to_owned(),
+        };
+        let sink = DurableCatalogSink::create(&output).expect("create legacy job");
+        sink.bind_source(&source).expect("bind source");
+        sink.bind_recovery_mode("balanced").expect("bind mode");
+        sink.bind_configuration(&legacy)
+            .expect("bind configuration");
+        sink.checkpoint().expect("checkpoint legacy job");
+        drop(sink);
+
+        let mut current = legacy.clone();
+        current.split_schema_version = SPLIT_SCHEMA_VERSION.to_owned();
+        let interrupted = AtomicBool::new(false);
+        let reopened = open_restartable_resume(&output, &source, &mut current, &interrupted)
+            .expect("reopen 0.4.4 restartable job");
+        assert_eq!(current.split_schema_version, "0.4.4");
+        drop(reopened);
+    }
+
+    #[test]
     fn later_parts_retain_only_used_source_folder_metadata() {
         let folders = [
             CanonicalFolder {
@@ -2509,8 +2646,9 @@ mod tests {
 
     fn split_report() -> SplitReport {
         SplitReport {
-            schema_version: "0.4.4".to_owned(),
+            schema_version: "0.4.5".to_owned(),
             command: "split".to_owned(),
+            execution_mode: "restartable".to_owned(),
             maximum_pst_bytes: 4_294_967_296,
             resumed: false,
             keep_work: false,
@@ -2527,7 +2665,7 @@ mod tests {
                 peak_process_rss_bytes: 1,
             },
             recovery: RecoveryReport {
-                schema_version: "0.4.4".to_owned(),
+                schema_version: "0.4.5".to_owned(),
                 command: "recover".to_owned(),
                 mode: "balanced".to_owned(),
                 source: SourceIdentity {

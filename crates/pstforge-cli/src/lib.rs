@@ -73,6 +73,9 @@ pub enum Command {
         max_pst_size: u64,
         #[arg(long, value_enum, default_value_t = RecoveryModeArg::Balanced)]
         recovery: RecoveryModeArg,
+        /// Retain a durable payload spool so an interrupted job can resume.
+        #[arg(long)]
+        restartable: bool,
         #[arg(long)]
         resume: bool,
         #[arg(long)]
@@ -262,6 +265,7 @@ pub fn execute(cli: &Cli, output: &mut dyn Write) -> Result<CommandStatus, CliEr
             output: job_directory,
             max_pst_size,
             recovery,
+            restartable,
             resume,
             keep_work,
             json,
@@ -272,9 +276,12 @@ pub fn execute(cli: &Cli, output: &mut dyn Write) -> Result<CommandStatus, CliEr
                 job_directory,
                 &executable,
                 (*recovery).into(),
-                *max_pst_size,
-                *resume,
-                *keep_work,
+                pstforge_core::SplitOptions {
+                    maximum_pst_bytes: *max_pst_size,
+                    restartable: *restartable,
+                    resume: *resume,
+                    keep_work: *keep_work,
+                },
             )?;
             if *json {
                 write_json(output, &report)?;
@@ -506,6 +513,7 @@ fn write_split(output: &mut dyn Write, report: &SplitReport) -> Result<(), std::
         "Maximum part size: {} bytes",
         report.maximum_pst_bytes
     )?;
+    writeln!(output, "Execution mode: {}", report.execution_mode)?;
     writeln!(output, "Resumed: {}", yes_no(report.resumed))?;
     writeln!(output, "Keep private work: {}", yes_no(report.keep_work))?;
     writeln!(
@@ -732,6 +740,7 @@ mod tests {
             Command::Split {
                 max_pst_size: 4_294_967_296,
                 recovery: RecoveryModeArg::Balanced,
+                restartable: false,
                 ..
             }
         ));
@@ -745,12 +754,14 @@ mod tests {
             "mail.pst",
             "--output",
             "job",
+            "--restartable",
             "--resume",
             "--keep-work",
         ])?;
         assert!(matches!(
             resume.command,
             Command::Split {
+                restartable: true,
                 resume: true,
                 keep_work: true,
                 ..

@@ -2498,6 +2498,60 @@ not modified.
     payload loss. The owner accepted the existing ScanPST/Outlook evidence and
     this final current-code reconciliation as completion of version 0.4.4.
 - [ ] Milestone 0.4.5: Direct-Write Performance.
+  - [x] Started `milestone/v0.4.5-direct-write` in sibling worktree
+    `../pstforge-worktrees/v0.4.5-direct-write` from approved and pushed
+    `main` commit `036fb53`.
+  - [x] Checkpoint 1: established the versioned execution-mode contract. Bumped
+    every producer/package version to 0.4.5, added `--restartable`, rejected
+    `--resume` and `--keep-work` without it before creating output, persisted
+    the selected mode in job identity and reports, and retained compatibility
+    for explicitly restartable pre-0.4.5 jobs. The fast gate passed at
+    `.agent/test-results/1784520407-fast`; focused tests prove read-only direct
+    refusal, restartable-only option refusal, persisted mode mismatch refusal,
+    legacy missing-mode interpretation, and an actual 0.4.4 ledger reopen.
+    Clean-context review found and resolved the skipped 0.4.4 schema fallback;
+    final clean-context review reported no blocker or high finding.
+  - [ ] Checkpoint 2: add documented writer primitives for a preflighted
+    streamed external value. Derive physical allocation from declared property
+    and attachment lengths plus PST block/table framing before consuming
+    payload bytes; stream chunks directly into the active message transaction;
+    hash and length-check at end; and roll back the exact message transaction
+    on abort. Add boundary, empty, huge, interrupted, malformed-length, and
+    rollback/reappend writer tests plus conformance references.
+  - [ ] Checkpoint 3: implement the direct supervisor/sink. Perform bounded
+    per-item structural preflight, select the destination part before payload
+    streaming, translate parser events without a payload pack, and keep only
+    compact accounting needed for reports and exact reconciliation. Permit
+    arbitrary source traversal while producing deterministic folder tables
+    and identifiers. A boundary decision must not require rereading or
+    rewriting a completed payload.
+  - [ ] Checkpoint 4: complete direct publication and failure behavior. Keep
+    one same-filesystem active PST temporary, independently validate and fsync
+    it, atomically rename it into `parts/`, preserve finalized parts on
+    interruption, mark the direct job terminal partial, refuse resume, and
+    require a new empty output directory for another attempt. Add disk
+    exhaustion, worker crash, signal, output conflict, validator failure, and
+    source-identity recheck tests.
+  - [ ] Checkpoint 5: optimize the explicit restartable path without changing
+    its recovery semantics. Buffer worker protocol control traffic and payload
+    pack appends at durable candidate-batch boundaries, eliminate redundant
+    metadata/seek syscalls from the append hot path, retain per-blob SHA-256
+    and transactional truncation, and benchmark cold recovery plus retained
+    replay. Treat the 0.4.4 9:30.47 cold run as the no-regression baseline.
+  - [ ] Checkpoint 6: expose mode-specific telemetry for logical source bytes,
+    payload-pack bytes, active-PST bytes, finalized bytes, validator reads,
+    peak temporary allocation, peak RSS, elapsed time, and throughput. Keep
+    user content out of logs and bound detailed recovery output.
+  - [ ] Checkpoint 7: run the canonical full gate and first qualify the 19 GB
+    source as one default-direct PST by selecting a part limit above its
+    recovered output size. Require exact 37,402-to-37,402 candidate assignment,
+    unchanged source identity/SHA-256, less than 2 GiB RSS, no more than one
+    minute per source GiB, a clean ScanPST result, and Outlook content/folder
+    acceptance before testing boundary packing. Then run the 4 GiB direct
+    split regression and explicit `--restartable` mode; require identical
+    aggregate results and independently valid outputs. Direct mode must show
+    no mailbox-sized payload-pack allocation; restartable mode must improve or
+    at least not regress the accepted 9:30.47 cold baseline.
   - [ ] Make direct output the default `split` mode. Feed parser output through
     bounded backpressure into canonical translation and the transactional PST
     writer without first creating a mailbox-sized payload pack. Retain a
@@ -4196,10 +4250,12 @@ not modified.
   Date/Author: 2026-07-19 / clean-context review followed by focused writer
   regression and independent completed-store evidence.
 
-- Decision: Make low-write non-restartable streaming the default `split`
-  mode. Add `--restartable` as the deliberate opt-in for durable payload
-  recovery; `--resume` resumes only such a job and `--keep-work` is invalid
-  otherwise. Direct mode still retains compact SQLite accounting, but no
+- Decision: Make low-write non-restartable streaming the default PST-output
+  execution mode for every supported recovery policy. Balanced and aggressive
+  select source-recovery breadth, not persistence. Add `--restartable` as the
+  deliberate opt-in for durable payload recovery; `--resume` resumes only such
+  a job and `--keep-work` is invalid otherwise. Direct mode still retains
+  compact SQLite accounting, but no
   payload pack. Deleting a spool after success does not
   reduce device writes and therefore is not an acceptable implementation of
   streaming mode. Both modes build each PST under a private name on the output
@@ -4217,7 +4273,9 @@ not modified.
   affecting QLC endurance on 19 GB, 50 GB, and 83 GB recovery jobs. The owner
   requires that tradeoff to be explicit rather than the default.
   Date/Author: 2026-07-19 / human owner direction after measured 0.4.3
-  retained-job write amplification.
+  retained-job write amplification; clarified 2026-07-20 for every supported
+  recovery policy. The first scale acceptance is one direct PST from the 19 GB
+  source with exact 1:1 content accounting and clean ScanPST/Outlook results.
 
 - Decision: Hash the complete source once at invocation open, match that hash
   before trusting resume state, and use held-descriptor/path identity including
@@ -4436,8 +4494,9 @@ accepted the current automated reconciliation and prior ScanPST/Outlook
 evidence as completing the version.
 
 Version 0.4.5 next removes restartable persistence write amplification from the
-default workflow. Direct mode streams through bounded queues into one active
-same-filesystem PST temporary and atomically renames the validated file;
+default PST-writing workflow for every supported recovery policy. Direct mode
+streams through bounded queues into one active same-filesystem PST temporary
+and atomically renames the validated file;
 `--restartable` deliberately selects the existing durable ledger and payload
 spool. This makes recoverability an operator choice and prevents a
 mailbox-sized private spool from being the default SSD cost.

@@ -145,8 +145,9 @@ and an unchanged source. The owner accepted this as completing version 0.4.4.
 
 ### 12. Version 0.4.5 - Direct-Write Performance
 
-Make bounded direct output the default `split` execution mode. Stream recovered
-candidates through bounded backpressure into the transactional PST writer,
+Make bounded direct output the default PST-writing execution mode for every
+supported recovery policy. Stream recovered candidates through bounded
+backpressure into the transactional PST writer,
 write each part to temporary storage beside its final destination, and publish
 by atomic rename after validation and `fsync`. Retain compact per-candidate and
 part metadata for reporting and exact reconciliation, but do not create a
@@ -159,7 +160,9 @@ result; rerunning requires a new empty output directory. Report measured
 source, temporary, validation, and finalized I/O so SSD write amplification is
 observable. Preserve exact 0.4.4 data accounting, the
 one-minute-per-source-GiB target, bounded memory, interruption safety, and
-independently valid 4 GiB parts.
+independent validity. First qualify the 19 GB source as one direct PST with
+exact 1:1 content accounting and ScanPST/Outlook acceptance, then retain the
+independently valid 4 GiB split regression.
 
 ### 13. Version 0.5.0 - Operational UX and Debian Packaging
 

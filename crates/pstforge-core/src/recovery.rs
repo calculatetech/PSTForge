@@ -21,7 +21,7 @@ use crate::{
 };
 use libpff_sys::{RecoveryMode, RecoveryUnit};
 
-pub const RECOVERY_SCHEMA_VERSION: &str = "0.4.4";
+pub const RECOVERY_SCHEMA_VERSION: &str = "0.4.5";
 const MAX_WORKER_RETRIES: u32 = 3;
 const MAX_UNIT_RETRIES: u32 = 0;
 
