@@ -2883,6 +2883,36 @@ not modified.
       remains in FFI lifetime, one-pass fidelity, nested identity/order, hard
       limits, parser containment, cleanup, folder/NAMEID handling,
       publication/accounting, or source immutability.
+    - [x] Completed the current-source single-part construction checkpoint.
+      Qualification exposed that a libpff record entry borrows its record-set
+      owner and that attachment data/property views share native cursor state.
+      Record entries now retain their record set through the deferred payload
+      phase; top-level and embedded message owners remain alive until that
+      graph drains. Ordinary attachment data is streamed through the
+      attachment API once, while duplicate `PR_ATTACH_DATA_BIN` property
+      capture remains prefix-only. Reacquired attachment handles use the
+      documented native seek operation to begin at the captured prefix.
+      A source-size-plus-25-percent capacity check selects the single-part
+      append path without per-message final-table projection; final byte size
+      is still checked before publication. Final sidecar folder accounting
+      uses the complete observed source-folder set because one-pass
+      construction begins before later empty folders are discovered.
+      An isolated full worker traversal completed in 180 seconds after the
+      former native crash point. Qualification r10 then published one
+      19,532,989,440-byte PST in 7:02.35 at 462,380 KiB peak RSS, with a
+      zero-byte payload pack, one worker attempt, and unchanged source
+      identity. The current source catalog contains 37,413 candidates and the
+      output contains the same 37,413, with zero unsupported candidates, zero
+      omitted attachments, zero omitted folders, and no unfinished items.
+      The known post-catalog libpff recovery-tail error remains one contained
+      issue. Automated acceptance is complete through the fast gate at
+      `.agent/test-results/1784561084-fast` and the refreshed canonical full
+      gate at `.agent/test-results/1784561714-full`, including every external
+      corpus and independent `pffinfo`/`readpst` check. The documented diff
+      then passed the fast gate at `.agent/test-results/1784561857-fast`; a
+      fresh clean-context adversarial review returned `CLEAN`, with no
+      milestone-relevant blocker or high finding. Human ScanPST/Outlook
+      acceptance is the remaining checkpoint gate.
   - [ ] Checkpoint 4: complete direct publication and failure behavior. Keep
     one same-filesystem active PST temporary, construct every documented PST
     relationship and allocation structure before one final file `fsync`, then
@@ -2904,7 +2934,8 @@ not modified.
     user content out of logs and bound detailed recovery output.
   - [ ] Checkpoint 7: run the canonical full gate and first qualify the 19 GB
     source as one default-direct PST by selecting a part limit above its
-    recovered output size. Require exact 37,402-to-37,402 candidate assignment,
+    recovered output size. Require exact current-source candidate assignment
+    (37,413-to-37,413 for the 2026-07-20 source identity),
     unchanged descriptor/path identity, less than 2 GiB RSS, no more than one
     minute per source GiB, a clean ScanPST result, and Outlook content/folder
     acceptance before testing boundary packing. Then run the 4 GiB direct
@@ -3048,6 +3079,30 @@ not modified.
   `0x0031AE44`; no invalid PST was published.
   Evidence: `.agent/test-results/1784541051-v045-direct-single-r10` and
   `transactional_validation_retains_unused_source_named_property_ids`.
+
+- Observation: A libpff record entry is not independently owned by its Rust
+  wrapper. Retaining the raw entry after freeing its record set caused a native
+  `memmove` crash at source candidate 24,966. Reopening the entry avoided the
+  invalid pointer but did not provide an independent cursor: a previously read
+  64 KiB prefix remained consumed in libpff's shared stream state, so the
+  34,342-byte remainder of a 99,878-byte property was absent. The safe,
+  single-read model is to retain the record-set owner with the original entry
+  until its remainder drains. Attachment handles are reacquired only because
+  libpff exposes an explicit attachment-data seek API.
+  Evidence: the r6 native core backtrace, isolated full-worker completion in
+  180 seconds after the ownership correction, focused document/OLE round
+  trips, and qualification r10.
+
+- Observation: One-pass direct construction can begin before the traversal has
+  discovered later empty folders. The initial part layout therefore had zero
+  reportable source folders even though the completed ledger contained 164
+  source folder records and the output retained 145 representable folders.
+  Using the initial count made the otherwise completed r9 part fail sidecar
+  integrity and correctly prevented publication. Publication accounting must
+  use the final observed folder set, while the writer continues to observe
+  late folders before finalization.
+  Evidence: r9 ledger counts, the sidecar integrity refusal, and r10's
+  atomically published 145-folder manifest.
 
 - Observation: The 0.4.2 fidelity expansion regressed a cold 19 GB split from
   approximately ten minutes in 0.4.1 to more than 57 minutes without
@@ -3720,6 +3775,20 @@ not modified.
   translation and hard part selection without mailbox-scale RAM.
   Date/Author: 2026-07-20 / project owner performance direction and Codex
   implementation evidence.
+
+- Decision: Native deferred-property ownership follows libpff's actual
+  lifetime and cursor behavior. A record entry retains its record-set owner
+  and continues from the bounded prefix on the same handle. It is neither
+  reopened nor reread. Message items remain alive for the graph lifetime.
+  Attachment data may use a freshly acquired attachment handle only with an
+  explicit checked seek to the already captured prefix. Duplicate
+  `PR_ATTACH_DATA_BIN` property data is not read a second time when the same
+  bytes are available through the attachment stream.
+  Rationale: The 19 GB source supplied both a deterministic use-after-owner
+  crash and a shared-cursor counterexample to reopen-based continuation.
+  Retained RAII ownership is bounded to one top-level graph, preserves the
+  one-read direct contract, and matches the native API's proven semantics.
+  Date/Author: 2026-07-20 / qualification evidence and Codex.
 
 - Decision: Close 0.4.2 at the owner-approved focused data-correctness
   boundary and move the failed final 19 GB scale reconciliation to an immediate
@@ -5051,13 +5120,19 @@ omissions correspond exactly to source `attachment_missing` events. The owner
 accepted the current automated reconciliation and prior ScanPST/Outlook
 evidence as completing the version.
 
-Version 0.4.5 next removes restartable persistence write amplification from the
-default PST-writing workflow for every supported recovery policy. Direct mode
-streams through bounded queues into one active same-filesystem PST temporary
-and atomically renames the validated file;
-`--restartable` deliberately selects the existing durable ledger and payload
-spool. This makes recoverability an operator choice and prevents a
-mailbox-sized private spool from being the default SSD cost.
+Version 0.4.5 now defaults every supported PST-output recovery policy to
+bounded one-traversal direct construction. Qualification r10 wrote the current
+19 GB source into one 19,532,989,440-byte PST in 7:02.35 at 462,380 KiB peak
+RSS. It assigned all 37,413 currently readable candidates exactly once, left
+`payload.pack` at zero bytes, omitted no attachment or folder, published no
+digest, and retained the unchanged source identity plus one known contained
+libpff recovery-tail issue. Record entries retain their native record-set
+owners through deferred streaming, attachment continuations use checked native
+seek, and late-discovered folders feed final publication accounting. The
+generated PST is ready for the remaining human ScanPST-first and Outlook
+acceptance gate. `--restartable` deliberately retains the existing durable
+ledger and payload spool; its performance optimization and the 4 GiB direct
+regression remain later 0.4.5 checkpoints after single-file acceptance.
 
 ## Context and Orientation
 

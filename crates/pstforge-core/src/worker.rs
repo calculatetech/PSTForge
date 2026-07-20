@@ -1078,11 +1078,35 @@ impl DirectBlobSource for DirectProtocolSource<'_> {
             .prefixes
             .remove(&requested_identity)
             .unwrap_or_default();
-        if u64::try_from(prefix.len()).unwrap_or(u64::MAX) == blob.byte_len {
+        let prefix_len = u64::try_from(prefix.len()).unwrap_or(u64::MAX);
+        if prefix_len > blob.byte_len {
+            return Err(direct_protocol_error(
+                "direct metadata prefix exceeds its declared stream length",
+            ));
+        }
+        if prefix_len == blob.byte_len {
             return Ok(Box::new(std::io::Cursor::new(prefix)));
         }
         loop {
             let frame = self.next_control()?;
+            if matches!(
+                frame,
+                ControlFrame::MessageStart {
+                    parent_message_id: None,
+                    ..
+                } | ControlFrame::TopLevelPayloadEnd
+                    | ControlFrame::Complete { .. }
+                    | ControlFrame::ParserBoundary { .. }
+            ) {
+                return Err(direct_protocol_error(format!(
+                    "requested stream was absent from the candidate payload \
+                     (owner={:?}, expected_bytes={}, prefix_bytes={}, boundary={})",
+                    requested_identity.owner,
+                    blob.byte_len,
+                    prefix_len,
+                    control_frame_kind(&frame),
+                )));
+            }
             let identity = self.current_data_identity(&frame)?;
             if identity
                 .as_ref()
@@ -1106,6 +1130,7 @@ impl DirectBlobSource for DirectProtocolSource<'_> {
                         direct_protocol_error("direct payload identity disappeared")
                     })?,
                     prefix: std::io::Cursor::new(prefix),
+                    blob_remaining: blob.byte_len,
                     remaining,
                     finished: false,
                 }));
@@ -1115,10 +1140,21 @@ impl DirectBlobSource for DirectProtocolSource<'_> {
     }
 }
 
+fn control_frame_kind(frame: &ControlFrame) -> &'static str {
+    match frame {
+        ControlFrame::MessageStart { .. } => "message_start",
+        ControlFrame::TopLevelPayloadEnd => "top_level_payload_end",
+        ControlFrame::Complete { .. } => "complete",
+        ControlFrame::ParserBoundary { .. } => "parser_boundary",
+        _ => "other",
+    }
+}
+
 struct DirectPayloadReader<'a, 'b> {
     source: &'a mut DirectProtocolSource<'b>,
     identity: DirectStreamIdentity,
     prefix: std::io::Cursor<Vec<u8>>,
+    blob_remaining: u64,
     remaining: u32,
     finished: bool,
 }
@@ -1145,6 +1181,9 @@ impl Read for DirectPayloadReader<'_, '_> {
         }
         let prefix_read = self.prefix.read(output)?;
         if prefix_read != 0 {
+            self.blob_remaining = self
+                .blob_remaining
+                .saturating_sub(u64::try_from(prefix_read).unwrap_or(u64::MAX));
             return Ok(prefix_read);
         }
         if self.remaining != 0 {
@@ -1165,6 +1204,9 @@ impl Read for DirectPayloadReader<'_, '_> {
             self.remaining = self
                 .remaining
                 .saturating_sub(u32::try_from(read).unwrap_or(u32::MAX));
+            self.blob_remaining = self
+                .blob_remaining
+                .saturating_sub(u64::try_from(read).unwrap_or(u64::MAX));
             return Ok(read);
         }
         let frame = self
@@ -1184,6 +1226,15 @@ impl Read for DirectPayloadReader<'_, '_> {
                 _ => 0,
             };
             return self.read(output);
+        }
+        if self.blob_remaining != 0 {
+            tracing::error!(
+                remaining_bytes = self.blob_remaining,
+                owner = ?self.identity.owner,
+                next_owner = ?identity.as_ref().map(|value| &value.owner),
+                "direct payload ownership changed before its declared length"
+            );
+            return Err(direct_worker_payload_io(std::io::ErrorKind::InvalidData));
         }
         self.source.pending = Some(frame);
         self.finished = true;
@@ -1416,7 +1467,16 @@ impl ProtocolSink<'_> {
 impl CatalogSink for ProtocolSink<'_> {
     fn property_payload(&self, descriptor: PropertyDescriptor) -> PayloadRequest {
         if self.writer_order && !matches!(descriptor.owner, libpff_sys::PropertyOwner::Folder(_)) {
-            PayloadRequest::DeferredPrefix(descriptor.data_size.min(METADATA_PROPERTY_PREFIX_BYTES))
+            let prefix = descriptor.data_size.min(METADATA_PROPERTY_PREFIX_BYTES);
+            if matches!(
+                descriptor.owner,
+                libpff_sys::PropertyOwner::Attachment { .. }
+            ) && descriptor.entry_type == Some(0x3701)
+            {
+                PayloadRequest::Prefix(prefix)
+            } else {
+                PayloadRequest::DeferredPrefix(prefix)
+            }
         } else if self.metadata_only {
             PayloadRequest::Prefix(descriptor.data_size.min(METADATA_PROPERTY_PREFIX_BYTES))
         } else {
@@ -2435,6 +2495,29 @@ mod tests {
         let writer =
             ProtocolSink::start(&mut writer_bytes, false, true).expect("start writer protocol");
         assert_eq!(writer.traversal_order(), TraversalOrder::Direct);
+        let attachment_data = PropertyDescriptor {
+            owner: PropertyOwner::Attachment {
+                message_id: 7,
+                index: 0,
+            },
+            record_set_index: 0,
+            entry_index: 0,
+            entry_type: Some(0x3701),
+            value_type: Some(0x0102),
+            data_size: METADATA_PROPERTY_PREFIX_BYTES + 1,
+        };
+        assert_eq!(
+            writer.property_payload(attachment_data),
+            PayloadRequest::Prefix(METADATA_PROPERTY_PREFIX_BYTES)
+        );
+        let attachment_metadata = PropertyDescriptor {
+            entry_type: Some(0x3702),
+            ..attachment_data
+        };
+        assert_eq!(
+            writer.property_payload(attachment_metadata),
+            PayloadRequest::DeferredPrefix(METADATA_PROPERTY_PREFIX_BYTES)
+        );
     }
 
     #[test]

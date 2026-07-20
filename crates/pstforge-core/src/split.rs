@@ -1038,11 +1038,11 @@ fn finalize_direct_part(
             CandidateRejectionCategory::UnsupportedEmbeddedItem,
         )?;
     }
-    let folder_count = if part_index == 1 {
-        layout_folder_count
-    } else {
-        saturating_len(stats.folder_keys.len())
-    };
+    let folder_count = published_folder_count(
+        part_index,
+        layout_folder_count,
+        saturating_len(stats.folder_keys.len()),
+    );
     let partial = stats.partial
         || stats.omitted_folders != 0
         || stats.omitted_properties != 0
@@ -1112,6 +1112,18 @@ fn direct_part_space_preflight(
         });
     }
     Ok(())
+}
+
+fn published_folder_count(
+    part_index: u32,
+    initial_layout_count: u64,
+    observed_folder_count: u64,
+) -> u64 {
+    if part_index == 1 {
+        initial_layout_count.max(observed_folder_count)
+    } else {
+        observed_folder_count
+    }
 }
 
 fn register_direct_mail_streams(
@@ -1284,11 +1296,12 @@ fn split_direct_recovered_job(
         .into_iter()
         .map(|(unit, _)| unit)
         .collect::<HashSet<_>>();
-    let single_part_projected_eof = None;
-    if let Some(projected_file_eof) = single_part_projected_eof {
+    let direct_capacity_estimate = direct_required_capacity(source.identity().size_bytes);
+    let single_part_without_incremental_projection = maximum_pst_bytes >= direct_capacity_estimate;
+    if single_part_without_incremental_projection {
         tracing::info!(
-            projected_file_eof,
-            "whole-part direct projection selected single-part streaming"
+            direct_capacity_estimate,
+            "direct capacity estimate selected single-part construction"
         );
     }
     let mut reports = Vec::new();
@@ -1406,11 +1419,8 @@ fn split_direct_recovered_job(
                         }
                     }
                     let message_count = count_messages(&message);
-                    if let Some(projected_file_eof) = single_part_projected_eof {
+                    if single_part_without_incremental_projection {
                         let transaction = active.as_mut().ok_or(SplitError::TooManyParts)?;
-                        if transaction.writer.message_count() == 0 {
-                            direct_part_space_preflight(transaction, projected_file_eof)?;
-                        }
                         transaction.writer.append_message_direct_projected_part(
                             location,
                             &path,
@@ -1577,16 +1587,6 @@ fn split_direct_recovered_job(
                 }
             }
             if let Some(transaction) = active {
-                if let Some(expected_file_eof) = single_part_projected_eof {
-                    let actual_file_eof = transaction.writer.projected_file_eof(interrupted)?;
-                    if actual_file_eof != expected_file_eof {
-                        return Err(WriterError::InvalidStructure(format!(
-                            "whole-part direct projection diverged before publication: \
-                             expected {expected_file_eof}, got {actual_file_eof}"
-                        ))
-                        .into());
-                    }
-                }
                 let completed =
                     finalize_direct_part(job, transaction, maximum_pst_bytes, interrupted)?;
                 written_candidates = written_candidates.saturating_add(completed.message_count);
@@ -2960,7 +2960,7 @@ fn disk_preflight(
             .saturating_mul(3)
             .saturating_sub(existing_job_bytes)
     } else {
-        source_bytes.saturating_add(source_bytes / 4)
+        direct_required_capacity(source_bytes)
     };
     let path = preflight_filesystem_path(job_directory);
     let stats = rustix::fs::statvfs(path).map_err(|source| SplitError::DiskSpaceIo {
@@ -2979,6 +2979,10 @@ fn disk_preflight(
         available_bytes,
         existing_job_bytes,
     })
+}
+
+fn direct_required_capacity(source_bytes: u64) -> u64 {
+    source_bytes.saturating_add(source_bytes / 4)
 }
 
 fn preflight_filesystem_path(job_directory: &Path) -> &Path {
@@ -3365,10 +3369,11 @@ mod tests {
     use super::{
         AdaptiveSizeModel, DirectFailureCategory, DiskPreflight, ExecutionMetrics, LayoutEstimator,
         MAX_RECOVERY_LOG_DETAIL_LINES, PartReport, SPLIT_SCHEMA_VERSION, SplitError,
-        SplitFailureKind, SplitOptions, SplitReport, disk_preflight, extend_to_fitting_prefix,
-        hash_file, open_restartable_resume, preflight_filesystem_path,
-        projection_batch_byte_target, render_recovery_log, shrink_to_fitting_prefix,
-        source_folders_for_part, split, take_fitting_prefix, translation_rejections,
+        SplitFailureKind, SplitOptions, SplitReport, direct_required_capacity, disk_preflight,
+        extend_to_fitting_prefix, hash_file, open_restartable_resume, preflight_filesystem_path,
+        projection_batch_byte_target, published_folder_count, render_recovery_log,
+        shrink_to_fitting_prefix, source_folders_for_part, split, take_fitting_prefix,
+        translation_rejections,
     };
     use crate::{
         CanonicalAttachment, CanonicalFolder, CanonicalFolderRole, CanonicalMail,
@@ -3812,6 +3817,19 @@ mod tests {
         ));
         assert!(!job.exists());
         Ok(())
+    }
+
+    #[test]
+    fn direct_capacity_estimate_is_saturating_and_scales_from_source() {
+        assert_eq!(direct_required_capacity(20_000), 25_000);
+        assert_eq!(direct_required_capacity(u64::MAX), u64::MAX);
+    }
+
+    #[test]
+    fn direct_publication_counts_folders_observed_after_part_construction_begins() {
+        assert_eq!(published_folder_count(1, 0, 164), 164);
+        assert_eq!(published_folder_count(1, 20, 164), 164);
+        assert_eq!(published_folder_count(2, 20, 7), 7);
     }
 
     #[test]

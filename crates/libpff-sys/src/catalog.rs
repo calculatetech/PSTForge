@@ -1,5 +1,6 @@
 use std::collections::HashSet;
 use std::ptr;
+use std::rc::Rc;
 
 use serde::{Deserialize, Serialize};
 
@@ -857,10 +858,15 @@ enum DeferredPayload {
     Attachment {
         embedded_path: Vec<u32>,
         index: u32,
-        attachment: PffItem,
         expected: u64,
         prefix_bytes: u64,
     },
+}
+
+struct RetainedMessage {
+    embedded_path: Vec<u32>,
+    item: PffItem,
+    _container: Option<PffItem>,
 }
 
 fn process_message(
@@ -872,14 +878,23 @@ fn process_message(
 ) -> Result<(), PffError> {
     let top_level = work.parent_message_id.is_none();
     let mut deferred = Vec::new();
-    process_message_inner(work, pending, visited, sink, catalog, &mut deferred)?;
+    let mut retained = Vec::new();
+    process_message_inner(
+        work,
+        pending,
+        visited,
+        sink,
+        catalog,
+        &mut deferred,
+        &mut retained,
+    )?;
     if top_level && sink.traversal_order() == TraversalOrder::Direct {
         emit(
             sink,
             "top-level metadata end",
             CatalogEvent::TopLevelMetadataEnd,
         )?;
-        stream_deferred_payloads(&mut deferred, sink, catalog)?;
+        stream_deferred_payloads(&mut deferred, &retained, sink, catalog)?;
         emit(
             sink,
             "top-level payload end",
@@ -896,6 +911,7 @@ fn process_message_inner(
     sink: &mut dyn CatalogSink,
     catalog: &mut RawCatalog,
     deferred: &mut Vec<DeferredPayload>,
+    retained: &mut Vec<RetainedMessage>,
 ) -> Result<(), PffError> {
     let issue_state = (catalog.issues.len(), catalog.issues_dropped);
     let message_id = recover_item_value(
@@ -1065,7 +1081,7 @@ fn process_message_inner(
     match work.item.attachment_count() {
         Ok(count) => {
             if let Err(error) = stream_attachments(
-                &work, message_id, count, pending, visited, sink, catalog, deferred,
+                &work, message_id, count, pending, visited, sink, catalog, deferred, retained,
             ) {
                 record_attachment_issue(catalog, Some(message_id), "stream attachments", error)?;
             }
@@ -1096,7 +1112,13 @@ fn process_message_inner(
             id: message_id,
             complete: (catalog.issues.len(), catalog.issues_dropped) == issue_state,
         },
-    )
+    )?;
+    retained.push(RetainedMessage {
+        embedded_path: work.embedded_path,
+        item: work.item,
+        _container: work._container,
+    });
+    Ok(())
 }
 
 fn supported_message_class(value: &str, embedded: bool) -> bool {
@@ -1192,6 +1214,7 @@ fn stream_attachments(
     sink: &mut dyn CatalogSink,
     catalog: &mut RawCatalog,
     deferred: &mut Vec<DeferredPayload>,
+    retained: &mut Vec<RetainedMessage>,
 ) -> Result<(), PffError> {
     for index in 0..count {
         let index_u32 = checked_index(index, "attachment index")?;
@@ -1368,7 +1391,6 @@ fn stream_attachments(
                 deferred.push(DeferredPayload::Attachment {
                     embedded_path: work.embedded_path.clone(),
                     index: index_u32,
-                    attachment,
                     expected,
                     prefix_bytes: actual,
                 });
@@ -1456,6 +1478,7 @@ fn stream_attachments(
                         sink,
                         catalog,
                         deferred,
+                        retained,
                     )?;
                 }
                 Ok(embedded_work) => queued_embedded = Some(embedded_work),
@@ -1691,6 +1714,7 @@ fn stream_record_set(
 
 fn stream_deferred_payloads(
     deferred: &mut Vec<DeferredPayload>,
+    retained: &[RetainedMessage],
     sink: &mut dyn CatalogSink,
     catalog: &mut RawCatalog,
 ) -> Result<(), PffError> {
@@ -1715,10 +1739,11 @@ fn stream_deferred_payloads(
             DeferredPayload::Attachment {
                 embedded_path,
                 index,
-                attachment,
                 expected,
                 prefix_bytes,
             } => {
+                let message = retained_message(retained, &embedded_path)?;
+                let attachment = message.item.attachment(u64::from(index))?;
                 let remaining = attachment.stream_attachment_deferred(
                     &embedded_path,
                     index,
@@ -1739,14 +1764,31 @@ fn stream_deferred_payloads(
     Ok(())
 }
 
+fn retained_message<'a>(
+    retained: &'a [RetainedMessage],
+    embedded_path: &[u32],
+) -> Result<&'a RetainedMessage, PffError> {
+    retained
+        .iter()
+        .find(|message| message.embedded_path == embedded_path)
+        .ok_or(PffError::InvalidValue {
+            field: "deferred message path",
+            value: i64::try_from(embedded_path.len()).unwrap_or(i64::MAX),
+        })
+}
+
 struct PffRecordSet {
+    inner: Rc<PffRecordSetInner>,
+}
+
+struct PffRecordSetInner {
     raw: *mut libpff_record_set_t,
 }
 
 impl PffRecordSet {
     fn entry_count(&self) -> Result<u64, PffError> {
         native_count(
-            self.raw,
+            self.inner.raw,
             "get number of record entries",
             bindings::libpff_record_set_get_number_of_entries,
             MAX_RECORD_ENTRIES,
@@ -1759,10 +1801,15 @@ impl PffRecordSet {
         let mut error = ptr::null_mut();
         // SAFETY: self.raw is valid and outputs are initialized.
         let result = unsafe {
-            bindings::libpff_record_set_get_entry_by_index(self.raw, index, &mut raw, &mut error)
+            bindings::libpff_record_set_get_entry_by_index(
+                self.inner.raw,
+                index,
+                &mut raw,
+                &mut error,
+            )
         };
         check_one(result, error, "get record entry")?;
-        PffRecordEntry::from_raw(raw, "get record entry")
+        PffRecordEntry::from_raw(raw, Rc::clone(&self.inner), "get record entry")
     }
 
     fn optional_entry(&self, entry_type: u32) -> Result<Option<PffRecordEntry>, PffError> {
@@ -1771,13 +1818,19 @@ impl PffRecordSet {
         // SAFETY: self.raw is valid and outputs are initialized. Value type zero and flag one mean any type.
         let result = unsafe {
             bindings::libpff_record_set_get_entry_by_type(
-                self.raw, entry_type, 0, &mut raw, 1, &mut error,
+                self.inner.raw,
+                entry_type,
+                0,
+                &mut raw,
+                1,
+                &mut error,
             )
         };
         match result {
             1 => {
                 free_error(error);
-                PffRecordEntry::from_raw(raw, "get record entry by type").map(Some)
+                PffRecordEntry::from_raw(raw, Rc::clone(&self.inner), "get record entry by type")
+                    .map(Some)
             }
             0 => {
                 free_error(error);
@@ -1800,7 +1853,7 @@ impl PffRecordSet {
     }
 }
 
-impl Drop for PffRecordSet {
+impl Drop for PffRecordSetInner {
     fn drop(&mut self) {
         if self.raw.is_null() {
             return;
@@ -1816,17 +1869,22 @@ impl Drop for PffRecordSet {
 
 struct PffRecordEntry {
     raw: *mut libpff_record_entry_t,
+    _record_set: Rc<PffRecordSetInner>,
 }
 
 impl PffRecordEntry {
     fn from_raw(
         raw: *mut libpff_record_entry_t,
+        record_set: Rc<PffRecordSetInner>,
         operation: &'static str,
     ) -> Result<Self, PffError> {
         if raw.is_null() {
             Err(PffError::NullPointer { operation })
         } else {
-            Ok(Self { raw })
+            Ok(Self {
+                raw,
+                _record_set: record_set,
+            })
         }
     }
 
@@ -2083,8 +2141,8 @@ impl PffRecordEntry {
                 value: i64::MAX,
             })?;
             let mut error = ptr::null_mut();
-            // SAFETY: self.raw is valid and the prefix read left its owned
-            // stream positioned at `prefix_bytes`.
+            // SAFETY: self.raw and its retained record-set owner are valid, and
+            // the prefix read left this stream positioned at `prefix_bytes`.
             let read = unsafe {
                 bindings::libpff_record_entry_read_buffer(
                     self.raw,
@@ -2267,7 +2325,9 @@ impl PffItem {
                 operation: "get record set",
             })
         } else {
-            Ok(PffRecordSet { raw })
+            Ok(PffRecordSet {
+                inner: Rc::new(PffRecordSetInner { raw }),
+            })
         }
     }
 
@@ -2525,9 +2585,36 @@ impl PffItem {
         prefix_bytes: u64,
         sink: &mut dyn CatalogSink,
     ) -> Result<u64, PffError> {
-        let expected_remaining = expected.saturating_sub(prefix_bytes);
+        if prefix_bytes > expected {
+            return Err(PffError::StreamSizeMismatch {
+                field: "deferred attachment prefix",
+                expected,
+                actual: prefix_bytes,
+            });
+        }
+        let expected_remaining = expected - prefix_bytes;
         let mut total = 0_u64;
         let mut buffer = vec![0_u8; STREAM_CHUNK_BYTES];
+        let prefix_offset = i64::try_from(prefix_bytes).map_err(|_| PffError::InvalidValue {
+            field: "attachment prefix size",
+            value: i64::MAX,
+        })?;
+        let mut error = ptr::null_mut();
+        // SAFETY: self.raw is valid; SEEK_SET positions the reacquired stream at the prefix boundary.
+        let offset = unsafe {
+            bindings::libpff_attachment_data_seek_offset(self.raw, prefix_offset, 0, &mut error)
+        };
+        if offset < 0 {
+            return Err(native_error(error, "seek deferred attachment data"));
+        }
+        free_error(error);
+        if offset != prefix_offset {
+            return Err(PffError::StreamSizeMismatch {
+                field: "deferred attachment offset",
+                expected: prefix_bytes,
+                actual: u64::try_from(offset).unwrap_or(u64::MAX),
+            });
+        }
         while total < expected_remaining {
             let requested = usize::try_from(
                 expected_remaining
@@ -2538,9 +2625,8 @@ impl PffItem {
                 field: "attachment read size",
                 value: i64::MAX,
             })?;
-            let mut error = ptr::null_mut();
-            // SAFETY: self.raw is valid and the prefix read left the owned
-            // attachment stream positioned at `prefix_bytes`.
+            error = ptr::null_mut();
+            // SAFETY: self.raw is valid and buffer is writable for its declared size.
             let read = unsafe {
                 bindings::libpff_attachment_data_read_buffer(
                     self.raw,
