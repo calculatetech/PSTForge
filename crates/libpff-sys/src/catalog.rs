@@ -330,6 +330,37 @@ impl RawCatalog {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+struct MessageIssueState {
+    node_id: u32,
+    retained: usize,
+    dropped: u64,
+}
+
+impl MessageIssueState {
+    fn capture(catalog: &RawCatalog, node_id: u32) -> Self {
+        Self {
+            node_id,
+            retained: catalog
+                .issues
+                .iter()
+                .filter(|issue| issue.node_id == Some(node_id))
+                .count(),
+            dropped: catalog.issues_dropped,
+        }
+    }
+
+    fn unchanged(self, catalog: &RawCatalog) -> bool {
+        self.dropped == catalog.issues_dropped
+            && self.retained
+                == catalog
+                    .issues
+                    .iter()
+                    .filter(|issue| issue.node_id == Some(self.node_id))
+                    .count()
+    }
+}
+
 impl PffFile {
     pub fn catalog(&self, sink: &mut dyn CatalogSink) -> Result<RawCatalog, PffError> {
         self.catalog_reachable(sink, &HashSet::new())
@@ -920,6 +951,8 @@ fn process_message_inner(
         "get message identifier",
         work.item.identifier(),
     )?;
+    let identifier_complete = (catalog.issues.len(), catalog.issues_dropped) == issue_state;
+    let message_issue_state = MessageIssueState::capture(catalog, message_id);
     if stable_top_level_identifier_seen(visited, message_id, &work.embedded_path) {
         catalog.record_issue(CatalogIssue {
             node_id: Some(message_id),
@@ -1110,7 +1143,7 @@ fn process_message_inner(
         "message end",
         CatalogEvent::MessageEnd {
             id: message_id,
-            complete: (catalog.issues.len(), catalog.issues_dropped) == issue_state,
+            complete: identifier_complete && message_issue_state.unchanged(catalog),
         },
     )?;
     retained.push(RetainedMessage {
@@ -2959,7 +2992,7 @@ mod tests {
 
     use super::{
         CatalogEvent, CatalogIssue, CatalogProvenance, CatalogSink, FolderAddress,
-        MAX_CATALOG_ISSUES, PropertyDescriptor, PropertyOwner,
+        MAX_CATALOG_ISSUES, MessageIssueState, PropertyDescriptor, PropertyOwner,
         RECOVERY_FLAG_IGNORE_ALLOCATION_DATA, RECOVERY_FLAG_SCAN_FOR_FRAGMENTS, RawCatalog,
         RecoveryMode, RecoveryUnit, STREAM_CHUNK_BYTES, checked_increment, contain_filetime,
         decode_native_identity_string, decode_native_string, mark_stable_top_level_identifier,
@@ -3213,5 +3246,24 @@ mod tests {
         }
         assert_eq!(catalog.issues.len(), MAX_CATALOG_ISSUES);
         assert_eq!(catalog.issues_dropped, 1);
+    }
+
+    #[test]
+    fn message_issue_state_ignores_retained_child_issues() {
+        let mut catalog = RawCatalog::default();
+        let parent = MessageIssueState::capture(&catalog, 7);
+        catalog.record_issue(CatalogIssue {
+            node_id: Some(8),
+            operation: "embedded child",
+            message: "child issue".to_owned(),
+        });
+        assert!(parent.unchanged(&catalog));
+
+        catalog.record_issue(CatalogIssue {
+            node_id: Some(7),
+            operation: "parent",
+            message: "parent issue".to_owned(),
+        });
+        assert!(!parent.unchanged(&catalog));
     }
 }

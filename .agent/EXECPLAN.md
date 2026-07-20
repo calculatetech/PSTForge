@@ -2996,7 +2996,7 @@ not modified.
     writes so logical workload is not presented as SSD traffic. Direct mode
     reports zero payload-pack and validator workload; restartable mode retains
     its logical validation workload. The fields contain no mailbox content.
-  - [ ] Checkpoint 7: run the canonical full gate and first qualify the 19 GB
+  - [x] Checkpoint 7: run the canonical full gate and first qualify the 19 GB
     source as one default-direct PST by selecting a part limit above its
     recovered output size. Require exact current-source candidate assignment
     (37,413-to-37,413 for the 2026-07-20 source identity),
@@ -3009,7 +3009,7 @@ not modified.
     at least not regress the accepted 9:30.47 cold baseline.
     - [x] The accepted r11 single-file run completed the first half of this
       checkpoint as recorded above.
-    - [ ] The first current-code 4 GiB run
+    - [x] The first current-code 4 GiB run
       `qualification-v045-one-pass-direct-4g-r1` wrote all 37,413 candidates
       once into five parts totaling 19,534,074,880 bytes, with zero unsupported
       candidates, omitted attachments, omitted folders, or payload-pack bytes.
@@ -3080,8 +3080,47 @@ not modified.
       All five r4 parts pass `pffinfo` and bounded one-part-at-a-time `readpst`
       extraction, with decoded scratch removed after every part. The canonical
       full gate passes at `.agent/test-results/1784571784-full`. Human
-      ScanPST-first and Outlook aggregate acceptance remain pending.
-  - [ ] Make direct output the default for every supported PST-output recovery
+      ScanPST-first and Outlook aggregate acceptance then passed for all five
+      r4 parts.
+    - [x] Explicit restartable r1 wrote the same 37,413 durable item keys in
+      five parts in 8:41.06, improving the accepted 9:30.47 baseline. It used
+      an 11,013,437,088-byte peak payload pack and measured 120,416,735,232
+      supervisor filesystem write bytes, versus direct r4's zero-byte pack and
+      44,564,631,552 writes. Direct therefore saves substantial capacity and
+      SSD traffic but only four seconds on this host. The restartable adaptive
+      writer amortizes final-size projection, while direct still performs one
+      exact private allocation simulation per candidate; a one-pass
+      replay-free equivalent is the remaining split-performance opportunity.
+      Ledger comparison found the exact same item-key set but 127 direct
+      candidates marked partial that restartable marked complete. Every
+      difference was a parent containing an embedded message, and both modes
+      retained identical property, recipient, and attachment event counts for
+      those candidates. Direct/writer-order recursion processed each child
+      before the parent's `MessageEnd`, and the global issue delta incorrectly
+      attributed child-local issues to the parent. Completeness now compares
+      issues attributed to the current message ID; message-identifier failures
+      and issue-log overflow remain conservatively partial. The libpff suite
+      and fast gate pass at `.agent/test-results/1784574626-fast`. A bounded
+      direct single-file r5 then reproduced the exact 37,413-key set in 6:08,
+      upgraded 110 embedded parents from partial to complete, and introduced no
+      completeness regression. Its 14,918 complete total differs from the
+      separate restartable traversal's 14,935 by the already-observed libpff
+      run-to-run classification variance; r5 retained six more writable
+      properties than restartable r1. The duplicate r5 PST and the
+      restartable spool/output were deleted after bounded evidence was
+      retained. This closes Checkpoint 7 with exact item identity/accounting,
+      independently valid direct parts, accepted ScanPST/Outlook behavior, and
+      measured direct/restartable performance and write cost. The post-fix
+      canonical full gate passes at
+      `.agent/test-results/1784575346-full`. Direct split did not demonstrate
+      a material wall-time advantage over restartable split on the current
+      host: 8:37 versus 8:41. Its accepted benefits are lower write traffic
+      and no mailbox-sized payload pack. Single-file direct recovery completed
+      in 6:08, localizing the remaining split cost to per-candidate part
+      projection. A future performance milestone must replace that projection
+      with an equivalent bounded one-pass packing decision; it must not weaken
+      the exact part-size or independent-validity guarantees.
+  - [x] Make direct output the default for every supported PST-output recovery
     policy. Feed parser output through bounded backpressure into canonical
     translation and the transactional PST writer without first creating a
     mailbox-sized payload pack. Balanced and aggressive continue to select
@@ -3090,26 +3129,26 @@ not modified.
     completeness, part assignments, manifests, aggregate
     omission/reconstruction counts, and terminal job state so `report` and
     exact reconciliation remain reproducible.
-  - [ ] Keep the current durable ledger/payload-spool implementation behind an
+  - [x] Keep the current durable ledger/payload-spool implementation behind an
     explicit `--restartable` flag. Permit `--resume` and `--keep-work` only in
     restartable mode and refuse incompatible combinations before creating the
     output directory.
-  - [ ] Write only the active PST part to a same-filesystem temporary file
+  - [x] Write only the active PST part to a same-filesystem temporary file
     beside its destination. Complete it by construction and `fsync` it, then
     publish with atomic
     rename; never rewrite the completed dataset to move from temporary to
     final storage, including disk-to-disk recovery paths.
-  - [ ] Bound parser-to-writer queues, candidate metadata, attachment chunks,
+  - [x] Bound parser-to-writer queues, candidate metadata, attachment chunks,
     and the active transaction independently of source or attachment size.
     Preserve finalized parts on interruption. An interrupted direct job is a
     terminal partial result that remains reportable but cannot resume; a new
     run requires a different empty output directory. This prevents duplicate
     candidate publication without retaining recovered payloads.
-  - [ ] Report logical source bytes, bytes written to active PST temporaries,
+  - [x] Report logical source bytes, bytes written to active PST temporaries,
     finalized output bytes, zero production validator reads, peak
     temporary allocation, and peak RSS. Prove the default path avoids one
     readable-mailbox-sized spool write and allocation.
-  - [ ] Preserve the 0.4.4 exact 37,402-to-37,402 reconciliation, one
+  - [x] Preserve the 0.4.4 exact 37,402-to-37,402 reconciliation, one
     serialization per normal part, independent readers, ScanPST/Outlook
     interoperability, less than 2 GiB RSS, and no more than one minute per
     source GiB on the 19 GB qualification.
@@ -3909,6 +3948,17 @@ not modified.
   `large-qualification-20260717T204931Z`.
 
 ## Decision Log
+
+- Decision: Defer any PSTForge-maintained libpff fork until after 1.0. Keep
+  using replaceable dynamic linking to the system library for the 1.0 product.
+  Retain evidence of traversal classification variance, corrupt-tail behavior,
+  and native recovery limitations as the input to that later investigation.
+  Rationale: The accumulated evidence justifies focused upstream/native parser
+  work, but current containment and accounting satisfy the pre-1.0 recovery
+  contract. Forking the LGPL component now would expand correctness,
+  distribution-source, and maintenance scope without closing the remaining
+  application-level acceptance work.
+  Date/Author: 2026-07-20 / project owner.
 
 - Decision: Default direct output performs one supervised libpff traversal and
   one destination construction. It buffers only one top-level message graph's
