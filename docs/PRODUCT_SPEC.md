@@ -542,3 +542,29 @@ determinism tests. Representative healthy, partial, orphan, attachment, and
 embedded-message cases must then import into a test Synology MailPlus mailbox
 with matching folder and message counts and sampled content. Outlook opening
 and inspection is a secondary release check.
+
+Before the 0.4 correctness series closes, every corrupt external acceptance
+sample with an owner-supplied ScanPST-repaired reference must be classified by
+an external SHA-256-pinned pair manifest. Every case that current libpff can
+read completely enough to compare must recover into a new one-part PST and
+pass a one-pass semantic item multiset covering placement, associated and
+embedded ownership, visible metadata, recipients, bodies, recovery-critical
+properties, and attachment payloads. The repaired reference controls
+multiplicity and values except for a manifest-pinned category that the repaired
+reference demonstrably drops or cannot read. Such a supplement may add only
+complete, exact source-readable values. Source-proven associated items from an
+exact unreadable repaired table may therefore make generated count exceed the
+repaired-reference count; invented or duplicate values remain failures.
+
+Cases where both corrupt source and repaired reference remain unreadable in the
+same required category cannot produce trustworthy equivalence evidence. Retain
+those compact cases with bounded diagnostics and defer them only through an
+explicit owner-approved native-reader exception. The accepted 0.4.6 archive
+result is 16 provable passing pairs, including 50 exact source-proven associated
+additions, and three current-libpff exceptions reserved for the post-1.0 fork.
+Existing focused corpus tests retain exact empty-folder, raw-property, and
+named-property coverage. Store-local allocation identifiers and documented
+ScanPST structural rewrites are normalized; mailbox values and private paths
+do not enter repository evidence. This historical pair gate does not repeat
+`readpst` extraction for every multi-gigabyte sample; the focused/full
+output-part gates retain that independent-reader requirement.

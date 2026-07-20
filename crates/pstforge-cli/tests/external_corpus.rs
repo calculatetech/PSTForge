@@ -19,6 +19,8 @@ use sha2::{Digest, Sha256};
 const WRITER_MANDATORY_FOLDER_COUNT: u64 = 5;
 const NID_IPM_SUBTREE: u32 = 0x8022;
 type MatchedSourceMessages = (Vec<Vec<String>>, usize);
+type FolderIdentity = Vec<(String, u32)>;
+type RepairedMessageCatalog = (Vec<MessageFingerprint>, BTreeSet<FolderIdentity>);
 
 #[derive(Default)]
 struct WriterOrderSink {
@@ -687,6 +689,7 @@ struct MessageContentFingerprint {
 #[derive(Debug, Clone)]
 struct MessageFingerprint {
     folder_path: Vec<String>,
+    folder_identity: FolderIdentity,
     content: MessageContentFingerprint,
     complete: bool,
 }
@@ -710,6 +713,9 @@ struct ActivePropertyFingerprint {
 #[derive(Default)]
 struct IndependentMessageSink {
     folder_paths: BTreeMap<u32, Vec<String>>,
+    folder_identities: BTreeMap<u32, FolderIdentity>,
+    sibling_name_counts: BTreeMap<(Option<u32>, String), u32>,
+    unsupported_items: u64,
     active: BTreeMap<u32, MessageFingerprint>,
     attachments: BTreeMap<(u32, u32), ActiveAttachmentFingerprint>,
     properties: BTreeMap<(u32, u32, u32), ActivePropertyFingerprint>,
@@ -734,14 +740,33 @@ impl CatalogSink for IndependentMessageSink {
                         .ok_or_else(|| "folder preceded its parent".to_owned())?,
                     None => Vec::new(),
                 };
+                let mut identity = match parent_id {
+                    Some(parent) => self
+                        .folder_identities
+                        .get(&parent)
+                        .cloned()
+                        .ok_or_else(|| "folder identity preceded its parent".to_owned())?,
+                    None => Vec::new(),
+                };
                 if parent_id.is_some()
                     && id != NID_IPM_SUBTREE
                     && let Some(name) = name
                 {
+                    let ordinal = self
+                        .sibling_name_counts
+                        .entry((parent_id, name.clone()))
+                        .or_default();
+                    identity.push((name.clone(), *ordinal));
+                    *ordinal = ordinal
+                        .checked_add(1)
+                        .ok_or_else(|| "same-name sibling ordinal overflow".to_owned())?;
                     path.push(name);
                 }
                 if self.folder_paths.insert(id, path).is_some() {
                     return Err("duplicate folder identifier".to_owned());
+                }
+                if self.folder_identities.insert(id, identity).is_some() {
+                    return Err("duplicate folder identity".to_owned());
                 }
             }
             CatalogEvent::MessageStart {
@@ -760,25 +785,39 @@ impl CatalogSink for IndependentMessageSink {
                 ..
             } => {
                 if !supported {
+                    self.unsupported_items = self
+                        .unsupported_items
+                        .checked_add(1)
+                        .ok_or_else(|| "unsupported item count overflow".to_owned())?;
                     return Ok(());
                 }
-                let folder_path = match (folder_id, parent_message_id) {
-                    (Some(folder), _) => self
-                        .folder_paths
-                        .get(&folder)
-                        .cloned()
-                        .ok_or_else(|| "message referenced an unknown folder".to_owned())?,
+                let (folder_path, folder_identity) = match (folder_id, parent_message_id) {
+                    (Some(folder), _) => (
+                        self.folder_paths
+                            .get(&folder)
+                            .cloned()
+                            .ok_or_else(|| "message referenced an unknown folder".to_owned())?,
+                        self.folder_identities
+                            .get(&folder)
+                            .cloned()
+                            .ok_or_else(|| {
+                                "message referenced an unknown folder identity".to_owned()
+                            })?,
+                    ),
                     (None, Some(parent)) => self
                         .active
                         .get(&parent)
-                        .map(|message| message.folder_path.clone())
+                        .map(|message| {
+                            (message.folder_path.clone(), message.folder_identity.clone())
+                        })
                         .ok_or_else(|| {
                             "embedded message referenced an unknown parent".to_owned()
                         })?,
-                    (None, None) => Vec::new(),
+                    (None, None) => (Vec::new(), Vec::new()),
                 };
                 let message = MessageFingerprint {
                     folder_path,
+                    folder_identity,
                     content: MessageContentFingerprint {
                         embedded_path,
                         associated,
@@ -1092,6 +1131,25 @@ struct Manifest {
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
+struct RepairManifest {
+    schema_version: u32,
+    cases: Vec<RepairCase>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RepairCase {
+    name: String,
+    source_path: PathBuf,
+    source_sha256: String,
+    repaired_path: PathBuf,
+    repaired_sha256: String,
+    #[serde(default)]
+    source_supplements: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct Case {
     name: String,
     path: PathBuf,
@@ -1141,30 +1199,73 @@ fn lower_hex(bytes: &[u8]) -> String {
 fn independent_messages(
     path: &std::path::Path,
 ) -> Result<Vec<MessageFingerprint>, Box<dyn std::error::Error>> {
-    let file = fs::File::open(path)?;
-    let native = libpff_sys::PffFile::open_fd(file.as_fd())?;
+    let source = pstforge_core::SourceFile::open(path)?;
+    independent_messages_with_issue_policy(&source, true, false).map(|(messages, _)| messages)
+}
+
+fn independent_generated_messages(
+    path: &std::path::Path,
+) -> Result<Vec<MessageFingerprint>, Box<dyn std::error::Error>> {
+    let source = pstforge_core::SourceFile::open(path)?;
+    independent_messages_with_issue_policy(&source, false, false).map(|(messages, _)| messages)
+}
+
+fn independent_repaired_messages(
+    source: &pstforge_core::SourceFile,
+) -> Result<RepairedMessageCatalog, Box<dyn std::error::Error>> {
+    independent_messages_with_issue_policy(source, false, true)
+}
+
+fn independent_damaged_messages(
+    source: &pstforge_core::SourceFile,
+) -> Result<Vec<MessageFingerprint>, Box<dyn std::error::Error>> {
+    let native = libpff_sys::PffFile::open_fd(source.file().as_fd())?;
+    let mut sink = IndependentMessageSink::default();
+    let catalog = native.catalog(&mut sink)?;
+    if catalog.issues_dropped != 0
+        || sink.unsupported_items != 0
+        || !sink.active.is_empty()
+        || !sink.attachments.is_empty()
+        || !sink.properties.is_empty()
+        || !sink.attachment_properties.is_empty()
+    {
+        return Err("damaged-source message catalog ended with unfinished state".into());
+    }
+    Ok(sink.completed)
+}
+
+fn independent_messages_with_issue_policy(
+    source: &pstforge_core::SourceFile,
+    allow_common_source_issues: bool,
+    allow_repaired_reference_issues: bool,
+) -> Result<RepairedMessageCatalog, Box<dyn std::error::Error>> {
+    let native = libpff_sys::PffFile::open_fd(source.file().as_fd())?;
     let mut sink = IndependentMessageSink::default();
     let catalog = native.catalog(&mut sink)?;
     if catalog.issues.iter().any(|issue| {
-        !matches!(
-            (issue.operation, issue.message.as_str()),
-            ("count attachments", message)
-                if message.contains("libpff_message_get_number_of_attachments")
-        ) && !matches!(
-            (issue.operation, issue.message.as_str()),
-            ("stream recipients", message)
-                if message.contains("libpff_message_get_recipients")
-        )
+        !(allow_common_source_issues
+            && (matches!(
+                (issue.operation, issue.message.as_str()),
+                ("count attachments", message)
+                    if message.contains("libpff_message_get_number_of_attachments")
+            ) || matches!(
+                (issue.operation, issue.message.as_str()),
+                ("stream recipients", message)
+                    if message.contains("libpff_message_get_recipients")
+            ))
+            || allow_repaired_reference_issues && is_repaired_reference_issue(issue))
     }) || catalog.issues_dropped != 0
+        || (!allow_common_source_issues && sink.unsupported_items != 0)
         || !sink.active.is_empty()
         || !sink.attachments.is_empty()
         || !sink.properties.is_empty()
         || !sink.attachment_properties.is_empty()
     {
         return Err(format!(
-            "independent message catalog was incomplete: issues={:?}, dropped={}, active={}, attachments={}, properties={}, attachment_properties={}",
+            "independent message catalog was incomplete: issues={:?}, dropped={}, unsupported={}, active={}, attachments={}, properties={}, attachment_properties={}",
             catalog.issues,
             catalog.issues_dropped,
+            sink.unsupported_items,
             sink.active.len(),
             sink.attachments.len(),
             sink.properties.len(),
@@ -1172,7 +1273,61 @@ fn independent_messages(
         )
         .into());
     }
-    Ok(sink.completed)
+    let unreadable_associated_folders = catalog
+        .issues
+        .iter()
+        .filter(|issue| is_repaired_reference_issue(issue))
+        .map(|issue| {
+            issue
+                .node_id
+                .and_then(|folder_id| sink.folder_identities.get(&folder_id).cloned())
+                .ok_or("repaired-reference issue has no readable folder path")
+        })
+        .collect::<Result<BTreeSet<_>, _>>()?;
+    Ok((sink.completed, unreadable_associated_folders))
+}
+
+fn is_repaired_reference_issue(issue: &libpff_sys::CatalogIssue) -> bool {
+    let Some(expected) = issue.node_id.and_then(repaired_reference_issue_message) else {
+        return false;
+    };
+    issue.operation == "count folder associated contents" && issue.message == expected
+}
+
+fn repaired_reference_issue_message(node_id: u32) -> Option<String> {
+    let descriptor_id = node_id.checked_add(13)?;
+    Some(format!(
+        "libpff get number of sub associated contents failed: libpff_local_descriptors_node_get_entry_data: invalid local descriptors node.\n\
+libpff_local_descriptors_get_value_by_identifier: unable to retrieve node entry: 0 data.\n\
+libpff_local_descriptors_tree_get_value_by_identifier: unable to retrieve index value: 10485855 from index.\n\
+libpff_table_read_entry_value: unable to retrieve descriptor identifier: 10485855 from local descriptors.\n\
+libpff_table_read_values_array: unable to read entry value: 0.\n\
+libpff_table_read_7c_values: unable to read values array.\n\
+libpff_table_read_values: unable to read 7c table values.\n\
+libpff_table_read: unable to read table values.\n\
+libpff_item_values_read: unable to read table.\n\
+libpff_folder_determine_sub_associated_contents: unable to read descriptor identifier: {descriptor_id}.\n\
+libpff_folder_get_number_of_sub_associated_contents: unable to determine sub associated contents."
+    ))
+}
+
+#[test]
+fn repaired_reference_issue_requires_the_exact_known_diagnostic() {
+    let message = repaired_reference_issue_message(32_994).expect("test node id is bounded");
+    let exact = libpff_sys::CatalogIssue {
+        node_id: Some(32_994),
+        operation: "count folder associated contents",
+        message: message.clone(),
+    };
+    assert!(is_repaired_reference_issue(&exact));
+    assert!(!is_repaired_reference_issue(&libpff_sys::CatalogIssue {
+        message: format!("{message}\nadditional native failure"),
+        ..exact.clone()
+    }));
+    assert!(!is_repaired_reference_issue(&libpff_sys::CatalogIssue {
+        node_id: Some(32_995),
+        ..exact
+    }));
 }
 
 fn independent_named_properties(
@@ -1475,6 +1630,313 @@ fn verify_exact_message_fidelity(
     if remaining != 0 {
         return Err("generated message multiplicity differs from the source catalog".into());
     }
+    Ok(())
+}
+
+fn verify_repair_message_fidelity(
+    expected: &[MessageFingerprint],
+    actual: Vec<MessageFingerprint>,
+) -> Result<Vec<MessageFingerprint>, RepairMismatch> {
+    let mut unmatched = actual;
+    for reference in expected {
+        let Some(position) = unmatched.iter().position(|generated| {
+            generated.folder_identity == reference.folder_identity
+                && content_matches_current_recovery_policy(&reference.content, &generated.content)
+        }) else {
+            let categories = unmatched
+                .iter()
+                .find(|generated| generated.folder_identity == reference.folder_identity)
+                .map(|generated| fingerprint_difference(&reference.content, &generated.content))
+                .filter(|categories| !categories.is_empty())
+                .unwrap_or_else(|| vec!["placement or multiplicity"]);
+            return Err(RepairMismatch {
+                categories: categories.into_iter().collect(),
+            });
+        };
+        unmatched.swap_remove(position);
+    }
+    Ok(unmatched)
+}
+
+#[derive(Debug)]
+struct RepairMismatch {
+    categories: BTreeSet<&'static str>,
+}
+
+impl std::fmt::Display for RepairMismatch {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let categories = self
+            .categories
+            .iter()
+            .copied()
+            .collect::<Vec<_>>()
+            .join(", ");
+        write!(
+            formatter,
+            "semantic message multiset differs from repaired reference in: {categories}"
+        )
+    }
+}
+
+impl std::error::Error for RepairMismatch {}
+
+fn verify_source_supplemented_fidelity(
+    references: &[MessageFingerprint],
+    sources: &[MessageFingerprint],
+    actual: Vec<MessageFingerprint>,
+    supplements: &BTreeSet<&str>,
+) -> Result<(Vec<MessageFingerprint>, Vec<bool>), Box<dyn std::error::Error>> {
+    let mut consumed_sources = vec![false; sources.len()];
+    let mut unmatched_actual = actual;
+    for reference in references {
+        let Some(source_position) = sources.iter().enumerate().position(|(index, source)| {
+            !consumed_sources[index]
+                && source.complete
+                && source.folder_identity == reference.folder_identity
+                && content_matches_except_supplements(
+                    &reference.content,
+                    &source.content,
+                    supplements,
+                )
+        }) else {
+            return Err("source supplement has no matching repaired-reference item".into());
+        };
+        consumed_sources[source_position] = true;
+        let source = &sources[source_position];
+        let expected = supplemented_content(&reference.content, &source.content, supplements)?;
+        let Some(actual_position) = unmatched_actual.iter().position(|generated| {
+            generated.folder_identity == reference.folder_identity && generated.content == expected
+        }) else {
+            return Err("output does not match the repaired/source hybrid reference".into());
+        };
+        unmatched_actual.swap_remove(actual_position);
+    }
+    Ok((unmatched_actual, consumed_sources))
+}
+
+fn content_matches_except_supplements(
+    reference: &MessageContentFingerprint,
+    source: &MessageContentFingerprint,
+    supplements: &BTreeSet<&str>,
+) -> bool {
+    let mut reference = reference.clone();
+    let mut source = source.clone();
+    normalize_current_recovery_policy(&mut reference);
+    normalize_current_recovery_policy(&mut source);
+    if supplements.contains("recipients") {
+        reference.recipients.clear();
+        source.recipients.clear();
+    }
+    if supplements.contains("body properties") {
+        reference.body_properties.clear();
+        source.body_properties.clear();
+    }
+    reference == source
+}
+
+fn supplemented_content(
+    reference: &MessageContentFingerprint,
+    source: &MessageContentFingerprint,
+    supplements: &BTreeSet<&str>,
+) -> Result<MessageContentFingerprint, Box<dyn std::error::Error>> {
+    let mut expected = reference.clone();
+    let mut source = source.clone();
+    normalize_current_recovery_policy(&mut expected);
+    normalize_current_recovery_policy(&mut source);
+    for supplement in supplements {
+        match *supplement {
+            "recipients" => {
+                require_multiset_subset(&expected.recipients, &source.recipients)
+                    .map_err(|_| "source supplement replaces a repaired recipient")?;
+                expected.recipients = source.recipients.clone();
+            }
+            "body properties" => {
+                require_multiset_subset(&expected.body_properties, &source.body_properties)
+                    .map_err(|_| "source supplement replaces a repaired body property")?;
+                expected.body_properties = source.body_properties.clone();
+            }
+            _ => return Err("repair manifest names an unsupported source supplement".into()),
+        }
+    }
+    Ok(expected)
+}
+
+fn require_multiset_subset<T: Eq>(subset: &[T], superset: &[T]) -> Result<(), ()> {
+    let mut unmatched = superset.iter().collect::<Vec<_>>();
+    for expected in subset {
+        let Some(position) = unmatched
+            .iter()
+            .position(|candidate| *candidate == expected)
+        else {
+            return Err(());
+        };
+        unmatched.swap_remove(position);
+    }
+    Ok(())
+}
+
+#[test]
+fn repair_supplement_accepts_only_multiset_additions() {
+    assert!(require_multiset_subset(&[1, 1, 2], &[2, 1, 3, 1]).is_ok());
+    assert!(require_multiset_subset(&[1, 1, 2], &[1, 2, 3]).is_err());
+    assert!(require_multiset_subset(&[1, 2], &[1, 3, 4]).is_err());
+}
+
+#[test]
+fn repair_extra_cannot_reuse_a_consumed_source_occurrence() {
+    let message = MessageFingerprint {
+        folder_path: vec!["Inbox".to_owned()],
+        folder_identity: vec![("Inbox".to_owned(), 0)],
+        content: MessageContentFingerprint {
+            embedded_path: Vec::new(),
+            associated: true,
+            message_class: Some("IPM.Note".to_owned()),
+            subject: Some("associated".to_owned()),
+            sender_name: None,
+            sender_email: None,
+            submit_filetime: None,
+            delivery_filetime: None,
+            recipients: Vec::new(),
+            attachments: Vec::new(),
+            body_properties: Vec::new(),
+        },
+        complete: true,
+    };
+    assert!(
+        verify_extra_messages_from_source(
+            std::slice::from_ref(&message),
+            std::slice::from_ref(&message),
+            std::slice::from_ref(&message),
+            None,
+        )
+        .is_err()
+    );
+    assert!(
+        verify_extra_messages_from_source(
+            &[],
+            std::slice::from_ref(&message),
+            std::slice::from_ref(&message),
+            Some(vec![true]),
+        )
+        .is_err()
+    );
+}
+
+fn verify_extra_messages_from_source(
+    references: &[MessageFingerprint],
+    extras: &[MessageFingerprint],
+    sources: &[MessageFingerprint],
+    consumed_sources: Option<Vec<bool>>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut consumed_sources = match consumed_sources {
+        Some(consumed) if consumed.len() == sources.len() => consumed,
+        Some(_) => {
+            return Err("source-consumption state length differs from source catalog".into());
+        }
+        None => vec![false; sources.len()],
+    };
+    if !consumed_sources.iter().any(|consumed| *consumed) {
+        for reference in references {
+            if let Some(position) = sources.iter().enumerate().position(|(index, source)| {
+                !consumed_sources[index]
+                    && source.complete
+                    && source.folder_identity == reference.folder_identity
+                    && content_matches_current_recovery_policy(&source.content, &reference.content)
+            }) {
+                consumed_sources[position] = true;
+            }
+        }
+    }
+    for extra in extras {
+        let Some(position) = sources.iter().enumerate().position(|(index, source)| {
+            !consumed_sources[index]
+                && source.complete
+                && source.folder_identity == extra.folder_identity
+                && content_matches_current_recovery_policy(&source.content, &extra.content)
+        }) else {
+            return Err("extra associated item has no exact readable source match".into());
+        };
+        consumed_sources[position] = true;
+    }
+    Ok(())
+}
+
+fn finish_repair_case<T>(
+    case_name: &str,
+    directory: tempfile::TempDir,
+    case_result: Result<T, Box<dyn std::error::Error>>,
+) -> Result<T, Box<dyn std::error::Error>> {
+    let cleanup_result = directory.close();
+    match (case_result, cleanup_result) {
+        (Ok(outcome), Ok(())) => Ok(outcome),
+        (Err(error), Ok(())) => Err(error),
+        (Ok(_), Err(cleanup)) => {
+            Err(format!("{case_name} scratch cleanup failed: {cleanup}").into())
+        }
+        (Err(error), Err(cleanup)) => Err(format!(
+            "{case_name} failed: {error}; scratch cleanup also failed: {cleanup}"
+        )
+        .into()),
+    }
+}
+
+fn finish_repair_immutability<T>(
+    case_name: &str,
+    case_result: Result<T, Box<dyn std::error::Error>>,
+    immutability_result: Result<(), Box<dyn std::error::Error>>,
+) -> Result<T, Box<dyn std::error::Error>> {
+    match (case_result, immutability_result) {
+        (Ok(outcome), Ok(())) => Ok(outcome),
+        (Err(error), Ok(())) => Err(error),
+        (Ok(_), Err(immutability)) => Err(immutability),
+        (Err(error), Err(immutability)) => Err(format!(
+            "{case_name} failed: {error}; immutability verification also failed: {immutability}"
+        )
+        .into()),
+    }
+}
+
+fn verify_repair_pair_unchanged(
+    case_name: &str,
+    source: &pstforge_core::SourceFile,
+    source_before: &pstforge_core::SourceIdentity,
+    repaired: &pstforge_core::SourceFile,
+    repaired_before: &pstforge_core::SourceIdentity,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let source_result = (|| -> Result<(), Box<dyn std::error::Error>> {
+        source.verify_unchanged()?;
+        if source.identity() != source_before {
+            return Err(format!("{case_name} source identity changed").into());
+        }
+        Ok(())
+    })();
+    let repaired_result = (|| -> Result<(), Box<dyn std::error::Error>> {
+        repaired.verify_unchanged()?;
+        if repaired.identity() != repaired_before {
+            return Err(format!("{case_name} repaired-reference identity changed").into());
+        }
+        Ok(())
+    })();
+    match (source_result, repaired_result) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(source), Ok(())) => Err(source),
+        (Ok(()), Err(repaired)) => Err(repaired),
+        (Err(source), Err(repaired)) => Err(format!(
+            "{case_name} source verification failed: {source}; repaired-reference verification also failed: {repaired}"
+        )
+        .into()),
+    }
+}
+
+#[test]
+fn failed_repair_case_removes_sensitive_scratch() -> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempfile::tempdir()?;
+    let path = directory.path().to_path_buf();
+    fs::write(path.join("generated.pst"), b"private mailbox bytes")?;
+    let result: Result<(), Box<dyn std::error::Error>> =
+        Err("forced post-write validation failure".into());
+    assert!(finish_repair_case("failure-cleanup", directory, result).is_err());
+    assert!(!path.exists());
     Ok(())
 }
 
@@ -3475,6 +3937,293 @@ fn milestone_0_4_real_pst_splits_deterministically_without_mutation()
         {
             return Err(format!("{} changed during deterministic splitting", case.name).into());
         }
+    }
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires PSTFORGE_REPAIR_CORPUS_MANIFEST and PSTFORGE_REPAIR_SCRATCH"]
+fn milestone_0_4_6_corrupt_sources_match_repaired_references()
+-> Result<(), Box<dyn std::error::Error>> {
+    let (manifest_path, scratch) = match (
+        std::env::var_os("PSTFORGE_REPAIR_CORPUS_MANIFEST"),
+        std::env::var_os("PSTFORGE_REPAIR_SCRATCH"),
+    ) {
+        (None, None) => {
+            eprintln!("historical repair corpus ... skipped (private passing pairs removed)");
+            return Ok(());
+        }
+        (Some(manifest), Some(scratch)) => (manifest, PathBuf::from(scratch)),
+        _ => {
+            return Err(
+                "PSTFORGE_REPAIR_CORPUS_MANIFEST and PSTFORGE_REPAIR_SCRATCH must be set together"
+                    .into(),
+            );
+        }
+    };
+    if !scratch.is_dir() {
+        return Err("PSTFORGE_REPAIR_SCRATCH must be an existing directory".into());
+    }
+    let manifest: RepairManifest = toml::from_str(&fs::read_to_string(&manifest_path)?)?;
+    if manifest.schema_version != 1 {
+        return Err("repair corpus manifest schema_version must be 1".into());
+    }
+    if manifest.cases.is_empty() {
+        return Err("repair corpus manifest contains no cases".into());
+    }
+    let requested_case = std::env::var("PSTFORGE_REPAIR_CASE").ok();
+    let mut names = BTreeSet::new();
+    let mut selected = 0_usize;
+    for case in &manifest.cases {
+        if case.name.is_empty() || !names.insert(case.name.as_str()) {
+            return Err("repair corpus case names must be nonempty and unique".into());
+        }
+        if requested_case
+            .as_deref()
+            .is_some_and(|requested| requested != case.name)
+        {
+            continue;
+        }
+        selected = selected.saturating_add(1);
+        let supplements = case
+            .source_supplements
+            .iter()
+            .map(String::as_str)
+            .collect::<BTreeSet<_>>();
+        if supplements.len() != case.source_supplements.len()
+            || supplements.iter().any(|value| {
+                !matches!(
+                    *value,
+                    "recipients" | "body properties" | "associated items"
+                )
+            })
+        {
+            return Err(format!("{} source supplements are invalid", case.name).into());
+        }
+        let source = pstforge_core::SourceFile::open(&case.source_path)?;
+        let source_before = source.identity().clone();
+        let repaired = match pstforge_core::SourceFile::open(&case.repaired_path) {
+            Ok(repaired) => repaired,
+            Err(error) => {
+                let source_immutability = (|| -> Result<(), Box<dyn std::error::Error>> {
+                    source.verify_unchanged()?;
+                    if source.identity() != &source_before {
+                        return Err(format!("{} source identity changed", case.name).into());
+                    }
+                    Ok(())
+                })();
+                return finish_repair_immutability(
+                    &case.name,
+                    Err(Box::new(error)),
+                    source_immutability,
+                );
+            }
+        };
+        let repaired_before = repaired.identity().clone();
+        let identity_result = (|| -> Result<(), Box<dyn std::error::Error>> {
+            if source_before.sha256.as_deref() != Some(case.source_sha256.as_str()) {
+                return Err(format!("{} corrupt-source SHA-256 mismatch", case.name).into());
+            }
+            if repaired_before.sha256.as_deref() != Some(case.repaired_sha256.as_str()) {
+                return Err(format!("{} repaired-reference SHA-256 mismatch", case.name).into());
+            }
+            Ok(())
+        })();
+        let identity_immutability = verify_repair_pair_unchanged(
+            &case.name,
+            &source,
+            &source_before,
+            &repaired,
+            &repaired_before,
+        );
+        finish_repair_immutability(&case.name, identity_result, identity_immutability)?;
+
+        let preparation_result = (|| -> Result<_, Box<dyn std::error::Error>> {
+            let (expected_messages, unreadable_associated_folders) =
+                independent_repaired_messages(&repaired)?;
+            if expected_messages.iter().any(|message| !message.complete) {
+                return Err(format!("{} repaired-reference item is incomplete", case.name).into());
+            }
+            Ok((expected_messages, unreadable_associated_folders))
+        })();
+        let preparation_immutability = verify_repair_pair_unchanged(
+            &case.name,
+            &source,
+            &source_before,
+            &repaired,
+            &repaired_before,
+        );
+        let (expected_messages, unreadable_associated_folders) =
+            finish_repair_immutability(&case.name, preparation_result, preparation_immutability)?;
+        let directory_result: Result<tempfile::TempDir, Box<dyn std::error::Error>> =
+            tempfile::Builder::new()
+                .prefix(".pstforge-repair-")
+                .tempdir_in(&scratch)
+                .map_err(Into::into);
+        let directory = match directory_result {
+            Ok(directory) => directory,
+            Err(error) => {
+                let immutability = verify_repair_pair_unchanged(
+                    &case.name,
+                    &source,
+                    &source_before,
+                    &repaired,
+                    &repaired_before,
+                );
+                return finish_repair_immutability(&case.name, Err(error), immutability);
+            }
+        };
+        let case_result = (|| -> Result<(u64, u64, bool), Box<dyn std::error::Error>> {
+            let job = directory.path().join("job");
+            let output = Command::new(env!("CARGO_BIN_EXE_pstforge"))
+                .arg("split")
+                .arg(&case.source_path)
+                .arg("--output")
+                .arg(&job)
+                .arg("--max-pst-size")
+                .arg("64GiB")
+                .arg("--json")
+                .arg("--color")
+                .arg("never")
+                .output()?;
+            if !output.status.success() && output.status.code() != Some(1) {
+                return Err(format!("{} recovery command failed", case.name).into());
+            }
+            let report: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+            if report["recovery"]["unsupported_candidates"].as_u64() != Some(0) {
+                return Err(
+                    format!("{} recovery reported unsupported candidates", case.name).into(),
+                );
+            }
+            let parts = report["parts"]
+                .as_array()
+                .ok_or_else(|| format!("{} report parts are absent", case.name))?;
+            if parts.len() != 1 {
+                return Err(
+                    format!("{} recovery did not produce exactly one part", case.name).into(),
+                );
+            }
+            let expected_count = u64::try_from(expected_messages.len())?;
+            let written_count = report["written_candidates"].as_u64().unwrap_or_default();
+            if written_count < expected_count {
+                return Err(format!(
+                    "{} item count is below repaired reference: expected at least {}, wrote {}",
+                    case.name, expected_count, written_count
+                )
+                .into());
+            }
+            let filename = parts[0]["filename"]
+                .as_str()
+                .ok_or_else(|| format!("{} part filename is absent", case.name))?;
+            let generated = job.join("parts").join(filename);
+            pstforge_core::verify(&generated)?;
+            let pffinfo = Command::new("pffinfo").arg(&generated).output()?;
+            if !pffinfo.status.success() {
+                return Err(format!("{} generated part failed pffinfo", case.name).into());
+            }
+
+            let actual_messages = independent_generated_messages(&generated)?;
+            if actual_messages.iter().any(|message| !message.complete) {
+                return Err(format!("{} generated item is incomplete", case.name).into());
+            }
+            let value_supplements = supplements
+                .iter()
+                .copied()
+                .filter(|supplement| *supplement != "associated items")
+                .collect::<BTreeSet<_>>();
+            let mut source_messages = None;
+            let mut consumed_sources = None;
+            let (extra_messages, value_supplemented) =
+                match verify_repair_message_fidelity(&expected_messages, actual_messages.clone()) {
+                    Ok(extra) => {
+                        if !value_supplements.is_empty() {
+                            return Err(format!(
+                                "{} declares an unobserved source value supplement",
+                                case.name
+                            )
+                            .into());
+                        }
+                        (extra, false)
+                    }
+                    Err(reference_error) => {
+                        if value_supplements.is_empty()
+                            || reference_error.categories != value_supplements
+                        {
+                            return Err(format!("{}: {reference_error}", case.name).into());
+                        }
+                        let damaged = independent_damaged_messages(&source)
+                            .map_err(|_| format!("{}: {reference_error}", case.name))?;
+                        let (extra, consumed) = verify_source_supplemented_fidelity(
+                            &expected_messages,
+                            &damaged,
+                            actual_messages,
+                            &value_supplements,
+                        )
+                        .map_err(|_| format!("{}: {reference_error}", case.name))?;
+                        source_messages = Some(damaged);
+                        consumed_sources = Some(consumed);
+                        (extra, true)
+                    }
+                };
+            let extra_count = u64::try_from(extra_messages.len())?;
+            let associated_supplemented = !extra_messages.is_empty();
+            if supplements.contains("associated items") != associated_supplemented {
+                return Err(format!(
+                    "{} associated-item supplement does not match observed extras",
+                    case.name
+                )
+                .into());
+            }
+            if written_count != expected_count.saturating_add(extra_count)
+                || (!extra_messages.is_empty()
+                    && extra_messages.iter().any(|message| {
+                        !message.content.associated
+                            || !unreadable_associated_folders.contains(&message.folder_identity)
+                    }))
+            {
+                return Err(format!(
+                    "{} has unexplained items beyond the repaired reference",
+                    case.name
+                )
+                .into());
+            }
+            if !extra_messages.is_empty() {
+                let damaged = match source_messages {
+                    Some(messages) => messages,
+                    None => independent_damaged_messages(&source)?,
+                };
+                verify_extra_messages_from_source(
+                    &expected_messages,
+                    &extra_messages,
+                    &damaged,
+                    consumed_sources,
+                )
+                .map_err(|error| format!("{}: {error}", case.name))?;
+            }
+
+            Ok((
+                expected_count,
+                extra_count,
+                value_supplemented || associated_supplemented,
+            ))
+        })();
+        let immutability_result = verify_repair_pair_unchanged(
+            &case.name,
+            &source,
+            &source_before,
+            &repaired,
+            &repaired_before,
+        );
+        let case_result = finish_repair_immutability(&case.name, case_result, immutability_result);
+        let (expected_count, extra_count, source_supplemented) =
+            finish_repair_case(&case.name, directory, case_result)?;
+        eprintln!(
+            "repair corpus {} ... ok ({} reference items, {} extra associated items, source supplement: {})",
+            case.name, expected_count, extra_count, source_supplemented
+        );
+    }
+    if selected == 0 {
+        return Err("PSTFORGE_REPAIR_CASE did not match a manifest case".into());
     }
     Ok(())
 }

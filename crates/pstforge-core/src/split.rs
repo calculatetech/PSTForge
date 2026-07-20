@@ -38,7 +38,7 @@ use crate::{
     load_canonical_mail_interruptible,
 };
 
-pub const SPLIT_SCHEMA_VERSION: &str = "0.4.5";
+pub const SPLIT_SCHEMA_VERSION: &str = "0.4.6";
 const TOOL_COMPATIBILITY_MAJOR: u64 = 0;
 const PART_SIZE_POLICY: &str = "hard-maximum-v1";
 const WRITER_FORMAT: &str = "unicode-pst-v23";
@@ -621,7 +621,7 @@ fn open_restartable_resume(
         Err(JobError::ResumeMismatch("split report schema version")) => {}
         Err(error) => return Err(error),
     }
-    for legacy_schema in ["0.4.4", "0.4.2"] {
+    for legacy_schema in ["0.4.5", "0.4.4", "0.4.2"] {
         let mut legacy_configuration = configuration.clone();
         legacy_configuration.split_schema_version = legacy_schema.to_owned();
         match DurableCatalogSink::open_resume_interruptible(
@@ -3676,9 +3676,8 @@ mod tests {
     }
 
     #[test]
-    fn restartable_resume_accepts_an_explicit_0_4_4_job() {
+    fn restartable_resume_accepts_explicit_0_4_5_and_0_4_4_jobs() {
         let directory = tempfile::tempdir().expect("temporary directory");
-        let output = directory.path().join("job");
         let source = JobSourceIdentity {
             canonical_path: "/external/mail.pst".to_owned(),
             device: 1,
@@ -3687,30 +3686,33 @@ mod tests {
             modified_at: "2026-07-19T00:00:00Z".to_owned(),
             sha256: Some("a".repeat(64)),
         };
-        let legacy = JobConfiguration {
-            tool_compatibility_major: 0,
-            split_schema_version: "0.4.4".to_owned(),
-            execution_mode: "restartable".to_owned(),
-            recovery_mode: "balanced".to_owned(),
-            maximum_pst_bytes: 4_294_967_296,
-            part_size_policy: "hard-maximum-v1".to_owned(),
-            writer_format: "unicode-pst-v23".to_owned(),
-        };
-        let sink = DurableCatalogSink::create(&output).expect("create legacy job");
-        sink.bind_source(&source).expect("bind source");
-        sink.bind_recovery_mode("balanced").expect("bind mode");
-        sink.bind_configuration(&legacy)
-            .expect("bind configuration");
-        sink.checkpoint().expect("checkpoint legacy job");
-        drop(sink);
+        for legacy_schema in ["0.4.5", "0.4.4"] {
+            let output = directory.path().join(legacy_schema);
+            let legacy = JobConfiguration {
+                tool_compatibility_major: 0,
+                split_schema_version: legacy_schema.to_owned(),
+                execution_mode: "restartable".to_owned(),
+                recovery_mode: "balanced".to_owned(),
+                maximum_pst_bytes: 4_294_967_296,
+                part_size_policy: "hard-maximum-v1".to_owned(),
+                writer_format: "unicode-pst-v23".to_owned(),
+            };
+            let sink = DurableCatalogSink::create(&output).expect("create legacy job");
+            sink.bind_source(&source).expect("bind source");
+            sink.bind_recovery_mode("balanced").expect("bind mode");
+            sink.bind_configuration(&legacy)
+                .expect("bind configuration");
+            sink.checkpoint().expect("checkpoint legacy job");
+            drop(sink);
 
-        let mut current = legacy.clone();
-        current.split_schema_version = SPLIT_SCHEMA_VERSION.to_owned();
-        let interrupted = AtomicBool::new(false);
-        let reopened = open_restartable_resume(&output, &source, &mut current, &interrupted)
-            .expect("reopen 0.4.4 restartable job");
-        assert_eq!(current.split_schema_version, "0.4.4");
-        drop(reopened);
+            let mut current = legacy.clone();
+            current.split_schema_version = SPLIT_SCHEMA_VERSION.to_owned();
+            let interrupted = AtomicBool::new(false);
+            let reopened = open_restartable_resume(&output, &source, &mut current, &interrupted)
+                .expect("reopen compatible restartable job");
+            assert_eq!(current.split_schema_version, legacy_schema);
+            drop(reopened);
+        }
     }
 
     #[test]
@@ -3769,7 +3771,7 @@ mod tests {
 
     fn split_report() -> SplitReport {
         SplitReport {
-            schema_version: "0.4.5".to_owned(),
+            schema_version: "0.4.6".to_owned(),
             command: "split".to_owned(),
             execution_mode: "restartable".to_owned(),
             maximum_pst_bytes: 4_294_967_296,
@@ -3796,7 +3798,7 @@ mod tests {
                 supervisor_filesystem_write_bytes: Some(0),
             },
             recovery: RecoveryReport {
-                schema_version: "0.4.5".to_owned(),
+                schema_version: "0.4.6".to_owned(),
                 command: "recover".to_owned(),
                 mode: "balanced".to_owned(),
                 source: SourceIdentity {
