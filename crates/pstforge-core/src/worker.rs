@@ -8,6 +8,7 @@ use libpff_sys::{
     PffFile, PropertyDescriptor, RawCatalog, RecoveryMode, RecoveryUnit, STREAM_CHUNK_BYTES,
     TraversalOrder,
 };
+use pstforge_job::CANDIDATE_CHECKPOINT_BATCH;
 use pstforge_job::ReplayCandidate;
 use pstforge_pst::writer::{DirectBlobSource, DirectBlobSpec, WriterError};
 use serde::{Deserialize, Serialize};
@@ -1370,6 +1371,7 @@ impl ProtocolSink<'_> {
                 version: PROTOCOL_VERSION,
             },
         )?;
+        output.flush()?;
         let abort_after_candidates = std::env::var("PSTFORGE_INTERNAL_ABORT_AFTER_CANDIDATES")
             .ok()
             .and_then(|value| value.parse().ok());
@@ -1521,6 +1523,9 @@ impl CatalogSink for ProtocolSink<'_> {
         match event {
             CatalogEvent::UnitStart(unit) => {
                 self.send(&ControlFrame::UnitStart { unit })?;
+                self.output
+                    .flush()
+                    .map_err(|error| WorkerProtocolError::Io(error).to_string())?;
                 self.active_unit = Some(unit);
                 self.units_started = self.units_started.saturating_add(1);
                 if self.abort_on_unit == Some(self.units_started) || self.abort_unit == Some(unit) {
@@ -1713,6 +1718,11 @@ impl CatalogSink for ProtocolSink<'_> {
             CatalogEvent::MessageEnd { id, complete } => {
                 self.send(&ControlFrame::MessageEnd { id, complete })?;
                 self.completed_candidates = self.completed_candidates.saturating_add(1);
+                if self.completed_candidates % u64::from(CANDIDATE_CHECKPOINT_BATCH) == 0 {
+                    self.output
+                        .flush()
+                        .map_err(|error| WorkerProtocolError::Io(error).to_string())?;
+                }
                 if self.abort_inside_after_candidates == Some(self.completed_candidates)
                     || self
                         .abort_inside_unit
@@ -2345,15 +2355,17 @@ fn require_end_of_stream(input: &mut dyn Read) -> Result<(), WorkerProtocolError
 
 #[cfg(test)]
 mod tests {
+    use std::cell::Cell;
     use std::collections::HashMap;
-    use std::io::Cursor;
+    use std::io::{BufWriter, Cursor, Write};
+    use std::rc::Rc;
 
     use libpff_sys::{
         CatalogEvent, CatalogIssue, CatalogProvenance, CatalogSink, NamedPropertyIdentity,
         NamedPropertyName, PayloadRequest, PropertyDescriptor, PropertyOwner, RawCatalog,
         TraversalOrder,
     };
-    use pstforge_job::ReplayCandidate;
+    use pstforge_job::{CANDIDATE_CHECKPOINT_BATCH, ReplayCandidate};
     use serde_json::json;
 
     use super::{
@@ -2370,6 +2382,21 @@ mod tests {
         messages: Vec<u32>,
         payload: Vec<u8>,
         named_properties: Vec<NamedPropertyIdentity>,
+    }
+
+    struct FlushRecorder {
+        flushes: Rc<Cell<u64>>,
+    }
+
+    impl Write for FlushRecorder {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            self.flushes.set(self.flushes.get().saturating_add(1));
+            Ok(())
+        }
     }
 
     impl CatalogSink for RecordingSink {
@@ -2396,6 +2423,50 @@ mod tests {
         ) -> Result<(), super::WorkerProtocolError> {
             Ok(())
         }
+    }
+
+    #[test]
+    fn buffered_protocol_flushes_unit_and_durable_candidate_boundaries() {
+        let flushes = Rc::new(Cell::new(0));
+        let recorder = FlushRecorder {
+            flushes: Rc::clone(&flushes),
+        };
+        let mut buffered = BufWriter::with_capacity(1024 * 1024, recorder);
+        let mut output =
+            ProtocolSink::start(&mut buffered, false, false).expect("start buffered protocol");
+        assert_eq!(flushes.get(), 1, "hello must be visible immediately");
+
+        let unit = libpff_sys::RecoveryUnit::Normal {
+            folder: libpff_sys::FolderAddress::root(),
+            folder_id: 1,
+            message_index: 0,
+        };
+        output
+            .event(CatalogEvent::UnitStart(unit))
+            .expect("unit start");
+        assert_eq!(flushes.get(), 2, "active unit must be visible immediately");
+
+        for id in 1..CANDIDATE_CHECKPOINT_BATCH {
+            output
+                .event(CatalogEvent::MessageEnd { id, complete: true })
+                .expect("message end");
+        }
+        assert_eq!(
+            flushes.get(),
+            2,
+            "partial durability batch may remain buffered"
+        );
+        output
+            .event(CatalogEvent::MessageEnd {
+                id: CANDIDATE_CHECKPOINT_BATCH,
+                complete: true,
+            })
+            .expect("durable boundary");
+        assert_eq!(
+            flushes.get(),
+            3,
+            "durable candidate boundary must be visible immediately"
+        );
     }
 
     #[test]

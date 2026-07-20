@@ -540,6 +540,41 @@ fn write_split(output: &mut dyn Write, report: &SplitReport) -> Result<(), std::
     writeln!(output, "Output bytes: {}", report.metrics.output_bytes)?;
     writeln!(
         output,
+        "Payload pack: {} bytes written, {} bytes peak",
+        report.metrics.payload_pack_bytes_written, report.metrics.peak_payload_pack_bytes
+    )?;
+    writeln!(
+        output,
+        "Active PST bytes written: {}",
+        report.metrics.active_pst_bytes_written
+    )?;
+    writeln!(
+        output,
+        "Finalized output bytes: {}",
+        report.metrics.finalized_output_bytes
+    )?;
+    writeln!(
+        output,
+        "Validator input bytes: {}",
+        report.metrics.validator_input_bytes
+    )?;
+    writeln!(
+        output,
+        "Peak payload plus active PST bytes: {}",
+        report.metrics.peak_payload_and_active_pst_bytes
+    )?;
+    write_optional_metric(
+        output,
+        "Supervisor filesystem read bytes",
+        report.metrics.supervisor_filesystem_read_bytes,
+    )?;
+    write_optional_metric(
+        output,
+        "Supervisor filesystem write bytes",
+        report.metrics.supervisor_filesystem_write_bytes,
+    )?;
+    writeln!(
+        output,
         "Peak process RSS: {} bytes",
         report.metrics.peak_process_rss_bytes
     )?;
@@ -567,6 +602,17 @@ fn write_split(output: &mut dyn Write, report: &SplitReport) -> Result<(), std::
         yes_no(report.recovery.source_unchanged)
     )?;
     Ok(())
+}
+
+fn write_optional_metric(
+    output: &mut dyn Write,
+    name: &str,
+    value: Option<u64>,
+) -> Result<(), std::io::Error> {
+    match value {
+        Some(value) => writeln!(output, "{name}: {value}"),
+        None => writeln!(output, "{name}: unavailable"),
+    }
 }
 
 fn parse_byte_size(value: &str) -> Result<u64, String> {

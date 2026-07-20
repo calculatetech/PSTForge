@@ -9,8 +9,8 @@ use std::time::{Duration, Instant};
 use libpff_sys::RecoveryMode;
 use pstforge_job::{
     CandidateRejectionCategory, CandidateRejectionCounts, DurableCatalogSink, JobConfiguration,
-    JobError, JobSourceIdentity, PartSidecar, PublishedPart, PublishedPartRecord,
-    ReconstructedField, ReconstructionCounts, RecoveryCompletion,
+    JobError, JobSourceIdentity, PartSidecar, PayloadPackMetrics, PublishedPart,
+    PublishedPartRecord, ReconstructedField, ReconstructionCounts, RecoveryCompletion,
 };
 use pstforge_pst::writer::{
     AttachmentContent, MailFolderLocation, MessageSpec, NamedPropertyCatalog, NamedPropertyName,
@@ -166,6 +166,20 @@ pub struct ExecutionMetrics {
     pub output_bytes: u64,
     pub average_source_bytes_per_second: u64,
     pub peak_process_rss_bytes: u64,
+    pub payload_pack_bytes_written: u64,
+    pub peak_payload_pack_bytes: u64,
+    pub active_pst_bytes_written: u64,
+    pub finalized_output_bytes: u64,
+    pub validator_input_bytes: u64,
+    pub peak_payload_and_active_pst_bytes: u64,
+    pub supervisor_filesystem_read_bytes: Option<u64>,
+    pub supervisor_filesystem_write_bytes: Option<u64>,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct ProcessIoSnapshot {
+    read_bytes: u64,
+    write_bytes: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -231,6 +245,7 @@ pub fn split(
     options: SplitOptions,
 ) -> Result<SplitReport, SplitError> {
     let started = Instant::now();
+    let process_io_started = process_io_snapshot();
     let SplitOptions {
         maximum_pst_bytes,
         restartable,
@@ -378,6 +393,9 @@ pub fn split(
             source.identity().size_bytes,
             &parts,
             recovery.peak_worker_rss_bytes,
+            true,
+            job.payload_pack_metrics()?,
+            process_io_started,
         );
         let report = SplitReport {
             schema_version: SPLIT_SCHEMA_VERSION.to_owned(),
@@ -457,6 +475,9 @@ pub fn split(
             source.identity().size_bytes,
             &outcome.parts,
             recovery.peak_worker_rss_bytes,
+            false,
+            job.payload_pack_metrics()?,
+            process_io_started,
         );
         let report = SplitReport {
             schema_version: SPLIT_SCHEMA_VERSION.to_owned(),
@@ -496,6 +517,9 @@ pub fn split(
             source.identity().size_bytes,
             &parts,
             recovery.peak_worker_rss_bytes,
+            true,
+            job.payload_pack_metrics()?,
+            process_io_started,
         );
         let report = SplitReport {
             schema_version: SPLIT_SCHEMA_VERSION.to_owned(),
@@ -549,6 +573,9 @@ pub fn split(
         source.identity().size_bytes,
         &parts,
         recovery.peak_worker_rss_bytes,
+        true,
+        job.payload_pack_metrics()?,
+        process_io_started,
     );
     tracing::info!(
         parts = parts.len(),
@@ -3001,6 +3028,9 @@ fn execution_metrics(
     source_bytes: u64,
     parts: &[PartReport],
     peak_worker_rss_bytes: u64,
+    restartable: bool,
+    payload_pack: PayloadPackMetrics,
+    process_io_started: Option<ProcessIoSnapshot>,
 ) -> ExecutionMetrics {
     let elapsed_millis = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
     let output_bytes = parts
@@ -3015,13 +3045,52 @@ fn execution_metrics(
             .checked_div(elapsed_millis)
             .unwrap_or(0)
     };
+    let peak_active_pst_bytes = parts.iter().map(|part| part.byte_len).max().unwrap_or(0);
+    let process_io_finished = process_io_snapshot();
+    let supervisor_filesystem_read_bytes = process_io_started
+        .zip(process_io_finished)
+        .map(|(started, finished)| finished.read_bytes.saturating_sub(started.read_bytes));
+    let supervisor_filesystem_write_bytes = process_io_started
+        .zip(process_io_finished)
+        .map(|(started, finished)| finished.write_bytes.saturating_sub(started.write_bytes));
     ExecutionMetrics {
         elapsed_millis,
         source_bytes,
         output_bytes,
         average_source_bytes_per_second,
         peak_process_rss_bytes: peak_worker_rss_bytes.max(self_peak_rss_bytes()),
+        payload_pack_bytes_written: payload_pack.bytes_written,
+        peak_payload_pack_bytes: payload_pack.peak_bytes,
+        active_pst_bytes_written: output_bytes,
+        finalized_output_bytes: output_bytes,
+        validator_input_bytes: if restartable {
+            output_bytes.saturating_mul(2)
+        } else {
+            0
+        },
+        peak_payload_and_active_pst_bytes: payload_pack
+            .peak_bytes
+            .saturating_add(peak_active_pst_bytes),
+        supervisor_filesystem_read_bytes,
+        supervisor_filesystem_write_bytes,
     }
+}
+
+fn process_io_snapshot() -> Option<ProcessIoSnapshot> {
+    let contents = std::fs::read_to_string("/proc/self/io").ok()?;
+    let mut snapshot = ProcessIoSnapshot::default();
+    let mut found_read = false;
+    let mut found_write = false;
+    for line in contents.lines() {
+        if let Some(value) = line.strip_prefix("read_bytes:") {
+            snapshot.read_bytes = value.trim().parse().ok()?;
+            found_read = true;
+        } else if let Some(value) = line.strip_prefix("write_bytes:") {
+            snapshot.write_bytes = value.trim().parse().ok()?;
+            found_write = true;
+        }
+    }
+    (found_read && found_write).then_some(snapshot)
 }
 
 fn self_peak_rss_bytes() -> u64 {
@@ -3643,6 +3712,14 @@ mod tests {
                 output_bytes: 80,
                 average_source_bytes_per_second: 100_000,
                 peak_process_rss_bytes: 1,
+                payload_pack_bytes_written: 0,
+                peak_payload_pack_bytes: 0,
+                active_pst_bytes_written: 80,
+                finalized_output_bytes: 80,
+                validator_input_bytes: 160,
+                peak_payload_and_active_pst_bytes: 80,
+                supervisor_filesystem_read_bytes: Some(0),
+                supervisor_filesystem_write_bytes: Some(0),
             },
             recovery: RecoveryReport {
                 schema_version: "0.4.5".to_owned(),

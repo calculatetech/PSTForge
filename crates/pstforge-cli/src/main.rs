@@ -1,6 +1,6 @@
 #![deny(unsafe_code)]
 
-use std::io;
+use std::io::{self, Write as _};
 use std::process::ExitCode;
 
 use clap::Parser;
@@ -12,8 +12,14 @@ fn main() -> ExitCode {
     let cli = Cli::parse();
     init_logging(&cli);
     let stdout = io::stdout();
-    let mut output = stdout.lock();
-    match pstforge_cli::execute(&cli, &mut output) {
+    let mut output = io::BufWriter::with_capacity(1024 * 1024, stdout.lock());
+    let result = pstforge_cli::execute(&cli, &mut output);
+    if let Err(error) = output.flush() {
+        error!(%error, "cannot flush command output");
+        eprintln!("pstforge: cannot flush command output: {error}");
+        return ExitCode::from(3);
+    }
+    match result {
         Ok(CommandStatus::Complete) => ExitCode::SUCCESS,
         Ok(CommandStatus::Partial) => ExitCode::from(1),
         Ok(CommandStatus::Interrupted) => ExitCode::from(130),

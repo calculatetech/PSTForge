@@ -27,7 +27,7 @@ const JOB_SCHEMA_VERSION: i64 = 19;
 const INLINE_BLOB_MAX_BYTES: u64 = 64 * 1024;
 const INLINE_CACHE_DIRECTORY: &str = ".pstforge-inline-cache";
 const PAYLOAD_PACK_FILENAME: &str = "payload.pack";
-const CANDIDATE_CHECKPOINT_BATCH: u32 = 128;
+pub const CANDIDATE_CHECKPOINT_BATCH: u32 = 128;
 const MAX_RECOVERY_LOG_BYTES: usize = 4 * 1024 * 1024;
 
 #[derive(Debug, Error)]
@@ -342,6 +342,13 @@ pub struct PublishedPartRecord {
     pub item_count: u64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct PayloadPackMetrics {
+    pub current_bytes: u64,
+    pub peak_bytes: u64,
+    pub bytes_written: u64,
+}
+
 pub struct DurableCatalogSink {
     connection: Connection,
     _parent_directory: File,
@@ -355,6 +362,9 @@ pub struct DurableCatalogSink {
     spool: PathBuf,
     payload_pack_path: PathBuf,
     payload_pack: File,
+    payload_pack_position: Cell<u64>,
+    payload_pack_bytes_written: Cell<u64>,
+    payload_pack_peak_bytes: Cell<u64>,
     partial: PathBuf,
     manifests: PathBuf,
     parts: PathBuf,
@@ -572,6 +582,9 @@ impl DurableCatalogSink {
             spool,
             payload_pack_path,
             payload_pack,
+            payload_pack_position: Cell::new(0),
+            payload_pack_bytes_written: Cell::new(0),
+            payload_pack_peak_bytes: Cell::new(0),
             partial,
             manifests,
             parts,
@@ -759,6 +772,10 @@ impl DurableCatalogSink {
             .open(&payload_pack_path)
             .map_err(|source| io_error(&payload_pack_path, source))?;
         reconcile_payload_pack(&connection, &mut payload_pack, &payload_pack_path)?;
+        let payload_pack_position = payload_pack
+            .metadata()
+            .map_err(|source| io_error(&payload_pack_path, source))?
+            .len();
         run_sql_interruptible(&mut connection, interrupted, |connection| {
             reconcile_publications(
                 connection,
@@ -791,6 +808,9 @@ impl DurableCatalogSink {
             spool,
             payload_pack_path,
             payload_pack,
+            payload_pack_position: Cell::new(payload_pack_position),
+            payload_pack_bytes_written: Cell::new(0),
+            payload_pack_peak_bytes: Cell::new(payload_pack_position),
             partial,
             manifests,
             parts,
@@ -813,6 +833,20 @@ impl DurableCatalogSink {
     pub fn allocated_bytes(&self) -> Result<u64, JobError> {
         Ok(allocated_private_bytes(&self.private_root)?
             .saturating_add(allocated_tracked_part_bytes(&self.connection, &self.parts)?))
+    }
+
+    pub fn payload_pack_metrics(&self) -> Result<PayloadPackMetrics, JobError> {
+        let current_bytes = self.payload_pack_len()?;
+        if current_bytes != self.payload_pack_position.get() {
+            return Err(JobError::Integrity(
+                "payload pack length disagrees with the append cursor".to_owned(),
+            ));
+        }
+        Ok(PayloadPackMetrics {
+            current_bytes,
+            peak_bytes: self.payload_pack_peak_bytes.get(),
+            bytes_written: self.payload_pack_bytes_written.get(),
+        })
     }
 
     pub fn available_part_filename(&self, part_index: u32) -> Result<String, JobError> {
@@ -856,7 +890,7 @@ impl DurableCatalogSink {
             self.connection.execute_batch("BEGIN IMMEDIATE")?;
             self.batch_open.set(true);
             self.batch_candidates.set(0);
-            self.batch_pack_start.set(self.payload_pack_len()?);
+            self.batch_pack_start.set(self.payload_pack_position.get());
         }
         self.connection
             .execute_batch("SAVEPOINT active_candidate")?;
@@ -884,10 +918,15 @@ impl DurableCatalogSink {
             self.payload_pack
                 .sync_all()
                 .map_err(|source| io_error(&self.payload_pack_path, source))?;
+            if self.payload_pack_len()? != self.payload_pack_position.get() {
+                return Err(JobError::Integrity(
+                    "payload pack length changed before durable batch commit".to_owned(),
+                ));
+            }
             self.connection.execute_batch("COMMIT")?;
             self.batch_open.set(false);
             self.batch_candidates.set(0);
-            self.batch_pack_start.set(self.payload_pack_len()?);
+            self.batch_pack_start.set(self.payload_pack_position.get());
         }
         Ok(())
     }
@@ -901,9 +940,7 @@ impl DurableCatalogSink {
 
     fn new_blob_writer(&mut self) -> Result<BlobWriter, JobError> {
         match self.capture_mode {
-            CatalogCaptureMode::Full => {
-                BlobWriter::new(&mut self.payload_pack, &self.payload_pack_path)
-            }
+            CatalogCaptureMode::Full => Ok(BlobWriter::new(self.payload_pack_position.get())),
             CatalogCaptureMode::Bounded { .. } => Ok(BlobWriter::new_inline()),
         }
     }
@@ -915,6 +952,7 @@ impl DurableCatalogSink {
         self.payload_pack
             .seek(std::io::SeekFrom::Start(length))
             .map_err(|source| io_error(&self.payload_pack_path, source))?;
+        self.payload_pack_position.set(length);
         Ok(())
     }
 
@@ -2720,7 +2758,7 @@ impl DurableCatalogSink {
             .map(|unit| serde_json::to_string(&unit))
             .transpose()?;
         let embedded_path_json = serde_json::to_string(&embedded_path)?;
-        let pack_start = self.payload_pack_len()?;
+        let pack_start = self.payload_pack_position.get();
         self.begin_candidate()?;
         let result = self.connection.execute(
             "INSERT INTO candidates(\
@@ -2960,7 +2998,7 @@ impl DurableCatalogSink {
             .start_offset
             .checked_add(blob.bytes)
             .ok_or_else(|| JobError::Integrity("payload pack offset overflow".to_owned()))?;
-        if self.payload_pack_len()? != expected_end {
+        if self.payload_pack_position.get() != expected_end {
             return Err(JobError::Integrity(
                 "payload pack changed during an active blob".to_owned(),
             ));
@@ -3358,7 +3396,14 @@ impl DurableCatalogSink {
                     .blob
                     .as_mut()
                     .ok_or_else(|| JobError::EventSequence("attachment blob missing".to_owned()))?
-                    .write(&mut self.payload_pack, &self.payload_pack_path, bytes)?;
+                    .write(
+                        &mut self.payload_pack,
+                        &self.payload_pack_path,
+                        &self.payload_pack_position,
+                        &self.payload_pack_bytes_written,
+                        &self.payload_pack_peak_bytes,
+                        bytes,
+                    )?;
             }
             CatalogEvent::AttachmentEnd { message_id, index } => {
                 require_message(self.active.as_ref(), message_id)?;
@@ -3436,9 +3481,14 @@ impl DurableCatalogSink {
                         "property data does not match active property".to_owned(),
                     ));
                 }
-                property
-                    .blob
-                    .write(&mut self.payload_pack, &self.payload_pack_path, bytes)?;
+                property.blob.write(
+                    &mut self.payload_pack,
+                    &self.payload_pack_path,
+                    &self.payload_pack_position,
+                    &self.payload_pack_bytes_written,
+                    &self.payload_pack_peak_bytes,
+                    bytes,
+                )?;
             }
             CatalogEvent::PropertyEnd(descriptor) => self.finish_property(descriptor)?,
             CatalogEvent::PropertyAbort { descriptor, reason } => {
@@ -3556,16 +3606,13 @@ impl Drop for DurableCatalogSink {
 }
 
 impl BlobWriter {
-    fn new(pack: &mut File, path: &Path) -> Result<Self, JobError> {
-        let start_offset = pack
-            .seek(std::io::SeekFrom::End(0))
-            .map_err(|source| io_error(path, source))?;
-        Ok(Self {
+    fn new(start_offset: u64) -> Self {
+        Self {
             start_offset,
             hasher: Sha256::new(),
             bytes: 0,
             inline: None,
-        })
+        }
     }
 
     fn new_inline() -> Self {
@@ -3577,7 +3624,15 @@ impl BlobWriter {
         }
     }
 
-    fn write(&mut self, pack: &mut File, path: &Path, bytes: &[u8]) -> Result<(), JobError> {
+    fn write(
+        &mut self,
+        pack: &mut File,
+        path: &Path,
+        pack_position: &Cell<u64>,
+        pack_bytes_written: &Cell<u64>,
+        pack_peak_bytes: &Cell<u64>,
+        bytes: &[u8],
+    ) -> Result<(), JobError> {
         if let Some(inline) = self.inline.as_mut() {
             inline.extend_from_slice(bytes);
             self.hasher.update(bytes);
@@ -3590,8 +3645,17 @@ impl BlobWriter {
                 .ok_or_else(|| JobError::Integrity("inline length overflow".to_owned()))?;
             Ok(())
         } else {
-            write_hashed(pack, &mut self.hasher, &mut self.bytes, bytes)
-                .map_err(|source| io_error(path, source))
+            let before = self.bytes;
+            let result = write_hashed(pack, &mut self.hasher, &mut self.bytes, bytes);
+            let written = self.bytes.saturating_sub(before);
+            let position = pack_position
+                .get()
+                .checked_add(written)
+                .ok_or_else(|| JobError::Integrity("payload pack offset overflow".to_owned()))?;
+            pack_position.set(position);
+            pack_bytes_written.set(pack_bytes_written.get().saturating_add(written));
+            pack_peak_bytes.set(pack_peak_bytes.get().max(position));
+            result.map_err(|source| io_error(path, source))
         }
     }
 }
@@ -5393,9 +5457,9 @@ mod tests {
     use super::{
         CANDIDATE_CHECKPOINT_BATCH, CandidateRejectionCategory, DirectEmbeddedCandidate,
         DurableCatalogSink, INLINE_BLOB_MAX_BYTES, INLINE_CACHE_DIRECTORY, JobConfiguration,
-        JobError, JobSourceIdentity, PAYLOAD_PACK_FILENAME, PartSidecar, PublishedPart,
-        WorkerEvent, digest_hex, private_state_attributes_valid, run_sql_interruptible,
-        validate_blob_store, write_hashed, write_sidecar_partial,
+        JobError, JobSourceIdentity, PAYLOAD_PACK_FILENAME, PartSidecar, PayloadPackMetrics,
+        PublishedPart, WorkerEvent, digest_hex, private_state_attributes_valid,
+        run_sql_interruptible, validate_blob_store, write_hashed, write_sidecar_partial,
     };
 
     struct PrefixThenError {
@@ -7931,6 +7995,46 @@ mod tests {
         assert_eq!(
             reopened.summary()?.committed_candidates,
             u64::from(CANDIDATE_CHECKPOINT_BATCH)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn payload_pack_cursor_tracks_append_dedup_and_reopen() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let directory = tempdir()?;
+        let job = directory.path().join("job");
+        let mut sink = DurableCatalogSink::create(&job)?;
+        for id in [10, 20] {
+            message_start(&mut sink, id)?;
+            let descriptor = body_descriptor(id, 3);
+            sink.event(CatalogEvent::PropertyStart(descriptor))?;
+            sink.event(CatalogEvent::PropertyData {
+                descriptor,
+                bytes: b"abc",
+            })?;
+            sink.event(CatalogEvent::PropertyEnd(descriptor))?;
+            sink.event(CatalogEvent::MessageEnd { id, complete: true })?;
+        }
+        sink.checkpoint()?;
+        assert_eq!(
+            sink.payload_pack_metrics()?,
+            PayloadPackMetrics {
+                current_bytes: 3,
+                peak_bytes: 6,
+                bytes_written: 6,
+            }
+        );
+        drop(sink);
+
+        let reopened = DurableCatalogSink::open(&job)?;
+        assert_eq!(
+            reopened.payload_pack_metrics()?,
+            PayloadPackMetrics {
+                current_bytes: 3,
+                peak_bytes: 3,
+                bytes_written: 0,
+            }
         );
         Ok(())
     }

@@ -450,6 +450,15 @@ prefilter translation, and source-blob verification observe that flag as well.
 Split reports include source identity, recovery mode, invocation elapsed time,
 logical source and finalized output bytes, average end-to-end source
 throughput, and peak sampled RSS across the supervisor and parser workers.
+They separately report cumulative payload-pack append bytes, peak payload-pack
+length, logical bytes in published active-PST constructions, logical input
+bytes scheduled across independent validators, and the peak sum of the payload
+pack and largest active PST. On Linux, reports also include the supervisor's
+measured `/proc/self/io` physical read and write deltas. The logical counters
+describe workload and retained allocation; the physical counters include
+filesystem traffic from retries, SQLite, cleanup, and other supervisor I/O and
+are the write-amplification evidence. Parser-worker source I/O is not
+misreported as supervisor I/O.
 Reports also include corruption observation, folders and candidates by
 provenance, items by completeness and status, attachment totals, unsupported
 item/property totals, exact aggregate rejection categories, part sizes and

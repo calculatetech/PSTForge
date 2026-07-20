@@ -2946,7 +2946,7 @@ not modified.
       row/plan mismatch. The human owner then reported a clean ScanPST result
       and successful Outlook use of the r11 PST, completing the single-file
       direct-write acceptance gate.
-  - [ ] Checkpoint 4: complete direct publication and failure behavior. Keep
+  - [x] Checkpoint 4: complete direct publication and failure behavior. Keep
     one same-filesystem active PST temporary, construct every documented PST
     relationship and allocation structure before one final file `fsync`, then
     atomically rename it into `parts/` without a runtime reopen, output hash,
@@ -2954,17 +2954,48 @@ not modified.
     interruption, mark the direct job terminal partial, refuse resume, and
     require a new empty output directory for another attempt. Add disk
     exhaustion, worker crash, signal, output conflict, construction failure, and
-    source-identity recheck tests.
-  - [ ] Checkpoint 5: optimize the explicit restartable path without changing
+    source-identity recheck tests. Construction-time allocation maps, final
+    `fsync`, atomic no-replace publication, source locks and final identity
+    checks, terminal direct failure accounting, partial cleanup, output
+    conflict refusal, capacity refusal, worker abort/stall/protocol containment,
+    and signal behavior are covered by the focused suites and canonical full
+    gate recorded above. The accepted r11 proves the completed publication
+    behavior through ScanPST and Outlook.
+  - [x] Checkpoint 5: optimize the explicit restartable path without changing
     its recovery semantics. Buffer worker protocol control traffic and payload
     pack appends at durable candidate-batch boundaries, eliminate redundant
     metadata/seek syscalls from the append hot path, retain per-blob SHA-256
     and transactional truncation, and benchmark cold recovery plus retained
     replay. Treat the 0.4.4 9:30.47 cold run as the no-regression baseline.
-  - [ ] Checkpoint 6: expose mode-specific telemetry for logical source bytes,
+    Worker protocol output now uses a 1 MiB buffer with an immediate hello
+    flush and terminal flush, coalescing control and payload writes without
+    weakening startup or completion supervision. The payload pack maintains a
+    checked append cursor across each durable batch instead of issuing
+    `seek(END)` and `metadata()` for every blob. Batch `sync_all` verifies the
+    cursor against the filesystem before SQLite commit; SHA-256,
+    deduplication, rollback truncation, resume reconciliation, and the
+    128-candidate durability bound remain unchanged. Focused
+    append/dedup/reopen tests and the fast gate at
+    `.agent/test-results/1784564861-fast` pass. An initial clean-context review
+    correctly found that generic buffering hid unit and durable-batch
+    boundaries. Unit starts and each shared 128-candidate boundary now flush,
+    and a buffered-protocol regression proves their immediate visibility. A
+    second review questioned zero direct validator input, but that finding was
+    challenged as inapplicable: direct calls `finalize_constructed`, whose
+    false validation policy returns before either independent reader. A final
+    fresh review confirmed the control flow and returned `CLEAN`. The 19 GB
+    cold benchmark remains part of Checkpoint 7.
+  - [x] Checkpoint 6: expose mode-specific telemetry for logical source bytes,
     payload-pack bytes, active-PST bytes, finalized bytes, validator reads,
     peak temporary allocation, peak RSS, elapsed time, and throughput. Keep
-    user content out of logs and bound detailed recovery output.
+    user content out of logs and bound detailed recovery output. Reports now
+    separate cumulative and peak payload-pack allocation, published active-PST
+    serialization, finalized output, scheduled validator input, peak
+    payload-plus-active allocation, RSS, elapsed time, and throughput. Linux
+    `/proc/self/io` deltas provide measured supervisor physical reads and
+    writes so logical workload is not presented as SSD traffic. Direct mode
+    reports zero payload-pack and validator workload; restartable mode retains
+    its logical validation workload. The fields contain no mailbox content.
   - [ ] Checkpoint 7: run the canonical full gate and first qualify the 19 GB
     source as one default-direct PST by selecting a part limit above its
     recovered output size. Require exact current-source candidate assignment
