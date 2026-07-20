@@ -1,4 +1,5 @@
 use std::fs::{File, Metadata, OpenOptions};
+use std::os::fd::AsFd;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -28,6 +29,8 @@ pub enum SourceError {
     NonUtf8Path(PathBuf),
     #[error("source hashing was interrupted")]
     Interrupted,
+    #[error("source is already locked for writing or cannot be protected: {0}")]
+    LockConflict(PathBuf),
     #[error("cannot {operation} source {path}: {source}")]
     Io {
         operation: &'static str,
@@ -44,7 +47,8 @@ pub struct SourceIdentity {
     pub inode: u64,
     pub size_bytes: u64,
     pub modified_at: String,
-    pub sha256: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sha256: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -63,23 +67,40 @@ pub struct SourceFile {
     path: PathBuf,
     stat: StatIdentity,
     identity: SourceIdentity,
+    read_lease: bool,
 }
 
 impl SourceFile {
     pub fn open(path: &Path) -> Result<Self, SourceError> {
-        Self::open_with_interrupt(path, None)
+        Self::open_with_interrupt(path, None, false, true)
     }
 
     pub(crate) fn open_interruptible(
         path: &Path,
         interrupted: &AtomicBool,
     ) -> Result<Self, SourceError> {
-        Self::open_with_interrupt(path, Some(interrupted))
+        Self::open_with_interrupt(path, Some(interrupted), true, true)
+    }
+
+    pub(crate) fn open_direct_interruptible(
+        path: &Path,
+        interrupted: &AtomicBool,
+    ) -> Result<Self, SourceError> {
+        Self::open_with_interrupt(path, Some(interrupted), true, false)
+    }
+
+    pub(crate) fn open_for_expected_identity(
+        path: &Path,
+        expected: &SourceIdentity,
+    ) -> Result<Self, SourceError> {
+        Self::open_with_interrupt(path, None, false, expected.sha256.is_some())
     }
 
     fn open_with_interrupt(
         path: &Path,
         interrupted: Option<&AtomicBool>,
+        protect: bool,
+        hash: bool,
     ) -> Result<Self, SourceError> {
         let initial = path
             .symlink_metadata()
@@ -113,9 +134,22 @@ impl SourceFile {
         if stat != StatIdentity::from(&initial) || stat != StatIdentity::from(&canonical_metadata) {
             return Err(SourceError::OpenRace(path.to_path_buf()));
         }
+        let read_lease = if protect {
+            protect_source(&file, &canonical_path)?
+        } else {
+            false
+        };
 
         let modified_at = timestamp(&canonical_path, stat)?;
-        let sha256 = hash_file_at_interruptible(&file, &canonical_path, interrupted)?;
+        let sha256 = if hash {
+            Some(hash_file_at_interruptible(
+                &file,
+                &canonical_path,
+                interrupted,
+            )?)
+        } else {
+            None
+        };
         let after_hash = file
             .metadata()
             .map_err(|source| io("recheck after hashing", &canonical_path, source))?;
@@ -140,6 +174,7 @@ impl SourceFile {
             path: canonical_path,
             stat,
             identity,
+            read_lease,
         })
     }
 
@@ -204,6 +239,75 @@ impl SourceFile {
             return Err(SourceError::Changed(self.path.clone()));
         }
         Ok(())
+    }
+}
+
+impl SourceIdentity {
+    pub(crate) fn stable_key(&self) -> String {
+        if let Some(sha256) = &self.sha256 {
+            return sha256.clone();
+        }
+        let mut hasher = Sha256::new();
+        hasher.update(b"pstforge-direct-source-identity-v1\0");
+        hasher.update(self.canonical_path.as_bytes());
+        hasher.update(self.device.to_le_bytes());
+        hasher.update(self.inode.to_le_bytes());
+        hasher.update(self.size_bytes.to_le_bytes());
+        hasher.update(self.modified_at.as_bytes());
+        format!("{:x}", hasher.finalize())
+    }
+}
+
+impl Drop for SourceFile {
+    fn drop(&mut self) {
+        if self.read_lease {
+            let _ = libpff_sys::release_read_lease(self.file.as_fd());
+        }
+    }
+}
+
+fn protect_source(file: &File, path: &Path) -> Result<bool, SourceError> {
+    use rustix::fs::{FlockOperation, fcntl_lock, flock};
+
+    flock(file, FlockOperation::NonBlockingLockShared)
+        .map_err(|_| SourceError::LockConflict(path.to_path_buf()))?;
+    let record_lock = match libpff_sys::acquire_ofd_read_lock(file.as_fd())
+        .map_err(|_| SourceError::LockConflict(path.to_path_buf()))?
+    {
+        libpff_sys::OfdReadLock::Acquired => "ofd-read-lock",
+        libpff_sys::OfdReadLock::Unsupported(errno) => {
+            fcntl_lock(file, FlockOperation::NonBlockingLockShared)
+                .map_err(|_| SourceError::LockConflict(path.to_path_buf()))?;
+            tracing::warn!(
+                source_protection = "posix-read-lock+flock-shared",
+                ofd_lock_errno = errno,
+                "kernel or filesystem does not support an OFD read lock; a process-scoped POSIX read lock remains active"
+            );
+            "posix-read-lock"
+        }
+    };
+    match libpff_sys::acquire_read_lease(file.as_fd())
+        .map_err(|_| SourceError::LockConflict(path.to_path_buf()))?
+    {
+        libpff_sys::ReadLease::Acquired => {
+            tracing::info!(
+                source_protection = record_lock,
+                read_lease = true,
+                flock_shared = true,
+                "source mutation protection acquired"
+            );
+            Ok(true)
+        }
+        libpff_sys::ReadLease::Unsupported(errno) => {
+            tracing::warn!(
+                source_protection = record_lock,
+                read_lease = false,
+                flock_shared = true,
+                lease_errno = errno,
+                "filesystem or caller does not support a Linux read lease; advisory source locks remain active"
+            );
+            Ok(false)
+        }
     }
 }
 
@@ -316,6 +420,7 @@ impl From<&Metadata> for StatIdentity {
 #[cfg(test)]
 mod tests {
     use std::fs;
+    use std::fs::OpenOptions;
     use std::os::unix::fs::symlink;
     use std::sync::atomic::AtomicBool;
 
@@ -330,8 +435,8 @@ mod tests {
         fs::write(&path, b"pst bytes")?;
         let source = SourceFile::open(&path)?;
         assert_eq!(
-            source.identity().sha256,
-            "99d7b1f5d1a9ac2aead14c3702f6d0b03eed5119a3e8012f80aad013b7981456"
+            source.identity().sha256.as_deref(),
+            Some("99d7b1f5d1a9ac2aead14c3702f6d0b03eed5119a3e8012f80aad013b7981456")
         );
         fs::write(&path, b"changed bytes")?;
         assert!(matches!(
@@ -351,6 +456,57 @@ mod tests {
         assert!(matches!(
             SourceFile::open_interruptible(&path, &interrupted),
             Err(SourceError::Interrupted)
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn direct_source_open_does_not_read_a_content_digest() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let directory = tempdir()?;
+        let path = directory.path().join("mail.pst");
+        fs::write(&path, b"direct bytes")?;
+        let interrupted = AtomicBool::new(false);
+        let source = SourceFile::open_direct_interruptible(&path, &interrupted)?;
+        assert_eq!(source.identity().sha256, None);
+        assert_eq!(source.identity().stable_key().len(), 64);
+        Ok(())
+    }
+
+    #[test]
+    fn protected_source_open_refuses_a_conflicting_file_lock()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempdir()?;
+        let path = directory.path().join("mail.pst");
+        fs::write(&path, b"locked bytes")?;
+        let writer = OpenOptions::new().read(true).write(true).open(&path)?;
+        rustix::fs::flock(
+            &writer,
+            rustix::fs::FlockOperation::NonBlockingLockExclusive,
+        )?;
+        let interrupted = AtomicBool::new(false);
+        assert!(matches!(
+            SourceFile::open_direct_interruptible(&path, &interrupted),
+            Err(SourceError::LockConflict(_))
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn protected_source_open_refuses_a_conflicting_record_lock()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempdir()?;
+        let path = directory.path().join("mail.pst");
+        fs::write(&path, b"locked bytes")?;
+        let writer = OpenOptions::new().read(true).write(true).open(&path)?;
+        rustix::fs::fcntl_lock(
+            &writer,
+            rustix::fs::FlockOperation::NonBlockingLockExclusive,
+        )?;
+        let interrupted = AtomicBool::new(false);
+        assert!(matches!(
+            SourceFile::open_direct_interruptible(&path, &interrupted),
+            Err(SourceError::LockConflict(_))
         ));
         Ok(())
     }

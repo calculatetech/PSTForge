@@ -350,18 +350,18 @@ overview reference is replaced by a section-specific reference.
 - **Evidence:** `btree_leaf_planning_splits_at_ms_pst_capacity`, shared-table reference-count regressions; ScanPST 19 GB parts
 
 ### NDB-06
-- **Status:** Verified for the DList allocation mode used by supported Outlook generations: first offsets, recurring intervals, reserved pages, AMap self-allocation, extent bits/free counts, page conventions/checksums, and large-file rebuild match. Deprecated PMap/FMap/FPMap pages are retained at required intervals and are not used for allocation, consistent with MS-PST product behavior.
+- **Status:** Implementation checkpoint in progress. The DList allocation mode used by supported Outlook generations is verified for first offsets, recurring intervals, reserved pages, AMap self-allocation, extent bits/free counts, page conventions/checksums, and large-file layout. Version 0.4.5 moves the adapted allocation-map construction into initial writer finalization so production publication does not reopen and rewrite the PST. Deprecated PMap/FMap/FPMap pages remain at required intervals and are not used for allocation, consistent with MS-PST product behavior.
 - **Requirement:** AMap/PMap/FMap/FPMap/DList pages occur at required intervals and allocation bits cover exactly written extents
 - **Sources:** [MS-PST 2.2.2.7.2 AMap](https://learn.microsoft.com/en-us/openspecs/office_file_formats/ms-pst/60466ef4-af15-49b6-8413-b3a72f0e9bdb); [2.2.2.7.3 PMap](https://learn.microsoft.com/en-us/openspecs/office_file_formats/ms-pst/e0c59db8-970a-40df-9547-c136e8858291); MS-PST 2.2.2.7.4-2.2.2.7.5; [2.2.2.7.6 FPMap](https://learn.microsoft.com/en-us/openspecs/office_file_formats/ms-pst/dd913b8e-5113-4b83-a5ea-351a08b4237b); PST-PB notes 14-17
-- **Implementation:** `write_fixed_pages`, `reserved_map_page_count`, `allocate_extent`, `allocation_file_eof`, adapted allocation-map rebuild
+- **Implementation:** `write_fixed_pages`, `reserved_map_page_count`, `allocate_extent`, `allocation_file_eof`, construction-time allocation-map finalization
 - **Evidence:** allocation-map and FPMap-boundary tests; ScanPST 4 GB parts
 
 ### NDB-07
-- **Status:** Verified: PSTForge builds a new private file rather than modifying a published PST, syncs it, completes any allocation-map rebuild and resync, validates all owned relationships, requires `pffinfo` and `readpst`, atomically renames without replacement, syncs the held destination directory, and verifies the published device/inode. Failure before rename leaves no public part; post-rename durability uncertainty is reported distinctly.
-- **Requirement:** File publication occurs only after internal and independent validation, file `fsync`, atomic no-clobber rename, and directory `fsync`
+- **Status:** Implementation checkpoint in progress. PSTForge builds a structurally complete private file by construction, syncs it once, atomically renames without replacement, syncs the held destination directory, and verifies the published device/inode. Production does not reopen, hash, extract, or independently read the completed PST. Internal structural assertions and independent readers remain mandatory in focused tests, CI gates, and release acceptance. Failure before rename leaves no public part; post-rename durability uncertainty is reported distinctly.
+- **Requirement:** The writer completes every documented relationship and allocation structure before file `fsync`, atomic no-clobber rename, and directory `fsync`; production publication does not depend on rereading its output
 - **Sources:** PST-INT 2.6; the verified NDB/LTP/Messaging rows above; POSIX durability is a PSTForge safety requirement
-- **Implementation:** `create_flat_store`, `validate_completed_store`, `validate_completed_folder_store`, `validate_with_independent_readers`, `publish_noclobber`, `sync_published_directory`, `verify_published_destination`
-- **Evidence:** publication, timeout, retained-candidate, moved-directory, no-clobber, and validator-scratch tests
+- **Implementation:** `create_flat_store`, transactional construction finalization, `publish_noclobber`, `sync_published_directory`, `verify_published_destination`; `validate_completed_store`, `validate_completed_folder_store`, and `validate_with_independent_readers` are test/acceptance utilities
+- **Evidence:** construction-invariant, publication, moved-directory, no-clobber, independent-reader gate, ScanPST, and Outlook tests
 
 ### NDB-08
 - **Status:** Verified; the transactional writer emits each accepted message block once before final NBT, BBT, allocation-map, and header construction. Bounded private batches amortize exact finalized-size projection while exact replay fixes every part boundary. Physical message-block order is independent of final folder-table membership and NBT order.

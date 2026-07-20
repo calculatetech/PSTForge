@@ -1189,7 +1189,7 @@ pub fn run_recovery_worker(
     output: &mut dyn Write,
 ) -> Result<(), WorkerProtocolError> {
     arm_parent_death_signal()?;
-    let source = match SourceFile::open(source_path) {
+    let source = match SourceFile::open_for_expected_identity(source_path, expected_identity) {
         Ok(source) => source,
         Err(error) => return report_worker_error(output, WorkerFailureKind::Source, error.into()),
     };

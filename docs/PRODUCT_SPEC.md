@@ -102,6 +102,13 @@ By default, `split` streams parser output through bounded queues into the
 transactional PST writer. It retains a compact metadata ledger for reporting,
 candidate-to-part reconciliation, source identity, manifests, and aggregate
 omission accounting, but it does not create a recovered-payload pack.
+Direct mode traverses readable source content once. It does not pre-hash the
+source, hash or reopen a completed part, or run PST readers in the production
+path. The writer emits documented PST structures and allocation metadata
+correctly as it constructs the destination-side temporary, syncs the completed
+file, and publishes it with an atomic rename. Independent readers, ScanPST,
+Outlook, and MailPlus are CI or release-acceptance evidence rather than runtime
+transformation stages.
 `--restartable` selects the durable payload pack so recovery and writing can
 resume without rereading committed payloads. Restartability costs
 approximately one additional readable-payload write and corresponding
@@ -117,13 +124,14 @@ than a separate single-file implementation.
 
 `--resume` and `--keep-work` require `--restartable`; incompatible combinations
 are refused before creating the output directory. Without `--resume`, an
-existing nonempty job directory is an error. With `--resume`, the source
+existing nonempty job directory is an error. With `--resume`, the restartable
+job's source
 SHA-256, source identity, job schema, recovery mode, part-size policy, writer
 format, and compatible tool major version must match. A mismatch is refused
 and neither existing parts nor state are changed. Restartable jobs retain the
 three-times-source conservative capacity requirement. Direct jobs use a
 mode-specific estimate for final parts, the active same-filesystem temporary,
-compact metadata, independent-reader scratch, manifests, and safety margin;
+compact metadata, manifests, and safety margin;
 they include no payload-spool allocation. On resume, validated allocation
 already consumed by the matching restartable job is credited against the
 requirement.
@@ -178,12 +186,22 @@ fails if the job state or a finalized part hash is inconsistent.
 
 PSTForge refuses non-regular files, source symlinks, an output directory that
 contains the source, and a source path that aliases any output file. It opens
-the source read-only and retains identity metadata for the entire job. Before
-recovery it records canonical path, device, inode, byte size, modification
-time, and SHA-256. At completion it rechecks device, inode, size, mtime, and
-ctime on both the held descriptor and source path. Resume recomputes the full
-SHA-256 and matches the durable source identity before trusting job state. An
-unexpected change stops new work and is reported.
+the source read-only and retains that descriptor and its identity metadata for
+the entire job. On Linux it requests a kernel read lease, a whole-file
+open-file-description record read lock, and a shared file lock where the
+filesystem supports them. A process-scoped POSIX record lock is the fallback
+when OFD locking is unavailable. A read lease blocks new write opens and turns
+a lease-break request into an interrupted recovery; record and file locks also
+protect against cooperating writers. Because Linux locks are not universally
+enforceable across every filesystem and writer, completion still rechecks
+device, inode, size, mtime, and ctime on both the held descriptor and source
+path.
+
+Direct mode records canonical path, device, inode, byte size, modification
+time, and change time without reading the source solely to calculate a digest.
+Restartable mode additionally computes SHA-256 before native parsing, and
+resume recomputes and matches it before trusting durable payload state. An
+unexpected change or lease-break attempt stops new work and is reported.
 
 The program never changes source permissions, times, names, bytes, allocation,
 or ownership. Corpus tests independently hash originals before and after every
@@ -191,7 +209,7 @@ run. The source must remain safe even if a parser worker crashes, the output
 filesystem fills, or the supervisor is forcibly terminated.
 
 Before starting, `split` estimates space for output parts, the current
-temporary part, compact durable metadata, independent-reader scratch,
+temporary part, compact durable metadata,
 manifests, mode-specific payload storage, and safety margin. Restartable mode
 is refused below three times the source size. Direct mode excludes a payload
 spool from its estimate and rechecks capacity before every part using observed
@@ -253,8 +271,10 @@ message; the final remainder may be smaller. A message that cannot fit by
 itself is preserved in a marked oversize part and makes the result partial.
 
 Each output store receives a deterministic identity derived from the source
-SHA-256, immutable job configuration, and part index. Node and block allocation
-is deterministic. Source creation and modification timestamps are preserved
+identity, immutable job configuration, and part index. Restartable jobs include
+the source SHA-256 in that identity; direct jobs use the held file's stable
+device, inode, size, and timestamps. Node and block allocation is deterministic.
+Source creation and modification timestamps are preserved
 where valid; tool run time is stored in manifests, not substituted for source
 mail time. Named property identifiers are rebuilt consistently per part when
 the source GUID/name identity is available. The current `libpff` catalog
@@ -330,11 +350,13 @@ canonical fixture boundary externalizes property values through 16 KiB and
 rejects larger values; arbitrary payload streaming and packing is a 0.4.x
 requirement.
 
-Output creation is append/build-only in a `.partial` file. The writer flushes
-all blocks, allocation maps, B-trees, tables, and headers, syncs the file,
-closes it, validates it with internal and external readers, hashes it, writes
-its sidecar manifest, syncs the directory, and atomically renames it to the
-final `.pst` name. PSTForge never modifies a published part in place.
+Output creation is append/build-only in a `.partial` file. In direct mode the
+writer emits all blocks, allocation maps, B-trees, tables, and headers by
+construction, syncs and closes the file, writes its sidecar manifest, syncs
+the directory, and atomically renames it to the final `.pst` name without
+rereading or hashing the content. Restartable mode performs its documented
+digest and validation work before publication. PSTForge never modifies a
+published part in place.
 
 Every writer invariant is traceable through `docs/WRITER_CONFORMANCE.md` to an
 authoritative Microsoft Open Specification or Microsoft MAPI requirement, the

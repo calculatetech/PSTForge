@@ -23,7 +23,7 @@ type MatchedSourceMessages = (Vec<Vec<String>>, usize);
 #[derive(Default)]
 struct WriterOrderSink {
     message_stack: Vec<u32>,
-    attachments: Vec<(u32, u32, bool)>,
+    attachments: Vec<(u32, u32)>,
     nested_messages: u64,
     attachment_payloads: u64,
     attachment_properties: u64,
@@ -74,22 +74,22 @@ impl CatalogSink for WriterOrderSink {
                 {
                     return Err("attachment start is outside its message".to_owned());
                 }
-                self.attachments.push((message_id, index, false));
+                self.attachments.push((message_id, index));
             }
             CatalogEvent::AttachmentData {
                 message_id, index, ..
             } => {
-                let Some(active) = self.attachments.last_mut() else {
+                let Some(active) = self.attachments.last() else {
                     return Err("attachment payload has no active attachment".to_owned());
                 };
-                if active.0 != message_id || active.1 != index || active.2 {
-                    return Err("attachment payload followed attachment properties".to_owned());
+                if active.0 != message_id || active.1 != index {
+                    return Err("attachment payload is outside its attachment".to_owned());
                 }
                 self.attachment_payloads = self.attachment_payloads.saturating_add(1);
             }
             CatalogEvent::PropertyStart(descriptor) => match descriptor.owner {
                 PropertyOwner::Attachment { message_id, index } => {
-                    let Some(active) = self.attachments.last_mut() else {
+                    let Some(active) = self.attachments.last() else {
                         return Err("attachment property has no active attachment".to_owned());
                     };
                     if active.0 != message_id
@@ -98,7 +98,6 @@ impl CatalogSink for WriterOrderSink {
                     {
                         return Err("attachment property is outside writer order".to_owned());
                     }
-                    active.2 = true;
                     self.attachment_properties = self.attachment_properties.saturating_add(1);
                 }
                 PropertyOwner::Message(message_id) => {
@@ -116,9 +115,7 @@ impl CatalogSink for WriterOrderSink {
             },
             CatalogEvent::AttachmentEnd { message_id, index }
             | CatalogEvent::AttachmentAbort { message_id, index } => {
-                if self.attachments.pop().map(|active| (active.0, active.1))
-                    != Some((message_id, index))
-                {
+                if self.attachments.pop() != Some((message_id, index)) {
                     return Err("attachment end does not match its start".to_owned());
                 }
             }
@@ -1749,7 +1746,7 @@ fn milestone_0_4_2_named_properties_roundtrip_through_libpff()
     let identity = pstforge_core::SourceFile::open(&case.path)?
         .identity()
         .clone();
-    if identity.sha256 != case.sha256 {
+    if identity.sha256.as_deref() != Some(case.sha256.as_str()) {
         return Err("named-property source SHA-256 does not match its manifest".into());
     }
 
@@ -1840,7 +1837,7 @@ fn milestone_0_4_2_empty_folders_roundtrip_through_libpff() -> Result<(), Box<dy
     let identity = pstforge_core::SourceFile::open(&case.path)?
         .identity()
         .clone();
-    if identity.sha256 != case.sha256 {
+    if identity.sha256.as_deref() != Some(case.sha256.as_str()) {
         return Err("empty-folder source SHA-256 does not match its manifest".into());
     }
 
@@ -1919,7 +1916,7 @@ fn milestone_0_4_2_contacts_roundtrip_through_libpff() -> Result<(), Box<dyn std
     let identity = pstforge_core::SourceFile::open(&case.path)?
         .identity()
         .clone();
-    if identity.sha256 != case.sha256 {
+    if identity.sha256.as_deref() != Some(case.sha256.as_str()) {
         return Err("contact source SHA-256 does not match its manifest".into());
     }
 
@@ -2034,7 +2031,7 @@ fn milestone_0_4_2_appointments_roundtrip_through_libpff() -> Result<(), Box<dyn
     let identity = pstforge_core::SourceFile::open(&case.path)?
         .identity()
         .clone();
-    if identity.sha256 != case.sha256 {
+    if identity.sha256.as_deref() != Some(case.sha256.as_str()) {
         return Err("appointment source SHA-256 does not match its manifest".into());
     }
 
@@ -2148,7 +2145,7 @@ fn milestone_0_4_2_meetings_roundtrip_through_libpff() -> Result<(), Box<dyn std
     let identity = pstforge_core::SourceFile::open(&case.path)?
         .identity()
         .clone();
-    if identity.sha256 != case.sha256 {
+    if identity.sha256.as_deref() != Some(case.sha256.as_str()) {
         return Err("meeting source SHA-256 does not match its manifest".into());
     }
 
@@ -2288,7 +2285,7 @@ fn milestone_0_4_2_pim_items_roundtrip_through_libpff() -> Result<(), Box<dyn st
     let identity = pstforge_core::SourceFile::open(&case.path)?
         .identity()
         .clone();
-    if identity.sha256 != case.sha256 {
+    if identity.sha256.as_deref() != Some(case.sha256.as_str()) {
         return Err("PIM source SHA-256 does not match its manifest".into());
     }
 
@@ -2461,7 +2458,7 @@ fn milestone_0_4_2_distribution_list_roundtrip_through_libpff()
     let identity = pstforge_core::SourceFile::open(&case.path)?
         .identity()
         .clone();
-    if identity.sha256 != case.sha256 {
+    if identity.sha256.as_deref() != Some(case.sha256.as_str()) {
         return Err("distribution-list source SHA-256 does not match its manifest".into());
     }
 
@@ -2571,7 +2568,7 @@ fn milestone_0_4_2_document_object_roundtrip_through_libpff()
     let identity = pstforge_core::SourceFile::open(&case.path)?
         .identity()
         .clone();
-    if identity.sha256 != case.sha256 {
+    if identity.sha256.as_deref() != Some(case.sha256.as_str()) {
         return Err("Document source SHA-256 does not match its manifest".into());
     }
 
@@ -2695,7 +2692,7 @@ fn milestone_0_4_2_reference_attachments_roundtrip_through_libpff()
     let identity = pstforge_core::SourceFile::open(&case.path)?
         .identity()
         .clone();
-    if identity.sha256 != case.sha256 {
+    if identity.sha256.as_deref() != Some(case.sha256.as_str()) {
         return Err("reference attachment source SHA-256 does not match its manifest".into());
     }
 
@@ -2883,7 +2880,7 @@ fn milestone_0_4_2_ole_attachments_roundtrip_through_libpff()
     let identity = pstforge_core::SourceFile::open(&case.path)?
         .identity()
         .clone();
-    if identity.sha256 != case.sha256 {
+    if identity.sha256.as_deref() != Some(case.sha256.as_str()) {
         return Err("OLE attachment source SHA-256 does not match its manifest".into());
     }
 
@@ -2996,7 +2993,7 @@ fn milestone_0_4_2_outlook_ole_objects_roundtrip_through_libpff()
     let identity = pstforge_core::SourceFile::open(&case.path)?
         .identity()
         .clone();
-    if identity.sha256 != case.sha256 {
+    if identity.sha256.as_deref() != Some(case.sha256.as_str()) {
         return Err("Outlook OLE source SHA-256 does not match its manifest".into());
     }
 
@@ -3122,7 +3119,7 @@ fn milestone_0_4_2_calendar_exceptions_roundtrip_through_libpff()
     let identity = pstforge_core::SourceFile::open(&case.path)?
         .identity()
         .clone();
-    if identity.sha256 != case.sha256 {
+    if identity.sha256.as_deref() != Some(case.sha256.as_str()) {
         return Err("calendar-exception source SHA-256 does not match its manifest".into());
     }
 
@@ -3222,7 +3219,7 @@ fn milestone_0_4_real_pst_splits_deterministically_without_mutation()
         let before = pstforge_core::SourceFile::open(&case.path)?
             .identity()
             .clone();
-        if before.sha256 != case.sha256 {
+        if before.sha256.as_deref() != Some(case.sha256.as_str()) {
             return Err(format!("{} SHA-256 does not match its manifest", case.name).into());
         }
         let source_messages = independent_messages(&case.path)?;
@@ -3241,6 +3238,7 @@ fn milestone_0_4_real_pst_splits_deterministically_without_mutation()
                 .arg(&job)
                 .arg("--max-pst-size")
                 .arg(case.milestone_0_4_max_pst_bytes.to_string())
+                .arg("--restartable")
                 .arg("--json")
                 .arg("--color")
                 .arg("never")
@@ -3311,7 +3309,7 @@ fn milestone_0_4_real_pst_splits_deterministically_without_mutation()
                 }
                 let path = job.join("parts").join(filename);
                 let identity = pstforge_core::SourceFile::open(&path)?.identity().clone();
-                if identity.size_bytes != byte_len || identity.sha256 != sha256 {
+                if identity.size_bytes != byte_len || identity.sha256.as_deref() != Some(sha256) {
                     return Err(format!("{} part identity mismatch", case.name).into());
                 }
                 let inventory = pstforge_core::verify(&path)?;
@@ -3347,7 +3345,7 @@ fn milestone_0_4_real_pst_splits_deterministically_without_mutation()
                     || u64::from(sidecar.index) != part["index"].as_u64().unwrap_or_default()
                     || sidecar.filename != filename
                     || sidecar.byte_len != byte_len
-                    || sidecar.sha256 != sha256
+                    || sidecar.sha256.as_deref() != Some(sha256)
                     || sidecar.oversize != oversize
                     || Some(sidecar.folder_count) != part["folder_count"].as_u64()
                     || Some(sidecar.message_count) != part["message_count"].as_u64()
@@ -3409,6 +3407,7 @@ fn milestone_0_4_real_pst_splits_deterministically_without_mutation()
                 .arg(&job)
                 .arg("--max-pst-size")
                 .arg(case.milestone_0_4_max_pst_bytes.to_string())
+                .arg("--restartable")
                 .arg("--resume")
                 .arg("--json")
                 .arg("--color")
@@ -3448,6 +3447,7 @@ fn milestone_0_4_real_pst_splits_deterministically_without_mutation()
                         .saturating_add(1)
                         .to_string(),
                 )
+                .arg("--restartable")
                 .arg("--resume")
                 .arg("--json")
                 .arg("--color")
@@ -3506,6 +3506,7 @@ fn milestone_0_4_1_interruption_and_sigkill_resume_without_orphan_worker()
             .arg(&job)
             .arg("--max-pst-size")
             .arg(case.milestone_0_4_max_pst_bytes.to_string())
+            .arg("--restartable")
             .arg("--json")
             .arg("--color")
             .arg("never")
@@ -3569,6 +3570,7 @@ fn milestone_0_4_1_interruption_and_sigkill_resume_without_orphan_worker()
             .arg(&job)
             .arg("--max-pst-size")
             .arg(case.milestone_0_4_max_pst_bytes.to_string())
+            .arg("--restartable")
             .arg("--resume")
             .arg("--json")
             .arg("--color")
@@ -3593,6 +3595,7 @@ fn milestone_0_4_1_interruption_and_sigkill_resume_without_orphan_worker()
         .arg(&job)
         .arg("--max-pst-size")
         .arg(case.milestone_0_4_max_pst_bytes.to_string())
+        .arg("--restartable")
         .arg("--json")
         .arg("--color")
         .arg("never")
@@ -3633,6 +3636,7 @@ fn milestone_0_4_1_interruption_and_sigkill_resume_without_orphan_worker()
         .arg(&job)
         .arg("--max-pst-size")
         .arg(case.milestone_0_4_max_pst_bytes.to_string())
+        .arg("--restartable")
         .arg("--resume")
         .arg("--json")
         .arg("--color")
@@ -3659,6 +3663,7 @@ fn milestone_0_4_1_interruption_and_sigkill_resume_without_orphan_worker()
         .arg(&job)
         .arg("--max-pst-size")
         .arg("4GiB")
+        .arg("--restartable")
         .arg("--json")
         .arg("--color")
         .arg("never")
@@ -3695,6 +3700,7 @@ fn milestone_0_4_1_interruption_and_sigkill_resume_without_orphan_worker()
         .arg(&job)
         .arg("--max-pst-size")
         .arg("4GiB")
+        .arg("--restartable")
         .arg("--resume")
         .arg("--json")
         .arg("--color")
@@ -3716,6 +3722,7 @@ fn milestone_0_4_1_interruption_and_sigkill_resume_without_orphan_worker()
         .arg(&job)
         .arg("--max-pst-size")
         .arg("4GiB")
+        .arg("--restartable")
         .arg("--json")
         .arg("--color")
         .arg("never")
@@ -3752,6 +3759,7 @@ fn milestone_0_4_1_interruption_and_sigkill_resume_without_orphan_worker()
         .arg(&job)
         .arg("--max-pst-size")
         .arg("4GiB")
+        .arg("--restartable")
         .arg("--resume")
         .arg("--json")
         .arg("--color")
@@ -3845,7 +3853,7 @@ fn milestone_0_3_external_recovery_spools_without_mutation()
             .identity()
             .sha256
             .clone();
-        if before_hash != case.sha256 {
+        if before_hash.as_deref() != Some(case.sha256.as_str()) {
             return Err(format!("{} SHA-256 does not match its manifest", case.name).into());
         }
         let directory = tempfile::tempdir()?;
@@ -3922,7 +3930,7 @@ fn milestone_0_3_aggressive_recovery_is_distinct_and_non_mutating()
     let before = pstforge_core::SourceFile::open(&case.path)?
         .identity()
         .clone();
-    if before.sha256 != case.sha256 {
+    if before.sha256.as_deref() != Some(case.sha256.as_str()) {
         return Err(format!("{} SHA-256 does not match its manifest", case.name).into());
     }
     let directory = tempfile::tempdir()?;
@@ -4306,7 +4314,7 @@ fn milestone_0_4_5_writer_order_traversal_matches_direct_stream_contract()
     let mut totals = WriterOrderSink::default();
     for case in &manifest.cases {
         let source = pstforge_core::SourceFile::open(&case.path)?;
-        if source.identity().sha256 != case.sha256 {
+        if source.identity().sha256.as_deref() != Some(case.sha256.as_str()) {
             return Err(format!("{} SHA-256 does not match its manifest", case.name).into());
         }
         let file = fs::File::open(&case.path)?;
@@ -4370,7 +4378,7 @@ fn milestone_0_1_external_psts_are_inspected_without_mutation()
             .identity()
             .sha256
             .clone();
-        if before_hash != case.sha256 {
+        if before_hash.as_deref() != Some(case.sha256.as_str()) {
             return Err(format!("{} SHA-256 does not match its manifest", case.name).into());
         }
 

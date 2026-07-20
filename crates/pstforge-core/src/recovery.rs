@@ -1117,6 +1117,7 @@ impl InterruptHandler {
         for signal in [
             signal_hook::consts::signal::SIGINT,
             signal_hook::consts::signal::SIGTERM,
+            signal_hook::consts::signal::SIGIO,
         ] {
             match signal_hook::flag::register(signal, Arc::clone(&interrupted)) {
                 Ok(registration) => registrations.push(registration),

@@ -18,7 +18,6 @@ use std::{
 use thiserror::Error;
 
 use crate::{
-    PstFile, UnicodePstFile,
     block_sig::compute_sig,
     ltp::{
         heap::{
@@ -64,7 +63,6 @@ use crate::{
 
 const FIRST_AMAP: u64 = 0x4400;
 const INITIAL_FILE_EOF: u64 = FIRST_AMAP + AMAP_DATA_SIZE;
-const FIRST_PMAP: u64 = 0x4600;
 const FIRST_DATA: u64 = 0x4800;
 const SLOTS_PER_AMAP: u64 = 496 * 8;
 const SLOT_SIZE: u64 = 64;
@@ -3668,6 +3666,7 @@ pub struct TransactionalMailStoreWriter {
     temporary: PublicationTemporary,
     spec: MailStoreSpec,
     named_identities: Vec<NamedIdentity>,
+    dynamic_named_properties: bool,
     message_stream: MessageStreamState,
     preserve_empty_folders: bool,
     validator_supervisor: Option<PathBuf>,
@@ -3679,6 +3678,42 @@ impl TransactionalMailStoreWriter {
         destination: impl AsRef<Path>,
         layout: MailStoreSpec,
         named_properties: &NamedPropertyCatalog,
+        preserve_empty_folders: bool,
+        validator_supervisor: Option<&Path>,
+    ) -> Result<Self, WriterError> {
+        Self::begin_with_named_policy(
+            destination,
+            layout,
+            named_properties.identities.iter().cloned().collect(),
+            false,
+            preserve_empty_folders,
+            validator_supervisor,
+        )
+    }
+
+    /// Begin a one-pass writer whose NAMEID assignments follow deterministic
+    /// first-seen traversal order.
+    pub fn begin_streaming(
+        destination: impl AsRef<Path>,
+        layout: MailStoreSpec,
+        preserve_empty_folders: bool,
+        validator_supervisor: Option<&Path>,
+    ) -> Result<Self, WriterError> {
+        Self::begin_with_named_policy(
+            destination,
+            layout,
+            Vec::new(),
+            true,
+            preserve_empty_folders,
+            validator_supervisor,
+        )
+    }
+
+    fn begin_with_named_policy(
+        destination: impl AsRef<Path>,
+        layout: MailStoreSpec,
+        named_identities: Vec<NamedIdentity>,
+        dynamic_named_properties: bool,
         preserve_empty_folders: bool,
         validator_supervisor: Option<&Path>,
     ) -> Result<Self, WriterError> {
@@ -3710,11 +3745,63 @@ impl TransactionalMailStoreWriter {
             parent_directory,
             temporary,
             spec: layout,
-            named_identities: named_properties.identities.iter().cloned().collect(),
+            named_identities,
+            dynamic_named_properties,
             message_stream: MessageStreamState::new(0),
             preserve_empty_folders,
             validator_supervisor: validator_supervisor.map(Path::to_path_buf),
         })
+    }
+
+    fn prepare_named_identities(&mut self, message: &MessageSpec) -> Result<(), WriterError> {
+        let message_identities = collect_named_identities(message);
+        if self.dynamic_named_properties {
+            for identity in message_identities {
+                if named_identity_index(&self.named_identities, &identity).is_none() {
+                    if self.named_identities.len() >= 0x8000 {
+                        return Err(WriterError::ValueTooLarge("named-property count"));
+                    }
+                    self.named_identities.push(identity);
+                }
+            }
+            return Ok(());
+        }
+        if message_identities
+            .iter()
+            .any(|identity| named_identity_index(&self.named_identities, identity).is_none())
+        {
+            return Err(WriterError::InvalidStructure(
+                "transactional named-property catalog is incomplete".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Add source folder metadata discovered after streaming construction began.
+    pub fn observe_folder(&mut self, folder: MailFolderSpec) -> Result<(), WriterError> {
+        if !folder.messages.is_empty() || !folder.associated_messages.is_empty() {
+            return Err(WriterError::InvalidStructure(
+                "observed streaming folder must not contain messages".to_owned(),
+            ));
+        }
+        if let Some(existing) =
+            self.spec.folders.iter().find(|existing| {
+                existing.location == folder.location && existing.path == folder.path
+            })
+        {
+            if existing.role != folder.role || existing.container_class != folder.container_class {
+                return Err(WriterError::InvalidStructure(
+                    "streaming folder metadata changed after observation".to_owned(),
+                ));
+            }
+            return Ok(());
+        }
+        self.spec.folders.push(folder);
+        if let Err(error) = validate_mail_store_layout_expected(&self.spec) {
+            self.spec.folders.pop();
+            return Err(error);
+        }
+        Ok(())
     }
 
     /// Capture the exact private state before appending a bounded batch.
@@ -3823,15 +3910,7 @@ impl TransactionalMailStoreWriter {
                 "direct projection cannot consume spooled values".to_owned(),
             ));
         }
-        let message_identities = collect_named_identities(message);
-        if message_identities
-            .iter()
-            .any(|identity| self.named_identities.binary_search(identity).is_err())
-        {
-            return Err(WriterError::InvalidStructure(
-                "transactional named-property catalog is incomplete".to_owned(),
-            ));
-        }
+        self.prepare_named_identities(message)?;
         let folder_index = self
             .spec
             .folders
@@ -3967,15 +4046,7 @@ impl TransactionalMailStoreWriter {
         validate_aggregate_properties(&message)?;
         validate_message(&message, 0)?;
         validate_message_size_bound(&message)?;
-        let message_identities = collect_named_identities(&message);
-        if message_identities
-            .iter()
-            .any(|identity| self.named_identities.binary_search(identity).is_err())
-        {
-            return Err(WriterError::InvalidStructure(
-                "transactional named-property catalog is incomplete".to_owned(),
-            ));
-        }
+        self.prepare_named_identities(&message)?;
         let folder_index = self
             .spec
             .folders
@@ -4176,6 +4247,22 @@ impl TransactionalMailStoreWriter {
 
     /// Finalize, validate, fsync, and atomically publish the accepted messages.
     pub fn finalize(self, interrupted: &AtomicBool) -> Result<FidelityWriteReport, WriterError> {
+        self.finalize_with_policy(interrupted, true)
+    }
+
+    /// Finalize by construction without rereading the completed PST.
+    pub fn finalize_constructed(
+        self,
+        interrupted: &AtomicBool,
+    ) -> Result<FidelityWriteReport, WriterError> {
+        self.finalize_with_policy(interrupted, false)
+    }
+
+    fn finalize_with_policy(
+        self,
+        interrupted: &AtomicBool,
+        validate_output: bool,
+    ) -> Result<FidelityWriteReport, WriterError> {
         check_interrupted(interrupted)?;
         if self.message_stream.message_count() == 0 {
             return Err(WriterError::InvalidStructure(
@@ -4188,6 +4275,7 @@ impl TransactionalMailStoreWriter {
             mut temporary,
             spec,
             named_identities,
+            dynamic_named_properties: _,
             message_stream,
             preserve_empty_folders,
             validator_supervisor,
@@ -4336,7 +4424,6 @@ impl TransactionalMailStoreWriter {
             write_bbt(&mut temporary.file, page_offset, 0x100, &written)?;
         let (nbt, allocated_end, next_page_id) =
             write_nbt(&mut temporary.file, nbt_offset, next_page_id, &nodes)?;
-        let dynamic_allocation = allocated_end > INITIAL_FILE_EOF;
         let file_eof = allocation_file_eof(allocated_end)?;
         if file_eof != projected_file_eof {
             return Err(WriterError::InvalidStructure(
@@ -4344,13 +4431,11 @@ impl TransactionalMailStoreWriter {
             ));
         }
         temporary.file.set_len(file_eof)?;
-        if !dynamic_allocation {
-            write_fixed_pages(
-                &mut temporary.file,
-                allocated_end,
-                UnicodePageId::from(next_page_id),
-            )?;
-        }
+        let allocation = write_allocation_pages(
+            &mut temporary.file,
+            allocated_end,
+            UnicodePageId::from(next_page_id),
+        )?;
         write_header(
             &mut temporary.file,
             nbt,
@@ -4359,28 +4444,26 @@ impl TransactionalMailStoreWriter {
             UnicodePageId::from(next_page_id),
             leaf_bid(next_block_index)?,
             nid_counters(&nodes, &blocks, &streamed_subnodes)?,
-            dynamic_allocation,
+            allocation,
         )?;
         temporary.file.sync_all()?;
         check_interrupted(interrupted)?;
+        if !validate_output {
+            publish_noclobber(
+                temporary.source_name(),
+                &temporary.directory,
+                &parent_directory,
+                &destination,
+            )?;
+            sync_published_directory(&destination, &parent_directory)?;
+            verify_published_destination(&destination, &temporary.file)?;
+            return Ok(report);
+        }
         let validated_path = PathBuf::from(format!(
             "/proc/{}/fd/{}",
             std::process::id(),
             temporary.file.as_raw_fd()
         ));
-        if dynamic_allocation {
-            (|| -> Result<(), WriterError> {
-                let mut pst = UnicodePstFile::open(&validated_path)?;
-                let mut transaction = pst.lock()?;
-                transaction.flush()?;
-                drop(transaction);
-                drop(pst);
-                temporary.file.sync_all()?;
-                Ok(())
-            })()
-            .map_err(completed_validation_error)?;
-        }
-        check_interrupted(interrupted)?;
         if !input.associated {
             let first_message_node = first_message_node.ok_or_else(|| {
                 WriterError::InvalidStructure(
@@ -4631,7 +4714,6 @@ fn create_flat_store(
     let (nbt, allocated_end, next_page_id) =
         write_nbt(&mut *file, nbt_offset, next_page_id, &nodes)?;
 
-    let dynamic_allocation = allocated_end > INITIAL_FILE_EOF;
     let file_eof = allocation_file_eof(allocated_end)?;
     if file_eof != projected_file_eof {
         return Err(WriterError::InvalidStructure(
@@ -4639,9 +4721,8 @@ fn create_flat_store(
         ));
     }
     file.set_len(file_eof)?;
-    if !dynamic_allocation {
-        write_fixed_pages(&mut *file, allocated_end, UnicodePageId::from(next_page_id))?;
-    }
+    let allocation =
+        write_allocation_pages(&mut *file, allocated_end, UnicodePageId::from(next_page_id))?;
     write_header(
         &mut *file,
         nbt,
@@ -4650,7 +4731,7 @@ fn create_flat_store(
         UnicodePageId::from(next_page_id),
         leaf_bid(next_block_index)?,
         nid_counters(&nodes, &blocks, &streamed_subnodes)?,
-        dynamic_allocation,
+        allocation,
     )?;
     file.sync_all()?;
     check_interrupted(interrupted)?;
@@ -4659,19 +4740,6 @@ fn create_flat_store(
         std::process::id(),
         temporary.file.as_raw_fd()
     ));
-    if dynamic_allocation {
-        (|| -> Result<(), WriterError> {
-            let mut pst = UnicodePstFile::open(&validated_path)?;
-            let mut transaction = pst.lock()?;
-            transaction.flush()?;
-            drop(transaction);
-            drop(pst);
-            temporary.file.sync_all()?;
-            Ok(())
-        })()
-        .map_err(completed_validation_error)?;
-    }
-    check_interrupted(interrupted)?;
     if !spec.associated {
         validate_completed_store(
             &validated_path,
@@ -6631,9 +6699,8 @@ fn validation_property_ids(
     ];
     ids.extend(message.raw_properties.iter().map(|property| property.id));
     for property in &message.named_properties {
-        let index = named_identities
-            .binary_search(&(property.set, property.name.clone()))
-            .map_err(|_| {
+        let index = named_identity_index(named_identities, &(property.set, property.name.clone()))
+            .ok_or_else(|| {
                 WriterError::InvalidStructure("named property is not mapped".to_owned())
             })?;
         ids.push(
@@ -6881,9 +6948,8 @@ fn validate_completed_store(
         }
     }
     for property in &spec.message.named_properties {
-        let index = named_identities
-            .binary_search(&(property.set, property.name.clone()))
-            .map_err(|_| invalid("completed store named property is not mapped"))?;
+        let index = named_identity_index(named_identities, &(property.set, property.name.clone()))
+            .ok_or_else(|| invalid("completed store named property is not mapped"))?;
         let id = 0x8000_u16
             .checked_add(
                 u16::try_from(index)
@@ -7540,7 +7606,7 @@ fn reference_named_property_id(
         NamedPropertySet::Guid(PSETID_ATTACHMENT),
         NamedPropertyName::String(name.to_owned()),
     );
-    let index = named_identities.binary_search(&identity).map_err(|_| {
+    let index = named_identity_index(named_identities, &identity).ok_or_else(|| {
         WriterError::InvalidStructure(
             "completed store reference named property is not mapped".to_owned(),
         )
@@ -7600,7 +7666,7 @@ fn validate_reference_named_values(
                 }
             }
             None => {
-                if let Ok(index) = named_identities.binary_search(&identity) {
+                if let Some(index) = named_identity_index(named_identities, &identity) {
                     let id = 0x8000_u16
                         .checked_add(u16::try_from(index).map_err(|_| {
                             WriterError::InvalidStructure(
@@ -8205,9 +8271,8 @@ fn validate_embedded_message(
         }
     }
     for property in &expected.named_properties {
-        let index = named_identities
-            .binary_search(&(property.set, property.name.clone()))
-            .map_err(|_| invalid("embedded named property is not mapped"))?;
+        let index = named_identity_index(named_identities, &(property.set, property.name.clone()))
+            .ok_or_else(|| invalid("embedded named property is not mapped"))?;
         let id = 0x8000_u16
             .checked_add(u16::try_from(index).map_err(|_| invalid("named property overflow"))?)
             .ok_or_else(|| invalid("named property overflow"))?;
@@ -8800,6 +8865,15 @@ fn collect_named_identities_many_refs(messages: &[&MessageSpec]) -> Vec<NamedIde
         .collect()
 }
 
+fn named_identity_index(
+    named_identities: &[NamedIdentity],
+    identity: &NamedIdentity,
+) -> Option<usize> {
+    named_identities
+        .iter()
+        .position(|candidate| candidate == identity)
+}
+
 fn named_property_map(named: &[NamedIdentity]) -> Result<Vec<(u16, PropertyValue)>, WriterError> {
     if named.is_empty() {
         // Outlook/libpff require the NAMEID entry and hash streams to be
@@ -8972,9 +9046,8 @@ fn message_properties(
     properties.push((0x0039, PropertyValue::Time(message.sent_filetime)));
     properties.extend(display_recipient_properties(&message.recipients));
     for property in &message.named_properties {
-        let index = named_identities
-            .binary_search(&(property.set, property.name.clone()))
-            .map_err(|_| {
+        let index = named_identity_index(named_identities, &(property.set, property.name.clone()))
+            .ok_or_else(|| {
                 WriterError::InvalidStructure("named property is not mapped".to_owned())
             })?;
         let id = 0x8000_u16
@@ -9626,7 +9699,7 @@ fn attachment_properties_mapped(
                 NamedPropertySet::Guid(PSETID_ATTACHMENT),
                 NamedPropertyName::String(name.to_owned()),
             );
-            let index = named_identities.binary_search(&identity).map_err(|_| {
+            let index = named_identity_index(named_identities, &identity).ok_or_else(|| {
                 WriterError::InvalidStructure(
                     "reference attachment named property is not mapped".to_owned(),
                 )
@@ -11375,25 +11448,114 @@ fn table_node_with_subnode(
     ))
 }
 
-fn write_fixed_pages(
+#[derive(Clone, Copy)]
+struct ConstructedAllocation {
+    free_bytes: u64,
+    first_free_map: [u8; 128],
+}
+
+fn write_allocation_pages(
     file: &mut std::fs::File,
     allocated_end: u64,
     next_page_id: UnicodePageId,
-) -> Result<(), WriterError> {
-    if allocated_end > INITIAL_FILE_EOF {
-        return Err(WriterError::ValueTooLarge("initial allocation region"));
-    }
-    let allocated_slots = allocated_end
+) -> Result<ConstructedAllocation, WriterError> {
+    let used = allocated_end
         .checked_sub(FIRST_AMAP)
         .ok_or_else(|| WriterError::InvalidStructure("allocation start underflow".to_owned()))?
-        .div_ceil(SLOT_SIZE);
-    let mut amap_bits = [0_u8; 496];
-    for slot in 0..allocated_slots {
-        let byte = usize::try_from(slot / 8)
-            .map_err(|_| WriterError::ValueTooLarge("allocation map index"))?;
-        let bit =
-            u8::try_from(slot % 8).map_err(|_| WriterError::ValueTooLarge("allocation map bit"))?;
-        amap_bits[byte] |= 0x80_u8 >> bit;
+        .max(1);
+    let amap_count = used.div_ceil(AMAP_DATA_SIZE).max(1);
+    let capacity = usize::try_from(amap_count)
+        .map_err(|_| WriterError::ValueTooLarge("allocation map count"))?;
+    let mut free_slots = Vec::with_capacity(capacity);
+    for amap_index in 0..amap_count {
+        let region_start = FIRST_AMAP
+            .checked_add(amap_index.saturating_mul(AMAP_DATA_SIZE))
+            .ok_or(WriterError::ValueTooLarge("allocation map offset"))?;
+        let region_end = region_start
+            .checked_add(AMAP_DATA_SIZE)
+            .ok_or(WriterError::ValueTooLarge("allocation map extent"))?;
+        let used_end = allocated_end.min(region_end).max(region_start);
+        let allocated_slots = used_end.saturating_sub(region_start).div_ceil(SLOT_SIZE);
+        let free = SLOTS_PER_AMAP
+            .checked_sub(allocated_slots)
+            .ok_or(WriterError::ValueTooLarge("allocation map free slots"))?;
+        free_slots.push(
+            u16::try_from(free)
+                .map_err(|_| WriterError::ValueTooLarge("allocation map free slots"))?,
+        );
+    }
+    for amap_index in 0..amap_count {
+        let region_start = FIRST_AMAP
+            .checked_add(amap_index.saturating_mul(AMAP_DATA_SIZE))
+            .ok_or(WriterError::ValueTooLarge("allocation map offset"))?;
+        let free = *free_slots
+            .get(
+                usize::try_from(amap_index)
+                    .map_err(|_| WriterError::ValueTooLarge("allocation map index"))?,
+            )
+            .ok_or_else(|| {
+                WriterError::InvalidStructure("allocation free map is incomplete".to_owned())
+            })?;
+        let allocated_slots = SLOTS_PER_AMAP.saturating_sub(u64::from(free));
+        let mut amap_bits = [0_u8; 496];
+        for slot in 0..allocated_slots {
+            let byte = usize::try_from(slot / 8)
+                .map_err(|_| WriterError::ValueTooLarge("allocation map index"))?;
+            let bit = u8::try_from(slot % 8)
+                .map_err(|_| WriterError::ValueTooLarge("allocation map bit"))?;
+            amap_bits[byte] |= 0x80_u8 >> bit;
+        }
+
+        file.seek(SeekFrom::Start(region_start))?;
+        let amap_trailer = page_trailer(
+            PageType::AllocationMap,
+            region_start,
+            UnicodePageId::from(region_start),
+        );
+        let amap = <UnicodeMapPage<{ PageType::AllocationMap as u8 }> as MapPageReadWrite<
+            crate::UnicodePstFile,
+            { PageType::AllocationMap as u8 },
+        >>::new(amap_bits, amap_trailer)
+        .map_err(|error| WriterError::InvalidStructure(error.to_string()))?;
+        MapPageReadWrite::write(&amap, file)?;
+
+        let mut reserved_offset = region_start + PAGE_SIZE;
+        if amap_index % 8 == 0 {
+            write_map_page::<{ PageType::AllocationPageMap as u8 }>(
+                file,
+                reserved_offset,
+                PageType::AllocationPageMap,
+                [0xFF; 496],
+            )?;
+            reserved_offset += PAGE_SIZE;
+            if amap_index >= FMAP_FIRST_AMAP
+                && (amap_index - FMAP_FIRST_AMAP) % FMAP_AMAP_COUNT == 0
+            {
+                let mut bits = [0_u8; 496];
+                let start = usize::try_from(amap_index)
+                    .map_err(|_| WriterError::ValueTooLarge("free map index"))?;
+                for (target, free) in bits.iter_mut().zip(free_slots.iter().skip(start)) {
+                    *target = free_slot_class(*free);
+                }
+                write_map_page::<{ PageType::FreeMap as u8 }>(
+                    file,
+                    reserved_offset,
+                    PageType::FreeMap,
+                    bits,
+                )?;
+                reserved_offset += PAGE_SIZE;
+            }
+            if amap_index >= FPMAP_FIRST_AMAP
+                && (amap_index - FPMAP_FIRST_AMAP) % FPMAP_AMAP_COUNT == 0
+            {
+                write_map_page::<{ PageType::FreePageMap as u8 }>(
+                    file,
+                    reserved_offset,
+                    PageType::FreePageMap,
+                    [0xFF; 496],
+                )?;
+            }
+        }
     }
 
     let density_trailer = page_trailer(
@@ -11401,45 +11563,54 @@ fn write_fixed_pages(
         DENSITY_LIST_FILE_OFFSET,
         next_page_id,
     );
-    let free_slots = SLOTS_PER_AMAP
-        .checked_sub(allocated_slots)
-        .ok_or(WriterError::ValueTooLarge("density list free slots"))?;
-    let density_entry = DensityListPageEntry::new(
-        0,
-        u16::try_from(free_slots)
-            .map_err(|_| WriterError::ValueTooLarge("density list free slots"))?,
-    )
-    .map_err(|error| WriterError::InvalidStructure(error.to_string()))?;
-    UnicodeDensityListPage::new(true, 1, &[density_entry], density_trailer)
-        .map_err(|error| WriterError::InvalidStructure(error.to_string()))?
-        .write(file)?;
+    if amap_count == 1 {
+        let entry = DensityListPageEntry::new(0, free_slots[0])
+            .map_err(|error| WriterError::InvalidStructure(error.to_string()))?;
+        UnicodeDensityListPage::new(true, 1, &[entry], density_trailer)
+            .map_err(|error| WriterError::InvalidStructure(error.to_string()))?
+            .write(file)?;
+    } else {
+        let current_page = u32::try_from(amap_count - 1)
+            .map_err(|_| WriterError::ValueTooLarge("density list current page"))?;
+        UnicodeDensityListPage::new(false, current_page, &[], density_trailer)
+            .map_err(|error| WriterError::InvalidStructure(error.to_string()))?
+            .write(file)?;
+    }
 
-    file.seek(SeekFrom::Start(FIRST_AMAP))?;
-    let amap_trailer = page_trailer(
-        PageType::AllocationMap,
-        FIRST_AMAP,
-        UnicodePageId::from(FIRST_AMAP),
-    );
-    let amap = <UnicodeMapPage<{ PageType::AllocationMap as u8 }> as MapPageReadWrite<
-        crate::UnicodePstFile,
-        { PageType::AllocationMap as u8 },
-    >>::new(amap_bits, amap_trailer)
-    .map_err(|error| WriterError::InvalidStructure(error.to_string()))?;
-    MapPageReadWrite::write(&amap, file)?;
+    let mut first_free_map = [0_u8; 128];
+    for (target, free) in first_free_map.iter_mut().zip(&free_slots) {
+        *target = free_slot_class(*free);
+    }
+    let free_bytes = free_slots.iter().try_fold(0_u64, |total, free| {
+        total
+            .checked_add(u64::from(*free).saturating_mul(SLOT_SIZE))
+            .ok_or(WriterError::ValueTooLarge("allocation free byte count"))
+    })?;
+    Ok(ConstructedAllocation {
+        free_bytes,
+        first_free_map,
+    })
+}
 
-    file.seek(SeekFrom::Start(FIRST_PMAP))?;
-    let pmap_trailer = page_trailer(
-        PageType::AllocationPageMap,
-        FIRST_PMAP,
-        UnicodePageId::from(FIRST_PMAP),
-    );
-    let pmap = <UnicodeMapPage<{ PageType::AllocationPageMap as u8 }> as MapPageReadWrite<
-        crate::UnicodePstFile,
-        { PageType::AllocationPageMap as u8 },
-    >>::new([0xFF; 496], pmap_trailer)
-    .map_err(|error| WriterError::InvalidStructure(error.to_string()))?;
-    MapPageReadWrite::write(&pmap, file)?;
+fn write_map_page<const PAGE_TYPE: u8>(
+    file: &mut std::fs::File,
+    offset: u64,
+    page_type: PageType,
+    bits: [u8; 496],
+) -> Result<(), WriterError> {
+    file.seek(SeekFrom::Start(offset))?;
+    let trailer = page_trailer(page_type, offset, UnicodePageId::from(offset));
+    let page =
+        <UnicodeMapPage<PAGE_TYPE> as MapPageReadWrite<crate::UnicodePstFile, PAGE_TYPE>>::new(
+            bits, trailer,
+        )
+        .map_err(|error| WriterError::InvalidStructure(error.to_string()))?;
+    MapPageReadWrite::write(&page, file)?;
     Ok(())
+}
+
+fn free_slot_class(free_slots: u16) -> u8 {
+    u8::try_from(free_slots.min(0xFF)).unwrap_or(0xFF)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -11451,35 +11622,19 @@ fn write_header(
     next_page_id: UnicodePageId,
     next_block_id: UnicodeBlockId,
     nids: [u32; 32],
-    dynamic_allocation: bool,
+    allocation: ConstructedAllocation,
 ) -> Result<(), WriterError> {
     let file_eof = allocation_file_eof(allocated_end)?;
-    let free_bytes = if dynamic_allocation {
-        0
-    } else {
-        let allocated_slots = allocated_end
-            .checked_sub(FIRST_AMAP)
-            .ok_or_else(|| WriterError::InvalidStructure("allocation start underflow".to_owned()))?
-            .div_ceil(SLOT_SIZE);
-        SLOTS_PER_AMAP
-            .checked_sub(allocated_slots)
-            .and_then(|slots| slots.checked_mul(SLOT_SIZE))
-            .ok_or(WriterError::ValueTooLarge("free byte count"))?
-    };
     let root = UnicodeRoot::new(
         UnicodeByteIndex::new(file_eof),
         UnicodeByteIndex::new(file_eof - AMAP_DATA_SIZE),
-        UnicodeByteIndex::new(free_bytes),
+        UnicodeByteIndex::new(allocation.free_bytes),
         UnicodeByteIndex::new(0),
         nbt,
         bbt,
-        if dynamic_allocation {
-            AmapStatus::Invalid
-        } else {
-            AmapStatus::Valid2
-        },
+        AmapStatus::Valid2,
     );
-    let header = UnicodeHeader::new_store(
+    let mut header = UnicodeHeader::new_store(
         root,
         NdbCryptMethod::Permute,
         next_page_id,
@@ -11487,6 +11642,8 @@ fn write_header(
         2,
         nids,
     );
+    HeaderReadWrite::<crate::UnicodePstFile>::first_free_map(&mut header)
+        .copy_from_slice(&allocation.first_free_map);
     file.seek(SeekFrom::Start(0))?;
     header.write(file)?;
     Ok(())
@@ -12736,7 +12893,7 @@ mod tests {
             };
             projected_sizes.push(projected_file_eof);
         }
-        transaction.finalize(&NEVER_INTERRUPTED)?;
+        transaction.finalize_constructed(&NEVER_INTERRUPTED)?;
         assert_eq!(
             Sha256::digest(std::fs::read(&transaction_path)?),
             Sha256::digest(std::fs::read(&batch_path)?)
@@ -15706,6 +15863,132 @@ mod tests {
             .ok_or("missing named-property string stream")?;
         assert!(matches!(&strings.1, PropertyValue::Binary(bytes) if !bytes.is_empty()));
         assert_eq!(map.iter().filter(|(id, _)| *id >= 0x1000).count(), 2);
+        Ok(())
+    }
+
+    #[test]
+    fn streaming_named_property_ids_remain_stable_as_later_identities_arrive()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("streaming-nameid.pst");
+        let fixture = FidelityStore::default();
+        let mut first = fixture.message.clone();
+        first.attachments.clear();
+        first.named_properties = vec![NamedProperty {
+            set: NamedPropertySet::PublicStrings,
+            name: NamedPropertyName::String("Zulu".to_owned()),
+            value: RawPropertyValue::Unicode("first".to_owned()),
+        }];
+        let mut second = first.clone();
+        second.subject = "Second".to_owned();
+        second.named_properties = vec![NamedProperty {
+            set: NamedPropertySet::PublicStrings,
+            name: NamedPropertyName::String("Alpha".to_owned()),
+            value: RawPropertyValue::Unicode("second".to_owned()),
+        }];
+        let layout = MailStoreSpec {
+            store_name: fixture.store_name,
+            record_key: fixture.record_key,
+            folders: vec![MailFolderSpec {
+                path: vec!["Inbox".to_owned()],
+                location: MailFolderLocation::IpmSubtree,
+                role: MailFolderRole::Ordinary,
+                container_class: "IPF.Note".to_owned(),
+                messages: Vec::new(),
+                associated_messages: Vec::new(),
+            }],
+        };
+        let mut writer = TransactionalMailStoreWriter::begin_streaming(&path, layout, true, None)?;
+        writer.append_message_deferred(
+            MailFolderLocation::IpmSubtree,
+            &["Inbox".to_owned()],
+            false,
+            first,
+            &NEVER_INTERRUPTED,
+        )?;
+        writer.append_message_deferred(
+            MailFolderLocation::IpmSubtree,
+            &["Inbox".to_owned()],
+            false,
+            second,
+            &NEVER_INTERRUPTED,
+        )?;
+        assert_eq!(
+            writer.named_identities,
+            vec![
+                (
+                    NamedPropertySet::PublicStrings,
+                    NamedPropertyName::String("Zulu".to_owned())
+                ),
+                (
+                    NamedPropertySet::PublicStrings,
+                    NamedPropertyName::String("Alpha".to_owned())
+                )
+            ]
+        );
+        writer.finalize_constructed(&NEVER_INTERRUPTED)?;
+        UnicodePstFile::open(path)?;
+        Ok(())
+    }
+
+    #[test]
+    fn streaming_folder_observation_preserves_earlier_message_layout()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("streaming-folders.pst");
+        let fixture = FidelityStore::default();
+        let inbox = MailFolderSpec {
+            path: vec!["Inbox".to_owned()],
+            location: MailFolderLocation::IpmSubtree,
+            role: MailFolderRole::Ordinary,
+            container_class: "IPF.Note".to_owned(),
+            messages: Vec::new(),
+            associated_messages: Vec::new(),
+        };
+        let layout = MailStoreSpec {
+            store_name: fixture.store_name,
+            record_key: fixture.record_key,
+            folders: vec![inbox],
+        };
+        let mut writer = TransactionalMailStoreWriter::begin_streaming(&path, layout, true, None)?;
+        let mut first = fixture.message.clone();
+        first.attachments.clear();
+        writer.append_message_deferred(
+            MailFolderLocation::IpmSubtree,
+            &["Inbox".to_owned()],
+            false,
+            first,
+            &NEVER_INTERRUPTED,
+        )?;
+        writer.observe_folder(MailFolderSpec {
+            path: vec!["Archive".to_owned()],
+            location: MailFolderLocation::IpmSubtree,
+            role: MailFolderRole::Ordinary,
+            container_class: "IPF.Note".to_owned(),
+            messages: Vec::new(),
+            associated_messages: Vec::new(),
+        })?;
+        let mut second = fixture.message;
+        second.attachments.clear();
+        second.subject = "Archive item".to_owned();
+        writer.append_message_deferred(
+            MailFolderLocation::IpmSubtree,
+            &["Archive".to_owned()],
+            false,
+            second,
+            &NEVER_INTERRUPTED,
+        )?;
+        writer.finalize_constructed(&NEVER_INTERRUPTED)?;
+        let store = open_store(path)?;
+        assert!(
+            store
+                .open_folder(
+                    &store
+                        .properties()
+                        .make_entry_id(node(NodeIdType::NormalFolder, MAIL_FOLDER_INDEX)?)?
+                )
+                .is_ok()
+        );
         Ok(())
     }
 

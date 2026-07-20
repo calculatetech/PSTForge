@@ -174,7 +174,8 @@ pub struct PartReport {
     pub index: u32,
     pub filename: String,
     pub byte_len: u64,
-    pub sha256: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sha256: Option<String>,
     pub folder_count: u64,
     pub message_count: u64,
     pub oversize: bool,
@@ -247,7 +248,12 @@ pub fn split(
     let interrupt_flag = interrupt.flag();
     crate::validate_output_relationship(source_path, job_directory)
         .map_err(RecoveryError::Source)?;
-    let source = SourceFile::open_interruptible(source_path, &interrupt_flag).map_err(|error| {
+    let source_result = if restartable {
+        SourceFile::open_interruptible(source_path, &interrupt_flag)
+    } else {
+        SourceFile::open_direct_interruptible(source_path, &interrupt_flag)
+    };
+    let source = source_result.map_err(|error| {
         if matches!(error, SourceError::Interrupted) {
             RecoveryError::Interrupted
         } else {
@@ -405,10 +411,11 @@ pub fn split(
         job.publish_recovery_log(&render_recovery_log(&report))?;
         return Ok(report);
     }
+    let source_key = recovery.source.stable_key();
     let (parts, written_candidates, output_partial, split_interrupted) =
         split_recovered_job_with_interrupt(
             &mut job,
-            &recovery.source.sha256,
+            &source_key,
             mode,
             maximum_pst_bytes,
             &interrupt_flag,
@@ -614,10 +621,11 @@ fn render_recovery_log(report: &SplitReport) -> String {
     if let Some(category) = report.terminal_failure {
         output.push_str(&format!("Terminal failure: {}\n", category.metadata_name()));
     }
-    output.push_str(&format!(
-        "Source SHA-256: {}\n",
-        report.recovery.source.sha256
-    ));
+    if let Some(sha256) = &report.recovery.source.sha256 {
+        output.push_str(&format!("Source SHA-256: {sha256}\n"));
+    } else {
+        output.push_str("Source SHA-256: not calculated (direct mode)\n");
+    }
     output.push_str(&format!(
         "Source size: {} bytes\n",
         report.recovery.source.size_bytes
@@ -702,9 +710,10 @@ fn render_recovery_log(report: &SplitReport) -> String {
     }
     output.push_str("\nOutput files\n");
     for part in report.parts.iter().take(MAX_RECOVERY_LOG_DETAIL_LINES) {
+        let digest = part.sha256.as_deref().unwrap_or("not calculated");
         output.push_str(&format!(
             "{}: {} bytes, SHA-256 {}, {} messages, {} folders\n",
-            part.filename, part.byte_len, part.sha256, part.message_count, part.folder_count
+            part.filename, part.byte_len, digest, part.message_count, part.folder_count
         ));
     }
     let unlisted = report
@@ -944,7 +953,7 @@ fn finalize_direct_part(
         _cleanup,
     } = transaction;
     let top_level_count = writer.message_count();
-    writer.finalize(interrupted)?;
+    writer.finalize_constructed(interrupted)?;
     let byte_len = staged_path
         .metadata()
         .map_err(|source| staged_io(&staged_path, source))?
@@ -957,7 +966,6 @@ fn finalize_direct_part(
             maximum_bytes: maximum_pst_bytes,
         });
     }
-    let sha256 = hash_file(&staged_path, interrupted)?.ok_or(RecoveryError::Interrupted)?;
     if !stats.unsupported_item_keys.is_empty() {
         job.mark_candidates_unsupported(
             &stats.unsupported_item_keys,
@@ -977,7 +985,7 @@ fn finalize_direct_part(
         index: part_index,
         filename: filename.clone(),
         byte_len,
-        sha256: sha256.clone(),
+        sha256: None,
         oversize,
     };
     let sidecar = PartSidecar {
@@ -986,7 +994,7 @@ fn finalize_direct_part(
         index: part_index,
         filename: filename.clone(),
         byte_len,
-        sha256: sha256.clone(),
+        sha256: None,
         store_record_key: hex(&store_record_key),
         folder_count,
         message_count: stats.message_count,
@@ -997,7 +1005,7 @@ fn finalize_direct_part(
         omitted_attachments: stats.omitted_attachments,
         reconstructions: stats.reconstructions.clone(),
     };
-    job.publish_validated_part_interruptible(
+    job.publish_constructed_part_interruptible(
         &staged_filename,
         &published,
         &sidecar,
@@ -1008,7 +1016,7 @@ fn finalize_direct_part(
         index: part_index,
         filename,
         byte_len,
-        sha256,
+        sha256: None,
         folder_count,
         message_count: stats.message_count,
         oversize,
@@ -1251,6 +1259,7 @@ fn split_direct_recovered_job(
     maximum_pst_bytes: u64,
     interrupted: &std::sync::Arc<AtomicBool>,
 ) -> Result<DirectSplitOutcome, SplitError> {
+    let source_key = source.identity().stable_key();
     let spooled_folders = job.spooled_folders()?;
     let mut source_folders = load_canonical_folders_interruptible(job, interrupted)?;
     let mode_name = recovery_mode_name(recovery_mode);
@@ -1296,7 +1305,7 @@ fn split_direct_recovered_job(
         let layout = build_part_writer_layout(
             std::slice::from_ref(&folder),
             PartBuildOptions {
-                source_sha256: &source.identity().sha256,
+                source_sha256: &source_key,
                 recovery_mode: mode_name,
                 maximum_pst_bytes,
                 part_index: 1,
@@ -1334,7 +1343,7 @@ fn split_direct_recovered_job(
         &spooled_folders,
         &source_folders,
         &named_properties,
-        &source.identity().sha256,
+        &source_key,
         mode_name,
         maximum_pst_bytes,
         worker_executable,
@@ -1419,7 +1428,7 @@ fn split_direct_recovered_job(
                         &[&mail],
                         &relevant_folders,
                         PartBuildOptions {
-                            source_sha256: &source.identity().sha256,
+                            source_sha256: &source_key,
                             recovery_mode: mode_name,
                             maximum_pst_bytes,
                             part_index,
@@ -1459,7 +1468,7 @@ fn split_direct_recovered_job(
                             job,
                             &source_folders,
                             &named_properties,
-                            &source.identity().sha256,
+                            &source_key,
                             mode_name,
                             maximum_pst_bytes,
                             part_index,
@@ -1513,7 +1522,7 @@ fn split_direct_recovered_job(
                                 job,
                                 &source_folders,
                                 &named_properties,
-                                &source.identity().sha256,
+                                &source_key,
                                 mode_name,
                                 maximum_pst_bytes,
                                 part_index,
@@ -2218,7 +2227,7 @@ fn split_recovered_job_with_interrupt(
             index: part_index,
             filename: filename.clone(),
             byte_len,
-            sha256: sha256.clone(),
+            sha256: Some(sha256.clone()),
             oversize,
         };
         let sidecar = PartSidecar {
@@ -2227,7 +2236,7 @@ fn split_recovered_job_with_interrupt(
             index: part_index,
             filename: filename.clone(),
             byte_len,
-            sha256: sha256.clone(),
+            sha256: Some(sha256.clone()),
             store_record_key: hex(&store_record_key),
             folder_count,
             message_count: stats.message_count,
@@ -2260,7 +2269,7 @@ fn split_recovered_job_with_interrupt(
             index: part_index,
             filename,
             byte_len,
-            sha256,
+            sha256: Some(sha256),
             folder_count,
             message_count: stats.message_count,
             oversize,
@@ -2746,7 +2755,7 @@ fn split_recovered_job_with_interrupt_legacy(
             index: part_index,
             filename: filename.clone(),
             byte_len,
-            sha256: sha256.clone(),
+            sha256: Some(sha256.clone()),
             oversize,
         };
         let folder_count = saturating_len(input.store.folders.len());
@@ -2775,7 +2784,7 @@ fn split_recovered_job_with_interrupt_legacy(
             index: part_index,
             filename: filename.clone(),
             byte_len,
-            sha256: sha256.clone(),
+            sha256: Some(sha256.clone()),
             store_record_key: hex(&input.store.record_key),
             folder_count,
             message_count,
@@ -2813,7 +2822,7 @@ fn split_recovered_job_with_interrupt_legacy(
             index: part_index,
             filename,
             byte_len,
-            sha256,
+            sha256: Some(sha256),
             folder_count,
             message_count,
             oversize,
@@ -3540,7 +3549,7 @@ mod tests {
             inode: 2,
             size_bytes: 3,
             modified_at: "2026-07-19T00:00:00Z".to_owned(),
-            sha256: "a".repeat(64),
+            sha256: Some("a".repeat(64)),
         };
         let legacy = JobConfiguration {
             tool_compatibility_major: 0,
@@ -3652,7 +3661,7 @@ mod tests {
                     inode: 2,
                     size_bytes: 100,
                     modified_at: "2026-01-01T00:00:00Z".to_owned(),
-                    sha256: "a".repeat(64),
+                    sha256: Some("a".repeat(64)),
                 },
                 job_directory: "/private/job".to_owned(),
                 normal_items: 1,
@@ -3679,7 +3688,7 @@ mod tests {
                 index: 1,
                 filename: "part-0001.pst".to_owned(),
                 byte_len: 80,
-                sha256: "b".repeat(64),
+                sha256: Some("b".repeat(64)),
                 folder_count: 1,
                 message_count: 1,
                 oversize: false,

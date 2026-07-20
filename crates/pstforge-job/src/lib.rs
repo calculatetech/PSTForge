@@ -191,7 +191,8 @@ pub struct PublishedPart {
     pub index: u32,
     pub filename: String,
     pub byte_len: u64,
-    pub sha256: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sha256: Option<String>,
     pub oversize: bool,
 }
 
@@ -273,7 +274,8 @@ pub struct PartSidecar {
     pub index: u32,
     pub filename: String,
     pub byte_len: u64,
-    pub sha256: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sha256: Option<String>,
     pub store_record_key: String,
     pub folder_count: u64,
     pub message_count: u64,
@@ -300,7 +302,8 @@ pub struct JobSourceIdentity {
     pub inode: u64,
     pub size_bytes: u64,
     pub modified_at: String,
-    pub sha256: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sha256: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -2422,6 +2425,24 @@ impl DurableCatalogSink {
         )
     }
 
+    pub fn publish_constructed_part_interruptible(
+        &mut self,
+        staged_filename: &str,
+        part: &PublishedPart,
+        sidecar: &PartSidecar,
+        item_keys: &[String],
+        interrupted: &AtomicBool,
+    ) -> Result<(), JobError> {
+        self.publish_part_with_interrupt(
+            staged_filename,
+            part,
+            sidecar,
+            item_keys,
+            Some(interrupted),
+            false,
+        )
+    }
+
     fn publish_validated_part_with_interrupt(
         &mut self,
         staged_filename: &str,
@@ -2430,11 +2451,32 @@ impl DurableCatalogSink {
         item_keys: &[String],
         interrupted: Option<&AtomicBool>,
     ) -> Result<(), JobError> {
+        self.publish_part_with_interrupt(
+            staged_filename,
+            part,
+            sidecar,
+            item_keys,
+            interrupted,
+            true,
+        )
+    }
+
+    fn publish_part_with_interrupt(
+        &mut self,
+        staged_filename: &str,
+        part: &PublishedPart,
+        sidecar: &PartSidecar,
+        item_keys: &[String],
+        interrupted: Option<&AtomicBool>,
+        verify_content: bool,
+    ) -> Result<(), JobError> {
         self.commit_candidate_batch()?;
         validate_part_record(part)?;
         validate_sidecar(part, sidecar)?;
         let staged = self.staged_part_path(staged_filename)?;
-        verify_part_artifact(&staged, part, interrupted)?;
+        if verify_content {
+            verify_part_artifact(&staged, part, interrupted)?;
+        }
         check_interrupted(interrupted)?;
         let final_path = self.parts.join(&part.filename);
         let sidecar_filename = part.filename.trim_end_matches(".pst").to_owned() + ".json";
@@ -2458,7 +2500,9 @@ impl DurableCatalogSink {
         )?;
         sync_file(&self._parts_directory, &self.parts)?;
         check_interrupted(interrupted)?;
-        verify_part_artifact(&final_path, part, interrupted)?;
+        if verify_content {
+            verify_part_artifact(&final_path, part, interrupted)?;
+        }
         check_interrupted(interrupted)?;
         rename_noclobber(
             &self._partial_directory,
@@ -4053,9 +4097,9 @@ fn create_schema(connection: &Connection) -> Result<(), JobError> {
             part_index INTEGER PRIMARY KEY CHECK(part_index > 0),\
             filename TEXT NOT NULL UNIQUE,\
             byte_len INTEGER NOT NULL CHECK(byte_len > 0),\
-            sha256 TEXT NOT NULL CHECK(\
+            sha256 TEXT CHECK(sha256 IS NULL OR (\
                 length(sha256) = 64 AND sha256 NOT GLOB '*[^0-9a-f]*'\
-            ),\
+            )),\
             oversize INTEGER NOT NULL CHECK(oversize IN (0, 1)),\
             sidecar_json TEXT NOT NULL\
          ) STRICT;\
@@ -4265,11 +4309,12 @@ fn validate_part_record(part: &PublishedPart) -> Result<(), JobError> {
             .and_then(|name| name.to_str())
             != Some(part.filename.as_str())
         || !part.filename.ends_with(".pst")
-        || part.sha256.len() != 64
-        || !part
-            .sha256
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        || part.sha256.as_ref().is_some_and(|sha256| {
+            sha256.len() != 64
+                || !sha256
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        })
     {
         return Err(JobError::Integrity(
             "invalid published part accounting record".to_owned(),
@@ -4911,6 +4956,9 @@ fn verify_part_artifact(
             part.filename
         )));
     }
+    let Some(expected) = part.sha256.as_deref() else {
+        return Ok(());
+    };
     let mut hasher = Sha256::new();
     let mut buffer = vec![0_u8; 1024 * 1024];
     loop {
@@ -4925,7 +4973,7 @@ fn verify_part_artifact(
         }
         hasher.update(&buffer[..read]);
     }
-    if digest_hex(hasher.finalize().as_slice()) != part.sha256 {
+    if digest_hex(hasher.finalize().as_slice()) != expected {
         return Err(JobError::Integrity(format!(
             "published part {} failed SHA-256 validation",
             part.filename
@@ -5358,7 +5406,7 @@ mod tests {
             inode: 2,
             size_bytes: 3,
             modified_at: "2026-07-16T00:00:00Z".to_owned(),
-            sha256: "a".repeat(64),
+            sha256: Some("a".repeat(64)),
         };
         let configuration = JobConfiguration {
             tool_compatibility_major: 0,
@@ -5398,7 +5446,7 @@ mod tests {
             Err(JobError::ResumeMismatch("execution mode"))
         ));
         let mut wrong_source = source.clone();
-        wrong_source.sha256 = "b".repeat(64);
+        wrong_source.sha256 = Some("b".repeat(64));
         assert!(matches!(
             DurableCatalogSink::validate_resume(&job, &wrong_source, &configuration),
             Err(JobError::ResumeMismatch("source identity or SHA-256"))
@@ -5434,7 +5482,7 @@ mod tests {
             inode: 2,
             size_bytes: 3,
             modified_at: "2026-07-16T00:00:00Z".to_owned(),
-            sha256: "a".repeat(64),
+            sha256: Some("a".repeat(64)),
         };
         let configuration = JobConfiguration {
             tool_compatibility_major: 0,
@@ -5564,7 +5612,7 @@ mod tests {
             inode: 2,
             size_bytes: 3,
             modified_at: "2026-07-16T00:00:00Z".to_owned(),
-            sha256: "a".repeat(64),
+            sha256: Some("a".repeat(64)),
         };
         let configuration = JobConfiguration {
             tool_compatibility_major: 0,
@@ -5639,7 +5687,7 @@ mod tests {
             inode: 2,
             size_bytes: 3,
             modified_at: "2026-07-16T00:00:00Z".to_owned(),
-            sha256: "a".repeat(64),
+            sha256: Some("a".repeat(64)),
         };
         let configuration = JobConfiguration {
             tool_compatibility_major: 0,
@@ -6494,7 +6542,7 @@ mod tests {
             index: 1,
             filename: "part-0001.pst".to_owned(),
             byte_len: 1024,
-            sha256: digest_hex(Sha256::digest(&part_bytes).as_slice()),
+            sha256: Some(digest_hex(Sha256::digest(&part_bytes).as_slice())),
             oversize: false,
         };
         let interrupted = AtomicBool::new(true);
@@ -6796,7 +6844,7 @@ mod tests {
                 index: 1,
                 filename: "part-0001.pst".to_owned(),
                 byte_len: bytes.len() as u64,
-                sha256: digest_hex(Sha256::digest(bytes).as_slice()),
+                sha256: Some(digest_hex(Sha256::digest(bytes).as_slice())),
                 oversize: false,
             };
             let sidecar = PartSidecar {

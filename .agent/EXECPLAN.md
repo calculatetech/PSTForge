@@ -2813,12 +2813,58 @@ not modified.
       `.agent/test-results/1784540039-v045-direct-single-r9` and
       `.agent/test-results/1784541051-v045-direct-single-r10`; the failed job
       directories contain no published PST and are removed after diagnosis.
+    - [x] Removed runtime source/output digest passes and output-reader
+      validation from the default direct path. Direct source identity now
+      carries no SHA-256; supervised workers match stable descriptor/path
+      metadata without hashing. Restartable source and part identities retain
+      SHA-256. Direct manifests represent an uncalculated part digest as absent,
+      and publication performs no content reread.
+    - [x] Replaced the large-file reopen/rebuild with construction-time
+      AMap/PMap/FMap/FPMap, DList, header free-map, free-count, and valid-status
+      serialization. The writer performs one final file `fsync`; the job layer
+      then uses same-filesystem atomic renames and directory `fsync` without
+      rewriting the PST. The 129 MiB attachment regression crosses recurring
+      FMap regions and passes the independent writer readers. The writer, core,
+      and job suites pass, and the fast gate is retained at
+      `.agent/test-results/1784552328-fast`.
+    - [x] Added Linux source mutation protection before parsing: a read lease
+      where supported, plus nonblocking whole-file OFD record and `flock`
+      shared locks. A process-scoped POSIX record lock is used only when OFD
+      locking is unavailable. `SIGIO` lease breaks feed the existing interrupt
+      supervisor; conflicting locks refuse recovery, and unsupported leases
+      retain both advisory protections plus final descriptor/path identity
+      checks. Focused `flock` and record-lock conflict tests and the fast gate
+      pass at `.agent/test-results/1784552889-fast`.
+    - [x] The first post-change full corpus run exposed ordinary attachment
+      payloads being streamed before their duplicate `PR_ATTACH_DATA_BIN`
+      property in metadata/writer order. libpff shares stream state between
+      those views, so the later property read returned zero bytes and falsely
+      marked document and OLE candidates partial. Non-embedded attachment
+      properties are again read before attachment payloads; embedded-message
+      properties remain deferred only for the recursive writer ordering they
+      require. Direct document and OLE fidelity cases now pass. Legacy
+      determinism and interruption/resume cases explicitly select
+      `--restartable`, matching the 0.4.5 CLI contract.
+    - [x] The construction, publication, source-protection, optional-digest,
+      dynamic NAMEID/folder, and attachment-order checkpoint passed the
+      canonical full gate at `.agent/test-results/1784555196-full`, including
+      all 26 external corpus cases and independent `pffinfo`/`readpst`
+      acceptance. A fresh focused adversarial review reported no blocker or
+      high-severity milestone-relevant findings.
+    - [ ] Collapse the remaining metadata catalog and payload replay into one
+      libpff traversal. The current direct path no longer hashes either worker
+      open, but still traverses the source once for bounded metadata and again
+      for payloads. Implement a two-phase candidate protocol within one native
+      traversal: emit complete bounded candidate metadata, choose the part,
+      then stream its payload exactly once.
   - [ ] Checkpoint 4: complete direct publication and failure behavior. Keep
-    one same-filesystem active PST temporary, independently validate and fsync
-    it, atomically rename it into `parts/`, preserve finalized parts on
+    one same-filesystem active PST temporary, construct every documented PST
+    relationship and allocation structure before one final file `fsync`, then
+    atomically rename it into `parts/` without a runtime reopen, output hash,
+    or reader-validation pass. Preserve finalized parts on
     interruption, mark the direct job terminal partial, refuse resume, and
     require a new empty output directory for another attempt. Add disk
-    exhaustion, worker crash, signal, output conflict, validator failure, and
+    exhaustion, worker crash, signal, output conflict, construction failure, and
     source-identity recheck tests.
   - [ ] Checkpoint 5: optimize the explicit restartable path without changing
     its recovery semantics. Buffer worker protocol control traffic and payload
@@ -2833,7 +2879,7 @@ not modified.
   - [ ] Checkpoint 7: run the canonical full gate and first qualify the 19 GB
     source as one default-direct PST by selecting a part limit above its
     recovered output size. Require exact 37,402-to-37,402 candidate assignment,
-    unchanged source identity/SHA-256, less than 2 GiB RSS, no more than one
+    unchanged descriptor/path identity, less than 2 GiB RSS, no more than one
     minute per source GiB, a clean ScanPST result, and Outlook content/folder
     acceptance before testing boundary packing. Then run the 4 GiB direct
     split regression and explicit `--restartable` mode; require identical
@@ -2854,7 +2900,8 @@ not modified.
     restartable mode and refuse incompatible combinations before creating the
     output directory.
   - [ ] Write only the active PST part to a same-filesystem temporary file
-    beside its destination. Validate and `fsync` it, then publish with atomic
+    beside its destination. Complete it by construction and `fsync` it, then
+    publish with atomic
     rename; never rewrite the completed dataset to move from temporary to
     final storage, including disk-to-disk recovery paths.
   - [ ] Bound parser-to-writer queues, candidate metadata, attachment chunks,
@@ -2864,7 +2911,7 @@ not modified.
     run requires a different empty output directory. This prevents duplicate
     candidate publication without retaining recovered payloads.
   - [ ] Report logical source bytes, bytes written to active PST temporaries,
-    finalized output bytes, validator read bytes where measurable, peak
+    finalized output bytes, zero production validator reads, peak
     temporary allocation, and peak RSS. Prove the default path avoids one
     readable-mailbox-sized spool write and allocation.
   - [ ] Preserve the 0.4.4 exact 37,402-to-37,402 reconciliation, one
@@ -4681,7 +4728,8 @@ not modified.
   payload pack. Deleting a spool after success does not
   reduce device writes and therefore is not an acceptable implementation of
   streaming mode. Both modes build each PST under a private name on the output
-  filesystem, `fsync` and independently validate it, and publish it with an
+  filesystem, complete it by documented construction, `fsync` it once, and
+  publish it with an
   atomic no-replace rename that never falls back to a cross-filesystem copy.
   Report the selected mode plus conservative estimated and measured temporary
   writes/disk use. Direct mode retains bounded per-candidate accounting,
@@ -4699,6 +4747,37 @@ not modified.
   recovery policy. The first scale acceptance is one direct PST from the 19 GB
   source with exact 1:1 content accounting and clean ScanPST/Outlook results.
 
+- Decision: Direct mode performs one source-content traversal and one
+  destination PST construction. It does not pre-hash source bytes, rehash
+  output bytes, reopen output to rebuild allocation maps, or invoke internal or
+  independent PST readers before publication. The writer must emit final NBT,
+  BBT, allocation maps, density list, header, and all client relationships
+  correctly as bytes land. It then performs one file `fsync`, an atomic
+  no-replace rename, and a directory `fsync`. Independent validation remains a
+  mandatory CI, adversarial-review, ScanPST, Outlook, and MailPlus acceptance
+  layer, not a production transformation stage. Restartable mode retains
+  source and payload SHA-256 because persisted state must be matched on a later
+  invocation.
+  Rationale: Runtime self-reading cannot make a structurally incorrect writer
+  trustworthy and multiplied the 19 GB job's reads and elapsed time. A direct
+  job has no resume state whose identity requires a content digest.
+  Date/Author: 2026-07-20 / human owner direction after the 19 GB r11 timing
+  analysis.
+
+- Decision: Hold the source through one read-only, no-follow descriptor and
+  request every applicable Linux read-side protection: a kernel read lease,
+  whole-file open-file-description record read lock, and shared file lock. A
+  process-scoped POSIX record lock is used only when OFD locking is unavailable.
+  A lease-break signal interrupts the supervised job. Unsupported lease
+  semantics are reported and fall back to the advisory protections; a
+  conflicting lock or existing writer is a refusal. Recheck descriptor/path
+  device, inode, size, mtime, and ctime before publication in all cases.
+  Rationale: A read lease prevents new write opens on supporting local
+  filesystems, while OFD/flock locks protect against cooperating software.
+  Linux cannot make advisory locks constrain an arbitrary writer, so unchanged
+  identity remains the final mixed-snapshot guard.
+  Date/Author: 2026-07-20 / human owner direction.
+
 - Decision: A direct full-payload worker failure receives at most three clean
   parser attempts. Finalized parts and terminal candidate classifications are
   drained on a later attempt; the unpublished active part is discarded and
@@ -4711,19 +4790,21 @@ not modified.
   published candidates or reintroducing payload-spool write amplification.
   Date/Author: 2026-07-20 / clean-context adversarial review.
 
-- Decision: Hash the complete source once at invocation open, match that hash
-  before trusting resume state, and use held-descriptor/path identity including
-  Linux ctime for the completion recheck instead of rereading the entire source
-  for a second SHA-256.
+- Decision: In restartable mode, hash the complete source once at invocation
+  open, match that hash before trusting resume state, and use
+  held-descriptor/path identity including Linux ctime for the completion
+  recheck instead of rereading the entire source for a second SHA-256. Direct
+  mode does not perform this pre-hash.
   Rationale: PSTForge never writes through the held read-only descriptor. Any
   filesystem-mediated content or metadata write changes ctime even when an
   actor restores the original size and mtime. Comparing device, inode, size,
   mtime, and ctime on both the held descriptor and pathname therefore detects
   an in-run source change without another 19/50/83 GB read. Full SHA-256 remains
-  mandatory before recovery and on every later invocation before a durable job
-  is trusted.
+  mandatory before restartable recovery and on every later invocation before a
+  durable job is trusted.
   Date/Author: 2026-07-19 / 0.4.3 measured resume optimization under the
-  repository's source-identity recheck contract.
+  repository's source-identity recheck contract; narrowed 2026-07-20 by human
+  owner direction to restartable execution.
 
 - Decision: On durable open, hash-verify payload blobs only when at least one
   `pending`, `spooled`, or `failed` candidate can still consume them. Continue

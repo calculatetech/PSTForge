@@ -396,7 +396,7 @@ fn write_info(output: &mut dyn Write, report: &InfoReport) -> Result<(), std::io
 fn write_verify(output: &mut dyn Write, report: &VerifyReport) -> Result<(), std::io::Error> {
     writeln!(output, "PSTForge verification")?;
     writeln!(output, "Source: {}", report.source.canonical_path)?;
-    writeln!(output, "SHA-256: {}", report.source.sha256)?;
+    write_source_hash(output, report.source.sha256.as_deref())?;
     writeln!(output, "Size: {} bytes", report.source.size_bytes)?;
     writeln!(output, "Format: {}", format_name(report.pst.format))?;
     writeln!(output, "Content type: {}", report.pst.content_type)?;
@@ -463,7 +463,7 @@ fn write_verify(output: &mut dyn Write, report: &VerifyReport) -> Result<(), std
 fn write_recovery(output: &mut dyn Write, report: &RecoveryReport) -> Result<(), std::io::Error> {
     writeln!(output, "PSTForge recovery")?;
     writeln!(output, "Source: {}", report.source.canonical_path)?;
-    writeln!(output, "SHA-256: {}", report.source.sha256)?;
+    write_source_hash(output, report.source.sha256.as_deref())?;
     writeln!(output, "Job: {}", report.job_directory)?;
     writeln!(output, "Mode: {}", report.mode)?;
     writeln!(output, "Normal items: {}", report.normal_items)?;
@@ -514,7 +514,7 @@ fn write_recovery(output: &mut dyn Write, report: &RecoveryReport) -> Result<(),
 fn write_split(output: &mut dyn Write, report: &SplitReport) -> Result<(), std::io::Error> {
     writeln!(output, "PSTForge split")?;
     writeln!(output, "Source: {}", report.recovery.source.canonical_path)?;
-    writeln!(output, "SHA-256: {}", report.recovery.source.sha256)?;
+    write_source_hash(output, report.recovery.source.sha256.as_deref())?;
     writeln!(output, "Job: {}", report.recovery.job_directory)?;
     writeln!(
         output,
@@ -554,7 +554,7 @@ fn write_split(output: &mut dyn Write, report: &SplitReport) -> Result<(), std::
             "  {}: {} bytes, SHA-256 {}, messages {}, folders {}, oversize {}, partial {}",
             part.filename,
             part.byte_len,
-            part.sha256,
+            part.sha256.as_deref().unwrap_or("not calculated"),
             part.message_count,
             part.folder_count,
             yes_no(part.oversize),
@@ -603,7 +603,7 @@ fn parse_byte_size(value: &str) -> Result<u64, String> {
 
 fn write_common(output: &mut dyn Write, report: &InfoReport) -> Result<(), std::io::Error> {
     writeln!(output, "Source: {}", report.source.canonical_path)?;
-    writeln!(output, "SHA-256: {}", report.source.sha256)?;
+    write_source_hash(output, report.source.sha256.as_deref())?;
     writeln!(output, "Size: {} bytes", report.source.size_bytes)?;
     writeln!(output, "Modified: {}", report.source.modified_at)?;
     writeln!(output, "Content type: {}", report.pst.content_type)?;
@@ -629,6 +629,13 @@ fn write_common(output: &mut dyn Write, report: &InfoReport) -> Result<(), std::
         yes_no(report.source_unchanged)
     )?;
     Ok(())
+}
+
+fn write_source_hash(output: &mut dyn Write, sha256: Option<&str>) -> Result<(), std::io::Error> {
+    match sha256 {
+        Some(value) => writeln!(output, "SHA-256: {value}"),
+        None => writeln!(output, "SHA-256: not calculated (direct mode)"),
+    }
 }
 
 fn format_name(format: FileFormat) -> &'static str {

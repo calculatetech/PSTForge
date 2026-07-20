@@ -63,6 +63,79 @@ pub struct RawPffMetadata {
     pub corrupted: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReadLease {
+    Acquired,
+    Unsupported(i32),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OfdReadLock {
+    Acquired,
+    Unsupported(i32),
+}
+
+/// Acquires a nonblocking whole-file Linux open-file-description read lock.
+///
+/// Unlike a process-scoped POSIX record lock, this lock remains associated
+/// with this open file description until its last descriptor is closed.
+pub fn acquire_ofd_read_lock(file: BorrowedFd<'_>) -> std::io::Result<OfdReadLock> {
+    // SAFETY: `lock` describes the whole file from offset zero, and `file` is a
+    // live borrowed descriptor. `fcntl` only reads this initialized structure.
+    let result = unsafe {
+        let mut lock: libc::flock = std::mem::zeroed();
+        lock.l_type = libc::F_RDLCK as _;
+        lock.l_whence = libc::SEEK_SET as _;
+        lock.l_start = 0;
+        lock.l_len = 0;
+        libc::fcntl(file.as_raw_fd(), libc::F_OFD_SETLK, &lock)
+    };
+    if result == 0 {
+        return Ok(OfdReadLock::Acquired);
+    }
+    let error = std::io::Error::last_os_error();
+    let code = error.raw_os_error().unwrap_or(libc::EIO);
+    if matches!(code, libc::EINVAL | libc::ENOSYS | libc::EOPNOTSUPP) {
+        Ok(OfdReadLock::Unsupported(code))
+    } else {
+        Err(error)
+    }
+}
+
+/// Requests a Linux read lease without exposing the raw `fcntl` boundary.
+///
+/// The caller must arrange `SIGIO` handling before calling this function and
+/// must retain `file` for the complete protected operation.
+pub fn acquire_read_lease(file: BorrowedFd<'_>) -> std::io::Result<ReadLease> {
+    // SAFETY: `file` is a live borrowed descriptor and F_SETLEASE consumes only
+    // the integer descriptor and constant third argument.
+    let result = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_SETLEASE, libc::F_RDLCK) };
+    if result == 0 {
+        return Ok(ReadLease::Acquired);
+    }
+    let error = std::io::Error::last_os_error();
+    let code = error.raw_os_error().unwrap_or(libc::EIO);
+    if matches!(
+        code,
+        libc::EINVAL | libc::ENOSYS | libc::EOPNOTSUPP | libc::EPERM
+    ) {
+        Ok(ReadLease::Unsupported(code))
+    } else {
+        Err(error)
+    }
+}
+
+pub fn release_read_lease(file: BorrowedFd<'_>) -> std::io::Result<()> {
+    // SAFETY: `file` is a live borrowed descriptor and F_SETLEASE consumes only
+    // the integer descriptor and constant third argument.
+    let result = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_SETLEASE, libc::F_UNLCK) };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InventoryIssue {
     pub node_id: Option<u32>,

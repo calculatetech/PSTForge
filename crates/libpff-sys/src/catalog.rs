@@ -1219,11 +1219,11 @@ fn stream_attachments(
                 })?;
         let traversal_order = sink.traversal_order();
         let writer_order = traversal_order == TraversalOrder::Writer;
-        let embedded_first = traversal_order != TraversalOrder::Source;
-        if !embedded_first {
+        let embedded_attachment = attachment_type == Some(i32::from(b'i'));
+        let defer_properties = embedded_attachment && traversal_order != TraversalOrder::Source;
+        if !defer_properties {
             stream_attachment_properties(&attachment, message_id, index_u32, sink, catalog)?;
         }
-        let embedded_attachment = attachment_type == Some(i32::from(b'i'));
         if !embedded_attachment && !reference_attachment {
             let result = data_size
                 .ok_or(PffError::Native {
@@ -1237,7 +1237,7 @@ fn stream_attachments(
                 Ok(actual) => actual,
                 Err(error @ PffError::Sink { .. }) => return Err(error),
                 Err(error) => {
-                    if embedded_first {
+                    if defer_properties {
                         stream_attachment_properties(
                             &attachment,
                             message_id,
@@ -1286,7 +1286,7 @@ fn stream_attachments(
                 Ok(embedded) => embedded,
                 Err(error @ PffError::Sink { .. }) => return Err(error),
                 Err(error) => {
-                    if embedded_first {
+                    if defer_properties {
                         stream_attachment_properties(
                             &attachment,
                             message_id,
@@ -1341,7 +1341,7 @@ fn stream_attachments(
                 }
                 Ok(embedded_work) => queued_embedded = Some(embedded_work),
                 Err(error) => {
-                    if embedded_first {
+                    if defer_properties {
                         stream_attachment_properties(
                             &attachment,
                             message_id,
@@ -1368,7 +1368,7 @@ fn stream_attachments(
                 }
             }
         }
-        if embedded_first {
+        if defer_properties {
             stream_attachment_properties(&attachment, message_id, index_u32, sink, catalog)?;
         }
         emit(
