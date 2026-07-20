@@ -2721,6 +2721,29 @@ not modified.
       breadth. Worker supervision contains native allocation failure. Wider
       pending-handle budgeting remains measurable parser hardening, not a
       reason to discard the additional readable children recovered here.
+    - [x] Removed quadratic final-size planning from the single-part direct
+      path. Qualification r6 spent 19:07 producing only a 3.54 GiB active PST
+      while one supervisor core remained saturated and the NVMe device was
+      mostly idle. The direct loop had rebuilt the finalized tables and B-tree
+      plan twice for every appended message, making final-size calculation
+      O(n²) in the message count. When the requested part limit is at least the
+      source file size, PSTForge now performs one metadata-only, whole-part
+      allocation projection, rolls that projected state back without touching
+      the temporary PST, preflights disk space once, streams every accepted
+      payload once, and verifies one final projection before publication.
+      Projection and actual writing use the same writer allocation path; any
+      byte-length divergence blocks publication. If the complete projected PST
+      does not fit, the existing exact incremental split path remains active.
+      A two-message direct regression proves that projection opens no payload,
+      changes no temporary-file metadata, rolls back to the initial private
+      state, and predicts the exact finalized byte length. The writer and core
+      suites pass (99 writer tests plus one ignored multi-gigabyte case, and
+      83 core tests), and the canonical fast gate passed at
+      `.agent/test-results/1784537731-fast`. A fresh clean-context adversarial
+      review found no blocker or high milestone-relevant issue in hard-limit
+      enforcement, projection/write parity, payload isolation, memory bounds,
+      cleanup, retry behavior, disk preflight, interruption, or publication
+      safety.
   - [ ] Checkpoint 4: complete direct publication and failure behavior. Keep
     one same-filesystem active PST temporary, independently validate and fsync
     it, atomically rename it into `parts/`, preserve finalized parts on
@@ -2834,6 +2857,19 @@ not modified.
   the existing source-controlled breadth.
   Evidence: `.agent/test-results/1784536000-v045-direct-single-r6`, r5/r6
   ledger comparison, and controlled `SIGTERM` at 19:07.
+
+- Observation: Exact per-message final-size projection became the dominant
+  cost in a large single direct PST. Each candidate caused the writer to plan
+  final folders, tables, and B-trees for all messages accepted so far, and the
+  real append repeated that projection. This is O(n²) CPU work even though
+  payload writing itself is sequential. During r6 one supervisor core remained
+  saturated while active-PST throughput decayed below 3 MiB/s on a host with
+  idle multi-GiB/s NVMe capacity. One whole-part projection followed by one
+  streaming write reduces this planning work to O(n) for the single-output
+  qualification without increasing payload retention or write amplification.
+  Evidence: `.agent/test-results/1784536000-v045-direct-single-r6`, process and
+  disk telemetry from that run, and the whole-part direct projection
+  regression.
 
 - Observation: The 0.4.2 fidelity expansion regressed a cold 19 GB split from
   approximately ten minutes in 0.4.1 to more than 57 minutes without
@@ -3566,6 +3602,21 @@ not modified.
   the recovery option without charging every run. Compact accounting remains
   necessary for trust, privacy-safe reporting, and one-to-one reconciliation.
   Date/Author: 2026-07-19 / project owner direction and closeout review.
+
+- Decision: Use one exact whole-part projection when the requested part limit
+  can contain the source file; otherwise retain exact incremental split
+  projection until a separately qualified batched boundary algorithm replaces
+  it.
+  Rationale: A recovered PST cannot exceed the source-size limit check without
+  first failing this fast eligibility test, so the optimization cannot weaken
+  the requested hard maximum. The projection consumes only bounded catalog
+  metadata and writer allocation state, opens no payload streams, and writes
+  no PST blocks. Actual output still streams once to a same-filesystem
+  temporary, is compared with the projected final EOF, independently
+  validated, synced, and atomically published. This removes the measured O(n²)
+  planning defect for the immediate single-file acceptance while leaving the
+  already-qualified 4 GiB split boundary behavior unchanged.
+  Date/Author: 2026-07-20 / measured r6 evidence and Codex implementation.
 
 - Decision: Reference attachment classification comes from the readable
   `PidTagAttachMethod` property, not libpff's narrower convenience type API.

@@ -1142,6 +1142,107 @@ fn projection_batch_byte_target(maximum_pst_bytes: u64, private_file_eof: u64) -
 }
 
 #[allow(clippy::too_many_arguments)]
+fn project_direct_single_part(
+    source_bytes: u64,
+    job: &mut DurableCatalogSink,
+    spooled_folders: &[pstforge_job::SpooledFolder],
+    source_folders: &crate::CanonicalFolderSet,
+    named_properties: &NamedPropertyCatalog,
+    source_sha256: &str,
+    mode_name: &str,
+    maximum_pst_bytes: u64,
+    worker_executable: &Path,
+    interrupted: &AtomicBool,
+) -> Result<Option<u64>, SplitError> {
+    if maximum_pst_bytes < source_bytes {
+        return Ok(None);
+    }
+    let mut transaction = begin_direct_part(
+        job,
+        source_folders,
+        named_properties,
+        source_sha256,
+        mode_name,
+        maximum_pst_bytes,
+        1,
+        worker_executable,
+    )?;
+    let checkpoint = transaction.writer.begin_batch();
+    let mut candidate_rowid = 0_i64;
+    loop {
+        let Some(candidate) = job.next_direct_top_level_candidate(candidate_rowid)? else {
+            break;
+        };
+        candidate_rowid = candidate.rowid;
+        if job.candidate_is_terminal(&candidate.item_key)? {
+            continue;
+        }
+        let mail = load_canonical_mail_tree_from_folders_interruptible(
+            job,
+            spooled_folders,
+            &candidate.item_key,
+            interrupted,
+        )?;
+        let relevant_folders = source_folders_for_mail(&source_folders.folders, &mail);
+        let mut input = match build_part_writer_input_with_folders_interruptible(
+            job,
+            &[&mail],
+            &relevant_folders,
+            PartBuildOptions {
+                source_sha256,
+                recovery_mode: mode_name,
+                maximum_pst_bytes,
+                part_index: 1,
+                omitted_folders: 0,
+            },
+            interrupted,
+        ) {
+            Ok(input) => input,
+            Err(error) if candidate_rejection_category(&error).is_some() => {
+                let rejections = translation_rejections(&mail, &error)
+                    .ok_or_else(|| SplitError::Translation(error))?;
+                job.mark_candidate_rejections(&rejections)?;
+                continue;
+            }
+            Err(error) => return Err(error.into()),
+        };
+        if let Err(error) = validate_mail_store_input(&input.store) {
+            if matches!(error, WriterError::InputRejected(_)) {
+                let mut keys = Vec::new();
+                collect_item_keys(&mail, &mut keys);
+                job.mark_candidates_unsupported(
+                    &keys,
+                    CandidateRejectionCategory::WriterInputRejected,
+                )?;
+                continue;
+            }
+            return Err(error.into());
+        }
+        let (location, path, associated, message) = take_incremental_message(&mut input)?;
+        transaction
+            .writer
+            .append_message_direct_projection_deferred(
+                location,
+                &path,
+                associated,
+                &message,
+                interrupted,
+            )?;
+        if transaction.writer.private_file_eof() > maximum_pst_bytes {
+            transaction.writer.rollback_projected_batch(checkpoint)?;
+            return Ok(None);
+        }
+    }
+    if transaction.writer.message_count() == 0 {
+        transaction.writer.rollback_projected_batch(checkpoint)?;
+        return Ok(None);
+    }
+    let projected_file_eof = transaction.writer.projected_file_eof(interrupted)?;
+    transaction.writer.rollback_projected_batch(checkpoint)?;
+    Ok((projected_file_eof <= maximum_pst_bytes).then_some(projected_file_eof))
+}
+
+#[allow(clippy::too_many_arguments)]
 fn split_direct_recovered_job(
     source: &SourceFile,
     job: &mut DurableCatalogSink,
@@ -1227,6 +1328,24 @@ fn split_direct_recovered_job(
         .into_iter()
         .map(|(unit, _)| unit)
         .collect::<HashSet<_>>();
+    let single_part_projected_eof = project_direct_single_part(
+        source.identity().size_bytes,
+        job,
+        &spooled_folders,
+        &source_folders,
+        &named_properties,
+        &source.identity().sha256,
+        mode_name,
+        maximum_pst_bytes,
+        worker_executable,
+        interrupted,
+    )?;
+    if let Some(projected_file_eof) = single_part_projected_eof {
+        tracing::info!(
+            projected_file_eof,
+            "whole-part direct projection selected single-part streaming"
+        );
+    }
     let mut reports = Vec::new();
     let mut written_candidates = 0_u64;
     let mut any_partial = source_folders.omitted_folders != 0;
@@ -1347,44 +1466,22 @@ fn split_direct_recovered_job(
                             worker_executable,
                         )?);
                     }
-                    let mut expected_eof = active
-                        .as_mut()
-                        .ok_or(SplitError::TooManyParts)?
-                        .writer
-                        .project_message_direct_eof(
+                    let message_count = count_messages(&message);
+                    if let Some(projected_file_eof) = single_part_projected_eof {
+                        let transaction = active.as_mut().ok_or(SplitError::TooManyParts)?;
+                        if transaction.writer.message_count() == 0 {
+                            direct_part_space_preflight(transaction, projected_file_eof)?;
+                        }
+                        transaction.writer.append_message_direct_projected_part(
                             location,
                             &path,
                             associated,
-                            &message,
+                            message,
                             interrupted,
+                            &mut protocol,
                         )?;
-                    if expected_eof > maximum_pst_bytes
-                        && active
-                            .as_ref()
-                            .is_some_and(|transaction| transaction.writer.message_count() != 0)
-                    {
-                        let completed = finalize_direct_part(
-                            job,
-                            active.take().ok_or(SplitError::TooManyParts)?,
-                            maximum_pst_bytes,
-                            interrupted,
-                        )?;
-                        written_candidates =
-                            written_candidates.saturating_add(completed.message_count);
-                        any_partial |= completed.partial || completed.oversize;
-                        reports.push(completed);
-                        part_index = part_index.checked_add(1).ok_or(SplitError::TooManyParts)?;
-                        active = Some(begin_direct_part(
-                            job,
-                            &source_folders,
-                            &named_properties,
-                            &source.identity().sha256,
-                            mode_name,
-                            maximum_pst_bytes,
-                            part_index,
-                            worker_executable,
-                        )?);
-                        expected_eof = active
+                    } else {
+                        let mut expected_eof = active
                             .as_mut()
                             .ok_or(SplitError::TooManyParts)?
                             .writer
@@ -1395,19 +1492,58 @@ fn split_direct_recovered_job(
                                 &message,
                                 interrupted,
                             )?;
+                        if expected_eof > maximum_pst_bytes
+                            && active
+                                .as_ref()
+                                .is_some_and(|transaction| transaction.writer.message_count() != 0)
+                        {
+                            let completed = finalize_direct_part(
+                                job,
+                                active.take().ok_or(SplitError::TooManyParts)?,
+                                maximum_pst_bytes,
+                                interrupted,
+                            )?;
+                            written_candidates =
+                                written_candidates.saturating_add(completed.message_count);
+                            any_partial |= completed.partial || completed.oversize;
+                            reports.push(completed);
+                            part_index =
+                                part_index.checked_add(1).ok_or(SplitError::TooManyParts)?;
+                            active = Some(begin_direct_part(
+                                job,
+                                &source_folders,
+                                &named_properties,
+                                &source.identity().sha256,
+                                mode_name,
+                                maximum_pst_bytes,
+                                part_index,
+                                worker_executable,
+                            )?);
+                            expected_eof = active
+                                .as_mut()
+                                .ok_or(SplitError::TooManyParts)?
+                                .writer
+                                .project_message_direct_eof(
+                                    location,
+                                    &path,
+                                    associated,
+                                    &message,
+                                    interrupted,
+                                )?;
+                        }
+                        let transaction = active.as_mut().ok_or(SplitError::TooManyParts)?;
+                        direct_part_space_preflight(transaction, expected_eof)?;
+                        transaction.writer.append_message_direct_preflighted(
+                            location,
+                            &path,
+                            associated,
+                            message,
+                            expected_eof,
+                            interrupted,
+                            &mut protocol,
+                        )?;
                     }
-                    let message_count = count_messages(&message);
                     let transaction = active.as_mut().ok_or(SplitError::TooManyParts)?;
-                    direct_part_space_preflight(transaction, expected_eof)?;
-                    transaction.writer.append_message_direct_preflighted(
-                        location,
-                        &path,
-                        associated,
-                        message,
-                        expected_eof,
-                        interrupted,
-                        &mut protocol,
-                    )?;
                     transaction.stats.item_keys.append(&mut input.item_keys);
                     transaction
                         .stats
@@ -1449,6 +1585,16 @@ fn split_direct_recovered_job(
             worker.progress();
             worker.finish()?;
             if let Some(transaction) = active {
+                if let Some(expected_file_eof) = single_part_projected_eof {
+                    let actual_file_eof = transaction.writer.projected_file_eof(interrupted)?;
+                    if actual_file_eof != expected_file_eof {
+                        return Err(WriterError::InvalidStructure(format!(
+                            "whole-part direct projection diverged before publication: \
+                             expected {expected_file_eof}, got {actual_file_eof}"
+                        ))
+                        .into());
+                    }
+                }
                 let completed =
                     finalize_direct_part(job, transaction, maximum_pst_bytes, interrupted)?;
                 written_candidates = written_candidates.saturating_add(completed.message_count);

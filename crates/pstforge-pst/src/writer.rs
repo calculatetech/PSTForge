@@ -3751,6 +3751,27 @@ impl TransactionalMailStoreWriter {
         Ok(())
     }
 
+    /// Restore a batch that allocated only projected direct blocks.
+    pub fn rollback_projected_batch(
+        &mut self,
+        checkpoint: TransactionBatchCheckpoint,
+    ) -> Result<(), WriterError> {
+        if checkpoint.folder_lengths.len() != self.spec.folders.len() {
+            return Err(WriterError::InvalidStructure(
+                "transactional projection checkpoint does not match the writer layout".to_owned(),
+            ));
+        }
+        self.message_stream
+            .restore_projected_message(checkpoint.message_stream);
+        for (folder, (messages, associated_messages)) in
+            self.spec.folders.iter_mut().zip(checkpoint.folder_lengths)
+        {
+            folder.messages.truncate(messages);
+            folder.associated_messages.truncate(associated_messages);
+        }
+        Ok(())
+    }
+
     /// Append a message privately without calculating the finalized PST size.
     pub fn append_message_deferred(
         &mut self,
@@ -3784,15 +3805,15 @@ impl TransactionalMailStoreWriter {
         )
     }
 
-    /// Calculate the exact finalized size after a direct append without opening payload streams.
-    pub fn project_message_direct_eof(
+    /// Append one direct message to in-memory allocation state without opening payload streams.
+    pub fn append_message_direct_projection_deferred(
         &mut self,
         location: MailFolderLocation,
         path: &[String],
         associated: bool,
         message: &MessageSpec,
         interrupted: &AtomicBool,
-    ) -> Result<u64, WriterError> {
+    ) -> Result<(), WriterError> {
         check_interrupted(interrupted)?;
         validate_aggregate_properties(message)?;
         validate_message(message, 0)?;
@@ -3853,14 +3874,39 @@ impl TransactionalMailStoreWriter {
                 None,
                 true,
             )?;
-            self.projected_file_eof(interrupted)
+            Ok(())
         })();
-        if associated {
-            self.spec.folders[folder_index].associated_messages.pop();
-        } else {
-            self.spec.folders[folder_index].messages.pop();
+        if let Err(error) = result {
+            if associated {
+                self.spec.folders[folder_index].associated_messages.pop();
+            } else {
+                self.spec.folders[folder_index].messages.pop();
+            }
+            self.message_stream.restore_projected_message(checkpoint);
+            return Err(error);
         }
-        self.message_stream.restore_projected_message(checkpoint);
+        Ok(())
+    }
+
+    /// Calculate the exact finalized size after a direct append without opening payload streams.
+    pub fn project_message_direct_eof(
+        &mut self,
+        location: MailFolderLocation,
+        path: &[String],
+        associated: bool,
+        message: &MessageSpec,
+        interrupted: &AtomicBool,
+    ) -> Result<u64, WriterError> {
+        let checkpoint = self.begin_batch();
+        self.append_message_direct_projection_deferred(
+            location,
+            path,
+            associated,
+            message,
+            interrupted,
+        )?;
+        let result = self.projected_file_eof(interrupted);
+        self.rollback_projected_batch(checkpoint)?;
         result
     }
 
@@ -3893,6 +3939,19 @@ impl TransactionalMailStoreWriter {
             )));
         }
         Ok(completions)
+    }
+
+    /// Append a direct message after a whole-part projection has established capacity.
+    pub fn append_message_direct_projected_part(
+        &mut self,
+        location: MailFolderLocation,
+        path: &[String],
+        associated: bool,
+        message: MessageSpec,
+        interrupted: &AtomicBool,
+        source: &mut dyn DirectBlobSource,
+    ) -> Result<Vec<DirectBlobCompletion>, WriterError> {
+        self.append_message_direct(location, path, associated, message, interrupted, source)
     }
 
     fn append_message_deferred_from(
@@ -11770,6 +11829,77 @@ mod tests {
         writer.finalize(&NEVER_INTERRUPTED)?;
         assert_eq!(destination.metadata()?.len(), projected_file_eof);
         assert!(projected_file_eof > u64::try_from(payload_len)?);
+        Ok(())
+    }
+
+    #[test]
+    fn whole_part_direct_projection_is_byte_exact_and_does_not_touch_payloads()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let destination = directory.path().join("whole-part-direct.pst");
+        let fixture = FidelityStore::default();
+        let mut message = fixture.message.clone();
+        let payload = vec![0x5a; MAX_DATA_BLOCK_PAYLOAD * 2 + 31];
+        let sha256: [u8; 32] = Sha256::digest(&payload).into();
+        message.attachments[0].content = AttachmentContent::Direct(DirectBlobSpec {
+            id: 17,
+            byte_len: u64::try_from(payload.len())?,
+            sha256: Some(sha256),
+        });
+        let mut writer = direct_transaction_fixture(&destination, &message, &fixture)?;
+        let checkpoint = writer.begin_batch();
+        let before_projection = writer.temporary.file.metadata()?;
+        for _ in 0..2 {
+            writer.append_message_direct_projection_deferred(
+                MailFolderLocation::IpmSubtree,
+                &["Inbox".to_owned()],
+                false,
+                &message,
+                &NEVER_INTERRUPTED,
+            )?;
+        }
+        let projected_file_eof = writer.projected_file_eof(&NEVER_INTERRUPTED)?;
+        writer.rollback_projected_batch(checkpoint)?;
+        assert_eq!(writer.message_count(), 0);
+        assert_eq!(writer.private_file_eof(), INITIAL_FILE_EOF);
+        let after_projection = writer.temporary.file.metadata()?;
+        assert_eq!(
+            (
+                before_projection.len(),
+                before_projection.mtime(),
+                before_projection.mtime_nsec(),
+                before_projection.ctime(),
+                before_projection.ctime_nsec(),
+                before_projection.blocks(),
+            ),
+            (
+                after_projection.len(),
+                after_projection.mtime(),
+                after_projection.mtime_nsec(),
+                after_projection.ctime(),
+                after_projection.ctime_nsec(),
+                after_projection.blocks(),
+            )
+        );
+
+        let mut source = MemoryDirectSource::one(17, payload);
+        for _ in 0..2 {
+            writer.append_message_direct_projected_part(
+                MailFolderLocation::IpmSubtree,
+                &["Inbox".to_owned()],
+                false,
+                message.clone(),
+                &NEVER_INTERRUPTED,
+                &mut source,
+            )?;
+        }
+        assert_eq!(source.opened, [17, 17]);
+        assert_eq!(
+            writer.projected_file_eof(&NEVER_INTERRUPTED)?,
+            projected_file_eof
+        );
+        writer.finalize(&NEVER_INTERRUPTED)?;
+        assert_eq!(destination.metadata()?.len(), projected_file_eof);
         Ok(())
     }
 
