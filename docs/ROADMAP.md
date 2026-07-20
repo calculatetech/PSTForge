@@ -164,14 +164,43 @@ independent validity. First qualify the 19 GB source as one direct PST with
 exact 1:1 content accounting and ScanPST/Outlook acceptance, then retain the
 independently valid 4 GiB split regression.
 
-### 13. Version 0.5.0 - Operational UX and Debian Packaging
+### 13. Version 0.4.6 - Historical Corruption Recovery
+
+Close the 0.4 correctness series against the external acceptance archive.
+Treat every corrupt PST as an immutable source and its owner-supplied
+ScanPST-repaired PST as an independent comparison reference. Recover every
+pair that current libpff can read completely enough to compare into one direct
+Unicode PST, require internal validation plus `pffinfo`, and compare a one-pass
+semantic fingerprint covering placement, message classes, visible metadata,
+bodies, recipients, recovery-critical properties, attachments, and recursive
+embedded content. The repaired reference controls item multiplicity except for
+complete, exact source-readable additions from a manifest-pinned category it
+demonstrably drops or cannot read. Existing focused/full gates retain
+independent `readpst`, empty-folder, raw-property, and named-property coverage;
+do not repeat multi-gigabyte extraction for every historical pair.
+
+The comparison manifest lives outside the repository and pins both files by
+SHA-256. ScanPST-generated allocation identifiers and other structural
+rewrites are not byte-equality requirements. Any semantic difference must be
+reported by bounded category and resolved individually; committed evidence
+must not contain mailbox values or private paths. Delete disposable recovered
+outputs after retaining bounded conclusions. A source-readable supplement is
+case-specific and category-pinned; it may only add complete values
+demonstrably absent from the repaired reference while every other value remains
+controlled by that reference. Retain and explicitly defer a compact pair only
+when both source and repaired reference are unreadable in the required
+category. The accepted result is 16 passing pairs, including 50 exact
+source-proven associated additions, and three current-libpff cases reserved for
+the post-1.0 fork.
+
+### 14. Version 0.5.0 - Operational UX and Debian Packaging
 
 Finalize human and JSON reports, documented exit codes, privacy-preserving
 diagnostics, installation checks, and a reproducible Debian 13 x86_64 package.
 Verify operation with Debian's older supported `libpff` ABI as well as the
 newer Ubuntu development host package.
 
-### 14. Version 0.5.1 - GitHub CI and Private-Corpus Automation
+### 15. Version 0.5.1 - GitHub CI and Private-Corpus Automation
 
 The GitHub remote and approved documentation baseline are available. Add branch
 checks, scheduled security and fuzzing jobs, release automation, and an
@@ -179,14 +208,14 @@ explicitly invoked private self-hosted corpus runner that never uploads PST
 content or sensitive logs. This repository does not use pull requests, so
 required checks apply to milestone branches and pre-merge local gates.
 
-### 15. Version 0.6.0 - Interoperability Release Candidate
+### 16. Version 0.6.0 - Interoperability Release Candidate
 
 Freeze the candidate CLI and schemas, run the complete external corpus,
 exercise fault injection and resource limits, import generated parts into a
 test Synology MailPlus mailbox, and perform secondary Outlook checks. Resolve
 all blocker and high-severity adversarial review findings.
 
-### 16. Version 1.0.0 - MailPlus-Ready Release
+### 17. Version 1.0.0 - MailPlus-Ready Release
 
 Repeat the 50 GB recovery and MailPlus import rehearsal from a clean install,
 reproduce the Debian package, verify licenses and notices, finalize operator
@@ -196,6 +225,6 @@ only after explicit human approval.
 ## Beyond 1.0
 
 Post-1.0 candidates include selection by date range, partitioning by folder,
-additional packing policies, contacts and calendar items, EML, Maildir, PDF,
-other archival formats, and broader platform packaging. They do not delay the
-mail-to-PST recovery release.
+additional packing policies, EML, Maildir, PDF, other archival formats, and
+broader platform packaging. They do not delay the native-item-to-PST recovery
+release.

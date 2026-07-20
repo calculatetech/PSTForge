@@ -2497,7 +2497,7 @@ not modified.
     exactly to three source `attachment_missing` events rather than readable
     payload loss. The owner accepted the existing ScanPST/Outlook evidence and
     this final current-code reconciliation as completion of version 0.4.4.
-- [ ] Milestone 0.4.5: Direct-Write Performance.
+- [x] Milestone 0.4.5: Direct-Write Performance.
   - [x] Started `milestone/v0.4.5-direct-write` in sibling worktree
     `../pstforge-worktrees/v0.4.5-direct-write` from approved and pushed
     `main` commit `036fb53`.
@@ -3152,6 +3152,157 @@ not modified.
     serialization per normal part, independent readers, ScanPST/Outlook
     interoperability, less than 2 GiB RSS, and no more than one minute per
     source GiB on the 19 GB qualification.
+- [x] Milestone 0.4.6: Historical Corruption Recovery.
+  - [x] Started `milestone/v0.4.6-final-correctness` in sibling worktree
+    `../pstforge-worktrees/v0.4.6-final-correctness` from approved, merged, and
+    pushed `main` commit `709825d`.
+  - [x] Checkpoint 1: add a strict external repair-pair manifest and reusable
+    privacy-safe semantic comparator. Pin corrupt source and repaired reference
+    SHA-256 values; verify source identity before and after recovery through
+    the production no-atime source wrapper. Compare item multiplicity and
+    placement, associated and embedded ownership, visible metadata, recipients,
+    bodies, recovery-critical properties, attachment metadata/payload hashes,
+    and recursive content in one traversal. Existing focused/full gates retain
+    exact empty-folder, folder-class, raw/named-property, and `readpst`
+    coverage. Normalize only store-local identifiers and documented
+    writer/ScanPST structural values. Any source-readable supplement must be
+    explicitly category-pinned in the external case. Every repaired-reference
+    value in that category must remain present as a multiset member; the source
+    may only add demonstrably omitted values, while the repaired reference
+    continues to control all other categories. Repaired-reference reads are
+    strict except for the exact recognized associated-table failure. Recovering
+    source-readable associated items requires an explicit `associated items`
+    case supplement; its presence must exactly match observed surplus items.
+    Reference matches and associated surplus consume one shared source
+    multiset, so one source occurrence cannot authorize a generated duplicate,
+    including when value supplementation and associated recovery occur in the
+    same case. The sole repaired-reference native issue exception matches the
+    complete observed 11-line diagnostic, including the checked relationship
+    between folder and descriptor node IDs; substring, appended, or compound
+    diagnostics fail.
+    Folder identity includes the same-name sibling ordinal at every level so
+    duplicate sibling display names cannot collapse. A surplus associated item
+    must be in the exact ordinal-qualified folder whose repaired table is
+    unreadable and must independently match one complete source-readable item;
+    duplicates and invented values therefore fail. Generated catalogs admit no
+    read issue, unsupported item, or incomplete item; repaired and
+    damaged-supplement catalogs likewise reject unsupported items, and the
+    recovery report must state zero unsupported candidates. A damaged-source
+    supplement can contribute only a complete item and only the exact
+    manifest-pinned category set.
+  - [x] Checkpoint 2: inventory the acceptance archive into distinct semantic
+    cases rather than historical attempt count. Run the smallest pairs first,
+    one isolated direct one-part recovery at a time. Require internal
+    validation and `pffinfo` before a one-pass repaired-reference item/content
+    comparison; existing focused tests retain `readpst`, empty-folder, raw, and
+    named-property coverage. Delete disposable recovered outputs after bounded
+    evidence is retained. Do not request a separate human ScanPST run for
+    every historical sample.
+    The SHA-256-pinned external inventory contains 19 corrupt/repaired pairs.
+    Sixteen pass sequential release-mode direct recovery, `pffinfo`, source
+    immutability, repaired-reference item matching, and one-pass semantic
+    comparison. They contain 44,465 libpff-readable repaired-reference items;
+    PSTForge writes all of them plus 50 associated items recovered from the
+    exact tables that remain unreadable in three ScanPST-repaired references.
+    The early 0.2.1 fidelity reference drops four source-readable recipient
+    rows; PSTForge retains them and otherwise matches the source under the
+    documented UTF-8 normalization, so the source-readable supplement controls
+    that value-level difference. Every disposable generated output was deleted
+    between cases. Two synthetic OLE pairs remain separately pinned because
+    their malformed `0x3701` object references use invalid NID types; ScanPST
+    discards the object payload and its repaired files still expose no readable
+    attachment data/type through libpff. The early MailPlus r6 source and its
+    ScanPST-repaired reference both expose the same unreadable attachment table,
+    so current libpff cannot prove whether the otherwise matched single item has
+    complete attachment content. It is retained as a third unresolved pair
+    rather than accepted through the old generic attachment-count tolerance.
+    The pre-review harness state passed the
+    fast gate at `.agent/test-results/1784579419-fast`; review then required
+    addition-only source supplementation and explicit fallible scratch cleanup.
+    The focused supplement regression and fidelity repair case pass with the
+    corrections, the scratch directory is empty after the case, and the
+    intermediate corrected state passed the fast gate at
+    `.agent/test-results/1784579716-fast`. A later review required strict
+    repaired-reference issue handling, explicit associated-item authorization,
+    and shared source-multiset accounting. The 10,201-item focused case passes
+    those corrections with all 25 associated extras accounted for, and the
+    intermediate state passed the fast gate at
+    `.agent/test-results/1784580481-fast`. A subsequent review found that
+    hybrid and associated matching still used separate source multisets and
+    that the native issue exception was substring-based. Both ordinary and
+    hybrid duplicate-reuse regressions now pass; the exact-diagnostic regression
+    rejects appended or node-mismatched errors; and the 10,201-item case passes
+    again with 25 extras. The corrected state passes the fast gate at
+    `.agent/test-results/1784581131-fast`. A later review found silent
+    unsupported-item exclusion and best-effort cleanup on failing cases. All
+    strict catalogs and the command report now reject unsupported items.
+    Success and failure both pass through explicit fallible scratch cleanup;
+    the forced post-write failure regression confirms its temporary data is
+    removed, and the focused fidelity case remains clean with an empty scratch
+    directory. The corrected state passes the fast gate at
+    `.agent/test-results/1784581576-fast`. A later review correctly required
+    failure-path immutability verification and 0.4.5 restartable-schema
+    compatibility; both are implemented with a focused resume regression. Its
+    proposed zero-omission report gate is outside the owner-approved historical
+    acceptance scope: the repaired-reference item/semantic comparison controls
+    this checkpoint, while existing focused/full gates retain raw-property and
+    empty-folder coverage. The resulting state passes the fast gate at
+    `.agent/test-results/1784582086-fast`. Review then found a pre-scratch
+    immutability gap: repaired-reference catalog failure could return before
+    the post-read check. Preparation now always combines with source/reference
+    verification, scratch-creation failure verifies them again, and every
+    post-creation result retains the existing verification-plus-cleanup path.
+    The focused fidelity case and failure cleanup regression pass. Review found
+    one final early repaired-reference SHA mismatch return; both manifest hash
+    checks now use the pair verifier, and repaired-reference open failure
+    verifies the already-open source before returning. Review then found that a
+    source verification error short-circuited the repaired-reference check.
+    Both checks now always execute and combine their evidence. The complete
+    state passes the fast gate at `.agent/test-results/1784582785-fast`.
+    Final clean-context review returned `CLEAN`. The full historical batch then
+    proved 16 passing pairs and exposed MailPlus r6 as a third unresolved
+    native-reader case because both source and repaired reference have the same
+    unreadable attachment table. The first canonical full gate attempt at
+    `.agent/test-results/1784584558-full` passed every existing stage but
+    launched the new repair test without its separate manifest. A correctly
+    wired full gate was
+    stopped after 33 minutes when its debug-profile repair test had read about
+    220 GB and only reached the first large spooled reference; scratch was
+    empty after termination. The full gate now runs the external corpus in the
+    release profile, matching the already proven 16.5-minute bounded batch
+    instead of multiplying libpff and comparator cost in an unoptimized binary.
+    The corrected automation passes the fast gate at
+    `.agent/test-results/1784586891-fast`, clean-context review returned
+    `CLEAN`, and the release-profile canonical full gate passes at
+    `.agent/test-results/1784587009-full`. All solved corrupt/reference pairs,
+    their logs, and two repaired-only remnants were then deleted from the
+    external acceptance archive. The stale passing manifest and empty scratch
+    directory were removed; the three-case unresolved manifest and its compact
+    evidence remain. With those owner-directed private inputs removed, the
+    historical test skips only when both opt-in variables are absent and
+    rejects a partially configured invocation. Permanent focused/full coverage
+    remains unchanged. The post-cleanup state passes the fast gate at
+    `.agent/test-results/1784588212-fast`.
+  - [x] Checkpoint 3: resolve each mismatch as a focused correctness change.
+    Update writer conformance before writer behavior changes. Run focused tests,
+    the fast gate, clean-context adversarial review, and commit/push each
+    independently successful repair category. Pause for human interoperability
+    only when automated evidence cannot decide correctness.
+  - [x] Final gate: all 16 provable pairs pass recovery and semantic comparison,
+    all sources remain unchanged, and the three current-libpff native-reader
+    gaps are separately pinned for post-1.0 work. The canonical full gate passes
+    before cleanup. After cleanup, the ordinary canonical full gate passes
+    without historical repair variables at
+    `.agent/test-results/1784588932-full`; its permanent external corpus,
+    `pffinfo`, and `readpst` checks remain green while the deleted historical
+    suite skips as designed. Clean-context review challenged and rejected an
+    inapplicable request to hardcode the deleted private archive's 16-case and
+    50-addition totals into every future opt-in manifest; no blocker or high
+    finding remains. If writer changes warrant another human interoperability
+    check, provide one large consolidated test-only validation PST rather than
+    dozens of samples; do not expose PST merging as a product command or API.
+    Merge and push 0.4.6, remove its worktree, and begin 0.5.0 only after this
+    permanently closes the 0.4 series.
 - [ ] Milestone 0.5.0: Operational UX and Debian Packaging.
 - [ ] Milestone 0.5.1: GitHub CI and Private-Corpus Automation; the remote is
   reachable, and work begins after the approved baseline is pushed.
@@ -3948,6 +4099,52 @@ not modified.
   `large-qualification-20260717T204931Z`.
 
 ## Decision Log
+
+- Decision: The 0.4.6 historical-pair gate accepts documented partial-success
+  output when item/content comparison against the repaired reference succeeds
+  and no item is classified as unsupported. It does not require every pair to
+  report zero omitted folders, properties, or attachments.
+  Rationale: The owner explicitly limited this historical archive gate to
+  repaired-reference item counts and automated semantic comparison, with
+  existing focused/full tests retaining exact empty-folder, raw-property,
+  named-property, and independent-reader coverage. The early fidelity fixture,
+  for example, preserves the approved behavior while reporting six source
+  property omissions. Turning this checkpoint into universal raw-property
+  equivalence would contradict that acceptance decision and reopen completed
+  writer design work. Unsupported items remain prohibited because they can
+  disappear from both the semantic catalog and the output count.
+  Date/Author: 2026-07-20 / project owner item-count acceptance direction and
+  Codex review-scope challenge.
+
+- Decision: Retain the two historical synthetic OLE invalid-NID pairs and the
+  early MailPlus r6 unreadable-attachment-table pair as the only unresolved
+  0.4.6 native-reader cases, and defer them with the libpff fork until after
+  1.0. Remove solved corrupt/repaired pairs and their paired
+  ScanPST logs from the external acceptance archive only after the 0.4.6
+  harness checkpoint passes review and repository gates.
+  Rationale: Both corrupt objects encode `PidTagAttachDataObject` through NID
+  types that are invalid under the PST contract. libpff cannot retrieve their
+  attachment type or data, and ScanPST repair discards rather than recovers the
+  payload. MailPlus r6 has one otherwise matched item, but both source and
+  repaired reference fail the same libpff attachment-table read, so neither can
+  serve as a complete attachment oracle. Later real-source OLE preservation
+  already passes; retaining these three specimens supplies focused evidence for
+  post-1.0 native salvage work without preserving dozens of solved
+  multi-gigabyte artifacts.
+  Date/Author: 2026-07-20 / project owner cleanup and libpff deferral direction
+  with automated comparison evidence.
+
+- Decision: Historical repair pairs use automated semantic content and item
+  count comparison plus independent readers; they do not each require human
+  ScanPST or Outlook work. If a writer correction requires final human
+  interoperability evidence, provide one large consolidated test-only
+  artifact where feasible. This does not add PST merging to the pre-1.0
+  product.
+  Rationale: Existing acceptance already establishes the output structure.
+  Repeating dozens of manual structural scans adds little evidence, while
+  automated pair comparison directly tests the milestone's data-preservation
+  purpose.
+  Date/Author: 2026-07-20 / project owner.
 
 - Decision: Defer any PSTForge-maintained libpff fork until after 1.0. Keep
   using replaceable dynamic linking to the system library for the 1.0 product.
@@ -5355,6 +5552,21 @@ retains the existing durable ledger and payload spool; its performance
 optimization and the 4 GiB direct regression remain later 0.4.5 checkpoints
 after single-file acceptance.
 
+Version 0.4.6 closes the historical corruption archive with a strict,
+privacy-safe repaired-reference harness. Sixteen provable pairs recover 44,465
+repaired-reference items plus 50 exact source-matched associated items; every
+case passes internal validation, `pffinfo`, semantic multiplicity/content
+comparison, and source/reference immutability checks. Clean-context review is
+clean and the canonical release-profile full gate passes at
+`.agent/test-results/1784587009-full`. Three compact cases remain explicitly
+unresolved for the post-1.0 libpff fork: two malformed OLE object-reference NID
+pairs and MailPlus r6, whose source and repaired reference share an unreadable
+attachment table. The owner-directed cleanup deleted solved corrupt/reference
+pairs, paired logs, repaired-only remnants, the stale passing manifest, and
+scratch. The unresolved manifest and those three compact evidence sets remain.
+No writer behavior changed, so no further human ScanPST or Outlook validation
+is required for this milestone.
+
 ## Context and Orientation
 
 The repository initially contains only documentation. `AGENTS.md` governs all
@@ -5898,7 +6110,40 @@ internals. Observe the interruption flag at least once per candidate, per
 streamed 64 KiB blob chunk, per BBT/NBT page, per allocation-map page, and
 before every sync, validation process, hash pass, and rename.
 
-### Milestone 11: Version 0.5.0 - Operational UX and Debian Packaging
+### Milestone 11: Version 0.4.4 - Exact Recovery Reconciliation
+
+Close the readable-source accounting gap exposed by the 19 GB qualification.
+Reconcile every recoverable source candidate exactly once against finalized
+output or a bounded, reason-coded omission. Preserve valid descendants when a
+damaged parent cannot be emitted, reject unexplained count differences, and
+distinguish source corruption from writer loss. Acceptance is exact automated
+accounting against the readable source inventory plus clean independent scans
+of representative output.
+
+### Milestone 12: Version 0.4.5 - Direct Construction and Performance
+
+Make one-pass direct construction the default for every supported recovery
+mode. Remove redundant output verification and hashing from the direct path,
+hold an operating-system read lock where available, refuse output-name
+conflicts, and retain restartable spooling only behind an explicit durability
+choice. Acceptance uses the 19 GB source to prove exact content accounting,
+clean ScanPST and Outlook behavior, bounded memory, and the one-minute-per-GiB
+performance target.
+
+### Milestone 13: Version 0.4.6 - Historical Corruption Archive
+
+Compare historical damaged cases to their ScanPST `-repaired` references,
+never to the damaged sources as the completeness oracle. Permit a
+manifest-pinned source supplement only when it proves an exact readable item
+that ScanPST omitted. The completed archive proves 16 cases containing 44,465
+reference items plus 50 exact source-only associated items. Three cases remain
+unprovable because current `libpff` cannot read the malformed OLE references or
+attachment table in either the damaged input or repaired reference; retain
+only those bounded cases for a post-1.0 reader fork. Remove passing private
+samples after recording bounded evidence, and keep the historical harness
+strict but opt-in when its private manifest is available.
+
+### Milestone 14: Version 0.5.0 - Operational UX and Debian Packaging
 
 Finalize report schemas, privacy redaction, exit statuses, error wording,
 report regeneration, install diagnostics, spool cleanup, and operator docs.
@@ -5911,7 +6156,7 @@ Acceptance: installing the package on clean Debian 13 makes `pstforge info`,
 it leaves user jobs and source PSTs untouched; package contents, licenses, and
 dependency metadata pass inspection.
 
-### Milestone 12: Version 0.5.1 - GitHub CI and Private-Corpus Automation
+### Milestone 15: Version 0.5.1 - GitHub CI and Private-Corpus Automation
 
 Begin after the human-approved documentation baseline is pushed to the
 reachable `origin` remote and repository settings can be configured. This
@@ -5926,7 +6171,7 @@ Add a release workflow that builds but cannot publish without an approved tag
 and environment. Repository automation does not waive the rule that agents may
 not push, merge, tag, or publish without explicit human approval.
 
-### Milestone 13: Version 0.6.0 - Interoperability Release Candidate
+### Milestone 16: Version 0.6.0 - Interoperability Release Candidate
 
 Freeze CLI/schema changes, run every local and GitHub gate, fuzz parsers and
 writer structures, inject disk and process failures, and complete security,
@@ -5938,7 +6183,7 @@ No blocker or high-severity review finding may remain. Medium findings must be
 fixed or explicitly accepted by the human owner in the Decision Log. A release
 candidate is not 1.0 until the real 50 GB rehearsal succeeds from clean state.
 
-### Milestone 14: Version 1.0.0 - MailPlus-Ready Release
+### Milestone 17: Version 1.0.0 - MailPlus-Ready Release
 
 From a clean Debian package install, repeat balanced recovery of the real 50 GB
 source, validate all parts, and import them into MailPlus. Confirm source
@@ -6118,6 +6363,8 @@ and self-hosted runner configuration build on the approved remote baseline.
 Recheck authentication and repository settings before creating or configuring
 them. Local work must never depend on their existence.
 
-Revision note (2026-07-19): Initialized 0.4.3 with concrete transactional
-writer, ordered-ledger streaming, bounded cancellation/resume, instrumentation,
-and 19 GB acceptance checkpoints after the 0.4.2 scale failure.
+Revision note (2026-07-20): Closed the 0.4.6 historical corruption archive
+after proving 16 repaired-reference cases, recording three current-libpff
+exceptions for post-1.0 work, completing the release-profile full gate, and
+removing private passing samples. The strict historical harness is now opt-in
+when its external manifest and scratch directory are explicitly supplied.
