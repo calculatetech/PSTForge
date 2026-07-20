@@ -2705,6 +2705,22 @@ not modified.
       the canonical fast gate passed at
       `.agent/test-results/1784534926-fast`, and final clean-context review
       found no blocker or high issue.
+    - [x] Retained each queued embedded item's owning native attachment handle
+      until that child finishes. r5 proved that a queued child header could
+      remain readable after its parent closed while later native attachment
+      access failed; the recursive payload pass succeeded only while the
+      container stayed alive. On r6 the metadata catalog increased from 37,400
+      candidates and 311 embedded descendants to 37,413 and 324, cleared both
+      earlier zero-binding writer failures, and reached the 19-minute
+      performance ceiling with a 3.54 GiB active PST before controlled
+      interruption. Peak aggregate RSS remained 323,600 KiB and the active PST
+      cleanup left only the compact ledger and zero-byte payload pack.
+      The pending traversal already retained one native child handle per queued
+      embedded item; retaining its container doubles that bounded-by-source
+      handle set but does not add payload retention or change asymptotic
+      breadth. Worker supervision contains native allocation failure. Wider
+      pending-handle budgeting remains measurable parser hardening, not a
+      reason to discard the additional readable children recovered here.
   - [ ] Checkpoint 4: complete direct publication and failure behavior. Keep
     one same-filesystem active PST temporary, independently validate and fsync
     it, atomically rename it into `parts/`, preserve finalized parts on
@@ -2806,6 +2822,18 @@ not modified.
   Evidence:
   `.agent/test-results/1784533900-v045-direct-single-r4/stderr.log`, read-only
   r4 ledger inspection, and focused clean-context reviews on 2026-07-20.
+
+- Observation: A libpff embedded `PffItem` can outlive the Rust attachment
+  wrapper enough to expose its header while later child attachment access
+  fails after that container is freed. Retaining the owning attachment beside
+  queued child work exposed 13 additional nested messages on the 19 GB source
+  and cleared the prior direct replay mismatch without retaining payload bytes.
+  The measured peak remained about 316 MiB, well below the 2 GiB acceptance
+  ceiling. The pending traversal already retained one child item per queued
+  embedded attachment; the container handle changes the constant factor, not
+  the existing source-controlled breadth.
+  Evidence: `.agent/test-results/1784536000-v045-direct-single-r6`, r5/r6
+  ledger comparison, and controlled `SIGTERM` at 19:07.
 
 - Observation: The 0.4.2 fidelity expansion regressed a cold 19 GB split from
   approximately ten minutes in 0.4.1 to more than 57 minutes without

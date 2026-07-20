@@ -586,6 +586,7 @@ impl PffFile {
                 };
                 let mut messages = vec![MessageWork {
                     item,
+                    _container: None,
                     folder_id: Some(folder_id),
                     parent_message_id: None,
                     parent_attachment_index: None,
@@ -646,6 +647,7 @@ impl PffFile {
                 };
                 let mut messages = vec![MessageWork {
                     item,
+                    _container: None,
                     folder_id: Some(folder_id),
                     parent_message_id: None,
                     parent_attachment_index: None,
@@ -753,6 +755,7 @@ impl PffFile {
             };
             let mut pending = vec![MessageWork {
                 item,
+                _container: None,
                 folder_id: None,
                 parent_message_id: None,
                 parent_attachment_index: None,
@@ -816,6 +819,7 @@ fn recovered_provenance(mode: RecoveryMode) -> CatalogProvenance {
 
 struct MessageWork {
     item: PffItem,
+    _container: Option<PffItem>,
     folder_id: Option<u32>,
     parent_message_id: Option<u32>,
     parent_attachment_index: Option<u32>,
@@ -1269,6 +1273,7 @@ fn stream_attachments(
                         limit: u64::MAX - 1,
                     })?;
         }
+        let mut queued_embedded = None;
         if embedded_attachment {
             let embedded = match attachment
                 .optional_item("get embedded item", bindings::libpff_attachment_get_item)
@@ -1319,6 +1324,7 @@ fn stream_attachments(
                 embedded_path.push(index_u32);
                 Ok(MessageWork {
                     item: embedded,
+                    _container: None,
                     folder_id: work.folder_id,
                     parent_message_id: Some(message_id),
                     parent_attachment_index: Some(index_u32),
@@ -1333,7 +1339,7 @@ fn stream_attachments(
                 Ok(embedded_work) if writer_order => {
                     process_message(embedded_work, pending, visited, sink, catalog)?;
                 }
-                Ok(embedded_work) => pending.push(embedded_work),
+                Ok(embedded_work) => queued_embedded = Some(embedded_work),
                 Err(error) => {
                     if embedded_first {
                         stream_attachment_properties(
@@ -1373,6 +1379,10 @@ fn stream_attachments(
                 index: index_u32,
             },
         )?;
+        if let Some(mut embedded_work) = queued_embedded {
+            embedded_work._container = Some(attachment);
+            pending.push(embedded_work);
+        }
     }
     Ok(())
 }
