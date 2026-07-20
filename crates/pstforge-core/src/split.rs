@@ -8,8 +8,9 @@ use std::time::{Duration, Instant};
 
 use libpff_sys::RecoveryMode;
 use pstforge_job::{
-    DurableCatalogSink, JobConfiguration, JobError, JobSourceIdentity, PartSidecar, PublishedPart,
-    PublishedPartRecord, ReconstructedField, ReconstructionCounts,
+    CandidateRejectionCategory, CandidateRejectionCounts, DurableCatalogSink, JobConfiguration,
+    JobError, JobSourceIdentity, PartSidecar, PublishedPart, PublishedPartRecord,
+    ReconstructedField, ReconstructionCounts,
 };
 use pstforge_pst::writer::{
     AttachmentContent, MailFolderLocation, MessageSpec, NamedPropertyCatalog, NamedPropertyName,
@@ -185,6 +186,7 @@ pub struct SplitReport {
     pub disk_preflight: DiskPreflight,
     pub metrics: ExecutionMetrics,
     pub recovery: RecoveryReport,
+    pub rejection_counts: CandidateRejectionCounts,
     pub parts: Vec<PartReport>,
     pub written_candidates: u64,
     pub partial: bool,
@@ -313,6 +315,7 @@ pub fn split(
             disk_preflight,
             metrics,
             recovery,
+            rejection_counts: job.candidate_rejection_counts()?,
             parts,
             written_candidates,
             partial: true,
@@ -351,6 +354,7 @@ pub fn split(
             disk_preflight,
             metrics,
             recovery,
+            rejection_counts: job.candidate_rejection_counts()?,
             parts,
             written_candidates,
             partial: true,
@@ -409,6 +413,7 @@ pub fn split(
         disk_preflight,
         metrics,
         recovery,
+        rejection_counts: job.candidate_rejection_counts()?,
         parts,
         written_candidates,
         partial,
@@ -531,6 +536,12 @@ fn render_recovery_log(report: &SplitReport) -> String {
             "Items not copied because their type or contents could not yet be preserved safely: {}\n",
             report.recovery.unsupported_candidates
         ));
+        for (category, count) in &report.rejection_counts {
+            output.push_str(&format!(
+                "  {}: {count}\n",
+                rejection_category_label(*category)
+            ));
+        }
         output.push_str(&format!("Attachments not copied: {omitted_attachments}\n"));
         output.push_str(&format!("Folders not copied: {omitted_folders}\n"));
         output.push_str(&format!("Item details not copied: {omitted_properties}\n"));
@@ -576,6 +587,30 @@ fn render_recovery_log(report: &SplitReport) -> String {
         ));
     }
     output
+}
+
+fn rejection_category_label(category: CandidateRejectionCategory) -> &'static str {
+    match category {
+        CandidateRejectionCategory::SourceItemUnsupported => {
+            "Source reader reported the item type as unsupported"
+        }
+        CandidateRejectionCategory::MalformedCandidate => {
+            "Item structure could not be translated safely"
+        }
+        CandidateRejectionCategory::MalformedProperty => "A required item property was malformed",
+        CandidateRejectionCategory::WriterInputRejected => {
+            "Translated item failed writer validation"
+        }
+        CandidateRejectionCategory::ItemGraphDependencyRejected => {
+            "Item depended on another item that could not be written"
+        }
+        CandidateRejectionCategory::UnsupportedEmbeddedItem => {
+            "Embedded item type or linkage could not be preserved"
+        }
+        CandidateRejectionCategory::StrandedEmbeddedItem => {
+            "Embedded item was stranded beneath a finalized parent"
+        }
+    }
 }
 
 fn append_reconstruction_group(
@@ -1011,15 +1046,15 @@ fn split_recovered_job_with_interrupt(
                     drop(writer);
                     return finish_incremental_interruption(job, reports, written_candidates);
                 }
-                Err(error) if candidate_local_translation_error(&error) => {
+                Err(error) if candidate_rejection_category(&error).is_some() => {
                     tracing::debug!(
                         error = %error,
                         durable_key = %candidate.durable_key,
                         "candidate rejected during incremental translation"
                     );
-                    let mut item_keys = Vec::new();
-                    collect_item_keys(&mail, &mut item_keys);
-                    job.mark_candidates_unsupported(&item_keys)?;
+                    let rejections = translation_rejections(&mail, &error)
+                        .ok_or_else(|| SplitError::Translation(error))?;
+                    job.mark_candidate_rejections(&rejections)?;
                     any_partial = true;
                     terminal_candidate_keys.insert(candidate.durable_key.clone());
                     candidate_index = candidate_index.saturating_add(1);
@@ -1038,7 +1073,10 @@ fn split_recovered_job_with_interrupt(
                     );
                     let mut item_keys = Vec::new();
                     collect_item_keys(&mail, &mut item_keys);
-                    job.mark_candidates_unsupported(&item_keys)?;
+                    job.mark_candidates_unsupported(
+                        &item_keys,
+                        CandidateRejectionCategory::WriterInputRejected,
+                    )?;
                     any_partial = true;
                     terminal_candidate_keys.insert(candidate.durable_key.clone());
                     candidate_index = candidate_index.saturating_add(1);
@@ -1143,7 +1181,10 @@ fn split_recovered_job_with_interrupt(
             return finish_incremental_interruption(job, reports, written_candidates);
         };
         if !stats.unsupported_item_keys.is_empty() {
-            job.mark_candidates_unsupported(&stats.unsupported_item_keys)?;
+            job.mark_candidates_unsupported(
+                &stats.unsupported_item_keys,
+                CandidateRejectionCategory::UnsupportedEmbeddedItem,
+            )?;
             any_partial = true;
         }
         let folder_count = if part_index == 1 {
@@ -1402,11 +1443,11 @@ fn split_recovered_job_with_interrupt_legacy(
                 return Ok((reports, written_candidates, true, true));
             }
             Ok(input) => input,
-            Err(error) if candidate_local_translation_error(&error) => {
+            Err(error) if candidate_rejection_category(&error).is_some() => {
                 tracing::debug!(error = %error, "candidate translation rejected during prefilter");
-                let mut item_keys = Vec::new();
-                collect_item_keys(message, &mut item_keys);
-                job.mark_candidates_unsupported(&item_keys)?;
+                let rejections = translation_rejections(message, &error)
+                    .ok_or_else(|| SplitError::Translation(error))?;
+                job.mark_candidate_rejections(&rejections)?;
                 any_partial = true;
                 continue;
             }
@@ -1418,7 +1459,10 @@ fn split_recovered_job_with_interrupt_legacy(
                 tracing::debug!(%detail, "writer input rejected candidate during prefilter");
                 let mut item_keys = Vec::new();
                 collect_item_keys(message, &mut item_keys);
-                job.mark_candidates_unsupported(&item_keys)?;
+                job.mark_candidates_unsupported(
+                    &item_keys,
+                    CandidateRejectionCategory::WriterInputRejected,
+                )?;
                 any_partial = true;
             }
             Err(error) => return Err(error.into()),
@@ -1660,7 +1704,10 @@ fn split_recovered_job_with_interrupt_legacy(
             break (input, staged_filename, staged_path, byte_len);
         };
         if !input.unsupported_item_keys.is_empty() {
-            job.mark_candidates_unsupported(&input.unsupported_item_keys)?;
+            job.mark_candidates_unsupported(
+                &input.unsupported_item_keys,
+                CandidateRejectionCategory::UnsupportedEmbeddedItem,
+            )?;
             any_partial = true;
         }
         let oversize = byte_len > maximum_pst_bytes;
@@ -1969,11 +2016,61 @@ fn self_peak_rss_bytes() -> u64 {
         .unwrap_or(0)
 }
 
-fn candidate_local_translation_error(error: &CanonicalWriteError) -> bool {
-    matches!(
-        error,
-        CanonicalWriteError::InvalidCandidate { .. } | CanonicalWriteError::InvalidProperty { .. }
-    )
+fn candidate_rejection_category(error: &CanonicalWriteError) -> Option<CandidateRejectionCategory> {
+    match error {
+        CanonicalWriteError::InvalidCandidate { .. } => {
+            Some(CandidateRejectionCategory::MalformedCandidate)
+        }
+        CanonicalWriteError::InvalidProperty { .. } => {
+            Some(CandidateRejectionCategory::MalformedProperty)
+        }
+        CanonicalWriteError::Job(_) | CanonicalWriteError::BlobRead { .. } => None,
+    }
+}
+
+fn translation_rejections(
+    message: &crate::CanonicalMail,
+    error: &CanonicalWriteError,
+) -> Option<Vec<(String, CandidateRejectionCategory)>> {
+    let category = candidate_rejection_category(error)?;
+    let target = match error {
+        CanonicalWriteError::InvalidCandidate { item_key, .. }
+        | CanonicalWriteError::InvalidProperty { item_key, .. } => item_key,
+        CanonicalWriteError::Job(_) | CanonicalWriteError::BlobRead { .. } => return None,
+    };
+    let mut path = Vec::new();
+    if !find_item_path(message, target, &mut path) {
+        return None;
+    }
+    let mut rejections = path
+        .iter()
+        .take(path.len().saturating_sub(1))
+        .cloned()
+        .map(|item_key| {
+            (
+                item_key,
+                CandidateRejectionCategory::ItemGraphDependencyRejected,
+            )
+        })
+        .collect::<Vec<_>>();
+    rejections.push((target.clone(), category));
+    Some(rejections)
+}
+
+fn find_item_path(message: &crate::CanonicalMail, target: &str, path: &mut Vec<String>) -> bool {
+    path.push(message.durable_item_key.clone());
+    if message.durable_item_key == target {
+        return true;
+    }
+    for attachment in &message.attachments {
+        if let Some(embedded) = &attachment.embedded
+            && find_item_path(embedded, target, path)
+        {
+            return true;
+        }
+    }
+    path.pop();
+    false
 }
 
 fn collect_item_keys(message: &crate::CanonicalMail, item_keys: &mut Vec<String>) {
@@ -2237,7 +2334,9 @@ mod tests {
     use std::path::PathBuf;
     use std::sync::atomic::AtomicBool;
 
-    use pstforge_job::{JobError, ReconstructedField};
+    use pstforge_job::{
+        CandidateRejectionCategory, CandidateRejectionCounts, JobError, ReconstructedField,
+    };
     use pstforge_pst::writer::WriterError;
 
     use tempfile::tempdir;
@@ -2247,12 +2346,12 @@ mod tests {
         MAX_RECOVERY_LOG_DETAIL_LINES, PartReport, SplitError, SplitFailureKind, SplitReport,
         disk_preflight, extend_to_fitting_prefix, hash_file, preflight_filesystem_path,
         projection_batch_byte_target, render_recovery_log, shrink_to_fitting_prefix,
-        source_folders_for_part, take_fitting_prefix,
+        source_folders_for_part, take_fitting_prefix, translation_rejections,
     };
     use crate::{
-        CanonicalFolder, CanonicalFolderRole, CanonicalMail, ContentCompleteness, ItemKey,
-        PackCandidate, PartSizeEstimator, RecoveryError, RecoveryProvenance, RecoveryReport,
-        SourceError, SourceIdentity,
+        CanonicalAttachment, CanonicalFolder, CanonicalFolderRole, CanonicalMail,
+        CanonicalWriteError, ContentCompleteness, ItemKey, PackCandidate, PartSizeEstimator,
+        RecoveryError, RecoveryProvenance, RecoveryReport, SourceError, SourceIdentity,
     };
 
     fn packing_candidate(index: u32, payload_bytes: u64) -> PackCandidate {
@@ -2267,6 +2366,78 @@ mod tests {
             folder_path: vec!["Inbox".to_owned()],
             payload_bytes,
         }
+    }
+
+    fn bare_mail(id: u32) -> CanonicalMail {
+        CanonicalMail {
+            durable_item_key: format!("normal:{id}:-:0"),
+            key: ItemKey {
+                provenance: RecoveryProvenance::Normal,
+                source_node_id: Some(id),
+                recovery_index: None,
+                occurrence: 0,
+            },
+            folder_path: vec!["Inbox".to_owned()],
+            folder_location: crate::CanonicalFolderLocation::IpmSubtree,
+            folder_role: CanonicalFolderRole::Ordinary,
+            placement: crate::CanonicalMessagePlacement::Normal,
+            message_class: Some("IPM.Note".to_owned()),
+            subject: None,
+            sender_name: None,
+            sender_email: None,
+            submit_filetime: None,
+            delivery_filetime: None,
+            recipients: Vec::new(),
+            attachments: Vec::new(),
+            properties: Vec::new(),
+            completeness: ContentCompleteness::Complete,
+            spooled_bytes: 0,
+        }
+    }
+
+    fn embed(parent: &mut CanonicalMail, child: CanonicalMail) {
+        let index = u32::try_from(parent.attachments.len()).expect("fixture attachment count");
+        parent.attachments.push(CanonicalAttachment {
+            index,
+            attachment_type: Some(i32::from(b'i')),
+            filename: None,
+            declared_size: None,
+            data: None,
+            data_complete: true,
+            reference_complete: true,
+            properties: Vec::new(),
+            embedded: Some(Box::new(child)),
+        });
+    }
+
+    #[test]
+    fn nested_translation_rejection_distinguishes_direct_and_dependent_items() {
+        let grandchild = bare_mail(3);
+        let mut child = bare_mail(2);
+        embed(&mut child, grandchild);
+        let sibling = bare_mail(4);
+        let mut root = bare_mail(1);
+        embed(&mut root, child);
+        embed(&mut root, sibling);
+
+        let error = CanonicalWriteError::InvalidProperty {
+            item_key: "normal:2:-:0".to_owned(),
+            property_id: 0x1000,
+            detail: "private diagnostic".to_owned(),
+        };
+        assert_eq!(
+            translation_rejections(&root, &error),
+            Some(vec![
+                (
+                    "normal:1:-:0".to_owned(),
+                    CandidateRejectionCategory::ItemGraphDependencyRejected,
+                ),
+                (
+                    "normal:2:-:0".to_owned(),
+                    CandidateRejectionCategory::MalformedProperty,
+                ),
+            ])
+        );
     }
 
     #[test]
@@ -2387,6 +2558,7 @@ mod tests {
                 interrupted: false,
                 source_unchanged: true,
             },
+            rejection_counts: CandidateRejectionCounts::new(),
             parts: vec![PartReport {
                 index: 1,
                 filename: "part-0001.pst".to_owned(),
@@ -2446,11 +2618,25 @@ mod tests {
 
         report.partial = true;
         report.recovery.unsupported_candidates = 2;
+        report
+            .rejection_counts
+            .insert(CandidateRejectionCategory::MalformedProperty, 1);
+        report
+            .rejection_counts
+            .insert(CandidateRejectionCategory::UnsupportedEmbeddedItem, 1);
         report.parts[0].omitted_attachments = 3;
         let partial = render_recovery_log(&report);
         assert!(partial.contains("Result: partial"));
         assert!(partial.contains("Attachments not copied: 3"));
         assert!(partial.contains("could not yet be preserved safely: 2"));
+        assert!(partial.contains("A required item property was malformed: 1"));
+        assert!(partial.contains("Embedded item type or linkage could not be preserved: 1"));
+        assert!(!partial.contains("/private/"));
+        let json = serde_json::to_value(&report).expect("split report serializes");
+        assert_eq!(
+            json["rejection_counts"]["malformed_property"],
+            serde_json::json!(1)
+        );
         assert!(partial.len() < 4 * 1024 * 1024);
 
         let part = report.parts[0].clone();

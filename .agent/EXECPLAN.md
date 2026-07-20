@@ -2449,11 +2449,32 @@ work. Hash and identity evidence show that the source was not modified.
     binary contain the same damaged text, code page 65001 is present, and no
     HTML or RTF alternative exists. Preserving those source values exactly is
     the correct recovery outcome; no output reconstruction is justified.
-  - [ ] Checkpoint 5: persist a bounded structured rejection category and
+  - [x] Checkpoint 5: persist a bounded structured rejection category and
     safe diagnostic summary whenever a candidate cannot be written. The
     ledger event must not be `{}` and must never include subjects, addresses,
     bodies, filenames, payload bytes, or private paths. `recovery.log` reports
     exact aggregate counts without itemizing private mailbox data.
+    The durable category is a closed enum rather than captured error text:
+    source item reported unsupported, malformed candidate, malformed property,
+    writer input rejection, item graph dependency rejection, unsupported
+    embedded item, or embedded item stranded beneath a finalized parent. The
+    split JSON and bounded human log expose exact aggregates from those durable
+    events. Unknown, malformed, missing, duplicate, or status-contradictory
+    rejection events are ledger-integrity failures; writer append failures
+    remain job failures and are not recast as safely contained omissions.
+    The implementation persists versioned enum-only metadata, attributes a
+    direct translation failure only to its identified item, attributes
+    ancestors to item-graph dependency, and leaves descendants and siblings
+    for the recursive stranded-parent pass. Aggregate counts are emitted in
+    split JSON and the bounded privacy-safe human log. Read-only resume
+    validation now enforces foreign keys plus the bidirectional rejection
+    event/status invariant before publication reconciliation, spool cleanup,
+    or any other application mutation. Regression coverage includes durable
+    reopen, malformed metadata, contradictory status, an orphan rejection
+    event, unchanged ledger/payload/output state after refusal, and nested
+    direct/dependent attribution. The final clean-context review returned
+    `CLEAN`; the canonical combined-manifest full gate passes at
+    `.agent/test-results/1784515992-full`.
   - [ ] Final gate: reconcile the 19 GB source's 37,402 readable candidate
     keys to exactly 37,402 unique written item keys across finalized parts,
     with zero unexplained `unsupported`, `failed`, stranded, duplicated, or

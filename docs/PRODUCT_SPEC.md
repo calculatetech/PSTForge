@@ -389,6 +389,14 @@ source identity remained unchanged. A writer implementation limit is reported
 as a product defect and does not establish that readable source data is
 unrecoverable.
 
+Candidate rejection records use only these bounded structural reasons: source
+reader reported unsupported, malformed candidate, malformed property, writer
+input rejection, item graph dependency rejection, unsupported embedded item,
+or an embedded item stranded beneath a finalized parent. The records never
+persist error text or mailbox values. Missing, duplicate, malformed, unknown,
+or status-contradictory rejection records are durable-state integrity failures
+rather than silently unclassified skips.
+
 Default progress events report only operation state, part index, counts, byte
 sizes, elapsed time, and interruption state. They never include mailbox names,
 subjects, addresses, bodies, attachment names, or payload data.

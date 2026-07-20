@@ -73,6 +73,27 @@ pub struct JobSummary {
     pub blob_bytes: u64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CandidateRejectionCategory {
+    SourceItemUnsupported,
+    MalformedCandidate,
+    MalformedProperty,
+    WriterInputRejected,
+    ItemGraphDependencyRejected,
+    UnsupportedEmbeddedItem,
+    StrandedEmbeddedItem,
+}
+
+pub type CandidateRejectionCounts = BTreeMap<CandidateRejectionCategory, u64>;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CandidateRejectionMetadata {
+    schema_version: u32,
+    category: CandidateRejectionCategory,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReplayCandidate {
     pub item_key: String,
@@ -395,7 +416,10 @@ impl DurableCatalogSink {
         if integrity != "ok" {
             return Err(JobError::Integrity(integrity));
         }
-        validate_resume_metadata(&connection, source, configuration)
+        validate_resume_metadata(&connection, source, configuration)?;
+        validate_foreign_keys(&connection)?;
+        read_candidate_rejection_counts(&connection)?;
+        Ok(())
     }
 
     pub fn create(job_directory: &Path) -> Result<Self, JobError> {
@@ -600,6 +624,8 @@ impl DurableCatalogSink {
         if integrity != "ok" {
             return Err(JobError::Integrity(integrity));
         }
+        validate_foreign_keys(&connection)?;
+        read_candidate_rejection_counts(&connection)?;
         if expected.is_some() {
             connection.execute_batch("PRAGMA query_only = OFF;")?;
         }
@@ -909,15 +935,35 @@ impl DurableCatalogSink {
         self.checkpoint()
     }
 
-    pub fn mark_candidates_unsupported(&mut self, item_keys: &[String]) -> Result<(), JobError> {
-        if self.active.is_some() || item_keys.is_empty() {
+    pub fn mark_candidates_unsupported(
+        &mut self,
+        item_keys: &[String],
+        category: CandidateRejectionCategory,
+    ) -> Result<(), JobError> {
+        let rejections = item_keys
+            .iter()
+            .cloned()
+            .map(|item_key| (item_key, category))
+            .collect::<Vec<_>>();
+        self.mark_candidate_rejections(&rejections)
+    }
+
+    pub fn mark_candidate_rejections(
+        &mut self,
+        rejections: &[(String, CandidateRejectionCategory)],
+    ) -> Result<(), JobError> {
+        if self.active.is_some() || rejections.is_empty() {
             return Err(JobError::EventSequence(
                 "cannot reject an empty candidate set during an active candidate".to_owned(),
             ));
         }
         self.commit_candidate_batch()?;
         let transaction = self.connection.transaction()?;
-        for item_key in item_keys {
+        for (item_key, category) in rejections {
+            let metadata_json = serde_json::to_string(&CandidateRejectionMetadata {
+                schema_version: 1,
+                category: *category,
+            })?;
             let changed = transaction.execute(
                 "UPDATE candidates SET status = 'unsupported' \
                  WHERE item_key = ?1 AND status = 'spooled'",
@@ -932,9 +978,9 @@ impl DurableCatalogSink {
                 "INSERT INTO candidate_events(\
                     item_key, sequence, kind, metadata_json, blob_sha256, byte_len\
                  ) SELECT ?1, COALESCE(MAX(sequence), 0) + 1, \
-                          'output_unrepresentable', '{}', NULL, NULL \
+                          'output_unrepresentable', ?2, NULL, NULL \
                    FROM candidate_events WHERE item_key = ?1",
-                [item_key],
+                params![item_key, metadata_json],
             )?;
         }
         transaction.commit()?;
@@ -961,8 +1007,15 @@ impl DurableCatalogSink {
         if item_keys.is_empty() {
             return Ok(0);
         }
-        self.mark_candidates_unsupported(&item_keys)?;
+        self.mark_candidates_unsupported(
+            &item_keys,
+            CandidateRejectionCategory::StrandedEmbeddedItem,
+        )?;
         Ok(u64::try_from(item_keys.len()).unwrap_or(u64::MAX))
+    }
+
+    pub fn candidate_rejection_counts(&self) -> Result<CandidateRejectionCounts, JobError> {
+        read_candidate_rejection_counts(&self.connection)
     }
 
     pub fn abort_worker_attempt(&mut self) -> Result<(), JobError> {
@@ -3016,6 +3069,16 @@ impl DurableCatalogSink {
                 if !complete {
                     self.finish_attachment(false)?;
                 }
+                if self.active.as_ref().is_some_and(|active| !active.supported) {
+                    self.record_event(
+                        "output_unrepresentable",
+                        serde_json::to_value(CandidateRejectionMetadata {
+                            schema_version: 1,
+                            category: CandidateRejectionCategory::SourceItemUnsupported,
+                        })?,
+                        None,
+                    )?;
+                }
                 let active = self.active.take().ok_or_else(|| {
                     JobError::EventSequence("message ended without start".to_owned())
                 })?;
@@ -3137,6 +3200,63 @@ fn read_metadata_json<T: serde::de::DeserializeOwned>(
             other => other.into(),
         })?;
     Ok(serde_json::from_str(&value)?)
+}
+
+fn read_candidate_rejection_counts(
+    connection: &Connection,
+) -> Result<CandidateRejectionCounts, JobError> {
+    let mut statement = connection.prepare(
+        "SELECT candidates.item_key, candidates.status, candidate_events.metadata_json \
+         FROM candidates \
+         LEFT JOIN candidate_events \
+           ON candidate_events.item_key = candidates.item_key \
+          AND candidate_events.kind = 'output_unrepresentable' \
+         WHERE candidates.status = 'unsupported' \
+            OR candidate_events.item_key IS NOT NULL \
+         ORDER BY candidates.item_key, candidate_events.sequence",
+    )?;
+    let rows = statement.query_map([], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, Option<String>>(2)?,
+        ))
+    })?;
+    let mut counts = BTreeMap::new();
+    let mut seen = HashSet::new();
+    for row in rows {
+        let (item_key, status, metadata_json) = row?;
+        if !seen.insert(item_key.clone()) {
+            return Err(JobError::Integrity(format!(
+                "unsupported candidate {item_key} has duplicate rejection events"
+            )));
+        }
+        if status != "unsupported" {
+            return Err(JobError::Integrity(format!(
+                "candidate {item_key} has a rejection event but status {status:?}"
+            )));
+        }
+        let metadata_json = metadata_json.ok_or_else(|| {
+            JobError::Integrity(format!(
+                "unsupported candidate {item_key} has no rejection event"
+            ))
+        })?;
+        let metadata: CandidateRejectionMetadata =
+            serde_json::from_str(&metadata_json).map_err(|error| {
+                JobError::Integrity(format!(
+                    "unsupported candidate {item_key} has invalid rejection metadata: {error}"
+                ))
+            })?;
+        if metadata.schema_version != 1 {
+            return Err(JobError::Integrity(format!(
+                "unsupported candidate {item_key} has unsupported rejection schema {}",
+                metadata.schema_version
+            )));
+        }
+        let count = counts.entry(metadata.category).or_insert(0_u64);
+        *count = count.saturating_add(1);
+    }
+    Ok(counts)
 }
 
 fn validate_resume_metadata(
@@ -4784,6 +4904,7 @@ mod tests {
     use std::io::Write as _;
     use std::io::{BufRead, BufReader, Read as _};
     use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
+    use std::path::Path;
     use std::process::{Command, Stdio};
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::thread;
@@ -4800,11 +4921,11 @@ mod tests {
     use sha2::{Digest, Sha256};
 
     use super::{
-        CANDIDATE_CHECKPOINT_BATCH, DurableCatalogSink, INLINE_BLOB_MAX_BYTES,
-        INLINE_CACHE_DIRECTORY, JobConfiguration, JobError, JobSourceIdentity,
-        PAYLOAD_PACK_FILENAME, PartSidecar, PublishedPart, WorkerEvent, digest_hex,
-        private_state_attributes_valid, run_sql_interruptible, validate_blob_store, write_hashed,
-        write_sidecar_partial,
+        CANDIDATE_CHECKPOINT_BATCH, CandidateRejectionCategory, DurableCatalogSink,
+        INLINE_BLOB_MAX_BYTES, INLINE_CACHE_DIRECTORY, JobConfiguration, JobError,
+        JobSourceIdentity, PAYLOAD_PACK_FILENAME, PartSidecar, PublishedPart, WorkerEvent,
+        digest_hex, private_state_attributes_valid, run_sql_interruptible, validate_blob_store,
+        write_hashed, write_sidecar_partial,
     };
 
     struct PrefixThenError {
@@ -4863,6 +4984,135 @@ mod tests {
         ));
         let after = Sha256::digest(std::fs::read(&database)?);
         assert_eq!(before, after);
+        Ok(())
+    }
+
+    #[test]
+    fn resume_refuses_invalid_rejection_state_before_mutating_work()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempdir()?;
+        let job = directory.path().join("job");
+        let mut sink = DurableCatalogSink::create(&job)?;
+        let source = JobSourceIdentity {
+            canonical_path: "/external/mail.pst".to_owned(),
+            device: 1,
+            inode: 2,
+            size_bytes: 3,
+            modified_at: "2026-07-16T00:00:00Z".to_owned(),
+            sha256: "a".repeat(64),
+        };
+        let configuration = JobConfiguration {
+            tool_compatibility_major: 0,
+            split_schema_version: "0.4.4".to_owned(),
+            recovery_mode: "balanced".to_owned(),
+            maximum_pst_bytes: 4_294_967_296,
+            part_size_policy: "hard-maximum-v1".to_owned(),
+            writer_format: "unicode-pst-v23".to_owned(),
+        };
+        sink.bind_source(&source)?;
+        sink.bind_recovery_mode("balanced")?;
+        sink.bind_configuration(&configuration)?;
+        message_start(&mut sink, 10)?;
+        let descriptor = body_descriptor(10, 4);
+        sink.event(CatalogEvent::PropertyStart(descriptor))?;
+        sink.event(CatalogEvent::PropertyData {
+            descriptor,
+            bytes: b"body",
+        })?;
+        sink.event(CatalogEvent::PropertyEnd(descriptor))?;
+        sink.event(CatalogEvent::MessageEnd {
+            id: 10,
+            complete: true,
+        })?;
+        sink.mark_candidates_unsupported(
+            &["normal:10:-:0".to_owned()],
+            CandidateRejectionCategory::MalformedProperty,
+        )?;
+        sink.checkpoint()?;
+        drop(sink);
+
+        let database = job.join(".pstforge/job.sqlite3");
+        let connection = Connection::open(&database)?;
+        connection.execute(
+            "UPDATE candidate_events SET metadata_json = '{}' \
+             WHERE kind = 'output_unrepresentable'",
+            [],
+        )?;
+        drop(connection);
+        let payload_path = job.join(".pstforge/spool").join(PAYLOAD_PACK_FILENAME);
+        let payload_before = std::fs::read(&payload_path)?;
+        let parts_before = std::fs::read_dir(job.join("parts"))?.count();
+
+        assert!(matches!(
+            DurableCatalogSink::validate_resume(&job, &source, &configuration),
+            Err(JobError::Integrity(_))
+        ));
+        assert!(matches!(
+            DurableCatalogSink::open_resume(&job, &source, &configuration),
+            Err(JobError::Integrity(_))
+        ));
+
+        let connection = Connection::open(&database)?;
+        let state_after = connection.query_row(
+            "SELECT candidates.status, candidate_events.metadata_json \
+             FROM candidates JOIN candidate_events USING(item_key) \
+             WHERE candidate_events.kind = 'output_unrepresentable'",
+            [],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+        )?;
+        assert_eq!(state_after, ("unsupported".to_owned(), "{}".to_owned()));
+        assert_eq!(std::fs::read(&payload_path)?, payload_before);
+        assert_eq!(std::fs::read_dir(job.join("parts"))?.count(), parts_before);
+
+        connection.execute(
+            "UPDATE candidate_events \
+             SET metadata_json = '{\"schema_version\":1,\"category\":\"malformed_property\"}' \
+             WHERE kind = 'output_unrepresentable'",
+            [],
+        )?;
+        connection.execute_batch("PRAGMA foreign_keys = OFF;")?;
+        connection.execute(
+            "INSERT INTO candidate_events(\
+                item_key, sequence, kind, metadata_json, blob_sha256, byte_len\
+             ) VALUES (\
+                'normal:999:-:0', 1, 'output_unrepresentable',\
+                '{\"schema_version\":1,\"category\":\"malformed_candidate\"}', NULL, NULL\
+             )",
+            [],
+        )?;
+        drop(connection);
+        let database_before = Sha256::digest(std::fs::read(&database)?);
+        let payload_before = std::fs::read(&payload_path)?;
+        let directory_entries = |path: &Path| -> Result<Vec<String>, std::io::Error> {
+            let mut names = std::fs::read_dir(path)?
+                .map(|entry| entry.map(|entry| entry.file_name().to_string_lossy().into_owned()))
+                .collect::<Result<Vec<_>, _>>()?;
+            names.sort();
+            Ok(names)
+        };
+        let partial_before = directory_entries(&job.join(".pstforge/partial"))?;
+        let manifests_before = directory_entries(&job.join(".pstforge/manifests"))?;
+        let parts_before = directory_entries(&job.join("parts"))?;
+
+        assert!(matches!(
+            DurableCatalogSink::validate_resume(&job, &source, &configuration),
+            Err(JobError::Integrity(_))
+        ));
+        assert!(matches!(
+            DurableCatalogSink::open_resume(&job, &source, &configuration),
+            Err(JobError::Integrity(_))
+        ));
+        assert_eq!(Sha256::digest(std::fs::read(&database)?), database_before);
+        assert_eq!(std::fs::read(payload_path)?, payload_before);
+        assert_eq!(
+            directory_entries(&job.join(".pstforge/partial"))?,
+            partial_before
+        );
+        assert_eq!(
+            directory_entries(&job.join(".pstforge/manifests"))?,
+            manifests_before
+        );
+        assert_eq!(directory_entries(&job.join("parts"))?, parts_before);
         Ok(())
     }
 
@@ -5268,6 +5518,73 @@ mod tests {
                 row.get::<_, String>(0)
             })?;
         assert_eq!(status, "unsupported");
+        assert_eq!(
+            sink.candidate_rejection_counts()?
+                .get(&CandidateRejectionCategory::SourceItemUnsupported),
+            Some(&1)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn rejection_metadata_is_typed_bounded_and_strictly_validated()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempdir()?;
+        let job = directory.path().join("job");
+        let mut sink = DurableCatalogSink::create(&job)?;
+        message_start(&mut sink, 10)?;
+        sink.event(CatalogEvent::MessageEnd {
+            id: 10,
+            complete: true,
+        })?;
+        sink.mark_candidates_unsupported(
+            &["normal:10:-:0".to_owned()],
+            CandidateRejectionCategory::MalformedProperty,
+        )?;
+        sink.checkpoint()?;
+        drop(sink);
+        let sink = DurableCatalogSink::open(&job)?;
+
+        let metadata = sink.connection.query_row(
+            "SELECT metadata_json FROM candidate_events \
+             WHERE kind = 'output_unrepresentable'",
+            [],
+            |row| row.get::<_, String>(0),
+        )?;
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&metadata)?,
+            json!({"schema_version": 1, "category": "malformed_property"})
+        );
+        assert!(!metadata.contains("private subject"));
+        assert_eq!(
+            sink.candidate_rejection_counts()?
+                .get(&CandidateRejectionCategory::MalformedProperty),
+            Some(&1)
+        );
+
+        sink.connection.execute(
+            "UPDATE candidate_events SET metadata_json = '{}' \
+             WHERE kind = 'output_unrepresentable'",
+            [],
+        )?;
+        assert!(matches!(
+            sink.candidate_rejection_counts(),
+            Err(JobError::Integrity(_))
+        ));
+        sink.connection.execute(
+            "UPDATE candidate_events SET metadata_json = ?1 \
+             WHERE kind = 'output_unrepresentable'",
+            [metadata],
+        )?;
+        sink.connection.execute(
+            "UPDATE candidates SET status = 'spooled' \
+             WHERE item_key = 'normal:10:-:0'",
+            [],
+        )?;
+        assert!(matches!(
+            sink.candidate_rejection_counts(),
+            Err(JobError::Integrity(_))
+        ));
         Ok(())
     }
 
@@ -5305,7 +5622,10 @@ mod tests {
         let interrupted = AtomicBool::new(false);
         let before = sink.candidate_named_property_identities_interruptible(&interrupted)?;
 
-        sink.mark_candidates_unsupported(&["normal:10:-:0".to_owned()])?;
+        sink.mark_candidates_unsupported(
+            &["normal:10:-:0".to_owned()],
+            CandidateRejectionCategory::MalformedCandidate,
+        )?;
         sink.connection.execute(
             "UPDATE candidates SET status = 'failed' WHERE item_key = 'normal:11:-:0'",
             [],
@@ -5442,6 +5762,11 @@ mod tests {
             .query_map([], |row| row.get::<_, String>(0))?
             .collect::<Result<Vec<_>, _>>()?;
         assert_eq!(statuses, ["written", "unsupported", "unsupported"]);
+        assert_eq!(
+            sink.candidate_rejection_counts()?
+                .get(&CandidateRejectionCategory::StrandedEmbeddedItem),
+            Some(&2)
+        );
         assert_eq!(sink.mark_stranded_embedded_candidates_unsupported()?, 0);
         Ok(())
     }
@@ -5827,7 +6152,10 @@ mod tests {
                 .windows(b"pstforge-private-inline-sentinel".len())
                 .any(|window| window == b"pstforge-private-inline-sentinel")
         );
-        sink.mark_candidates_unsupported(&["normal:10:-:0".to_owned()])?;
+        sink.mark_candidates_unsupported(
+            &["normal:10:-:0".to_owned()],
+            CandidateRejectionCategory::MalformedCandidate,
+        )?;
         sink.finalize_private_work(false)?;
         assert!(!pack.exists());
         sink.connection.execute(
@@ -6597,7 +6925,10 @@ mod tests {
             id: 10,
             complete: true,
         })?;
-        sink.mark_candidates_unsupported(&["normal:10:-:0".to_owned()])?;
+        sink.mark_candidates_unsupported(
+            &["normal:10:-:0".to_owned()],
+            CandidateRejectionCategory::MalformedCandidate,
+        )?;
         sink.checkpoint()?;
         drop(sink);
 
