@@ -1903,31 +1903,32 @@ fn plan_transaction_folders<'a>(
     folders: &'a [MailFolderSpec],
     preserve_empty_folders: bool,
 ) -> Result<Vec<FolderPlan<'a>>, WriterError> {
-    plan_folders_expected(
+    let mut plans = plan_folders_expected(
         fallback_name,
         fallback_messages,
         Some(folders),
         preserve_empty_folders,
         false,
-    )
+    )?;
+    for plan in &mut plans {
+        plan.node = transaction_folder_node(folders, plan.location, &plan.path)?;
+    }
+    Ok(plans)
 }
 
 fn transaction_folder_node(
     folders: &[MailFolderSpec],
     location: MailFolderLocation,
     path: &[String],
-    preserve_empty_folders: bool,
 ) -> Result<NodeId, WriterError> {
-    let mut paths = BTreeSet::new();
+    let mut paths = Vec::new();
+    let mut observed = BTreeSet::new();
     for folder in folders {
-        if !preserve_empty_folders
-            && folder.messages.is_empty()
-            && folder.associated_messages.is_empty()
-        {
-            continue;
-        }
         for depth in 1..=folder.path.len() {
-            paths.insert((folder.location, folder.path[..depth].to_vec()));
+            let candidate = (folder.location, folder.path[..depth].to_vec());
+            if observed.insert(candidate.clone()) {
+                paths.push(candidate);
+            }
         }
     }
     let target = (location, path.to_vec());
@@ -3301,6 +3302,11 @@ fn build_finalization_plan(
             .iter()
             .filter_map(|(parent, row)| (*parent == folder.node).then_some((*row).clone()))
             .collect::<Vec<_>>();
+        if rows.len() != folder.messages.len() {
+            return Err(WriterError::InvalidStructure(
+                "streamed normal contents rows disagree with the final folder plan".to_owned(),
+            ));
+        }
         let (contents_block, contents_subnode) = if rows.is_empty() {
             (leaf_bid(5)?, None)
         } else if rows.len() == 1 {
@@ -3339,6 +3345,11 @@ fn build_finalization_plan(
             .iter()
             .filter_map(|(parent, row)| (*parent == folder.node).then_some((*row).clone()))
             .collect::<Vec<_>>();
+        if rows.len() != folder.associated_messages.len() {
+            return Err(WriterError::InvalidStructure(
+                "streamed associated contents rows disagree with the final folder plan".to_owned(),
+            ));
+        }
         let (associated_block, associated_subnode) = if rows.is_empty() {
             (leaf_bid(13)?, None)
         } else if rows.len() == 1 {
@@ -3932,12 +3943,7 @@ impl TransactionalMailStoreWriter {
                 .push(message.clone());
         }
         let result = (|| {
-            let parent = transaction_folder_node(
-                &self.spec.folders,
-                location,
-                path,
-                self.preserve_empty_folders,
-            )?;
+            let parent = transaction_folder_node(&self.spec.folders, location, path)?;
             let contents_columns = contents_columns()?;
             let associated_columns = associated_columns()?;
             self.message_stream.append_message(
@@ -4067,12 +4073,7 @@ impl TransactionalMailStoreWriter {
 
         let stream_checkpoint = self.message_stream.checkpoint();
         let result = (|| {
-            let parent = transaction_folder_node(
-                &self.spec.folders,
-                location,
-                path,
-                self.preserve_empty_folders,
-            )?;
+            let parent = transaction_folder_node(&self.spec.folders, location, path)?;
             let message = if associated {
                 self.spec.folders[folder_index].associated_messages.last()
             } else {
@@ -15957,7 +15958,7 @@ mod tests {
             MailFolderLocation::IpmSubtree,
             &["Inbox".to_owned()],
             false,
-            first,
+            first.clone(),
             &NEVER_INTERRUPTED,
         )?;
         writer.observe_folder(MailFolderSpec {
@@ -15975,20 +15976,84 @@ mod tests {
             MailFolderLocation::IpmSubtree,
             &["Archive".to_owned()],
             false,
-            second,
+            second.clone(),
             &NEVER_INTERRUPTED,
         )?;
         writer.finalize_constructed(&NEVER_INTERRUPTED)?;
-        let store = open_store(path)?;
-        assert!(
-            store
-                .open_folder(
-                    &store
-                        .properties()
-                        .make_entry_id(node(NodeIdType::NormalFolder, MAIL_FOLDER_INDEX)?)?
-                )
-                .is_ok()
-        );
+        let expected_folders = vec![
+            MailFolderSpec {
+                path: vec!["Inbox".to_owned()],
+                location: MailFolderLocation::IpmSubtree,
+                role: MailFolderRole::Ordinary,
+                container_class: "IPF.Note".to_owned(),
+                messages: vec![first],
+                associated_messages: Vec::new(),
+            },
+            MailFolderSpec {
+                path: vec!["Archive".to_owned()],
+                location: MailFolderLocation::IpmSubtree,
+                role: MailFolderRole::Ordinary,
+                container_class: "IPF.Note".to_owned(),
+                messages: vec![second],
+                associated_messages: Vec::new(),
+            },
+        ];
+        let messages = expected_folders
+            .iter()
+            .flat_map(|folder| folder.messages.iter())
+            .collect::<Vec<_>>();
+        let plans = plan_transaction_folders("Inbox", &messages, &expected_folders, true)?;
+        validate_completed_folder_store(
+            &path,
+            fixture.record_key,
+            &plans,
+            &collect_named_identities_many_refs(&messages),
+        )?;
+        Ok(())
+    }
+
+    #[test]
+    fn construction_rejects_a_streamed_message_bound_to_the_wrong_folder()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("shifted-streaming-folder.pst");
+        let fixture = FidelityStore::default();
+        let layout = MailStoreSpec {
+            store_name: fixture.store_name,
+            record_key: fixture.record_key,
+            folders: vec![MailFolderSpec {
+                path: vec!["Inbox".to_owned()],
+                location: MailFolderLocation::IpmSubtree,
+                role: MailFolderRole::Ordinary,
+                container_class: "IPF.Note".to_owned(),
+                messages: Vec::new(),
+                associated_messages: Vec::new(),
+            }],
+        };
+        let mut writer = TransactionalMailStoreWriter::begin_streaming(&path, layout, true, None)?;
+        let mut message = fixture.message;
+        message.attachments.clear();
+        writer.append_message_deferred(
+            MailFolderLocation::IpmSubtree,
+            &["Inbox".to_owned()],
+            false,
+            message,
+            &NEVER_INTERRUPTED,
+        )?;
+        writer.message_stream.contents_rows[0].0 = node(
+            NodeIdType::NormalFolder,
+            MAIL_FOLDER_INDEX
+                .checked_add(1)
+                .ok_or(WriterError::ValueTooLarge("folder node"))?,
+        )?;
+        let error = writer
+            .finalize_constructed(&NEVER_INTERRUPTED)
+            .expect_err("shifted folder ownership must block publication");
+        assert!(matches!(
+            error,
+            WriterError::InvalidStructure(detail)
+                if detail.contains("normal contents rows disagree")
+        ));
         Ok(())
     }
 

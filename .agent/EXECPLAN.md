@@ -2913,6 +2913,39 @@ not modified.
       fresh clean-context adversarial review returned `CLEAN`, with no
       milestone-relevant blocker or high finding. Human ScanPST/Outlook
       acceptance is the remaining checkpoint gate.
+    - [x] Corrected the folder-identity defect exposed by the first human
+      single-file gate. ScanPST found 149 folders and 37,060 items in r10, then
+      reported two BBT reference-count mismatches, widespread swapped
+      `PR_CONTENT_COUNT`/`PR_CONTENT_UNREAD` values, 38 orphaned messages, and
+      hierarchy repairs. Transactional message rows had stored a folder node
+      calculated from the currently known sorted path set; observing a
+      lexicographically earlier folder later shifted existing node identities.
+      Final folder properties used the complete sorted set, so rows, folder
+      properties, shared empty-table selection, and BBT reference counts
+      disagreed. Transactional folder nodes now follow append-stable first
+      observation order, and final folder plans reuse those exact nodes.
+      Construction additionally refuses any final folder whose expected normal
+      or associated message count differs from the streamed rows bound to its
+      node, preventing publication without a completed-file reread. A focused
+      late-earlier-folder regression validates names, properties, contents
+      rows, and messages through the independent writer reader; an injected
+      shifted parent proves the construction-time refusal. The complete writer
+      suite passes 104 tests with one intentional multi-gigabyte case ignored,
+      and the fast gate passes at
+      `.agent/test-results/1784562422-fast`.
+      Qualification r11 published one 19,533,751,296-byte PST in 6:55.18 at
+      462,420 KiB peak RSS. It again writes all 37,413 current-source
+      candidates, reports 145 representable folders, zero omitted attachments
+      or folders, one contained parser-tail issue, unchanged source identity,
+      and a zero-byte payload pack. The refreshed canonical full gate passes
+      every external corpus and independent `pffinfo`/`readpst` check at
+      `.agent/test-results/1784562960-full`. A fresh clean-context adversarial
+      review returned `CLEAN`, confirming stable uniqueness across folder
+      locations, implicit parents, Deleted Items, empty-folder policies,
+      rollback/projection, and independent parts, plus pre-BBT refusal of
+      row/plan mismatch. The human owner then reported a clean ScanPST result
+      and successful Outlook use of the r11 PST, completing the single-file
+      direct-write acceptance gate.
   - [ ] Checkpoint 4: complete direct publication and failure behavior. Keep
     one same-filesystem active PST temporary, construct every documented PST
     relationship and allocation structure before one final file `fsync`, then
@@ -3103,6 +3136,19 @@ not modified.
   late folders before finalization.
   Evidence: r9 ledger counts, the sidecar integrity refusal, and r10's
   atomically published 145-folder manifest.
+
+- Observation: A folder node derived from the sorted set of paths currently
+  known to a streaming writer is not stable. Adding a lexicographically earlier
+  path shifts every later index even though previously written message rows
+  retain their old parent node. In r10, final folder properties described the
+  correct source counts while the contents rows belonged to different folders;
+  shared empty-table selection then understated two BBT reference counts.
+  Append-stable first-observation node assignment fixes the causal ownership
+  error. A finalization-time row/plan equality check is required so any future
+  identity divergence blocks publication without relying on output rereads.
+  Evidence: human r10 ScanPST log, including folder count swaps, BBT entries 14
+  and 34, and orphan recovery; focused late-folder and injected-shift
+  regressions; qualification r11.
 
 - Observation: The 0.4.2 fidelity expansion regressed a cold 19 GB split from
   approximately ten minutes in 0.4.1 to more than 57 minutes without
@@ -5121,18 +5167,21 @@ accepted the current automated reconciliation and prior ScanPST/Outlook
 evidence as completing the version.
 
 Version 0.4.5 now defaults every supported PST-output recovery policy to
-bounded one-traversal direct construction. Qualification r10 wrote the current
-19 GB source into one 19,532,989,440-byte PST in 7:02.35 at 462,380 KiB peak
-RSS. It assigned all 37,413 currently readable candidates exactly once, left
-`payload.pack` at zero bytes, omitted no attachment or folder, published no
-digest, and retained the unchanged source identity plus one known contained
-libpff recovery-tail issue. Record entries retain their native record-set
-owners through deferred streaming, attachment continuations use checked native
-seek, and late-discovered folders feed final publication accounting. The
-generated PST is ready for the remaining human ScanPST-first and Outlook
-acceptance gate. `--restartable` deliberately retains the existing durable
-ledger and payload spool; its performance optimization and the 4 GiB direct
-regression remain later 0.4.5 checkpoints after single-file acceptance.
+bounded one-traversal direct construction. Human ScanPST rejected
+qualification r10 because late folder discovery shifted folder nodes already
+referenced by streamed message rows. The corrected r11 assigns append-stable
+folder nodes and refuses final row/plan disagreement before publication. It
+wrote the current 19 GB source into one 19,533,751,296-byte PST in 6:55.18 at
+462,420 KiB peak RSS. It assigned all 37,413 currently readable candidates
+exactly once, left `payload.pack` at zero bytes, omitted no attachment or
+folder, published no digest, and retained the unchanged source identity plus
+one known contained libpff recovery-tail issue. Record entries retain their
+native record-set owners through deferred streaming and attachment
+continuations use checked native seek. The human owner reported a clean
+ScanPST result and successful Outlook use of r11. `--restartable` deliberately
+retains the existing durable ledger and payload spool; its performance
+optimization and the 4 GiB direct regression remain later 0.4.5 checkpoints
+after single-file acceptance.
 
 ## Context and Orientation
 
