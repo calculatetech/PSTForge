@@ -235,6 +235,16 @@ pub enum CatalogEvent<'a> {
         descriptor: PropertyDescriptor,
         bytes: &'a [u8],
     },
+    DeferredPropertyData {
+        embedded_path: &'a [u32],
+        descriptor: PropertyDescriptor,
+        bytes: &'a [u8],
+    },
+    DeferredAttachmentData {
+        embedded_path: &'a [u32],
+        index: u32,
+        bytes: &'a [u8],
+    },
     PropertyEnd(PropertyDescriptor),
     PropertyAbort {
         descriptor: PropertyDescriptor,
@@ -244,6 +254,8 @@ pub enum CatalogEvent<'a> {
         id: u32,
         complete: bool,
     },
+    TopLevelMetadataEnd,
+    TopLevelPayloadEnd,
 }
 
 pub trait CatalogSink {
@@ -271,6 +283,7 @@ pub trait CatalogSink {
 pub enum PayloadRequest {
     Full,
     Prefix(u64),
+    DeferredPrefix(u64),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -278,6 +291,7 @@ pub enum TraversalOrder {
     Source,
     EmbeddedFirst,
     Writer,
+    Direct,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -458,11 +472,14 @@ impl PffFile {
                     container_class,
                 },
             )?;
+            let mut folder_deferred = Vec::new();
             if let Err(error) = stream_item_properties(
                 &folder,
                 PropertyOwner::Folder(folder_id),
+                &[],
                 sink,
                 &mut catalog,
+                &mut folder_deferred,
             ) {
                 record_item_issue(
                     &mut catalog,
@@ -830,12 +847,55 @@ struct MessageWork {
     associated: bool,
 }
 
+enum DeferredPayload {
+    Property {
+        embedded_path: Vec<u32>,
+        descriptor: PropertyDescriptor,
+        entry: PffRecordEntry,
+        prefix_bytes: u64,
+    },
+    Attachment {
+        embedded_path: Vec<u32>,
+        index: u32,
+        attachment: PffItem,
+        expected: u64,
+        prefix_bytes: u64,
+    },
+}
+
 fn process_message(
     work: MessageWork,
     pending: &mut Vec<MessageWork>,
     visited: &mut HashSet<u32>,
     sink: &mut dyn CatalogSink,
     catalog: &mut RawCatalog,
+) -> Result<(), PffError> {
+    let top_level = work.parent_message_id.is_none();
+    let mut deferred = Vec::new();
+    process_message_inner(work, pending, visited, sink, catalog, &mut deferred)?;
+    if top_level && sink.traversal_order() == TraversalOrder::Direct {
+        emit(
+            sink,
+            "top-level metadata end",
+            CatalogEvent::TopLevelMetadataEnd,
+        )?;
+        stream_deferred_payloads(&mut deferred, sink, catalog)?;
+        emit(
+            sink,
+            "top-level payload end",
+            CatalogEvent::TopLevelPayloadEnd,
+        )?;
+    }
+    Ok(())
+}
+
+fn process_message_inner(
+    work: MessageWork,
+    pending: &mut Vec<MessageWork>,
+    visited: &mut HashSet<u32>,
+    sink: &mut dyn CatalogSink,
+    catalog: &mut RawCatalog,
+    deferred: &mut Vec<DeferredPayload>,
 ) -> Result<(), PffError> {
     let issue_state = (catalog.issues.len(), catalog.issues_dropped);
     let message_id = recover_item_value(
@@ -991,16 +1051,22 @@ fn process_message(
     catalog.embedded_messages = embedded_messages;
     catalog.unsupported_messages = unsupported_messages;
     mark_stable_top_level_identifier(visited, message_id, &work.embedded_path);
-    if let Err(error) =
-        stream_recipients(&work.item, message_id, recipient_count_hint, sink, catalog)
-    {
+    if let Err(error) = stream_recipients(
+        &work.item,
+        message_id,
+        recipient_count_hint,
+        &work.embedded_path,
+        sink,
+        catalog,
+        deferred,
+    ) {
         record_item_issue(catalog, Some(message_id), "stream recipients", error)?;
     }
     match work.item.attachment_count() {
         Ok(count) => {
-            if let Err(error) =
-                stream_attachments(&work, message_id, count, pending, visited, sink, catalog)
-            {
+            if let Err(error) = stream_attachments(
+                &work, message_id, count, pending, visited, sink, catalog, deferred,
+            ) {
                 record_attachment_issue(catalog, Some(message_id), "stream attachments", error)?;
             }
         }
@@ -1011,8 +1077,10 @@ fn process_message(
     if let Err(error) = stream_item_properties(
         &work.item,
         PropertyOwner::Message(message_id),
+        &work.embedded_path,
         sink,
         catalog,
+        deferred,
     ) {
         record_item_issue(
             catalog,
@@ -1061,8 +1129,10 @@ fn stream_recipients(
     message: &PffItem,
     message_id: u32,
     count_hint: Option<u32>,
+    embedded_path: &[u32],
     sink: &mut dyn CatalogSink,
     catalog: &mut RawCatalog,
+    deferred: &mut Vec<DeferredPayload>,
 ) -> Result<(), PffError> {
     if count_hint == Some(0) {
         return Ok(());
@@ -1103,13 +1173,16 @@ fn stream_recipients(
                 index: index_u32,
             },
             checked_index(index, "record set index")?,
+            embedded_path,
             sink,
             catalog,
+            deferred,
         )?;
     }
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn stream_attachments(
     work: &MessageWork,
     message_id: u32,
@@ -1118,6 +1191,7 @@ fn stream_attachments(
     visited: &mut HashSet<u32>,
     sink: &mut dyn CatalogSink,
     catalog: &mut RawCatalog,
+    deferred: &mut Vec<DeferredPayload>,
 ) -> Result<(), PffError> {
     for index in 0..count {
         let index_u32 = checked_index(index, "attachment index")?;
@@ -1218,20 +1292,36 @@ fn stream_attachments(
                     limit: u64::MAX - 1,
                 })?;
         let traversal_order = sink.traversal_order();
-        let writer_order = traversal_order == TraversalOrder::Writer;
+        let writer_order = matches!(
+            traversal_order,
+            TraversalOrder::Writer | TraversalOrder::Direct
+        );
         let embedded_attachment = attachment_type == Some(i32::from(b'i'));
         let defer_properties = embedded_attachment && traversal_order != TraversalOrder::Source;
         if !defer_properties {
-            stream_attachment_properties(&attachment, message_id, index_u32, sink, catalog)?;
+            stream_attachment_properties(
+                &attachment,
+                message_id,
+                index_u32,
+                &work.embedded_path,
+                sink,
+                catalog,
+                deferred,
+            )?;
         }
         if !embedded_attachment && !reference_attachment {
+            let expected = data_size.ok_or(PffError::Native {
+                operation: "get attachment size",
+                detail: "attachment data size is unavailable".to_owned(),
+            })?;
+            let request = sink.attachment_payload(message_id, index_u32, Some(expected));
             let result = data_size
                 .ok_or(PffError::Native {
                     operation: "get attachment size",
                     detail: "attachment data size is unavailable".to_owned(),
                 })
                 .and_then(|expected| {
-                    attachment.stream_attachment(message_id, index_u32, expected, sink)
+                    attachment.stream_attachment(message_id, index_u32, expected, request, sink)
                 });
             let actual = match result {
                 Ok(actual) => actual,
@@ -1242,8 +1332,10 @@ fn stream_attachments(
                             &attachment,
                             message_id,
                             index_u32,
+                            &work.embedded_path,
                             sink,
                             catalog,
+                            deferred,
                         )?;
                     }
                     emit(
@@ -1272,6 +1364,24 @@ fn stream_attachments(
                         value: u64::MAX,
                         limit: u64::MAX - 1,
                     })?;
+            if matches!(request, PayloadRequest::DeferredPrefix(_)) && actual < expected {
+                deferred.push(DeferredPayload::Attachment {
+                    embedded_path: work.embedded_path.clone(),
+                    index: index_u32,
+                    attachment,
+                    expected,
+                    prefix_bytes: actual,
+                });
+                emit(
+                    sink,
+                    "attachment end",
+                    CatalogEvent::AttachmentEnd {
+                        message_id,
+                        index: index_u32,
+                    },
+                )?;
+                continue;
+            }
         }
         let mut queued_embedded = None;
         if embedded_attachment {
@@ -1291,8 +1401,10 @@ fn stream_attachments(
                             &attachment,
                             message_id,
                             index_u32,
+                            &work.embedded_path,
                             sink,
                             catalog,
+                            deferred,
                         )?;
                     }
                     emit(
@@ -1337,7 +1449,14 @@ fn stream_attachments(
             })();
             match embedded_work {
                 Ok(embedded_work) if writer_order => {
-                    process_message(embedded_work, pending, visited, sink, catalog)?;
+                    process_message_inner(
+                        embedded_work,
+                        pending,
+                        visited,
+                        sink,
+                        catalog,
+                        deferred,
+                    )?;
                 }
                 Ok(embedded_work) => queued_embedded = Some(embedded_work),
                 Err(error) => {
@@ -1346,8 +1465,10 @@ fn stream_attachments(
                             &attachment,
                             message_id,
                             index_u32,
+                            &work.embedded_path,
                             sink,
                             catalog,
+                            deferred,
                         )?;
                     }
                     emit(
@@ -1369,7 +1490,15 @@ fn stream_attachments(
             }
         }
         if defer_properties {
-            stream_attachment_properties(&attachment, message_id, index_u32, sink, catalog)?;
+            stream_attachment_properties(
+                &attachment,
+                message_id,
+                index_u32,
+                &work.embedded_path,
+                sink,
+                catalog,
+                deferred,
+            )?;
         }
         emit(
             sink,
@@ -1391,14 +1520,18 @@ fn stream_attachment_properties(
     attachment: &PffItem,
     message_id: u32,
     index: u32,
+    embedded_path: &[u32],
     sink: &mut dyn CatalogSink,
     catalog: &mut RawCatalog,
+    deferred: &mut Vec<DeferredPayload>,
 ) -> Result<(), PffError> {
     if let Err(error) = stream_item_properties(
         attachment,
         PropertyOwner::Attachment { message_id, index },
+        embedded_path,
         sink,
         catalog,
+        deferred,
     ) {
         record_attachment_issue(
             catalog,
@@ -1428,8 +1561,10 @@ fn recover_attachment_value<T: Default>(
 fn stream_item_properties(
     item: &PffItem,
     owner: PropertyOwner,
+    embedded_path: &[u32],
     sink: &mut dyn CatalogSink,
     catalog: &mut RawCatalog,
+    deferred: &mut Vec<DeferredPayload>,
 ) -> Result<(), PffError> {
     let count = item.record_set_count()?;
     for index in 0..count {
@@ -1438,8 +1573,10 @@ fn stream_item_properties(
             &set,
             owner,
             checked_index(index, "record set index")?,
+            embedded_path,
             sink,
             catalog,
+            deferred,
         )?;
     }
     Ok(())
@@ -1449,8 +1586,10 @@ fn stream_record_set(
     set: &PffRecordSet,
     owner: PropertyOwner,
     record_set_index: u32,
+    embedded_path: &[u32],
     sink: &mut dyn CatalogSink,
     catalog: &mut RawCatalog,
+    deferred: &mut Vec<DeferredPayload>,
 ) -> Result<(), PffError> {
     let count = set.entry_count()?;
     for index in 0..count {
@@ -1485,7 +1624,7 @@ fn stream_record_set(
             CatalogEvent::PropertyStart(descriptor),
         )?;
         let request = sink.property_payload(descriptor);
-        let actual = match entry.stream(descriptor, sink) {
+        let actual = match entry.stream(descriptor, request, sink) {
             Ok(actual) => actual,
             Err(error @ PffError::Sink { .. }) => return Err(error),
             Err(error) => {
@@ -1500,7 +1639,9 @@ fn stream_record_set(
         };
         let expected = match request {
             PayloadRequest::Full => descriptor.data_size,
-            PayloadRequest::Prefix(limit) => descriptor.data_size.min(limit),
+            PayloadRequest::Prefix(limit) | PayloadRequest::DeferredPrefix(limit) => {
+                descriptor.data_size.min(limit)
+            }
         };
         if actual != expected {
             let error = PffError::StreamSizeMismatch {
@@ -1519,6 +1660,14 @@ fn stream_record_set(
             return Err(error);
         }
         emit(sink, "property end", CatalogEvent::PropertyEnd(descriptor))?;
+        if matches!(request, PayloadRequest::DeferredPrefix(_)) && actual < descriptor.data_size {
+            deferred.push(DeferredPayload::Property {
+                embedded_path: embedded_path.to_vec(),
+                descriptor,
+                entry,
+                prefix_bytes: actual,
+            });
+        }
         catalog.properties = catalog
             .properties
             .checked_add(1)
@@ -1536,6 +1685,56 @@ fn stream_record_set(
                     value: u64::MAX,
                     limit: u64::MAX - 1,
                 })?;
+    }
+    Ok(())
+}
+
+fn stream_deferred_payloads(
+    deferred: &mut Vec<DeferredPayload>,
+    sink: &mut dyn CatalogSink,
+    catalog: &mut RawCatalog,
+) -> Result<(), PffError> {
+    for payload in deferred.drain(..) {
+        match payload {
+            DeferredPayload::Property {
+                embedded_path,
+                descriptor,
+                entry,
+                prefix_bytes,
+            } => {
+                let remaining =
+                    entry.stream_deferred(&embedded_path, descriptor, prefix_bytes, sink)?;
+                catalog.property_bytes = catalog.property_bytes.checked_add(remaining).ok_or(
+                    PffError::LimitExceeded {
+                        field: "property byte count",
+                        value: u64::MAX,
+                        limit: u64::MAX - 1,
+                    },
+                )?;
+            }
+            DeferredPayload::Attachment {
+                embedded_path,
+                index,
+                attachment,
+                expected,
+                prefix_bytes,
+            } => {
+                let remaining = attachment.stream_attachment_deferred(
+                    &embedded_path,
+                    index,
+                    expected,
+                    prefix_bytes,
+                    sink,
+                )?;
+                catalog.attachment_bytes = catalog.attachment_bytes.checked_add(remaining).ok_or(
+                    PffError::LimitExceeded {
+                        field: "attachment byte count",
+                        value: u64::MAX,
+                        limit: u64::MAX - 1,
+                    },
+                )?;
+            }
+        }
     }
     Ok(())
 }
@@ -1776,22 +1975,28 @@ impl PffRecordEntry {
     fn stream(
         &self,
         descriptor: PropertyDescriptor,
+        request: PayloadRequest,
         sink: &mut dyn CatalogSink,
     ) -> Result<u64, PffError> {
-        let request = sink.property_payload(descriptor);
         let limit = match request {
             PayloadRequest::Full => descriptor.data_size,
-            PayloadRequest::Prefix(limit) => descriptor.data_size.min(limit),
+            PayloadRequest::Prefix(limit) | PayloadRequest::DeferredPrefix(limit) => {
+                descriptor.data_size.min(limit)
+            }
         };
         let mut total = 0_u64;
         let mut buffer = vec![0_u8; STREAM_CHUNK_BYTES];
         loop {
-            if matches!(request, PayloadRequest::Prefix(_)) && total >= limit {
+            if matches!(
+                request,
+                PayloadRequest::Prefix(_) | PayloadRequest::DeferredPrefix(_)
+            ) && total >= limit
+            {
                 break;
             }
             let requested = match request {
                 PayloadRequest::Full => buffer.len(),
-                PayloadRequest::Prefix(_) => usize::try_from(
+                PayloadRequest::Prefix(_) | PayloadRequest::DeferredPrefix(_) => usize::try_from(
                     limit
                         .saturating_sub(total)
                         .min(u64::try_from(buffer.len()).unwrap_or(u64::MAX)),
@@ -1853,6 +2058,84 @@ impl PffRecordEntry {
                     bytes: &buffer[..read],
                 },
             )?;
+        }
+        Ok(total)
+    }
+
+    fn stream_deferred(
+        &self,
+        embedded_path: &[u32],
+        descriptor: PropertyDescriptor,
+        prefix_bytes: u64,
+        sink: &mut dyn CatalogSink,
+    ) -> Result<u64, PffError> {
+        let expected = descriptor.data_size.saturating_sub(prefix_bytes);
+        let mut total = 0_u64;
+        let mut buffer = vec![0_u8; STREAM_CHUNK_BYTES];
+        while total < expected {
+            let requested = usize::try_from(
+                expected
+                    .saturating_sub(total)
+                    .min(u64::try_from(buffer.len()).unwrap_or(u64::MAX)),
+            )
+            .map_err(|_| PffError::InvalidValue {
+                field: "record read size",
+                value: i64::MAX,
+            })?;
+            let mut error = ptr::null_mut();
+            // SAFETY: self.raw is valid and the prefix read left its owned
+            // stream positioned at `prefix_bytes`.
+            let read = unsafe {
+                bindings::libpff_record_entry_read_buffer(
+                    self.raw,
+                    buffer.as_mut_ptr(),
+                    requested,
+                    &mut error,
+                )
+            };
+            if read < 0 {
+                return Err(native_error(error, "read deferred record data"));
+            }
+            free_error(error);
+            if read == 0 {
+                break;
+            }
+            let read = usize::try_from(read).map_err(|_| PffError::InvalidValue {
+                field: "record read size",
+                value: i64::MAX,
+            })?;
+            if read > requested {
+                return Err(PffError::InvalidValue {
+                    field: "record read size",
+                    value: i64::try_from(read).unwrap_or(i64::MAX),
+                });
+            }
+            total = total
+                .checked_add(u64::try_from(read).map_err(|_| PffError::InvalidValue {
+                    field: "record read size",
+                    value: i64::MAX,
+                })?)
+                .ok_or(PffError::LimitExceeded {
+                    field: "record streamed size",
+                    value: u64::MAX,
+                    limit: u64::MAX - 1,
+                })?;
+            emit(
+                sink,
+                "deferred property data",
+                CatalogEvent::DeferredPropertyData {
+                    embedded_path,
+                    descriptor,
+                    bytes: &buffer[..read],
+                },
+            )?;
+        }
+        if total != expected {
+            return Err(PffError::StreamSizeMismatch {
+                field: "deferred property data",
+                expected,
+                actual: total,
+            });
         }
         Ok(total)
     }
@@ -2112,12 +2395,14 @@ impl PffItem {
         message_id: u32,
         index: u32,
         expected: u64,
+        request: PayloadRequest,
         sink: &mut dyn CatalogSink,
     ) -> Result<u64, PffError> {
-        let request = sink.attachment_payload(message_id, index, Some(expected));
         let limit = match request {
             PayloadRequest::Full => expected,
-            PayloadRequest::Prefix(limit) => expected.min(limit),
+            PayloadRequest::Prefix(limit) | PayloadRequest::DeferredPrefix(limit) => {
+                expected.min(limit)
+            }
         };
         let mut total = 0_u64;
         let mut buffer = vec![0_u8; STREAM_CHUNK_BYTES];
@@ -2130,12 +2415,16 @@ impl PffItem {
         }
         free_error(error);
         loop {
-            if matches!(request, PayloadRequest::Prefix(_)) && total >= limit {
+            if matches!(
+                request,
+                PayloadRequest::Prefix(_) | PayloadRequest::DeferredPrefix(_)
+            ) && total >= limit
+            {
                 break;
             }
             let requested = match request {
                 PayloadRequest::Full => buffer.len(),
-                PayloadRequest::Prefix(_) => usize::try_from(
+                PayloadRequest::Prefix(_) | PayloadRequest::DeferredPrefix(_) => usize::try_from(
                     limit
                         .saturating_sub(total)
                         .min(u64::try_from(buffer.len()).unwrap_or(u64::MAX)),
@@ -2226,6 +2515,85 @@ impl PffItem {
                 actual: total,
             })
         }
+    }
+
+    fn stream_attachment_deferred(
+        &self,
+        embedded_path: &[u32],
+        index: u32,
+        expected: u64,
+        prefix_bytes: u64,
+        sink: &mut dyn CatalogSink,
+    ) -> Result<u64, PffError> {
+        let expected_remaining = expected.saturating_sub(prefix_bytes);
+        let mut total = 0_u64;
+        let mut buffer = vec![0_u8; STREAM_CHUNK_BYTES];
+        while total < expected_remaining {
+            let requested = usize::try_from(
+                expected_remaining
+                    .saturating_sub(total)
+                    .min(u64::try_from(buffer.len()).unwrap_or(u64::MAX)),
+            )
+            .map_err(|_| PffError::InvalidValue {
+                field: "attachment read size",
+                value: i64::MAX,
+            })?;
+            let mut error = ptr::null_mut();
+            // SAFETY: self.raw is valid and the prefix read left the owned
+            // attachment stream positioned at `prefix_bytes`.
+            let read = unsafe {
+                bindings::libpff_attachment_data_read_buffer(
+                    self.raw,
+                    buffer.as_mut_ptr(),
+                    requested,
+                    &mut error,
+                )
+            };
+            if read < 0 {
+                return Err(native_error(error, "read deferred attachment data"));
+            }
+            free_error(error);
+            if read == 0 {
+                break;
+            }
+            let read = usize::try_from(read).map_err(|_| PffError::InvalidValue {
+                field: "attachment read size",
+                value: i64::MAX,
+            })?;
+            if read > requested {
+                return Err(PffError::InvalidValue {
+                    field: "attachment read size",
+                    value: i64::try_from(read).unwrap_or(i64::MAX),
+                });
+            }
+            total = total
+                .checked_add(u64::try_from(read).map_err(|_| PffError::InvalidValue {
+                    field: "attachment read size",
+                    value: i64::MAX,
+                })?)
+                .ok_or(PffError::LimitExceeded {
+                    field: "attachment streamed size",
+                    value: u64::MAX,
+                    limit: u64::MAX - 1,
+                })?;
+            emit(
+                sink,
+                "deferred attachment data",
+                CatalogEvent::DeferredAttachmentData {
+                    embedded_path,
+                    index,
+                    bytes: &buffer[..read],
+                },
+            )?;
+        }
+        if total != expected_remaining {
+            return Err(PffError::StreamSizeMismatch {
+                field: "deferred attachment data",
+                expected: expected_remaining,
+                actual: total,
+            });
+        }
+        Ok(total)
     }
 }
 

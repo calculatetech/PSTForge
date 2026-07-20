@@ -109,6 +109,12 @@ correctly as it constructs the destination-side temporary, syncs the completed
 file, and publishes it with an atomic rename. Independent readers, ScanPST,
 Outlook, and MailPlus are CI or release-acceptance evidence rather than runtime
 transformation stages.
+Direct traversal retains metadata for at most one top-level message graph.
+Bounded prefixes, control metadata, and collection overhead have a checked
+256 MiB aggregate supervisor budget and a 262,144-frame ceiling. Exceeding
+either limit stops the non-restartable run as an explicit terminal partial
+failure before a second prefix copy or destination publication can consume
+unbounded memory.
 `--restartable` selects the durable payload pack so recovery and writing can
 resume without rereading committed payloads. Restartability costs
 approximately one additional readable-payload write and corresponding
@@ -141,17 +147,17 @@ finalized parts, manifests, compact ledger, and `recovery.log` remain valid and
 `report` can inspect them, but the job cannot resume. Rerunning direct recovery
 requires a new empty output directory. This avoids duplicating candidates
 across already published parts without reintroducing restartable payload state.
-The full-payload parser receives at most three clean attempts. A later attempt
-drains candidates already assigned to finalized parts and rebuilds only the
-unpublished active part. Exhausting those attempts produces a typed
-`failed-partial` result with the same non-resumable retained-state contract;
-it never reports an unfinished candidate as written.
-If libpff reports a parser failure after writer-order replay has emitted every
-top-level candidate in the durable metadata catalog, the supervisor accepts
-that exact catalog boundary and continues validation instead of rewriting the
-complete unpublished part. The same boundary is a hard protocol failure when
-even one durable candidate remains expected. Source identity is rechecked
-before the worker reports the boundary and again before job completion.
+The direct parser receives one supervised attempt. A worker crash, stall, or
+protocol failure aborts the active ledger transaction, removes the unpublished
+active part, preserves atomically finalized parts, and produces a typed
+`failed-partial` result with the same non-resumable retained-state contract.
+PSTForge never reports an unfinished candidate as written. Operators who need
+durable retry select `--restartable`.
+If libpff reports a parser boundary after the last complete top-level graph,
+the supervisor retains every committed candidate and reports the contained
+parser issue instead of discarding the completed graph. Source identity is
+rechecked before the worker reports the boundary and again before job
+completion.
 
 PSTForge owns only ledger-tracked output names. It ignores and preserves
 untracked files placed in the public `parts/` directory, including human

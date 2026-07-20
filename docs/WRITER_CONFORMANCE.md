@@ -357,25 +357,27 @@ overview reference is replaced by a section-specific reference.
 - **Evidence:** allocation-map and FPMap-boundary tests; ScanPST 4 GB parts
 
 ### NDB-07
-- **Status:** Implementation checkpoint in progress. PSTForge builds a structurally complete private file by construction, syncs it once, atomically renames without replacement, syncs the held destination directory, and verifies the published device/inode. Production does not reopen, hash, extract, or independently read the completed PST. Internal structural assertions and independent readers remain mandatory in focused tests, CI gates, and release acceptance. Failure before rename leaves no public part; post-rename durability uncertainty is reported distinctly.
+- **Status:** Verified. PSTForge builds a structurally complete private file by construction, syncs it once, atomically renames without replacement, syncs the held destination directory, and verifies the published device/inode. Production does not reopen, hash, extract, or independently read the completed PST. Internal structural assertions and independent readers remain mandatory in focused tests, CI gates, and release acceptance. Failure before rename leaves no public part; post-rename durability uncertainty is reported distinctly.
 - **Requirement:** The writer completes every documented relationship and allocation structure before file `fsync`, atomic no-clobber rename, and directory `fsync`; production publication does not depend on rereading its output
 - **Sources:** PST-INT 2.6; the verified NDB/LTP/Messaging rows above; POSIX durability is a PSTForge safety requirement
 - **Implementation:** `create_flat_store`, transactional construction finalization, `publish_noclobber`, `sync_published_directory`, `verify_published_destination`; `validate_completed_store`, `validate_completed_folder_store`, and `validate_with_independent_readers` are test/acceptance utilities
 - **Evidence:** construction-invariant, publication, moved-directory, no-clobber, independent-reader gate, ScanPST, and Outlook tests
 
 ### NDB-08
-- **Status:** Verified; the transactional writer emits each accepted message block once before final NBT, BBT, allocation-map, and header construction. Bounded private batches amortize exact finalized-size projection while exact replay fixes every part boundary. Physical message-block order is independent of final folder-table membership and NBT order.
+- **Status:** Verified; the transactional writer emits each accepted message block once before final NBT, BBT, allocation-map, and header construction. Restartable mode uses bounded private batches to amortize exact finalized-size projection while exact replay fixes every part boundary. Direct mode performs bounded structural preflight for one top-level graph, selects its part without opening an unread payload remainder, and then consumes that remainder exactly once from the retained native handle. Physical message-block order is independent of final folder-table membership and NBT order.
 - **Requirement:** Transactional construction may append complete message nodes and their referenced blocks in source traversal order before finalization, provided final NBT and BBT entries remain sorted and complete, each message row is assigned to the contents or associated-contents table of its actual parent folder, allocation maps cover exactly retained extents, the header references only the final roots and high-water marks, and no pre-finalized file is published. Folder hierarchy and metadata validation is independent of any recovered message, so an unrepresentable candidate cannot suppress otherwise valid or empty source folders. A provisional batch may defer finalized-size projection; its primary bound scales from the requested part size and the bytes actually allocated in the private PST, with a message-count ceiling only to bound latency for very small items. The batch is accepted only after one exact projection. If that projection exceeds the part limit, the complete batch is rolled back to its byte-for-byte private checkpoint and replayed one message at a time with exact projection so the published part remains at the last fitting message.
 - **Sources:** NDB-01 through NDB-07; MS-PST 2.2.2.1 defines the NDB as nodes and blocks addressed through the NBT and BBT, and PST-INT 2.6 requires the final database relationships and allocation state to be internally consistent
 - **Implementation:** `validate_mail_store_layout`,
   `TransactionalMailStoreWriter::begin`, `begin_batch`,
-  `append_message_deferred`, the 0.4.5 direct-source append API,
+  `append_message_deferred`, the 0.4.5 one-pass direct-source append API and
+  metadata/payload protocol boundaries,
   `projected_file_eof`, `rollback_batch`, `append_message`, and `finalize`;
   `write_bbt`, `write_nbt`, `write_fixed_pages`, `write_header`, and the NDB-07
   publication path remain authoritative
 - **Evidence:** focused append, direct-source failure rollback/reappend, batch
   rollback, interleaved source-folder and normal/associated placement,
-  exact and mismatched direct projection, message-atomic direct
+  exact and mismatched direct projection, one-traversal prefix/remainder
+  concatenation, nested-graph metadata ordering, message-atomic direct
   completion, projection metadata immutability, recursive normal/associated
   identity rejection, exact-boundary, and byte-comparison tests; independent
   `pffinfo` and `readpst`; all five 19 GB qualification parts pass ScanPST and

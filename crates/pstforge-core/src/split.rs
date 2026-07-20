@@ -10,7 +10,7 @@ use libpff_sys::RecoveryMode;
 use pstforge_job::{
     CandidateRejectionCategory, CandidateRejectionCounts, DurableCatalogSink, JobConfiguration,
     JobError, JobSourceIdentity, PartSidecar, PublishedPart, PublishedPartRecord,
-    ReconstructedField, ReconstructionCounts,
+    ReconstructedField, ReconstructionCounts, RecoveryCompletion,
 };
 use pstforge_pst::writer::{
     AttachmentContent, MailFolderLocation, MessageSpec, NamedPropertyCatalog, NamedPropertyName,
@@ -27,7 +27,6 @@ use crate::recovery::{
 };
 use crate::worker::{
     DirectCandidateBindings, DirectProtocolSource, DirectStreamIdentity, DirectStreamOwner,
-    DirectTopLevelBinding,
 };
 use crate::writer_input::{
     PartBuildOptions, PartWriterInput, build_part_writer_input_with_folders_interruptible,
@@ -48,7 +47,7 @@ const ESTIMATED_MESSAGE_BYTES: u64 = 64 * 1024;
 const ESTIMATED_FOLDER_BYTES: u64 = 16 * 1024;
 const MAX_RECOVERY_LOG_DETAIL_LINES: usize = 10_000;
 const MAX_BATCH_MESSAGES: usize = 2_048;
-const MAX_DIRECT_WORKER_ATTEMPTS: u32 = 3;
+const MAX_DIRECT_WORKER_ATTEMPTS: u32 = 1;
 
 #[derive(Debug, Error)]
 pub enum SplitError {
@@ -307,19 +306,70 @@ pub fn split(
         existing_job_bytes = disk_preflight.existing_job_bytes,
         "output space preflight passed"
     );
-    let (mut recovery, mut job) = recover_for_split(
-        &source,
-        job_directory,
-        worker_executable,
-        mode,
-        std::sync::Arc::clone(&interrupt_flag),
-        PreparedSplitRecovery {
-            resume,
-            configuration: &configuration,
-            job: resumed_job,
-            metadata_only: !restartable,
-        },
-    )?;
+    let (mut recovery, mut job) = if restartable {
+        recover_for_split(
+            &source,
+            job_directory,
+            worker_executable,
+            mode,
+            std::sync::Arc::clone(&interrupt_flag),
+            PreparedSplitRecovery {
+                resume,
+                configuration: &configuration,
+                job: resumed_job,
+                metadata_only: false,
+            },
+        )?
+    } else {
+        let job = DurableCatalogSink::create_direct_metadata(
+            job_directory,
+            crate::worker::METADATA_PROPERTY_PREFIX_BYTES,
+            crate::worker::METADATA_ATTACHMENT_PREFIX_BYTES,
+        )?;
+        let job_source = JobSourceIdentity {
+            canonical_path: source.identity().canonical_path.clone(),
+            device: source.identity().device,
+            inode: source.identity().inode,
+            size_bytes: source.identity().size_bytes,
+            modified_at: source.identity().modified_at.clone(),
+            sha256: None,
+        };
+        job.bind_source(&job_source)?;
+        job.bind_recovery_mode(recovery_mode_name(mode))?;
+        job.bind_configuration(&configuration)?;
+        (
+            RecoveryReport {
+                schema_version: crate::recovery::RECOVERY_SCHEMA_VERSION.to_owned(),
+                command: "recover".to_owned(),
+                mode: recovery_mode_name(mode).to_owned(),
+                source: source.identity().clone(),
+                job_directory: job_directory
+                    .canonicalize()
+                    .unwrap_or_else(|_| job_directory.to_path_buf())
+                    .to_string_lossy()
+                    .into_owned(),
+                normal_items: 0,
+                recovered_items: 0,
+                orphan_items: 0,
+                fragment_items: 0,
+                committed_candidates: 0,
+                complete_candidates: 0,
+                partial_candidates: 0,
+                unsupported_candidates: 0,
+                blob_count: 0,
+                blob_bytes: 0,
+                issues: 0,
+                issues_dropped: 0,
+                worker_attempts: 0,
+                worker_failures: 0,
+                isolated_units: 0,
+                peak_worker_rss_bytes: 0,
+                interrupted: false,
+                source_unchanged: true,
+            },
+            job,
+        )
+    };
     if recovery.interrupted {
         let (parts, written_candidates, unsupported_candidates) = durable_output_snapshot(&job)?;
         recovery.unsupported_candidates = unsupported_candidates;
@@ -367,7 +417,23 @@ pub fn split(
             .worker_failures
             .saturating_add(outcome.worker_failures);
         recovery.interrupted |= outcome.interrupted;
-        recovery.unsupported_candidates = job.summary()?.unsupported_candidates;
+        let summary = job.summary()?;
+        recovery.normal_items = summary
+            .committed_candidates
+            .saturating_sub(summary.recovered_candidates)
+            .saturating_sub(summary.orphan_candidates)
+            .saturating_sub(summary.fragment_candidates);
+        recovery.recovered_items = summary.recovered_candidates;
+        recovery.orphan_items = summary.orphan_candidates;
+        recovery.fragment_items = summary.fragment_candidates;
+        recovery.committed_candidates = summary.committed_candidates;
+        recovery.complete_candidates = summary.complete_candidates;
+        recovery.partial_candidates = summary.partial_candidates;
+        recovery.unsupported_candidates = summary.unsupported_candidates;
+        recovery.blob_count = summary.blob_count;
+        recovery.blob_bytes = summary.blob_bytes;
+        recovery.issues = outcome.catalog.issues;
+        recovery.issues_dropped = outcome.catalog.issues_dropped;
         if recovery.interrupted {
             recovery.source_unchanged = false;
         } else {
@@ -877,13 +943,14 @@ struct DirectSplitOutcome {
     terminal_failure: Option<DirectFailureCategory>,
     worker_attempts: u32,
     worker_failures: u32,
+    catalog: crate::worker::WorkerCatalog,
 }
 
 #[allow(clippy::too_many_arguments)]
 fn begin_direct_part(
     job: &DurableCatalogSink,
     source_folders: &crate::CanonicalFolderSet,
-    named_properties: &NamedPropertyCatalog,
+    _named_properties: &NamedPropertyCatalog,
     source_sha256: &str,
     recovery_mode: &str,
     maximum_pst_bytes: u64,
@@ -906,10 +973,9 @@ fn begin_direct_part(
     let staged_filename = format!("part-{part_index:04}-direct.pst.partial");
     let staged_path = job.staged_part_path(&staged_filename)?;
     remove_staged_if_present(&staged_path)?;
-    let writer = TransactionalMailStoreWriter::begin(
+    let writer = TransactionalMailStoreWriter::begin_streaming(
         &staged_path,
         layout,
-        named_properties,
         part_index == 1,
         Some(validator_supervisor),
     )?;
@@ -1122,24 +1188,6 @@ fn register_direct_mail_streams(
     Ok(())
 }
 
-fn register_direct_embedded_bindings(
-    job: &DurableCatalogSink,
-    source: &mut DirectProtocolSource<'_>,
-    root_item_key: &str,
-    interrupted: &AtomicBool,
-) -> Result<(), SplitError> {
-    for candidate in job.direct_embedded_candidates_interruptible(root_item_key, interrupted)? {
-        source.register_embedded_message(
-            &candidate.parent_item_key,
-            candidate.parent_attachment_index,
-            &candidate.item_key,
-            candidate.provenance,
-            candidate.recovery_index,
-        )?;
-    }
-    Ok(())
-}
-
 fn projection_batch_byte_target(maximum_pst_bytes: u64, private_file_eof: u64) -> u64 {
     let finalization_reserve = (maximum_pst_bytes / 16).max(1);
     if private_file_eof >= maximum_pst_bytes.saturating_sub(finalization_reserve) {
@@ -1147,107 +1195,6 @@ fn projection_batch_byte_target(maximum_pst_bytes: u64, private_file_eof: u64) -
     } else {
         (maximum_pst_bytes / 16).max(1)
     }
-}
-
-#[allow(clippy::too_many_arguments)]
-fn project_direct_single_part(
-    source_bytes: u64,
-    job: &mut DurableCatalogSink,
-    spooled_folders: &[pstforge_job::SpooledFolder],
-    source_folders: &crate::CanonicalFolderSet,
-    named_properties: &NamedPropertyCatalog,
-    source_sha256: &str,
-    mode_name: &str,
-    maximum_pst_bytes: u64,
-    worker_executable: &Path,
-    interrupted: &AtomicBool,
-) -> Result<Option<u64>, SplitError> {
-    if maximum_pst_bytes < source_bytes {
-        return Ok(None);
-    }
-    let mut transaction = begin_direct_part(
-        job,
-        source_folders,
-        named_properties,
-        source_sha256,
-        mode_name,
-        maximum_pst_bytes,
-        1,
-        worker_executable,
-    )?;
-    let checkpoint = transaction.writer.begin_batch();
-    let mut candidate_rowid = 0_i64;
-    loop {
-        let Some(candidate) = job.next_direct_top_level_candidate(candidate_rowid)? else {
-            break;
-        };
-        candidate_rowid = candidate.rowid;
-        if job.candidate_is_terminal(&candidate.item_key)? {
-            continue;
-        }
-        let mail = load_canonical_mail_tree_from_folders_interruptible(
-            job,
-            spooled_folders,
-            &candidate.item_key,
-            interrupted,
-        )?;
-        let relevant_folders = source_folders_for_mail(&source_folders.folders, &mail);
-        let mut input = match build_part_writer_input_with_folders_interruptible(
-            job,
-            &[&mail],
-            &relevant_folders,
-            PartBuildOptions {
-                source_sha256,
-                recovery_mode: mode_name,
-                maximum_pst_bytes,
-                part_index: 1,
-                omitted_folders: 0,
-            },
-            interrupted,
-        ) {
-            Ok(input) => input,
-            Err(error) if candidate_rejection_category(&error).is_some() => {
-                let rejections = translation_rejections(&mail, &error)
-                    .ok_or_else(|| SplitError::Translation(error))?;
-                job.mark_candidate_rejections(&rejections)?;
-                continue;
-            }
-            Err(error) => return Err(error.into()),
-        };
-        if let Err(error) = validate_mail_store_input(&input.store) {
-            if matches!(error, WriterError::InputRejected(_)) {
-                let mut keys = Vec::new();
-                collect_item_keys(&mail, &mut keys);
-                job.mark_candidates_unsupported(
-                    &keys,
-                    CandidateRejectionCategory::WriterInputRejected,
-                )?;
-                continue;
-            }
-            return Err(error.into());
-        }
-        let (location, path, associated, message) = take_incremental_message(&mut input)?;
-        transaction
-            .writer
-            .append_message_direct_projection_deferred(
-                location,
-                &path,
-                associated,
-                &message,
-                interrupted,
-            )?;
-        if transaction.writer.private_file_eof() > maximum_pst_bytes {
-            transaction.writer.rollback_projected_batch(checkpoint)?;
-            return Ok(None);
-        }
-    }
-    if transaction.writer.message_count() == 0 {
-        transaction.writer.rollback_projected_batch(checkpoint)?;
-        return Ok(None);
-    }
-    let projected_file_eof = transaction.writer.projected_file_eof(interrupted)?;
-    transaction.writer.rollback_projected_batch(checkpoint)?;
-    Ok((projected_file_eof <= maximum_pst_bytes).then_some(projected_file_eof))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1260,7 +1207,7 @@ fn split_direct_recovered_job(
     interrupted: &std::sync::Arc<AtomicBool>,
 ) -> Result<DirectSplitOutcome, SplitError> {
     let source_key = source.identity().stable_key();
-    let spooled_folders = job.spooled_folders()?;
+    let mut spooled_folders = job.spooled_folders()?;
     let mut source_folders = load_canonical_folders_interruptible(job, interrupted)?;
     let mode_name = recovery_mode_name(recovery_mode);
     let mut discovered_folders = BTreeSet::new();
@@ -1337,18 +1284,7 @@ fn split_direct_recovered_job(
         .into_iter()
         .map(|(unit, _)| unit)
         .collect::<HashSet<_>>();
-    let single_part_projected_eof = project_direct_single_part(
-        source.identity().size_bytes,
-        job,
-        &spooled_folders,
-        &source_folders,
-        &named_properties,
-        &source_key,
-        mode_name,
-        maximum_pst_bytes,
-        worker_executable,
-        interrupted,
-    )?;
+    let single_part_projected_eof = None;
     if let Some(projected_file_eof) = single_part_projected_eof {
         tracing::info!(
             projected_file_eof,
@@ -1361,6 +1297,7 @@ fn split_direct_recovered_job(
     let mut part_index = 1_u32;
     let mut worker_attempts = 0_u32;
     let mut worker_failures = 0_u32;
+    let mut completed_catalog = None;
     loop {
         worker_attempts = worker_attempts.saturating_add(1);
         job.record_worker_event("started", worker_attempts, "direct_parser")?;
@@ -1384,33 +1321,20 @@ fn split_direct_recovered_job(
                 .with_progress(move || progress.notify());
                 let mut candidate_rowid = 0_i64;
                 loop {
-                    let expected = job.next_direct_top_level_candidate(candidate_rowid)?;
-                    let next_rowid = expected.as_ref().map(|candidate| candidate.rowid);
-                    let binding = expected.map(|candidate| DirectTopLevelBinding {
-                        item_key: candidate.item_key,
-                        provenance: candidate.provenance,
-                        source_node_id: candidate.source_node_id,
-                        recovery_index: candidate.recovery_index,
-                    });
-                    let Some(durable_key) = protocol.next_top_level_message(binding)? else {
+                    let Some(candidate) =
+                        protocol.next_one_pass_candidate(job, candidate_rowid, interrupted)?
+                    else {
                         break;
                     };
-                    candidate_rowid = next_rowid.ok_or_else(|| {
-                        SplitError::Writer(WriterError::InvalidStructure(
-                            "direct candidate cursor disappeared".to_owned(),
-                        ))
-                    })?;
+                    candidate_rowid = candidate.rowid;
+                    let durable_key = candidate.item_key;
+                    spooled_folders = job.spooled_folders()?;
+                    source_folders = load_canonical_folders_interruptible(job, interrupted)?;
                     if interrupted.load(Ordering::Relaxed) {
                         job.record_interrupted()?;
                         job.checkpoint()?;
                         return Ok(true);
                     }
-                    register_direct_embedded_bindings(
-                        job,
-                        &mut protocol,
-                        &durable_key,
-                        interrupted,
-                    )?;
                     if job.candidate_is_terminal(&durable_key)? {
                         protocol.finish_top_level_message()?;
                         continue;
@@ -1474,6 +1398,12 @@ fn split_direct_recovered_job(
                             part_index,
                             worker_executable,
                         )?);
+                    }
+                    {
+                        let transaction = active.as_mut().ok_or(SplitError::TooManyParts)?;
+                        for folder in input.store.folders.iter().cloned() {
+                            transaction.writer.observe_folder(folder)?;
+                        }
                     }
                     let message_count = count_messages(&message);
                     if let Some(projected_file_eof) = single_part_projected_eof {
@@ -1590,9 +1520,62 @@ fn split_direct_recovered_job(
                     .into());
                 }
                 protocol.require_end_of_stream()?;
+                let catalog = protocol.take_completed_catalog().ok_or_else(|| {
+                    WriterError::InvalidStructure(
+                        "direct worker completion omitted catalog counters".to_owned(),
+                    )
+                })?;
+                job.record_recovery_completion(&RecoveryCompletion {
+                    normal_items: catalog
+                        .messages
+                        .saturating_sub(catalog.recovered_messages)
+                        .saturating_sub(catalog.orphan_messages)
+                        .saturating_sub(catalog.fragment_messages),
+                    recovered_items: catalog.recovered_messages,
+                    orphan_items: catalog.orphan_messages,
+                    fragment_items: catalog.fragment_messages,
+                    issues: catalog.issues,
+                    issues_dropped: catalog.issues_dropped,
+                    peak_worker_rss_bytes: 0,
+                })?;
+                job.checkpoint()?;
+                completed_catalog = Some(catalog);
             }
             worker.progress();
             worker.finish()?;
+            if let Some(transaction) = active.as_mut() {
+                source_folders = load_canonical_folders_interruptible(job, interrupted)?;
+                for source_folder in &source_folders.folders {
+                    let layout = build_part_writer_layout(
+                        std::slice::from_ref(source_folder),
+                        PartBuildOptions {
+                            source_sha256: &source_key,
+                            recovery_mode: mode_name,
+                            maximum_pst_bytes,
+                            part_index,
+                            omitted_folders: 0,
+                        },
+                    )?;
+                    match validate_mail_store_layout(&layout) {
+                        Ok(()) => {
+                            for folder in layout.folders {
+                                transaction
+                                    .stats
+                                    .folder_keys
+                                    .insert((folder.location, folder.path.clone()));
+                                transaction.writer.observe_folder(folder)?;
+                            }
+                        }
+                        Err(WriterError::InputRejected(_)) => {
+                            transaction.stats.omitted_folders =
+                                transaction.stats.omitted_folders.saturating_add(1);
+                            transaction.stats.partial = true;
+                            any_partial = true;
+                        }
+                        Err(error) => return Err(error.into()),
+                    }
+                }
+            }
             if let Some(transaction) = active {
                 if let Some(expected_file_eof) = single_part_projected_eof {
                     let actual_file_eof = transaction.writer.projected_file_eof(interrupted)?;
@@ -1622,6 +1605,7 @@ fn split_direct_recovered_job(
                     terminal_failure: None,
                     worker_attempts,
                     worker_failures,
+                    catalog: crate::worker::WorkerCatalog::default(),
                 });
             }
             Ok(false) => break,
@@ -1648,12 +1632,14 @@ fn split_direct_recovered_job(
                         terminal_failure: None,
                         worker_attempts,
                         worker_failures,
+                        catalog: crate::worker::WorkerCatalog::default(),
                     });
                 }
                 let Some(category) = direct_failure_category(&error) else {
                     return Err(error);
                 };
                 worker_failures = worker_failures.saturating_add(1);
+                job.abort_worker_attempt()?;
                 tracing::warn!(
                     attempt = worker_attempts,
                     category = category.metadata_name(),
@@ -1673,6 +1659,7 @@ fn split_direct_recovered_job(
                         terminal_failure: Some(category),
                         worker_attempts,
                         worker_failures,
+                        catalog: crate::worker::WorkerCatalog::default(),
                     });
                 }
             }
@@ -1690,6 +1677,7 @@ fn split_direct_recovered_job(
         terminal_failure: None,
         worker_attempts,
         worker_failures,
+        catalog: completed_catalog.unwrap_or_default(),
     })
 }
 

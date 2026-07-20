@@ -2559,25 +2559,22 @@ not modified.
     message's nested direct attachment. The complete writer suite passes 97
     tests with its existing multi-gigabyte test ignored. The post-fix fast gate
     passed at `.agent/test-results/1784523711-fast`.
-  - [ ] Checkpoint 3: implement the direct supervisor/sink. Perform bounded
+  - [x] Checkpoint 3: implement the direct supervisor/sink. Perform bounded
     per-item structural preflight, select the destination part before payload
     streaming, translate parser events without a payload pack, and keep only
     compact accounting needed for reports and exact reconciliation. Permit
     arbitrary source traversal while producing deterministic folder tables
     and identifiers. A boundary decision must not require rereading or
     rewriting a completed payload.
-    The direct supervisor uses two contained parser passes. The first pass is
-    metadata-only: it emits the existing structural events, bounded values
-    required for canonical translation, declared lengths, and bounded content
-    signatures, but neither writes nor retains mailbox-sized payloads. That
-    pass fixes folder layout, named-property identities, message projections,
-    and part assignments before output allocation. The second pass emits
-    accepted payloads once in the writer's consumption order and streams them
-    through bounded protocol buffers into the already-selected active PST.
-    Restartable mode retains the existing traversal and full-payload protocol.
-    This deliberately trades a second read-only libpff traversal for removal
-    of the payload-spool write, read, allocation, and SSD wear; it does not
-    reread or rewrite a payload after that payload has been committed to a PST.
+    The completed direct supervisor uses one contained parser traversal. For
+    each top-level message graph it captures only bounded property and
+    attachment prefixes, declared lengths, and structural metadata, chooses
+    the destination part, then streams every unread payload remainder from the
+    still-open native handle exactly once. Parent metadata is committed before
+    buffered embedded descendants so the transactional ledger remains flat;
+    the payload phase retains native writer order. Memory is bounded to one
+    message graph and its configured prefixes rather than the mailbox.
+    Restartable mode retains the existing durable full-payload protocol.
     - [x] Added a distinct non-resumable metadata capture mode to the existing
       private SQLite catalog. It stores at most 64 KiB per property and 16 KiB
       per attachment directly in SQLite, assigns stable direct-stream IDs to
@@ -2851,12 +2848,41 @@ not modified.
       all 26 external corpus cases and independent `pffinfo`/`readpst`
       acceptance. A fresh focused adversarial review reported no blocker or
       high-severity milestone-relevant findings.
-    - [ ] Collapse the remaining metadata catalog and payload replay into one
-      libpff traversal. The current direct path no longer hashes either worker
-      open, but still traverses the source once for bounded metadata and again
-      for payloads. Implement a two-phase candidate protocol within one native
-      traversal: emit complete bounded candidate metadata, choose the part,
-      then stream its payload exactly once.
+    - [x] Collapsed metadata capture and payload replay into one libpff
+      traversal. A top-level metadata/payload boundary retains native record
+      and attachment handles only until that graph drains. Prefix bytes are
+      consumed once and concatenated with the unread native remainder; neither
+      source payload nor completed output is reread. Construction-time
+      allocation maps, one final file `fsync`, and atomic no-clobber
+      publication remain unchanged. Nested calendar-exception metadata is
+      committed parent-first from a bounded graph buffer while native payloads
+      retain recursive writer order. Late-discovered empty folders are
+      observed before finalization. Parser-boundary accounting comes from the
+      committed ledger if the optional completion frame is unavailable.
+      The canonical full gate passed at
+      `.agent/test-results/1784557059-full` after the calendar-exception
+      regression exposed and verified the nested ordering correction.
+      The final documented state passed the canonical full gate at
+      `.agent/test-results/1784557519-full`. An injected direct worker abort
+      after one complete candidate returned exit status 1 with one attempt,
+      one failure, `worker_protocol`, zero written candidates, no published
+      PST, a zero-byte payload pack, and only compact ledger/log state.
+      The first clean-context review found one applicable high issue: bounded
+      individual prefixes could aggregate without a graph-wide ceiling and
+      were briefly retained in two representations. Direct metadata now
+      charges serialized control bytes, twice the prefix length, and
+      conservative per-frame overhead against a checked 256 MiB/262,144-frame
+      per-graph budget before creating the second prefix copy. Exact-boundary,
+      byte-overflow, and frame-overflow tests cover the limit; exhaustion is a
+      recorded terminal partial result rather than supervisor OOM.
+      The post-fix fast and canonical full gates pass at
+      `.agent/test-results/1784557946-fast` and
+      `.agent/test-results/1784557989-full`.
+      A fresh clean-context adversarial rereview returned `CLEAN`: the prior
+      aggregate-memory high finding is closed, and no blocker/high issue
+      remains in FFI lifetime, one-pass fidelity, nested identity/order, hard
+      limits, parser containment, cleanup, folder/NAMEID handling,
+      publication/accounting, or source immutability.
   - [ ] Checkpoint 4: complete direct publication and failure behavior. Keep
     one same-filesystem active PST temporary, construct every documented PST
     relationship and allocation structure before one final file `fsync`, then
@@ -3677,6 +3703,23 @@ not modified.
   `large-qualification-20260717T204931Z`.
 
 ## Decision Log
+
+- Decision: Default direct output performs one supervised libpff traversal and
+  one destination construction. It buffers only one top-level message graph's
+  bounded metadata prefixes, commits parent metadata before embedded
+  descendants, then streams unread payload remainders from the retained native
+  handles. It does not retry a failed direct worker because reconstructing an
+  unpublished one-pass stream would require rereading source content. A worker
+  failure aborts the active ledger transaction, removes the unpublished PST,
+  preserves finalized parts, and returns a terminal partial result.
+  `--restartable` remains the deliberate choice for durable replay and retry.
+  Rationale: Direct mode exists to minimize source reads, SSD write
+  amplification, elapsed time, and retained state. Claiming transparent retry
+  while restarting traversal would contradict that contract and can duplicate
+  catalog occurrences. Bounded one-graph metadata is sufficient for canonical
+  translation and hard part selection without mailbox-scale RAM.
+  Date/Author: 2026-07-20 / project owner performance direction and Codex
+  implementation evidence.
 
 - Decision: Close 0.4.2 at the owner-approved focused data-correctness
   boundary and move the failed final 19 GB scale reconciliation to an immediate

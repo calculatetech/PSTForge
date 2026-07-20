@@ -3536,6 +3536,14 @@ impl DurableCatalogSink {
                 self.recent_candidates
                     .insert(active.embedded_path, active.key.clone());
             }
+            CatalogEvent::DeferredPropertyData { .. }
+            | CatalogEvent::DeferredAttachmentData { .. }
+            | CatalogEvent::TopLevelMetadataEnd
+            | CatalogEvent::TopLevelPayloadEnd => {
+                return Err(JobError::EventSequence(
+                    "deferred direct payload event reached the durable metadata sink".to_owned(),
+                ));
+            }
         }
         Ok(())
     }

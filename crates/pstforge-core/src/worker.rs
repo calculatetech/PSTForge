@@ -20,6 +20,9 @@ const PROTOCOL_VERSION: u32 = 3;
 const MAX_CONTROL_FRAME_BYTES: usize = 32 * 1024 * 1024;
 pub(crate) const METADATA_PROPERTY_PREFIX_BYTES: u64 = 64 * 1024;
 pub(crate) const METADATA_ATTACHMENT_PREFIX_BYTES: u64 = 16 * 1024;
+const MAX_DIRECT_METADATA_BUFFER_BYTES: usize = 256 * 1024 * 1024;
+const MAX_DIRECT_METADATA_BUFFER_FRAMES: usize = 262_144;
+const DIRECT_METADATA_FRAME_OVERHEAD_BYTES: usize = 256;
 
 #[derive(Debug, Error)]
 pub enum WorkerProtocolError {
@@ -41,7 +44,7 @@ pub enum WorkerProtocolError {
     ReportedParser(String),
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum ControlFrame {
     Hello {
@@ -120,6 +123,16 @@ enum ControlFrame {
         descriptor: PropertyDescriptor,
         byte_len: u32,
     },
+    DeferredPropertyData {
+        embedded_path: Vec<u32>,
+        descriptor: PropertyDescriptor,
+        byte_len: u32,
+    },
+    DeferredAttachmentData {
+        embedded_path: Vec<u32>,
+        index: u32,
+        byte_len: u32,
+    },
     PropertyEnd {
         descriptor: PropertyDescriptor,
     },
@@ -131,6 +144,8 @@ enum ControlFrame {
         id: u32,
         complete: bool,
     },
+    TopLevelMetadataEnd,
+    TopLevelPayloadEnd,
     Complete {
         catalog: WorkerCatalog,
     },
@@ -158,6 +173,7 @@ pub(crate) struct DirectStreamIdentity {
     pub owner: DirectStreamOwner,
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) struct DirectTopLevelBinding {
     pub item_key: String,
     pub provenance: CatalogProvenance,
@@ -169,6 +185,91 @@ pub(crate) struct DirectTopLevelBinding {
 struct DirectMessageBase {
     provenance: CatalogProvenance,
     recovery_index: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct DirectPathStreamIdentity {
+    embedded_path: Vec<u32>,
+    owner: DirectStreamOwner,
+}
+
+struct BufferedMetadataFrame {
+    control: ControlFrame,
+    payload: Option<Vec<u8>>,
+}
+
+struct BufferedMetadataMessage {
+    frames: Vec<BufferedMetadataFrame>,
+    children: Vec<BufferedMetadataMessage>,
+}
+
+struct DirectMetadataBudget {
+    bytes: usize,
+    frames: usize,
+    maximum_bytes: usize,
+    maximum_frames: usize,
+}
+
+impl DirectMetadataBudget {
+    fn production() -> Self {
+        Self {
+            bytes: 0,
+            frames: 0,
+            maximum_bytes: MAX_DIRECT_METADATA_BUFFER_BYTES,
+            maximum_frames: MAX_DIRECT_METADATA_BUFFER_FRAMES,
+        }
+    }
+
+    fn charge(&mut self, control: &ControlFrame, payload_bytes: usize) -> Result<(), WriterError> {
+        let control_bytes = serde_json::to_vec(control)
+            .map_err(|error| direct_protocol_error(error.to_string()))?
+            .len();
+        let retained_payload_bytes = payload_bytes.checked_mul(2).ok_or_else(|| {
+            direct_protocol_error("direct metadata graph byte accounting overflow")
+        })?;
+        let charge = control_bytes
+            .checked_add(retained_payload_bytes)
+            .and_then(|value| value.checked_add(DIRECT_METADATA_FRAME_OVERHEAD_BYTES))
+            .ok_or_else(|| {
+                direct_protocol_error("direct metadata graph byte accounting overflow")
+            })?;
+        let next_bytes = self.bytes.checked_add(charge).ok_or_else(|| {
+            direct_protocol_error("direct metadata graph byte accounting overflow")
+        })?;
+        let next_frames = self.frames.checked_add(1).ok_or_else(|| {
+            direct_protocol_error("direct metadata graph frame accounting overflow")
+        })?;
+        if next_bytes > self.maximum_bytes || next_frames > self.maximum_frames {
+            return Err(direct_protocol_error(
+                "direct metadata graph exceeds the bounded supervisor memory budget",
+            ));
+        }
+        self.bytes = next_bytes;
+        self.frames = next_frames;
+        Ok(())
+    }
+}
+
+impl BufferedMetadataMessage {
+    fn start(control: ControlFrame) -> Self {
+        Self {
+            frames: vec![BufferedMetadataFrame {
+                control,
+                payload: None,
+            }],
+            children: Vec::new(),
+        }
+    }
+
+    fn emit(self, sink: &mut dyn CatalogSink) -> Result<(), WorkerProtocolError> {
+        for frame in self.frames {
+            send_buffered_metadata_to_sink(sink, frame)?;
+        }
+        for child in self.children {
+            child.emit(sink)?;
+        }
+        Ok(())
+    }
 }
 
 pub(crate) struct DirectCandidateBindings {
@@ -190,6 +291,11 @@ pub(crate) struct DirectProtocolSource<'a> {
     messages: Vec<(u32, String)>,
     attachments: Vec<(u32, u32)>,
     property: Option<PropertyDescriptor>,
+    prefixes: HashMap<DirectStreamIdentity, Vec<u8>>,
+    path_keys: HashMap<Vec<u32>, String>,
+    active_paths: Vec<Vec<u32>>,
+    unbound_prefixes: HashMap<DirectPathStreamIdentity, Vec<u8>>,
+    completed_catalog: Option<WorkerCatalog>,
     pending: Option<ControlFrame>,
     complete: bool,
     progress: Option<Box<dyn FnMut() + 'a>>,
@@ -208,6 +314,11 @@ impl<'a> DirectProtocolSource<'a> {
             messages: Vec::new(),
             attachments: Vec::new(),
             property: None,
+            prefixes: HashMap::new(),
+            path_keys: HashMap::new(),
+            active_paths: Vec::new(),
+            unbound_prefixes: HashMap::new(),
+            completed_catalog: None,
             pending: None,
             complete: false,
             progress: None,
@@ -219,6 +330,227 @@ impl<'a> DirectProtocolSource<'a> {
         self
     }
 
+    pub(crate) fn next_one_pass_candidate(
+        &mut self,
+        job: &mut pstforge_job::DurableCatalogSink,
+        after_rowid: i64,
+        interrupted: &std::sync::atomic::AtomicBool,
+    ) -> Result<Option<pstforge_job::DirectTopLevelCandidate>, WriterError> {
+        let mut messages = Vec::<BufferedMetadataMessage>::new();
+        let mut root: Option<BufferedMetadataMessage> = None;
+        let mut budget = DirectMetadataBudget::production();
+        loop {
+            let frame = self.next_control()?;
+            match frame {
+                ControlFrame::TopLevelMetadataEnd => {
+                    if !messages.is_empty() {
+                        return Err(direct_protocol_error(
+                            "top-level metadata ended inside an active message",
+                        ));
+                    }
+                    root.take()
+                        .ok_or_else(|| {
+                            direct_protocol_error(
+                                "top-level metadata ended without a message graph",
+                            )
+                        })?
+                        .emit(job)
+                        .map_err(worker_writer_error)?;
+                    let candidate = job
+                        .next_direct_top_level_candidate(after_rowid)
+                        .map_err(|error| direct_protocol_error(error.to_string()))?
+                        .ok_or_else(|| {
+                            direct_protocol_error(
+                                "worker completed candidate metadata without a durable candidate",
+                            )
+                        })?;
+                    let tree = job
+                        .spooled_candidate_tree_interruptible(&candidate.item_key, interrupted)
+                        .map_err(|error| direct_protocol_error(error.to_string()))?;
+                    self.path_keys.clear();
+                    for ownership in tree.ownerships {
+                        self.path_keys
+                            .insert(ownership.embedded_path, ownership.item_key);
+                    }
+                    self.prefixes.clear();
+                    for (path_identity, bytes) in self.unbound_prefixes.drain() {
+                        let item_key = self
+                            .path_keys
+                            .get(&path_identity.embedded_path)
+                            .cloned()
+                            .ok_or_else(|| {
+                                direct_protocol_error(
+                                    "metadata prefix has no durable message binding",
+                                )
+                            })?;
+                        self.prefixes.insert(
+                            DirectStreamIdentity {
+                                item_key,
+                                owner: path_identity.owner,
+                            },
+                            bytes,
+                        );
+                    }
+                    return Ok(Some(candidate));
+                }
+                ControlFrame::Complete { catalog } => {
+                    self.completed_catalog = Some(catalog);
+                    self.complete = true;
+                    return Ok(None);
+                }
+                ControlFrame::ParserBoundary { detail } => {
+                    tracing::warn!(
+                        error = %detail,
+                        "one-pass direct traversal accepted parser boundary after durable metadata"
+                    );
+                    let summary = job
+                        .summary()
+                        .map_err(|error| direct_protocol_error(error.to_string()))?;
+                    self.completed_catalog = Some(WorkerCatalog {
+                        messages: summary.committed_candidates,
+                        recovered_messages: summary.recovered_candidates,
+                        orphan_messages: summary.orphan_candidates,
+                        fragment_messages: summary.fragment_candidates,
+                        unsupported_messages: summary.unsupported_candidates,
+                        issues: 1,
+                        ..WorkerCatalog::default()
+                    });
+                    self.complete = true;
+                    return Ok(None);
+                }
+                ControlFrame::Error { kind, detail } => {
+                    return Err(direct_protocol_error(format!(
+                        "worker reported {kind:?}: {detail}"
+                    )));
+                }
+                ControlFrame::AttachmentData {
+                    message_id,
+                    index,
+                    byte_len,
+                } => {
+                    let bytes = read_payload(self.input, byte_len).map_err(worker_writer_error)?;
+                    let buffered_control = ControlFrame::AttachmentData {
+                        message_id,
+                        index,
+                        byte_len,
+                    };
+                    budget.charge(&buffered_control, bytes.len())?;
+                    let embedded_path = self.active_paths.last().cloned().ok_or_else(|| {
+                        direct_protocol_error("attachment prefix has no active message")
+                    })?;
+                    self.unbound_prefixes
+                        .entry(DirectPathStreamIdentity {
+                            embedded_path,
+                            owner: DirectStreamOwner::AttachmentData { index },
+                        })
+                        .or_default()
+                        .extend(bytes.iter().copied());
+                    buffer_metadata_frame(
+                        &mut messages,
+                        BufferedMetadataFrame {
+                            control: buffered_control,
+                            payload: Some(bytes),
+                        },
+                    )?;
+                }
+                ControlFrame::PropertyData {
+                    descriptor,
+                    byte_len,
+                } => {
+                    let bytes = read_payload(self.input, byte_len).map_err(worker_writer_error)?;
+                    let buffered_control = ControlFrame::PropertyData {
+                        descriptor,
+                        byte_len,
+                    };
+                    if !messages.is_empty() {
+                        budget.charge(&buffered_control, bytes.len())?;
+                    }
+                    if !matches!(descriptor.owner, libpff_sys::PropertyOwner::Folder(_)) {
+                        let embedded_path = self.active_paths.last().cloned().ok_or_else(|| {
+                            direct_protocol_error("property prefix has no active message")
+                        })?;
+                        self.unbound_prefixes
+                            .entry(DirectPathStreamIdentity {
+                                embedded_path,
+                                owner: direct_property_owner(descriptor)?,
+                            })
+                            .or_default()
+                            .extend(bytes.iter().copied());
+                    }
+                    let buffered = BufferedMetadataFrame {
+                        control: buffered_control,
+                        payload: Some(bytes),
+                    };
+                    if messages.is_empty() {
+                        send_buffered_metadata_to_sink(job, buffered)
+                            .map_err(worker_writer_error)?;
+                    } else {
+                        buffer_metadata_frame(&mut messages, buffered)?;
+                    }
+                }
+                ControlFrame::MessageStart {
+                    ref embedded_path, ..
+                } => {
+                    budget.charge(&frame, 0)?;
+                    self.active_paths.push(embedded_path.clone());
+                    messages.push(BufferedMetadataMessage::start(frame));
+                }
+                ControlFrame::MessageEnd { .. } => {
+                    budget.charge(&frame, 0)?;
+                    buffer_metadata_frame(
+                        &mut messages,
+                        BufferedMetadataFrame {
+                            control: frame,
+                            payload: None,
+                        },
+                    )?;
+                    let completed = messages.pop().ok_or_else(|| {
+                        direct_protocol_error("message ended without buffered metadata")
+                    })?;
+                    if let Some(parent) = messages.last_mut() {
+                        parent.children.push(completed);
+                    } else if root.replace(completed).is_some() {
+                        return Err(direct_protocol_error(
+                            "multiple top-level messages preceded one metadata boundary",
+                        ));
+                    }
+                    self.active_paths.pop().ok_or_else(|| {
+                        direct_protocol_error("message ended without an active metadata path")
+                    })?;
+                }
+                ControlFrame::DeferredPropertyData { .. }
+                | ControlFrame::DeferredAttachmentData { .. }
+                | ControlFrame::TopLevelPayloadEnd => {
+                    return Err(direct_protocol_error(
+                        "payload phase began before candidate metadata was consumed",
+                    ));
+                }
+                ControlFrame::Hello { .. } => {
+                    return Err(direct_protocol_error("worker repeated its protocol hello"));
+                }
+                other => {
+                    if messages.is_empty() {
+                        send_control_to_sink(job, other).map_err(worker_writer_error)?;
+                    } else {
+                        budget.charge(&other, 0)?;
+                        buffer_metadata_frame(
+                            &mut messages,
+                            BufferedMetadataFrame {
+                                control: other,
+                                payload: None,
+                            },
+                        )?;
+                    }
+                }
+            }
+        }
+    }
+
+    pub(crate) fn take_completed_catalog(&mut self) -> Option<WorkerCatalog> {
+        self.completed_catalog.take()
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn next_top_level_message(
         &mut self,
         expected: Option<DirectTopLevelBinding>,
@@ -235,6 +567,7 @@ impl<'a> DirectProtocolSource<'a> {
                     id,
                     provenance,
                     recovery_index,
+                    embedded_path,
                     parent_message_id: None,
                     ..
                 } => {
@@ -258,6 +591,7 @@ impl<'a> DirectProtocolSource<'a> {
                         recovery_index,
                         None,
                         None,
+                        &embedded_path,
                         Some(expected.item_key),
                     )?;
                     return Ok(Some(key));
@@ -295,21 +629,29 @@ impl<'a> DirectProtocolSource<'a> {
     }
 
     pub(crate) fn finish_top_level_message(&mut self) -> Result<(), WriterError> {
-        let top_level = self
-            .messages
-            .first()
-            .map(|(_, key)| key.clone())
-            .ok_or_else(|| direct_protocol_error("no active direct message"))?;
-        while self
-            .messages
-            .first()
-            .is_some_and(|(_, key)| key == &top_level)
-        {
-            let frame = self.next_control()?;
-            self.consume_control(frame)?;
+        if let Some(top_level) = self.messages.first().map(|(_, key)| key.clone()) {
+            while self
+                .messages
+                .first()
+                .is_some_and(|(_, key)| key == &top_level)
+            {
+                let frame = self.next_control()?;
+                self.consume_control(frame)?;
+            }
+        } else {
+            loop {
+                let frame = self.next_control()?;
+                if matches!(frame, ControlFrame::TopLevelPayloadEnd) {
+                    break;
+                }
+                self.consume_control(frame)?;
+            }
         }
         self.direct_ids.clear();
         self.bindings.embedded.clear();
+        self.prefixes.clear();
+        self.path_keys.clear();
+        self.active_paths.clear();
         Ok(())
     }
 
@@ -367,6 +709,7 @@ impl<'a> DirectProtocolSource<'a> {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn start_message(
         &mut self,
         provenance: CatalogProvenance,
@@ -374,6 +717,7 @@ impl<'a> DirectProtocolSource<'a> {
         recovery_index: Option<u64>,
         parent_message_id: Option<u32>,
         parent_attachment_index: Option<u32>,
+        embedded_path: &[u32],
         top_level_item_key: Option<String>,
     ) -> Result<String, WriterError> {
         let source_id = (id != 0).then_some(id);
@@ -429,6 +773,8 @@ impl<'a> DirectProtocolSource<'a> {
             }
         };
         self.messages.push((id, key.clone()));
+        self.active_paths.push(embedded_path.to_vec());
+        self.path_keys.insert(embedded_path.to_vec(), key.clone());
         Ok(key)
     }
 
@@ -450,6 +796,7 @@ impl<'a> DirectProtocolSource<'a> {
                 recovery_index,
                 parent_message_id,
                 parent_attachment_index,
+                embedded_path,
                 ..
             } => {
                 self.start_message(
@@ -458,6 +805,7 @@ impl<'a> DirectProtocolSource<'a> {
                     recovery_index,
                     parent_message_id,
                     parent_attachment_index,
+                    &embedded_path,
                     None,
                 )?;
             }
@@ -471,6 +819,9 @@ impl<'a> DirectProtocolSource<'a> {
                         "worker ended a different message than the active message",
                     ));
                 }
+                self.active_paths.pop().ok_or_else(|| {
+                    direct_protocol_error("worker ended a message without an active path")
+                })?;
             }
             ControlFrame::AttachmentStart {
                 message_id, index, ..
@@ -514,8 +865,17 @@ impl<'a> DirectProtocolSource<'a> {
                         "worker attachment payload has inconsistent ownership",
                     ));
                 }
-                discard_payload(self.input, byte_len, &mut self.progress)
-                    .map_err(worker_writer_error)?;
+                let identity = self
+                    .current_data_identity(&ControlFrame::AttachmentData {
+                        message_id,
+                        index,
+                        byte_len,
+                    })?
+                    .ok_or_else(|| {
+                        direct_protocol_error("attachment prefix has no stream identity")
+                    })?;
+                let bytes = read_payload(self.input, byte_len).map_err(worker_writer_error)?;
+                self.prefixes.entry(identity).or_default().extend(bytes);
             }
             ControlFrame::PropertyData {
                 descriptor,
@@ -527,8 +887,13 @@ impl<'a> DirectProtocolSource<'a> {
                         "worker property payload has inconsistent ownership",
                     ));
                 }
-                discard_payload(self.input, byte_len, &mut self.progress)
-                    .map_err(worker_writer_error)?;
+                let bytes = read_payload(self.input, byte_len).map_err(worker_writer_error)?;
+                if let Some(identity) = self.current_data_identity(&ControlFrame::PropertyData {
+                    descriptor,
+                    byte_len,
+                })? {
+                    self.prefixes.entry(identity).or_default().extend(bytes);
+                }
             }
             ControlFrame::Complete { .. } => self.complete = true,
             ControlFrame::ParserBoundary { .. } => {
@@ -549,6 +914,16 @@ impl<'a> DirectProtocolSource<'a> {
             | ControlFrame::Folder { .. }
             | ControlFrame::Recipient { .. }
             | ControlFrame::NamedProperty { .. } => {}
+            ControlFrame::DeferredPropertyData { byte_len, .. }
+            | ControlFrame::DeferredAttachmentData { byte_len, .. } => {
+                discard_payload(self.input, byte_len, &mut self.progress)
+                    .map_err(worker_writer_error)?;
+            }
+            ControlFrame::TopLevelMetadataEnd | ControlFrame::TopLevelPayloadEnd => {
+                return Err(direct_protocol_error(
+                    "direct candidate boundary occurred out of sequence",
+                ));
+            }
         }
         Ok(())
     }
@@ -589,11 +964,7 @@ impl<'a> DirectProtocolSource<'a> {
         &self,
         frame: &ControlFrame,
     ) -> Result<Option<DirectStreamIdentity>, WriterError> {
-        let Some((_, item_key)) = self.messages.last() else {
-            return Ok(None);
-        };
-        let item_key = item_key.clone();
-        let owner = match frame {
+        let (item_key, owner) = match frame {
             ControlFrame::AttachmentData {
                 message_id, index, ..
             } => {
@@ -602,7 +973,17 @@ impl<'a> DirectProtocolSource<'a> {
                         "worker attachment payload has inconsistent ownership",
                     ));
                 }
-                DirectStreamOwner::AttachmentData { index: *index }
+                let item_key = self
+                    .messages
+                    .last()
+                    .map(|(_, key)| key.clone())
+                    .ok_or_else(|| {
+                        direct_protocol_error("attachment data has no active message")
+                    })?;
+                (
+                    item_key,
+                    DirectStreamOwner::AttachmentData { index: *index },
+                )
             }
             ControlFrame::PropertyData { descriptor, .. } => {
                 self.validate_property_owner(*descriptor)?;
@@ -621,12 +1002,61 @@ impl<'a> DirectProtocolSource<'a> {
                     }
                     libpff_sys::PropertyOwner::Folder(_) => return Ok(None),
                 };
-                DirectStreamOwner::Property {
-                    owner,
-                    owner_index,
-                    record_set_index: descriptor.record_set_index,
-                    entry_index: descriptor.entry_index,
-                }
+                let item_key = self
+                    .messages
+                    .last()
+                    .map(|(_, key)| key.clone())
+                    .ok_or_else(|| direct_protocol_error("property data has no active message"))?;
+                (
+                    item_key,
+                    DirectStreamOwner::Property {
+                        owner,
+                        owner_index,
+                        record_set_index: descriptor.record_set_index,
+                        entry_index: descriptor.entry_index,
+                    },
+                )
+            }
+            ControlFrame::DeferredAttachmentData {
+                embedded_path,
+                index,
+                ..
+            } => {
+                let item_key = self.path_keys.get(embedded_path).cloned().ok_or_else(|| {
+                    direct_protocol_error("deferred attachment has no message binding")
+                })?;
+                (
+                    item_key,
+                    DirectStreamOwner::AttachmentData { index: *index },
+                )
+            }
+            ControlFrame::DeferredPropertyData {
+                embedded_path,
+                descriptor,
+                ..
+            } => {
+                let item_key = self.path_keys.get(embedded_path).cloned().ok_or_else(|| {
+                    direct_protocol_error("deferred property has no message binding")
+                })?;
+                let (owner, owner_index) = match descriptor.owner {
+                    libpff_sys::PropertyOwner::Message(_) => ("message", None),
+                    libpff_sys::PropertyOwner::Recipient { index, .. } => {
+                        ("recipient", Some(index))
+                    }
+                    libpff_sys::PropertyOwner::Attachment { index, .. } => {
+                        ("attachment", Some(index))
+                    }
+                    libpff_sys::PropertyOwner::Folder(_) => return Ok(None),
+                };
+                (
+                    item_key,
+                    DirectStreamOwner::Property {
+                        owner,
+                        owner_index,
+                        record_set_index: descriptor.record_set_index,
+                        entry_index: descriptor.entry_index,
+                    },
+                )
             }
             _ => return Ok(None),
         };
@@ -639,11 +1069,18 @@ impl DirectBlobSource for DirectProtocolSource<'_> {
         &'a mut self,
         blob: &DirectBlobSpec,
     ) -> Result<Box<dyn Read + 'a>, WriterError> {
-        let top_level = self
-            .messages
-            .first()
-            .map(|(_, key)| key.clone())
-            .ok_or_else(|| direct_protocol_error("direct stream requested outside a message"))?;
+        let requested_identity = self
+            .direct_ids
+            .iter()
+            .find_map(|(identity, id)| (*id == blob.id).then_some(identity.clone()))
+            .ok_or_else(|| direct_protocol_error("direct stream identifier is not registered"))?;
+        let prefix = self
+            .prefixes
+            .remove(&requested_identity)
+            .unwrap_or_default();
+        if u64::try_from(prefix.len()).unwrap_or(u64::MAX) == blob.byte_len {
+            return Ok(Box::new(std::io::Cursor::new(prefix)));
+        }
         loop {
             let frame = self.next_control()?;
             let identity = self.current_data_identity(&frame)?;
@@ -654,7 +1091,9 @@ impl DirectBlobSource for DirectProtocolSource<'_> {
             {
                 let remaining = match frame {
                     ControlFrame::AttachmentData { byte_len, .. }
-                    | ControlFrame::PropertyData { byte_len, .. } => byte_len,
+                    | ControlFrame::PropertyData { byte_len, .. }
+                    | ControlFrame::DeferredPropertyData { byte_len, .. }
+                    | ControlFrame::DeferredAttachmentData { byte_len, .. } => byte_len,
                     _ => {
                         return Err(direct_protocol_error(
                             "direct identity does not name a payload frame",
@@ -666,20 +1105,12 @@ impl DirectBlobSource for DirectProtocolSource<'_> {
                     identity: identity.ok_or_else(|| {
                         direct_protocol_error("direct payload identity disappeared")
                     })?,
+                    prefix: std::io::Cursor::new(prefix),
                     remaining,
                     finished: false,
                 }));
             }
             self.consume_control(frame)?;
-            if self
-                .messages
-                .first()
-                .is_none_or(|(_, key)| key != &top_level)
-            {
-                return Err(direct_protocol_error(
-                    "requested direct stream was absent from its top-level message",
-                ));
-            }
         }
     }
 }
@@ -687,6 +1118,7 @@ impl DirectBlobSource for DirectProtocolSource<'_> {
 struct DirectPayloadReader<'a, 'b> {
     source: &'a mut DirectProtocolSource<'b>,
     identity: DirectStreamIdentity,
+    prefix: std::io::Cursor<Vec<u8>>,
     remaining: u32,
     finished: bool,
 }
@@ -710,6 +1142,10 @@ impl Read for DirectPayloadReader<'_, '_> {
     fn read(&mut self, output: &mut [u8]) -> std::io::Result<usize> {
         if output.is_empty() || self.finished {
             return Ok(0);
+        }
+        let prefix_read = self.prefix.read(output)?;
+        if prefix_read != 0 {
+            return Ok(prefix_read);
         }
         if self.remaining != 0 {
             if let Some(progress) = self.source.progress.as_mut() {
@@ -742,7 +1178,9 @@ impl Read for DirectPayloadReader<'_, '_> {
         if identity.as_ref() == Some(&self.identity) {
             self.remaining = match frame {
                 ControlFrame::AttachmentData { byte_len, .. }
-                | ControlFrame::PropertyData { byte_len, .. } => byte_len,
+                | ControlFrame::PropertyData { byte_len, .. }
+                | ControlFrame::DeferredPropertyData { byte_len, .. }
+                | ControlFrame::DeferredAttachmentData { byte_len, .. } => byte_len,
                 _ => 0,
             };
             return self.read(output);
@@ -783,7 +1221,26 @@ fn direct_protocol_error(detail: impl Into<String>) -> WriterError {
     WriterError::InvalidStructure(format!("direct worker protocol failed: {}", detail.into()))
 }
 
-#[derive(Debug, Default, Serialize, Deserialize)]
+fn direct_property_owner(descriptor: PropertyDescriptor) -> Result<DirectStreamOwner, WriterError> {
+    let (owner, owner_index) = match descriptor.owner {
+        libpff_sys::PropertyOwner::Message(_) => ("message", None),
+        libpff_sys::PropertyOwner::Recipient { index, .. } => ("recipient", Some(index)),
+        libpff_sys::PropertyOwner::Attachment { index, .. } => ("attachment", Some(index)),
+        libpff_sys::PropertyOwner::Folder(_) => {
+            return Err(direct_protocol_error(
+                "folder property cannot be a direct message stream",
+            ));
+        }
+    };
+    Ok(DirectStreamOwner::Property {
+        owner,
+        owner_index,
+        record_set_index: descriptor.record_set_index,
+        entry_index: descriptor.entry_index,
+    })
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub(crate) struct WorkerCatalog {
     pub(crate) folders: u64,
     pub(crate) messages: u64,
@@ -958,7 +1415,9 @@ impl ProtocolSink<'_> {
 
 impl CatalogSink for ProtocolSink<'_> {
     fn property_payload(&self, descriptor: PropertyDescriptor) -> PayloadRequest {
-        if self.metadata_only {
+        if self.writer_order && !matches!(descriptor.owner, libpff_sys::PropertyOwner::Folder(_)) {
+            PayloadRequest::DeferredPrefix(descriptor.data_size.min(METADATA_PROPERTY_PREFIX_BYTES))
+        } else if self.metadata_only {
             PayloadRequest::Prefix(descriptor.data_size.min(METADATA_PROPERTY_PREFIX_BYTES))
         } else {
             PayloadRequest::Full
@@ -971,7 +1430,13 @@ impl CatalogSink for ProtocolSink<'_> {
         _index: u32,
         declared_size: Option<u64>,
     ) -> PayloadRequest {
-        if self.metadata_only {
+        if self.writer_order {
+            PayloadRequest::DeferredPrefix(
+                declared_size
+                    .unwrap_or_default()
+                    .min(METADATA_ATTACHMENT_PREFIX_BYTES),
+            )
+        } else if self.metadata_only {
             PayloadRequest::Prefix(
                 declared_size
                     .unwrap_or_default()
@@ -984,7 +1449,7 @@ impl CatalogSink for ProtocolSink<'_> {
 
     fn traversal_order(&self) -> TraversalOrder {
         if self.writer_order {
-            TraversalOrder::Writer
+            TraversalOrder::Direct
         } else if self.metadata_only {
             TraversalOrder::EmbeddedFirst
         } else {
@@ -1147,6 +1612,38 @@ impl CatalogSink for ProtocolSink<'_> {
                     bytes,
                 )
             }
+            CatalogEvent::DeferredPropertyData {
+                embedded_path,
+                descriptor,
+                bytes,
+            } => {
+                let byte_len = u32::try_from(bytes.len())
+                    .map_err(|_| "property frame length exceeds u32".to_owned())?;
+                self.send_data(
+                    &ControlFrame::DeferredPropertyData {
+                        embedded_path: embedded_path.to_vec(),
+                        descriptor,
+                        byte_len,
+                    },
+                    bytes,
+                )
+            }
+            CatalogEvent::DeferredAttachmentData {
+                embedded_path,
+                index,
+                bytes,
+            } => {
+                let byte_len = u32::try_from(bytes.len())
+                    .map_err(|_| "attachment frame length exceeds u32".to_owned())?;
+                self.send_data(
+                    &ControlFrame::DeferredAttachmentData {
+                        embedded_path: embedded_path.to_vec(),
+                        index,
+                        byte_len,
+                    },
+                    bytes,
+                )
+            }
             CatalogEvent::PropertyEnd(descriptor) => {
                 self.send(&ControlFrame::PropertyEnd { descriptor })
             }
@@ -1175,6 +1672,8 @@ impl CatalogSink for ProtocolSink<'_> {
                 }
                 Ok(())
             }
+            CatalogEvent::TopLevelMetadataEnd => self.send(&ControlFrame::TopLevelMetadataEnd),
+            CatalogEvent::TopLevelPayloadEnd => self.send(&ControlFrame::TopLevelPayloadEnd),
         }
     }
 }
@@ -1552,6 +2051,50 @@ fn replay_signature(
         .map_err(WorkerProtocolError::Json)
 }
 
+fn buffer_metadata_frame(
+    messages: &mut [BufferedMetadataMessage],
+    frame: BufferedMetadataFrame,
+) -> Result<(), WriterError> {
+    messages
+        .last_mut()
+        .ok_or_else(|| direct_protocol_error("message metadata occurred outside a message"))?
+        .frames
+        .push(frame);
+    Ok(())
+}
+
+fn send_buffered_metadata_to_sink(
+    sink: &mut dyn CatalogSink,
+    frame: BufferedMetadataFrame,
+) -> Result<(), WorkerProtocolError> {
+    match (frame.control, frame.payload) {
+        (
+            ControlFrame::AttachmentData {
+                message_id, index, ..
+            },
+            Some(bytes),
+        ) => send_to_sink(
+            sink,
+            CatalogEvent::AttachmentData {
+                message_id,
+                index,
+                bytes: &bytes,
+            },
+        ),
+        (ControlFrame::PropertyData { descriptor, .. }, Some(bytes)) => send_to_sink(
+            sink,
+            CatalogEvent::PropertyData {
+                descriptor,
+                bytes: &bytes,
+            },
+        ),
+        (control, None) => send_control_to_sink(sink, control),
+        _ => Err(WorkerProtocolError::Invalid(
+            "buffered metadata payload disagrees with its control frame".to_owned(),
+        )),
+    }
+}
+
 fn send_control_to_sink(
     sink: &mut dyn CatalogSink,
     frame: ControlFrame,
@@ -1654,6 +2197,10 @@ fn send_control_to_sink(
         ControlFrame::MessageEnd { id, complete } => CatalogEvent::MessageEnd { id, complete },
         ControlFrame::AttachmentData { .. }
         | ControlFrame::PropertyData { .. }
+        | ControlFrame::DeferredPropertyData { .. }
+        | ControlFrame::DeferredAttachmentData { .. }
+        | ControlFrame::TopLevelMetadataEnd
+        | ControlFrame::TopLevelPayloadEnd
         | ControlFrame::Hello { .. }
         | ControlFrame::Error { .. }
         | ControlFrame::ParserBoundary { .. }
@@ -1750,10 +2297,11 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        ControlFrame, DirectCandidateBindings, DirectProtocolSource, DirectStreamIdentity,
-        DirectStreamOwner, DirectTopLevelBinding, METADATA_ATTACHMENT_PREFIX_BYTES,
-        METADATA_PROPERTY_PREFIX_BYTES, ProtocolSink, ReplayCatalogSink, WorkerCatalog,
-        receive_worker_catalog, receive_worker_catalog_body, receive_worker_hello, write_control,
+        ControlFrame, DIRECT_METADATA_FRAME_OVERHEAD_BYTES, DirectCandidateBindings,
+        DirectMetadataBudget, DirectProtocolSource, DirectStreamIdentity, DirectStreamOwner,
+        DirectTopLevelBinding, METADATA_ATTACHMENT_PREFIX_BYTES, METADATA_PROPERTY_PREFIX_BYTES,
+        ProtocolSink, ReplayCatalogSink, WorkerCatalog, receive_worker_catalog,
+        receive_worker_catalog_body, receive_worker_hello, write_control,
     };
     use pstforge_pst::writer::{DirectBlobSource, DirectBlobSpec};
 
@@ -1886,7 +2434,41 @@ mod tests {
         let mut writer_bytes = Vec::new();
         let writer =
             ProtocolSink::start(&mut writer_bytes, false, true).expect("start writer protocol");
-        assert_eq!(writer.traversal_order(), TraversalOrder::Writer);
+        assert_eq!(writer.traversal_order(), TraversalOrder::Direct);
+    }
+
+    #[test]
+    fn direct_metadata_budget_accepts_exact_boundary_and_rejects_overflow() {
+        let frame = ControlFrame::MessageEnd {
+            id: 7,
+            complete: true,
+        };
+        let payload_bytes = 11_usize;
+        let exact_bytes = serde_json::to_vec(&frame)
+            .expect("serialize control frame")
+            .len()
+            + payload_bytes * 2
+            + DIRECT_METADATA_FRAME_OVERHEAD_BYTES;
+        let mut exact = DirectMetadataBudget {
+            bytes: 0,
+            frames: 0,
+            maximum_bytes: exact_bytes,
+            maximum_frames: 1,
+        };
+        exact
+            .charge(&frame, payload_bytes)
+            .expect("exact metadata budget");
+        assert!(exact.charge(&frame, 0).is_err());
+
+        let mut over = DirectMetadataBudget {
+            bytes: 0,
+            frames: 0,
+            maximum_bytes: exact_bytes - 1,
+            maximum_frames: 1,
+        };
+        assert!(over.charge(&frame, payload_bytes).is_err());
+        assert_eq!(over.bytes, 0);
+        assert_eq!(over.frames, 0);
     }
 
     #[test]
