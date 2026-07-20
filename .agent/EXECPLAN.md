@@ -2359,11 +2359,96 @@ work. Hash and identity evidence show that the source was not modified.
     content. The project owner accepts the isolated `readpst` limitation as
     non-blocking for this documented structure. The canonical full gate passes
     at `.agent/test-results/1784506612-full`.
-  - [ ] Checkpoint 4: diagnose from durable local evidence, then resolve the
+  - [x] Checkpoint 4: diagnose from durable local evidence, then resolve the
     two raw-property representation failures and one aggregate-recipient
-    metadata failure. Recover the embedded item stranded beneath a rejected
-    parent. Do not use an adversarial reviewer for diagnosis when the cause is
-    locally clear.
+    metadata failure. A retained-spool replay proved the previously stranded
+    embedded item is recovered naturally when its parent becomes writable:
+    363 accepted top-level candidates produced 364 messages. No independent
+    child-promotion behavior is required. The remaining failures are three
+    ordinary top-level messages: two named binary values of 19,811 and 64,051
+    bytes rejected by the obsolete 16 KiB raw-value ceiling, and one
+    368-recipient message with 31,140 bytes of aggregate display/address text
+    rejected by the obsolete 16 KiB aggregate ceiling. Both limits predate the
+    documented scalable PC/TC implementations and are not PST format
+    boundaries. Remove only those artificial gates, retain the existing
+    per-value, collection-count, and 32-bit PST size bounds, and add focused
+    regressions. Do not use an adversarial reviewer for diagnosis when the
+    cause is locally clear.
+    Implementation removed the obsolete single-page limits from PC raw-value
+    subnode externalization and aggregate recipient/custom-property
+    validation. The real 368-recipient case also exposed a masked writer
+    defect: a singleton folder contents table always selected the compact TC
+    encoder even when `PidTagDisplayTo` required an external value. Singleton
+    normal and associated contents now fall back to the documented scalable
+    TC representation on compact HN exhaustion. The complete writer suite
+    passes with 90 active tests and one intentionally ignored large-boundary
+    test.
+    A current-binary replay of only the three remaining candidates from the
+    retained 19 GB spool published
+    `qualification-v044-replay-r1/parts/part-0007.pst` in one serialization:
+    779,264 bytes, SHA-256
+    `8bcb4fd0c7516e8eb72b5e7e1db42c9e94faf0a281aefc42519b8aa634f7bc4e`,
+    three top-level messages, and one source folder. The durable ledger now
+    contains exactly 37,402 `written` candidates, no other candidate status,
+    zero `output_unrepresentable` events, and passes SQLite integrity check.
+    `pffinfo` 20231205 accepts the part; `readpst` 0.6.76 extracts all three
+    messages with zero skipped. Fresh adversarial review, fast/full gates, and
+    ScanPST-first/Outlook human acceptance remain pending.
+    The first clean-context review found one newly reachable high issue and
+    one medium resource issue. Removing the aggregate limit allowed 339
+    external raw values plus the two mandatory table subnodes to exceed a
+    message's 340-entry SLBLOCK, while the top-level message builder still
+    emitted only a single leaf. Message subnode roots now preserve their
+    assigned BID while selecting a leaf through 340 entries or a documented
+    level-1 intermediate tree above it; focused 338/339 external-property
+    tests pass. The review also correctly rejected `i32::MAX` as an
+    operational in-memory acceptance limit because current serialization can
+    hold approximately four copies of materialized bytes. Per-value
+    materialization is now capped at the core translator's existing 1 MiB
+    bound, and aggregate in-memory custom properties are capped at 128 MiB,
+    bounding that peak near 512 MiB before fixed overhead and retaining
+    headroom beneath the 2 GiB gate. Source properties already classified as
+    stream-capable continue to use the spooled path; this change does not claim
+    that every named-property type is stream-capable. A fresh final-state
+    review remains required.
+    The next fresh review found that the prescribed-root builder had only
+    replaced top-level message SLBLOCK emission; recursively embedded messages
+    still emitted one leaf. It also found that the 128 MiB budget excluded
+    attachment raw properties and embedded descendants. Both findings were
+    high and applicable. Embedded messages now use the same scalable
+    prescribed-root builder, with focused top-level and embedded 338/339
+    external-property boundaries. One checked budget now accumulates every
+    materialized message, attachment, and descendant custom-property payload
+    in the top-level item graph. Arithmetic boundary coverage accepts exactly
+    128 MiB and rejects the next byte without allocating a boundary-sized
+    fixture. The focused regression passes; another fresh final-state review
+    remains required.
+    The following fresh review confirmed scalable root construction and block
+    identity/refcount behavior, then found two medium enforcement/coverage
+    gaps: public transactional append bypassed the new resource validation,
+    and tests did not directly exercise transactional rollback/reappend,
+    singleton associated external TC fallback, or graph-wide aggregate
+    traversal. Transactional append now validates aggregate and message
+    contracts before mutating state. Focused tests cover transactional
+    top-level and embedded 341-entry roots through rollback/reappend, a
+    singleton associated row with a 4,000-byte display value, and a 3+4+5-byte
+    top-level/attachment/embedded graph accepted at 12 bytes and rejected at
+    11. A fresh final-state review remains required.
+    The final clean-context gate review returned `CLEAN`. It verified public
+    one-shot and transactional validation, top-level and embedded level-1
+    subnode roots, prescribed BID/refcount handling, rollback/reappend
+    coverage, graph-wide resource accounting, singleton associated external
+    fallback, and preservation of the three real-candidate recovery changes.
+    The canonical combined-manifest full gate passes at
+    `.agent/test-results/1784511461-full`, including licenses, advisories,
+    writer `pffinfo`/`readpst`, writer acceptance, and all external-corpus
+    reader pairs. ScanPST-first and Outlook human acceptance of retained-spool
+    part 7 passed. One message displays corrupted quoted text, but the owner
+    confirmed the same corruption in the 19 GB source. Its source
+    `PidTagBody/PtypString` and 64,051-byte `Internet Charset Body` named
+    binary contain the same damaged text, code page 65001 is present, and no
+    HTML or RTF alternative exists. Preserving those source values exactly is
+    the correct recovery outcome; no output reconstruction is justified.
   - [ ] Checkpoint 5: persist a bounded structured rejection category and
     safe diagnostic summary whenever a candidate cannot be written. The
     ledger event must not be `{}` and must never include subjects, addresses,

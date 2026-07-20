@@ -949,7 +949,9 @@ const SUBNODE_INTERMEDIATE_CAPACITY: usize = (MAX_DATA_BLOCK_PAYLOAD - 8) / 16;
 const MAX_SUBNODE_TREE_ENTRIES: usize = SUBNODE_LEAF_CAPACITY * SUBNODE_INTERMEDIATE_CAPACITY;
 const MAX_FIDELITY_PROPERTY_BYTES: usize = 16 * 1024;
 const MAX_FIDELITY_COLLECTION_ITEMS: usize = MAX_FIDELITY_PROPERTY_BYTES / 8;
-const MAX_FIDELITY_CUSTOM_PROPERTY_BYTES: usize = 64 * 1024;
+const MAX_PST_PROPERTY_BYTES: usize = i32::MAX as usize;
+const MAX_IN_MEMORY_PROPERTY_BYTES: usize = 1024 * 1024;
+const MAX_IN_MEMORY_CUSTOM_PROPERTY_BYTES: usize = 128 * 1024 * 1024;
 const MAX_DISTRIBUTION_LIST_PROPERTY_BYTES: usize = 15_000;
 const PSETID_ADDRESS: [u8; 16] = [
     0x04, 0x20, 0x06, 0x00, 0x00, 0x00, 0x00, 0x00, 0xC0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x46,
@@ -976,11 +978,7 @@ fn externalize_large_properties(
         let Some(bytes) = value.variable_bytes()? else {
             continue;
         };
-        if bytes.len() > MAX_FIDELITY_PROPERTY_BYTES {
-            return Err(WriterError::ValueTooLarge(
-                "0.2.1 canonical property payload (16 KiB)",
-            ));
-        }
+        validate_pst_property_len("property subnode", bytes.len())?;
         if bytes.len() <= 2048 || matches!(value, PropertyValue::Object(_, _)) {
             continue;
         }
@@ -1415,6 +1413,54 @@ fn append_subnode_tree(
     Ok(roots[0].block())
 }
 
+fn append_subnode_tree_at(
+    mut entries: Vec<UnicodeLeafSubNodeTreeEntry>,
+    root: UnicodeBlockId,
+    next_block_index: &mut u64,
+    blocks: &mut Vec<BlockSpec>,
+) -> Result<(), WriterError> {
+    if entries.is_empty() {
+        return Err(WriterError::InvalidStructure(
+            "subnode tree must contain entries".to_owned(),
+        ));
+    }
+    if entries.len() > MAX_SUBNODE_TREE_ENTRIES {
+        return Err(WriterError::ValueTooLarge("subnode tree entry count"));
+    }
+    entries.sort_by_key(|entry| u32::from(entry.node()));
+    if entries.len() <= SUBNODE_LEAF_CAPACITY {
+        blocks.push(BlockSpec {
+            id: root,
+            payload: BlockPayload::Subnode(entries),
+            ref_count: 2,
+        });
+        return Ok(());
+    }
+
+    let mut leaves = Vec::with_capacity(entries.len().div_ceil(SUBNODE_LEAF_CAPACITY));
+    for group in entries.chunks(SUBNODE_LEAF_CAPACITY) {
+        let id = take_block_id(next_block_index, true)?;
+        blocks.push(BlockSpec {
+            id,
+            payload: BlockPayload::Subnode(group.to_vec()),
+            ref_count: 2,
+        });
+        leaves.push(UnicodeIntermediateSubNodeTreeEntry::new(
+            group[0].node(),
+            id,
+        ));
+    }
+    blocks.push(BlockSpec {
+        id: root,
+        payload: BlockPayload::IntermediateSubnode {
+            level: 1,
+            entries: leaves,
+        },
+        ref_count: 2,
+    });
+    Ok(())
+}
+
 fn take_block_id(next: &mut u64, internal: bool) -> Result<UnicodeBlockId, WriterError> {
     let index = *next;
     *next = next
@@ -1455,7 +1501,10 @@ struct BuiltTopMessage {
     message: MessageBlocks,
 }
 
-fn built_message_block_specs(built: BuiltTopMessage) -> Vec<BlockSpec> {
+fn built_message_block_specs(
+    built: BuiltTopMessage,
+    next_block_index: &mut u64,
+) -> Result<Vec<BlockSpec>, WriterError> {
     let mut blocks = Vec::new();
     if let Some(recipient_table) = built.message.recipient_table {
         blocks.push(BlockSpec {
@@ -1470,21 +1519,20 @@ fn built_message_block_specs(built: BuiltTopMessage) -> Vec<BlockSpec> {
             },
         });
     }
-    blocks.extend([
-        BlockSpec {
-            id: built.attachment_block,
-            payload: BlockPayload::Data(built.message.attachment_table),
-            ref_count: if built.shared_table_blocks { 3 } else { 2 },
-        },
-        BlockSpec {
-            id: built.subnode_block,
-            payload: BlockPayload::Subnode(built.message.subnodes),
-            ref_count: 2,
-        },
-    ]);
+    blocks.push(BlockSpec {
+        id: built.attachment_block,
+        payload: BlockPayload::Data(built.message.attachment_table),
+        ref_count: if built.shared_table_blocks { 3 } else { 2 },
+    });
+    append_subnode_tree_at(
+        built.message.subnodes,
+        built.subnode_block,
+        next_block_index,
+        &mut blocks,
+    )?;
     blocks.extend(built.message.dynamic_blocks);
     blocks.sort_by_key(|block| u64::from(block.id));
-    blocks
+    Ok(blocks)
 }
 
 fn collect_subnode_ids(blocks: &[BlockSpec], output: &mut Vec<NodeId>) {
@@ -1864,18 +1912,17 @@ fn build_message_blocks(
                         ref_count: 2,
                     });
                 }
-                dynamic_blocks.extend([
-                    BlockSpec {
-                        id: embedded_attachment_block,
-                        payload: BlockPayload::Data(embedded_blocks.attachment_table),
-                        ref_count: 2,
-                    },
-                    BlockSpec {
-                        id: embedded_subnode_block,
-                        payload: BlockPayload::Subnode(embedded_blocks.subnodes),
-                        ref_count: 2,
-                    },
-                ]);
+                dynamic_blocks.push(BlockSpec {
+                    id: embedded_attachment_block,
+                    payload: BlockPayload::Data(embedded_blocks.attachment_table),
+                    ref_count: 2,
+                });
+                append_subnode_tree_at(
+                    embedded_blocks.subnodes,
+                    embedded_subnode_block,
+                    next_block_index,
+                    &mut dynamic_blocks,
+                )?;
                 dynamic_blocks.extend(embedded_blocks.dynamic_blocks);
                 attachment_local_subnodes.push(UnicodeLeafSubNodeTreeEntry::new(
                     embedded_node,
@@ -2577,13 +2624,16 @@ impl MessageStreamState {
             subnode_block,
             parent,
         });
-        let message_blocks = built_message_block_specs(BuiltTopMessage {
-            recipient_block,
-            attachment_block,
-            subnode_block,
-            shared_table_blocks: index == 0,
-            message,
-        });
+        let message_blocks = built_message_block_specs(
+            BuiltTopMessage {
+                recipient_block,
+                attachment_block,
+                subnode_block,
+                shared_table_blocks: index == 0,
+                message,
+            },
+            &mut self.next_block_index,
+        )?;
         collect_subnode_ids(&message_blocks, &mut self.streamed_subnodes);
         for block in message_blocks {
             stream.emit(block)?;
@@ -2723,12 +2773,25 @@ fn build_finalization_plan(
             } else {
                 take_block_id(&mut next_block_index, false)?
             };
-            folder_blocks.push(BlockSpec {
-                id: block,
-                payload: BlockPayload::Data(table_context(contents_columns, rows)?),
-                ref_count: 2,
-            });
-            (block, None)
+            match table_context(contents_columns, rows) {
+                Ok(table) => {
+                    folder_blocks.push(BlockSpec {
+                        id: block,
+                        payload: BlockPayload::Data(table),
+                        ref_count: 2,
+                    });
+                    (block, None)
+                }
+                Err(WriterError::ValueTooLarge("heap page")) => {
+                    let contents =
+                        table_context_external(contents_columns, rows, &mut next_block_index)?;
+                    let data = contents.data_block;
+                    let subnode = contents.subnode_block;
+                    folder_blocks.extend(contents.blocks);
+                    (data, Some(subnode))
+                }
+                Err(error) => return Err(error),
+            }
         } else {
             let contents = table_context_external(contents_columns, rows, &mut next_block_index)?;
             let data = contents.data_block;
@@ -2745,12 +2808,25 @@ fn build_finalization_plan(
             (leaf_bid(13)?, None)
         } else if rows.len() == 1 {
             let block = take_block_id(&mut next_block_index, false)?;
-            folder_blocks.push(BlockSpec {
-                id: block,
-                payload: BlockPayload::Data(table_context(associated_columns, rows)?),
-                ref_count: 2,
-            });
-            (block, None)
+            match table_context(associated_columns, rows) {
+                Ok(table) => {
+                    folder_blocks.push(BlockSpec {
+                        id: block,
+                        payload: BlockPayload::Data(table),
+                        ref_count: 2,
+                    });
+                    (block, None)
+                }
+                Err(WriterError::ValueTooLarge("heap page")) => {
+                    let associated =
+                        table_context_external(associated_columns, rows, &mut next_block_index)?;
+                    let data = associated.data_block;
+                    let subnode = associated.subnode_block;
+                    folder_blocks.extend(associated.blocks);
+                    (data, Some(subnode))
+                }
+                Err(error) => return Err(error),
+            }
         } else {
             let associated =
                 table_context_external(associated_columns, rows, &mut next_block_index)?;
@@ -3022,7 +3098,7 @@ fn build_finalization_plan(
     ];
     blocks.extend(folder_blocks);
     if let Some(message) = single_message {
-        blocks.extend(built_message_block_specs(message));
+        blocks.extend(built_message_block_specs(message, &mut next_block_index)?);
     }
     blocks.sort_by_key(|block| u64::from(block.id));
     let nodes = node_entries(
@@ -3152,6 +3228,8 @@ impl TransactionalMailStoreWriter {
         interrupted: &AtomicBool,
     ) -> Result<(), WriterError> {
         check_interrupted(interrupted)?;
+        validate_aggregate_properties(&message)?;
+        validate_message(&message, 0)?;
         let order = (location, path.to_vec(), associated);
         if self
             .last_order
@@ -4302,12 +4380,60 @@ fn validate_spec(spec: &FidelityStore) -> Result<(), WriterError> {
 }
 
 fn validate_aggregate_properties(message: &MessageSpec) -> Result<(), WriterError> {
+    validate_aggregate_properties_with_limit(message, MAX_IN_MEMORY_CUSTOM_PROPERTY_BYTES)
+}
+
+fn validate_aggregate_properties_with_limit(
+    message: &MessageSpec,
+    maximum_materialized_bytes: usize,
+) -> Result<(), WriterError> {
     fn visit(
         message: &MessageSpec,
         identities: &mut BTreeSet<NamedIdentity>,
         named_occurrences: &mut usize,
         unsupported_occurrences: &mut usize,
+        materialized_custom_property_bytes: &mut usize,
+        maximum_materialized_bytes: usize,
     ) -> Result<(), WriterError> {
+        let message_custom_property_bytes =
+            message
+                .named_properties
+                .iter()
+                .map(|property| &property.value)
+                .chain(
+                    message
+                        .raw_properties
+                        .iter()
+                        .map(|property| &property.value),
+                )
+                .try_fold(0_usize, |total, value| {
+                    total.checked_add(raw_value_payload_len(value)?).ok_or(
+                        WriterError::ValueTooLarge("aggregate custom-property payload"),
+                    )
+                })?;
+        add_in_memory_custom_property_bytes(
+            materialized_custom_property_bytes,
+            message_custom_property_bytes,
+            maximum_materialized_bytes,
+        )?;
+        for attachment in &message.attachments {
+            let attachment_custom_property_bytes =
+                attachment
+                    .raw_properties
+                    .iter()
+                    .try_fold(0_usize, |total, property| {
+                        total
+                            .checked_add(raw_value_payload_len(&property.value)?)
+                            .ok_or(WriterError::ValueTooLarge(
+                                "aggregate custom-property payload",
+                            ))
+                    })?;
+            add_in_memory_custom_property_bytes(
+                materialized_custom_property_bytes,
+                attachment_custom_property_bytes,
+                maximum_materialized_bytes,
+            )?;
+        }
         if message.recipients.len() > MAX_FIDELITY_COLLECTION_ITEMS {
             return Err(WriterError::ValueTooLarge("recipient count"));
         }
@@ -4321,7 +4447,7 @@ fn validate_aggregate_properties(message: &MessageSpec) -> Result<(), WriterErro
                     .and_then(|total| total.checked_add(email_size))
                     .ok_or(WriterError::ValueTooLarge("aggregate recipient metadata"))
             })?;
-        validate_payload_len("aggregate recipient metadata", recipient_bytes)?;
+        validate_pst_property_len("aggregate recipient metadata", recipient_bytes)?;
         for kind in [RecipientKind::To, RecipientKind::Cc, RecipientKind::Bcc] {
             let mut count = 0_usize;
             let display_bytes = message
@@ -4339,7 +4465,7 @@ fn validate_aggregate_properties(message: &MessageSpec) -> Result<(), WriterErro
                         .and_then(|total| total.checked_add(display_size))
                         .ok_or(WriterError::ValueTooLarge("display recipient property"))
                 })?;
-            validate_payload_len("display recipient property", display_bytes)?;
+            validate_pst_property_len("display recipient property", display_bytes)?;
         }
         validate_recipient_table_shape(message)?;
 
@@ -4389,6 +4515,8 @@ fn validate_aggregate_properties(message: &MessageSpec) -> Result<(), WriterErro
                     identities,
                     named_occurrences,
                     unsupported_occurrences,
+                    materialized_custom_property_bytes,
+                    maximum_materialized_bytes,
                 )?;
             }
         }
@@ -4398,11 +4526,14 @@ fn validate_aggregate_properties(message: &MessageSpec) -> Result<(), WriterErro
     let mut identities = BTreeSet::new();
     let mut named_occurrences = 0_usize;
     let mut unsupported_occurrences = 0_usize;
+    let mut materialized_custom_property_bytes = 0_usize;
     visit(
         message,
         &mut identities,
         &mut named_occurrences,
         &mut unsupported_occurrences,
+        &mut materialized_custom_property_bytes,
+        maximum_materialized_bytes,
     )?;
     validate_payload_len(
         "named-property entry stream",
@@ -4526,6 +4657,24 @@ fn validate_named_property_map_shape(
         .ok_or(WriterError::ValueTooLarge("named-property map heap page"))?;
     if total > MAX_DATA_BLOCK_PAYLOAD {
         return Err(WriterError::ValueTooLarge("named-property map heap page"));
+    }
+    Ok(())
+}
+
+fn add_in_memory_custom_property_bytes(
+    total: &mut usize,
+    addition: usize,
+    maximum: usize,
+) -> Result<(), WriterError> {
+    *total = total
+        .checked_add(addition)
+        .ok_or(WriterError::ValueTooLarge(
+            "aggregate custom-property payload",
+        ))?;
+    if *total > maximum {
+        return Err(WriterError::ValueTooLarge(
+            "aggregate custom-property payload",
+        ));
     }
     Ok(())
 }
@@ -4655,9 +4804,7 @@ fn validate_property_context_shape(
         return Err(WriterError::ValueTooLarge("property count"));
     }
     for length in variable_lengths {
-        if *length > MAX_FIDELITY_PROPERTY_BYTES {
-            return Err(WriterError::ValueTooLarge(name));
-        }
+        validate_pst_property_len(name, *length)?;
     }
     Ok(())
 }
@@ -5047,7 +5194,7 @@ fn validate_message(message: &MessageSpec, depth: usize) -> Result<(), WriterErr
             }
             validate_file_blob(&property.blob)?;
         }
-        if raw_bytes > MAX_FIDELITY_CUSTOM_PROPERTY_BYTES {
+        if raw_bytes > MAX_IN_MEMORY_CUSTOM_PROPERTY_BYTES {
             return Err(WriterError::ValueTooLarge(
                 "aggregate attachment raw-property payload",
             ));
@@ -5177,7 +5324,7 @@ fn validate_message(message: &MessageSpec, depth: usize) -> Result<(), WriterErr
                     "aggregate custom-property payload",
                 ))
         })?;
-    if custom_property_bytes > MAX_FIDELITY_CUSTOM_PROPERTY_BYTES {
+    if custom_property_bytes > MAX_IN_MEMORY_CUSTOM_PROPERTY_BYTES {
         return Err(WriterError::ValueTooLarge(
             "aggregate custom-property payload",
         ));
@@ -5336,7 +5483,12 @@ fn validate_raw_value(value: &RawPropertyValue) -> Result<(), WriterError> {
             "multi-valued Unicode properties cannot contain NUL".to_owned(),
         ));
     }
-    validate_payload_len("raw property", raw_value_payload_len(value)?)
+    let length = raw_value_payload_len(value)?;
+    validate_pst_property_len("raw property", length)?;
+    if length > MAX_IN_MEMORY_PROPERTY_BYTES {
+        return Err(WriterError::ValueTooLarge("in-memory raw property"));
+    }
+    Ok(())
 }
 
 fn raw_value_payload_len(value: &RawPropertyValue) -> Result<usize, WriterError> {
@@ -5513,6 +5665,13 @@ fn unicode_payload_len(value: &str) -> Result<usize, WriterError> {
 
 fn validate_payload_len(name: &'static str, length: usize) -> Result<(), WriterError> {
     if length > MAX_FIDELITY_PROPERTY_BYTES {
+        return Err(WriterError::ValueTooLarge(name));
+    }
+    Ok(())
+}
+
+fn validate_pst_property_len(name: &'static str, length: usize) -> Result<(), WriterError> {
+    if length > MAX_PST_PROPERTY_BYTES {
         return Err(WriterError::ValueTooLarge(name));
     }
     Ok(())
@@ -11810,25 +11969,47 @@ mod tests {
     #[test]
     fn private_message_tables_do_not_retain_template_refcounts()
     -> Result<(), Box<dyn std::error::Error>> {
-        let blocks = built_message_block_specs(BuiltTopMessage {
-            recipient_block: leaf_bid(101)?,
-            attachment_block: leaf_bid(102)?,
-            subnode_block: internal_bid(103)?,
-            shared_table_blocks: false,
-            message: MessageBlocks {
-                property_data_block: leaf_bid(100)?,
-                recipient_table: Some(Vec::new()),
-                recipient_table_referenced_by_message: true,
-                attachment_table: Vec::new(),
-                subnodes: Vec::new(),
-                dynamic_blocks: Vec::new(),
-                record_key: [0; 16],
-                message_size: 0,
-                streamed_logical_size: 0,
+        let mut next_block_index = 104;
+        let recipient_block = leaf_bid(101)?;
+        let attachment_block = leaf_bid(102)?;
+        let blocks = built_message_block_specs(
+            BuiltTopMessage {
+                recipient_block,
+                attachment_block,
+                subnode_block: internal_bid(103)?,
+                shared_table_blocks: false,
+                message: MessageBlocks {
+                    property_data_block: leaf_bid(100)?,
+                    recipient_table: Some(Vec::new()),
+                    recipient_table_referenced_by_message: true,
+                    attachment_table: Vec::new(),
+                    subnodes: vec![UnicodeLeafSubNodeTreeEntry::new(
+                        NodeId::from(NID_RECIPIENT_TABLE_TEMPLATE),
+                        leaf_bid(101)?,
+                        None,
+                    )],
+                    dynamic_blocks: Vec::new(),
+                    record_key: [0; 16],
+                    message_size: 0,
+                    streamed_logical_size: 0,
+                },
             },
-        });
-        assert_eq!(blocks[0].ref_count, 2);
-        assert_eq!(blocks[1].ref_count, 2);
+            &mut next_block_index,
+        )?;
+        assert_eq!(
+            blocks
+                .iter()
+                .find(|block| block.id == recipient_block)
+                .map(|block| block.ref_count),
+            Some(2)
+        );
+        assert_eq!(
+            blocks
+                .iter()
+                .find(|block| block.id == attachment_block)
+                .map(|block| block.ref_count),
+            Some(2)
+        );
         Ok(())
     }
 
@@ -13572,18 +13753,63 @@ mod tests {
         .map_err(|error| format!("multi-page recipient values failed: {error}"))?;
 
         let mut many_recipients = FidelityStore::default();
-        many_recipients.message.recipients = (0..200)
-            .map(|_| RecipientSpec {
+        many_recipients.message.attachments.clear();
+        many_recipients.message.named_properties.clear();
+        many_recipients.message.raw_properties.clear();
+        many_recipients.message.recipients = (0..368)
+            .map(|index| RecipientSpec {
                 kind: RecipientKind::To,
-                display_name: "R".to_owned(),
-                email_address: "r@x".to_owned(),
+                display_name: format!("Recipient {index:03}"),
+                email_address: format!("recipient-{index:03}@example.test"),
             })
             .collect();
+        validate_spec(&many_recipients)
+            .map_err(|error| format!("multi-page recipient preflight failed: {error}"))?;
         create_fidelity_store(
             directory.path().join("recipient-multi-page-rows.pst"),
             &many_recipients,
         )
         .map_err(|error| format!("multi-page recipient rows failed: {error}"))?;
+
+        let mut large_named_binary = FidelityStore::default();
+        large_named_binary.message.named_properties = vec![
+            NamedProperty {
+                set: NamedPropertySet::PublicStrings,
+                name: NamedPropertyName::String("LargeBinaryA".to_owned()),
+                value: RawPropertyValue::Binary(vec![0xA5; 19_811]),
+            },
+            NamedProperty {
+                set: NamedPropertySet::PublicStrings,
+                name: NamedPropertyName::String("LargeBinaryB".to_owned()),
+                value: RawPropertyValue::Binary(vec![0x5A; 64_051]),
+            },
+        ];
+        create_fidelity_store(
+            directory.path().join("large-named-binary.pst"),
+            &large_named_binary,
+        )
+        .map_err(|error| format!("large named binary values failed: {error}"))?;
+
+        let mut associated_singleton = FidelityStore::default().message;
+        associated_singleton.subject = "A".repeat(2000);
+        associated_singleton.attachments.clear();
+        associated_singleton.named_properties.clear();
+        associated_singleton.raw_properties.clear();
+        create_mail_store(
+            directory.path().join("associated-singleton-external.pst"),
+            &MailStoreSpec {
+                store_name: "Associated singleton external table".to_owned(),
+                record_key: [0xA5; 16],
+                folders: vec![MailFolderSpec {
+                    path: vec!["Associated".to_owned()],
+                    location: MailFolderLocation::IpmSubtree,
+                    role: MailFolderRole::Ordinary,
+                    container_class: "IPF.Note".to_owned(),
+                    messages: Vec::new(),
+                    associated_messages: vec![associated_singleton],
+                }],
+            },
+        )?;
 
         let property = |name: String| NamedProperty {
             set: NamedPropertySet::PublicStrings,
@@ -13611,38 +13837,181 @@ mod tests {
             Err(WriterError::ValueTooLarge("named-property map heap page"))
         ));
 
-        let mut raw_overflow = FidelityStore::default();
-        raw_overflow.message.raw_properties = (0..5)
+        let mut scalable_raw = FidelityStore::default();
+        scalable_raw.message.raw_properties = (0..5)
             .map(|index| RawProperty {
                 id: 0x1100 + index,
                 value: RawPropertyValue::Binary(vec![0; MAX_FIDELITY_PROPERTY_BYTES]),
             })
             .collect();
+        create_fidelity_store(directory.path().join("scalable-raw.pst"), &scalable_raw)?;
+
+        for external_count in [338_u16, 339] {
+            let mut subnode_boundary = FidelityStore::default();
+            subnode_boundary.message.attachments.clear();
+            subnode_boundary.message.named_properties.clear();
+            subnode_boundary.message.raw_properties = (0..external_count)
+                .map(|index| RawProperty {
+                    id: 0x1100 + index,
+                    value: RawPropertyValue::Binary(vec![0xA5; 2049]),
+                })
+                .collect();
+            create_fidelity_store(
+                directory
+                    .path()
+                    .join(format!("message-subnodes-{external_count}.pst")),
+                &subnode_boundary,
+            )
+            .map_err(|error| {
+                format!("{external_count}-property message subnode tree failed: {error}")
+            })?;
+
+            let mut embedded_subnode_boundary = FidelityStore::default();
+            let AttachmentContent::Embedded(embedded) =
+                &mut embedded_subnode_boundary.message.attachments[1].content
+            else {
+                return Err("expected embedded message fixture".into());
+            };
+            embedded.attachments.clear();
+            embedded.named_properties.clear();
+            embedded.raw_properties = (0..external_count)
+                .map(|index| RawProperty {
+                    id: 0x1100 + index,
+                    value: RawPropertyValue::Binary(vec![0x5A; 2049]),
+                })
+                .collect();
+            create_fidelity_store(
+                directory
+                    .path()
+                    .join(format!("embedded-message-subnodes-{external_count}.pst")),
+                &embedded_subnode_boundary,
+            )
+            .map_err(|error| {
+                format!("{external_count}-property embedded subnode tree failed: {error}")
+            })?;
+
+            if external_count == 339 {
+                for (label, message) in [
+                    ("top-level", subnode_boundary.message.clone()),
+                    ("embedded", embedded_subnode_boundary.message.clone()),
+                ] {
+                    let folder = MailFolderSpec {
+                        path: vec!["Inbox".to_owned()],
+                        location: MailFolderLocation::IpmSubtree,
+                        role: MailFolderRole::Ordinary,
+                        container_class: "IPF.Note".to_owned(),
+                        messages: Vec::new(),
+                        associated_messages: Vec::new(),
+                    };
+                    let layout = MailStoreSpec {
+                        store_name: format!("Transactional {label} subnodes"),
+                        record_key: [0x44; 16],
+                        folders: vec![folder.clone()],
+                    };
+                    let mut catalog = NamedPropertyCatalog::default();
+                    catalog.observe_message(&message);
+                    let mut transaction = TransactionalMailStoreWriter::begin(
+                        directory
+                            .path()
+                            .join(format!("transactional-{label}-subnodes.pst")),
+                        layout,
+                        &catalog,
+                        true,
+                        None,
+                    )?;
+                    let checkpoint = transaction.begin_batch();
+                    transaction.append_message_deferred(
+                        folder.location,
+                        &folder.path,
+                        false,
+                        message.clone(),
+                        &NEVER_INTERRUPTED,
+                    )?;
+                    transaction.rollback_batch(checkpoint)?;
+                    transaction.append_message_deferred(
+                        folder.location,
+                        &folder.path,
+                        false,
+                        message,
+                        &NEVER_INTERRUPTED,
+                    )?;
+                    transaction.finalize(&NEVER_INTERRUPTED)?;
+                }
+            }
+        }
+
+        let mut graph_budget = FidelityStore::default();
+        graph_budget.message.named_properties.clear();
+        graph_budget.message.raw_properties = vec![RawProperty {
+            id: 0x1100,
+            value: RawPropertyValue::Binary(vec![0x11; 3]),
+        }];
+        graph_budget.message.attachments[0]
+            .raw_properties
+            .push(RawProperty {
+                id: 0x3702,
+                value: RawPropertyValue::Binary(vec![0x22; 4]),
+            });
+        let AttachmentContent::Embedded(graph_child) =
+            &mut graph_budget.message.attachments[1].content
+        else {
+            return Err("expected embedded message fixture".into());
+        };
+        graph_child.named_properties.clear();
+        graph_child.raw_properties = vec![RawProperty {
+            id: 0x1101,
+            value: RawPropertyValue::Binary(vec![0x33; 5]),
+        }];
+        validate_aggregate_properties_with_limit(&graph_budget.message, 12)?;
         assert!(matches!(
-            create_fidelity_store(directory.path().join("raw-overflow.pst"), &raw_overflow),
+            validate_aggregate_properties_with_limit(&graph_budget.message, 11),
             Err(WriterError::ValueTooLarge(
                 "aggregate custom-property payload"
             ))
         ));
 
-        let mut guid_at_limit = FidelityStore::default();
-        guid_at_limit.message.raw_properties = vec![RawProperty {
+        let mut aggregate_boundary = 0;
+        add_in_memory_custom_property_bytes(
+            &mut aggregate_boundary,
+            MAX_IN_MEMORY_CUSTOM_PROPERTY_BYTES,
+            MAX_IN_MEMORY_CUSTOM_PROPERTY_BYTES,
+        )?;
+        assert!(matches!(
+            add_in_memory_custom_property_bytes(
+                &mut aggregate_boundary,
+                1,
+                MAX_IN_MEMORY_CUSTOM_PROPERTY_BYTES
+            ),
+            Err(WriterError::ValueTooLarge(
+                "aggregate custom-property payload"
+            ))
+        ));
+
+        let mut in_memory_overflow = FidelityStore::default();
+        in_memory_overflow.message.raw_properties = vec![RawProperty {
+            id: 0x1100,
+            value: RawPropertyValue::Binary(vec![0; MAX_IN_MEMORY_PROPERTY_BYTES + 1]),
+        }];
+        assert!(matches!(
+            validate_spec(&in_memory_overflow),
+            Err(WriterError::ValueTooLarge("in-memory raw property"))
+        ));
+
+        let mut scalable_guid = FidelityStore::default();
+        scalable_guid.message.raw_properties = vec![RawProperty {
             id: 0x1100,
             value: RawPropertyValue::MultipleGuid(vec![
                 [0xAB; 16];
                 MAX_FIDELITY_PROPERTY_BYTES / 16
             ]),
         }];
-        create_fidelity_store(directory.path().join("guid-limit.pst"), &guid_at_limit)?;
+        create_fidelity_store(directory.path().join("guid-limit.pst"), &scalable_guid)?;
         if let RawPropertyValue::MultipleGuid(values) =
-            &mut guid_at_limit.message.raw_properties[0].value
+            &mut scalable_guid.message.raw_properties[0].value
         {
             values.push([0xCD; 16]);
         }
-        assert!(matches!(
-            create_fidelity_store(directory.path().join("guid-overflow.pst"), &guid_at_limit),
-            Err(WriterError::ValueTooLarge("raw property"))
-        ));
+        create_fidelity_store(directory.path().join("guid-scalable.pst"), &scalable_guid)?;
 
         let mut unsupported_overflow = FidelityStore::default();
         unsupported_overflow.message.unsupported_properties = vec![
