@@ -936,6 +936,11 @@ struct ExternalTableBuild {
     blocks: Vec<BlockSpec>,
 }
 
+struct ExternalPropertyBuild {
+    data_block: UnicodeBlockId,
+    blocks: Vec<BlockSpec>,
+}
+
 const MAX_DATA_BLOCK_PAYLOAD: usize = 8176;
 const MAX_HEAP_ALLOCATION: usize = 3580;
 const MAX_DATA_TREE_ENTRIES: usize = 1021;
@@ -1127,20 +1132,44 @@ fn append_data_tree_pages(
     if leaves.len() == 1 {
         return Ok(leaves[0].0);
     }
-    if leaves.len() > MAX_DATA_TREE_ENTRIES {
-        return Err(WriterError::ValueTooLarge("heap data-tree page count"));
+    let mut xblocks = Vec::with_capacity(leaves.len().div_ceil(MAX_DATA_TREE_ENTRIES));
+    for group in leaves.chunks(MAX_DATA_TREE_ENTRIES) {
+        let total_size = group.iter().try_fold(0_u32, |total, (_, size)| {
+            total.checked_add(u32::try_from(*size).ok()?)
+        });
+        let total_size = total_size.ok_or(WriterError::ValueTooLarge("heap data-tree size"))?;
+        let id = take_block_id(next_block_index, true)?;
+        blocks.push(BlockSpec {
+            id,
+            payload: BlockPayload::DataTree {
+                level: 1,
+                total_size,
+                entries: group
+                    .iter()
+                    .map(|(block, _)| UnicodeDataTreeEntry::from(*block))
+                    .collect(),
+            },
+            ref_count: 2,
+        });
+        xblocks.push((id, total_size));
     }
-    let total_size = leaves.iter().try_fold(0_u32, |total, (_, size)| {
-        total.checked_add(u32::try_from(*size).ok()?)
-    });
-    let total_size = total_size.ok_or(WriterError::ValueTooLarge("heap data-tree size"))?;
+    if xblocks.len() == 1 {
+        return Ok(xblocks[0].0);
+    }
+    if xblocks.len() > MAX_DATA_TREE_ENTRIES {
+        return Err(WriterError::ValueTooLarge("heap data-tree XBLOCK count"));
+    }
+    let total_size = xblocks
+        .iter()
+        .try_fold(0_u32, |total, (_, size)| total.checked_add(*size))
+        .ok_or(WriterError::ValueTooLarge("heap data-tree size"))?;
     let id = take_block_id(next_block_index, true)?;
     blocks.push(BlockSpec {
         id,
         payload: BlockPayload::DataTree {
-            level: 1,
+            level: 2,
             total_size,
-            entries: leaves
+            entries: xblocks
                 .iter()
                 .map(|(block, _)| UnicodeDataTreeEntry::from(*block))
                 .collect(),
@@ -1407,7 +1436,7 @@ pub fn create_minimal_store(
 }
 
 struct MessageBlocks {
-    property_context: Vec<u8>,
+    property_data_block: UnicodeBlockId,
     recipient_table: Option<Vec<u8>>,
     recipient_table_referenced_by_message: bool,
     attachment_table: Vec<u8>,
@@ -1419,7 +1448,6 @@ struct MessageBlocks {
 }
 
 struct BuiltTopMessage {
-    property_block: UnicodeBlockId,
     recipient_block: UnicodeBlockId,
     attachment_block: UnicodeBlockId,
     subnode_block: UnicodeBlockId,
@@ -1428,11 +1456,7 @@ struct BuiltTopMessage {
 }
 
 fn built_message_block_specs(built: BuiltTopMessage) -> Vec<BlockSpec> {
-    let mut blocks = vec![BlockSpec {
-        id: built.property_block,
-        payload: BlockPayload::Data(built.message.property_context),
-        ref_count: 2,
-    }];
+    let mut blocks = Vec::new();
     if let Some(recipient_table) = built.message.recipient_table {
         blocks.push(BlockSpec {
             id: built.recipient_block,
@@ -1711,6 +1735,7 @@ fn build_message_blocks(
     associated: bool,
     record_key: [u8; 16],
     named_identities: &[NamedIdentity],
+    property_block: UnicodeBlockId,
     recipient_block: UnicodeBlockId,
     attachment_table_block: UnicodeBlockId,
     next_block_index: &mut u64,
@@ -1818,6 +1843,7 @@ fn build_message_blocks(
                     false,
                     embedded_message_record_key(record_key, attachment_index),
                     named_identities,
+                    embedded_pc_block,
                     embedded_recipient_block,
                     embedded_attachment_block,
                     next_block_index,
@@ -1831,11 +1857,6 @@ fn build_message_blocks(
                 let embedded_object_size = u32::try_from(embedded_size)
                     .map_err(|_| WriterError::ValueTooLarge("embedded message"))?;
                 let embedded_subnode_block = take_block_id(next_block_index, true)?;
-                dynamic_blocks.push(BlockSpec {
-                    id: embedded_pc_block,
-                    payload: BlockPayload::Data(embedded_blocks.property_context),
-                    ref_count: 2,
-                });
                 if let Some(recipient_table) = embedded_blocks.recipient_table {
                     dynamic_blocks.push(BlockSpec {
                         id: embedded_recipient_block,
@@ -1858,7 +1879,7 @@ fn build_message_blocks(
                 dynamic_blocks.extend(embedded_blocks.dynamic_blocks);
                 attachment_local_subnodes.push(UnicodeLeafSubNodeTreeEntry::new(
                     embedded_node,
-                    embedded_pc_block,
+                    embedded_blocks.property_data_block,
                     Some(embedded_subnode_block),
                 ));
                 (
@@ -1953,11 +1974,10 @@ fn build_message_blocks(
             &mut dynamic_blocks,
             &mut attachment_local_subnodes,
         )?;
-        dynamic_blocks.push(BlockSpec {
-            id: attachment_block,
-            payload: BlockPayload::Data(property_context(&properties)?),
-            ref_count: 2,
-        });
+        let attachment_property =
+            build_property_context(&properties, attachment_block, next_block_index)?;
+        let attachment_data_block = attachment_property.data_block;
+        dynamic_blocks.extend(attachment_property.blocks);
         attachment_local_subnodes.sort_by_key(|entry| u32::from(entry.node()));
         let attachment_subnode = if attachment_local_subnodes.is_empty() {
             None
@@ -1972,7 +1992,7 @@ fn build_message_blocks(
         };
         message_subnodes.push(UnicodeLeafSubNodeTreeEntry::new(
             attachment_node,
-            attachment_block,
+            attachment_data_block,
             attachment_subnode,
         ));
     }
@@ -2003,8 +2023,8 @@ fn build_message_blocks(
         &mut message_subnodes,
     )?;
     message_subnodes.sort_by_key(|entry| u32::from(entry.node()));
-    let message_bytes = property_context(&top_properties)?
-        .len()
+    let property_logical_size = property_context_logical_size(&top_properties)?;
+    let message_bytes = property_logical_size
         .checked_add(recipient_inline_size)
         .and_then(|total| total.checked_add(attachment_table.len()))
         .and_then(|total| {
@@ -2017,8 +2037,11 @@ fn build_message_blocks(
     let message_size =
         i32::try_from(message_bytes).map_err(|_| WriterError::ValueTooLarge("message size"))?;
     set_message_size(&mut top_properties, message_size)?;
+    let property = build_property_context(&top_properties, property_block, next_block_index)?;
+    let property_data_block = property.data_block;
+    dynamic_blocks.extend(property.blocks);
     Ok(MessageBlocks {
-        property_context: property_context(&top_properties)?,
+        property_data_block,
         recipient_table,
         recipient_table_referenced_by_message,
         attachment_table,
@@ -2525,6 +2548,7 @@ impl MessageStreamState {
             associated,
             message_record_key(store_record_key, message_node),
             named_identities,
+            property_block,
             recipient_block,
             attachment_block,
             &mut self.next_block_index,
@@ -2549,12 +2573,11 @@ impl MessageStreamState {
         }
         self.top_nodes.push(TopMessageNode {
             node: message_node,
-            property_block,
+            property_block: message.property_data_block,
             subnode_block,
             parent,
         });
         let message_blocks = built_message_block_specs(BuiltTopMessage {
-            property_block,
             recipient_block,
             attachment_block,
             subnode_block,
@@ -3667,6 +3690,7 @@ fn create_flat_store(
             associated,
             message_record_key(spec.record_key, message_node),
             &named_identities,
+            leaf_bid(12)?,
             leaf_bid(17)?,
             leaf_bid(18)?,
             &mut message_stream.next_block_index,
@@ -3693,12 +3717,11 @@ fn create_flat_store(
         }
         message_stream.top_nodes.push(TopMessageNode {
             node: message_node,
-            property_block: leaf_bid(12)?,
+            property_block: message.property_data_block,
             subnode_block: internal_bid(27)?,
             parent: top_level_messages[0].1,
         });
         single_message = Some(BuiltTopMessage {
-            property_block: leaf_bid(12)?,
             recipient_block: leaf_bid(17)?,
             attachment_block: leaf_bid(18)?,
             subnode_block: internal_bid(27)?,
@@ -4628,49 +4651,13 @@ fn validate_property_context_shape(
     property_count: usize,
     variable_lengths: &[usize],
 ) -> Result<(), WriterError> {
-    let placeholders = (0..property_count)
-        .map(|index| {
-            Ok((
-                u16::try_from(index).map_err(|_| WriterError::ValueTooLarge("property count"))?,
-                PropertyValue::Integer32(0),
-            ))
-        })
-        .collect::<Result<Vec<_>, WriterError>>()?;
-    let base_size = property_context(&placeholders)
-        .map_err(|error| match error {
-            WriterError::ValueTooLarge(_) => WriterError::ValueTooLarge(name),
-            other => other,
-        })?
-        .len();
-    let (variable_bytes, allocation_count) =
-        variable_lengths
-            .iter()
-            .try_fold((0_usize, 0_usize), |(bytes, count), length| {
-                if *length == 0 || *length > 2048 {
-                    return Ok::<_, WriterError>((bytes, count));
-                }
-                Ok((
-                    bytes
-                        .checked_add(*length)
-                        .ok_or(WriterError::ValueTooLarge(name))?,
-                    count
-                        .checked_add(1)
-                        .ok_or(WriterError::ValueTooLarge(name))?,
-                ))
-            })?;
-    let aligned_bytes = variable_bytes
-        .checked_add(variable_bytes % 2)
-        .ok_or(WriterError::ValueTooLarge(name))?;
-    let total = base_size
-        .checked_add(aligned_bytes)
-        .and_then(|size| {
-            allocation_count
-                .checked_mul(2)
-                .and_then(|map| size.checked_add(map))
-        })
-        .ok_or(WriterError::ValueTooLarge(name))?;
-    if total > MAX_DATA_BLOCK_PAYLOAD {
-        return Err(WriterError::ValueTooLarge(name));
+    if property_count > usize::from(u16::MAX) + 1 {
+        return Err(WriterError::ValueTooLarge("property count"));
+    }
+    for length in variable_lengths {
+        if *length > MAX_FIDELITY_PROPERTY_BYTES {
+            return Err(WriterError::ValueTooLarge(name));
+        }
     }
     Ok(())
 }
@@ -7816,9 +7803,9 @@ fn property_context(properties: &[(u16, PropertyValue)]) -> Result<Vec<u8>, Writ
             }
             allocations.push(bytes);
             let index = u16::try_from(allocations.len())
-                .map_err(|_| WriterError::ValueTooLarge("property allocation count"))?;
-            let heap_id = HeapId::new(index, 0)
-                .map_err(|error| WriterError::InvalidStructure(error.to_string()))?;
+                .map_err(|_| WriterError::ValueTooLarge("heap page"))?;
+            let heap_id =
+                HeapId::new(index, 0).map_err(|_| WriterError::ValueTooLarge("heap page"))?;
             records.write_u32::<LittleEndian>(u32::from(heap_id))?;
         }
     }
@@ -7833,6 +7820,172 @@ fn property_context(properties: &[(u16, PropertyValue)]) -> Result<Vec<u8>, Writ
     allocations[0] = tree_header;
 
     heap_page(HeapNodeType::Properties, &allocations)
+}
+
+fn property_context_logical_size(
+    properties: &[(u16, PropertyValue)],
+) -> Result<usize, WriterError> {
+    match property_context(properties) {
+        Ok(context) => Ok(context.len()),
+        Err(WriterError::ValueTooLarge("heap page")) => property_context_external(properties)?
+            .iter()
+            .try_fold(0_usize, |total, page| total.checked_add(page.len()))
+            .ok_or(WriterError::ValueTooLarge("property context")),
+        Err(error) => Err(error),
+    }
+}
+
+fn build_property_context(
+    properties: &[(u16, PropertyValue)],
+    preferred_block: UnicodeBlockId,
+    next_block_index: &mut u64,
+) -> Result<ExternalPropertyBuild, WriterError> {
+    match property_context(properties) {
+        Ok(context) => Ok(ExternalPropertyBuild {
+            data_block: preferred_block,
+            blocks: vec![BlockSpec {
+                id: preferred_block,
+                payload: BlockPayload::Data(context),
+                ref_count: 2,
+            }],
+        }),
+        Err(WriterError::ValueTooLarge("heap page")) => {
+            let pages = property_context_external(properties)?;
+            let mut blocks = Vec::new();
+            let data_block = append_data_tree_pages(&pages, next_block_index, &mut blocks)?;
+            Ok(ExternalPropertyBuild { data_block, blocks })
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn property_context_external(
+    properties: &[(u16, PropertyValue)],
+) -> Result<Vec<Vec<u8>>, WriterError> {
+    let mut sorted = properties.to_vec();
+    sorted.sort_by_key(|(id, _)| *id);
+    if sorted.is_empty() {
+        return Err(WriterError::InvalidStructure(
+            "external property context must contain properties".to_owned(),
+        ));
+    }
+
+    let mut page_allocations = Vec::<Vec<Vec<u8>>>::new();
+    let mut records = Vec::with_capacity(sorted.len().saturating_mul(8));
+    for (property_id, value) in sorted {
+        records.write_u16::<LittleEndian>(property_id)?;
+        records.write_u16::<LittleEndian>(u16::from(value.property_type()))?;
+        if let Some(inline) = value.inline_value() {
+            records.write_u32::<LittleEndian>(inline)?;
+            continue;
+        }
+        let bytes = value.variable_bytes()?.ok_or_else(|| {
+            WriterError::InvalidStructure("property has no serialized value".to_owned())
+        })?;
+        if bytes.is_empty() {
+            records.write_u32::<LittleEndian>(0)?;
+            continue;
+        }
+        let heap_id = push_heap_allocation(&mut page_allocations, bytes)?;
+        records.write_u32::<LittleEndian>(u32::from(heap_id))?;
+    }
+
+    const PC_LEAF_RECORD_SIZE: usize = 8;
+    const PC_INTERMEDIATE_RECORD_SIZE: usize = 6;
+    let mut roots = Vec::with_capacity(records.len().div_ceil(MAX_HEAP_ALLOCATION));
+    for chunk in records.chunks((MAX_HEAP_ALLOCATION / PC_LEAF_RECORD_SIZE) * PC_LEAF_RECORD_SIZE) {
+        let key = u16::from_le_bytes(
+            chunk[0..2]
+                .try_into()
+                .map_err(|_| WriterError::InvalidStructure("empty PC BTH leaf".to_owned()))?,
+        );
+        let heap_id = push_heap_allocation(&mut page_allocations, chunk.to_vec())?;
+        roots.push((key, heap_id));
+    }
+
+    let mut levels = 0_u8;
+    while roots.len() > 1 {
+        levels = levels
+            .checked_add(1)
+            .ok_or(WriterError::ValueTooLarge("PC BTH depth"))?;
+        let mut parents = Vec::with_capacity(
+            roots
+                .len()
+                .div_ceil(MAX_HEAP_ALLOCATION / PC_INTERMEDIATE_RECORD_SIZE),
+        );
+        for group in roots.chunks(MAX_HEAP_ALLOCATION / PC_INTERMEDIATE_RECORD_SIZE) {
+            let mut entries = Vec::with_capacity(group.len() * PC_INTERMEDIATE_RECORD_SIZE);
+            for (key, next_level) in group {
+                entries.write_u16::<LittleEndian>(*key)?;
+                entries.write_u32::<LittleEndian>(u32::from(*next_level))?;
+            }
+            let heap_id = push_heap_allocation(&mut page_allocations, entries)?;
+            parents.push((group[0].0, heap_id));
+        }
+        roots = parents;
+    }
+
+    let mut tree_header = Vec::new();
+    HeapTreeHeader::new(2, 6, levels, roots[0].1)
+        .map_err(|error| WriterError::InvalidStructure(error.to_string()))?
+        .write(&mut tree_header)?;
+    let mut pages = Vec::with_capacity(page_allocations.len().saturating_add(1));
+    pages.push(heap_page(HeapNodeType::Properties, &[tree_header])?);
+    for (index, allocations) in page_allocations.into_iter().enumerate() {
+        let page_index =
+            u16::try_from(index + 1).map_err(|_| WriterError::ValueTooLarge("heap page index"))?;
+        pages.push(heap_continuation_page_allocations(
+            page_index,
+            &allocations,
+        )?);
+    }
+    let non_final = pages.len().saturating_sub(1);
+    for page in pages.iter_mut().take(non_final) {
+        fill_heap_page(page)?;
+    }
+    update_heap_fill_levels(&mut pages)?;
+    Ok(pages)
+}
+
+fn push_heap_allocation(
+    pages: &mut Vec<Vec<Vec<u8>>>,
+    allocation: Vec<u8>,
+) -> Result<HeapId, WriterError> {
+    if allocation.is_empty() || allocation.len() > MAX_HEAP_ALLOCATION {
+        return Err(WriterError::ValueTooLarge("heap allocation"));
+    }
+    let current_page_index =
+        u16::try_from(pages.len()).map_err(|_| WriterError::ValueTooLarge("heap page index"))?;
+    if let Some(current) = pages.last_mut() {
+        let page_index = current_page_index;
+        current.push(allocation);
+        match heap_continuation_page_allocations(page_index, current) {
+            Ok(_) => {
+                let allocation_index = u16::try_from(current.len())
+                    .map_err(|_| WriterError::ValueTooLarge("heap allocation count"))?;
+                return HeapId::new(allocation_index, page_index)
+                    .map_err(|error| WriterError::InvalidStructure(error.to_string()));
+            }
+            Err(WriterError::ValueTooLarge("heap continuation page")) => {
+                let allocation = current.pop().ok_or_else(|| {
+                    WriterError::InvalidStructure("heap allocation rollback failed".to_owned())
+                })?;
+                pages.push(vec![allocation]);
+            }
+            Err(error) => return Err(error),
+        }
+    } else {
+        pages.push(vec![allocation]);
+    }
+    let page_index =
+        u16::try_from(pages.len()).map_err(|_| WriterError::ValueTooLarge("heap page index"))?;
+    heap_continuation_page_allocations(
+        page_index,
+        pages.last().ok_or_else(|| {
+            WriterError::InvalidStructure("heap allocation page is missing".to_owned())
+        })?,
+    )?;
+    HeapId::new(1, page_index).map_err(|error| WriterError::InvalidStructure(error.to_string()))
 }
 
 fn hierarchy_columns() -> Result<Vec<TableColumnDescriptor>, WriterError> {
@@ -9299,11 +9452,22 @@ fn heap_page(kind: HeapNodeType, allocations: &[Vec<u8>]) -> Result<Vec<u8>, Wri
 }
 
 fn heap_continuation_page(page_index: u16, allocation: &[u8]) -> Result<Vec<u8>, WriterError> {
+    heap_continuation_page_allocations(page_index, &[allocation.to_vec()])
+}
+
+fn heap_continuation_page_allocations(
+    page_index: u16,
+    allocations: &[Vec<u8>],
+) -> Result<Vec<u8>, WriterError> {
     let bitmap = page_index % 128 == 8;
     let header_size = if bitmap { 66_usize } else { 2_usize };
-    let allocation_end = header_size
-        .checked_add(allocation.len())
-        .ok_or(WriterError::ValueTooLarge("heap continuation page"))?;
+    let allocation_end = allocations
+        .iter()
+        .try_fold(header_size, |total, allocation| {
+            total.checked_add(allocation.len())
+        });
+    let allocation_end =
+        allocation_end.ok_or(WriterError::ValueTooLarge("heap continuation page"))?;
     let payload_size = usize::try_from(align_up(
         u64::try_from(allocation_end)
             .map_err(|_| WriterError::ValueTooLarge("heap continuation page"))?,
@@ -9311,7 +9475,14 @@ fn heap_continuation_page(page_index: u16, allocation: &[u8]) -> Result<Vec<u8>,
     ))
     .map_err(|_| WriterError::ValueTooLarge("heap continuation page"))?;
     let total = payload_size
-        .checked_add(8)
+        .checked_add(
+            allocations
+                .len()
+                .checked_add(1)
+                .and_then(|count| count.checked_mul(size_of::<u16>()))
+                .and_then(|offsets| offsets.checked_add(2 * size_of::<u16>()))
+                .ok_or(WriterError::ValueTooLarge("heap continuation page"))?,
+        )
         .ok_or(WriterError::ValueTooLarge("heap continuation page"))?;
     if total > MAX_DATA_BLOCK_PAYLOAD {
         return Err(WriterError::ValueTooLarge("heap continuation page"));
@@ -9324,18 +9495,27 @@ fn heap_continuation_page(page_index: u16, allocation: &[u8]) -> Result<Vec<u8>,
     } else {
         HeapNodePageHeader::new(page_map_offset).write(&mut data)?;
     }
-    data.extend_from_slice(allocation);
+    let mut offsets = Vec::with_capacity(allocations.len().saturating_add(1));
+    offsets.push(
+        u16::try_from(data.len())
+            .map_err(|_| WriterError::ValueTooLarge("heap continuation offset"))?,
+    );
+    for allocation in allocations {
+        data.extend_from_slice(allocation);
+        offsets.push(
+            u16::try_from(data.len())
+                .map_err(|_| WriterError::ValueTooLarge("heap continuation offset"))?,
+        );
+    }
     data.resize(payload_size, 0);
-    data.write_u16::<LittleEndian>(1)?;
+    data.write_u16::<LittleEndian>(
+        u16::try_from(allocations.len())
+            .map_err(|_| WriterError::ValueTooLarge("heap allocation count"))?,
+    )?;
     data.write_u16::<LittleEndian>(0)?;
-    data.write_u16::<LittleEndian>(
-        u16::try_from(header_size)
-            .map_err(|_| WriterError::ValueTooLarge("heap continuation offset"))?,
-    )?;
-    data.write_u16::<LittleEndian>(
-        u16::try_from(allocation_end)
-            .map_err(|_| WriterError::ValueTooLarge("heap continuation offset"))?,
-    )?;
+    for offset in offsets {
+        data.write_u16::<LittleEndian>(offset)?;
+    }
     Ok(data)
 }
 
@@ -10519,6 +10699,107 @@ mod tests {
     }
 
     #[test]
+    fn external_property_contexts_survive_transactional_rollback_and_embedding()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let scalable_properties = || {
+            (0..500_u16)
+                .map(|index| RawProperty {
+                    id: 0x1100 + index,
+                    value: RawPropertyValue::Boolean(index % 2 == 0),
+                })
+                .chain((0..5_u16).map(|index| RawProperty {
+                    id: 0x1400 + index,
+                    value: RawPropertyValue::Binary(vec![u8::try_from(index).unwrap_or(0); 1024]),
+                }))
+                .collect::<Vec<_>>()
+        };
+        let directory = tempfile::tempdir()?;
+        let expected_path = directory.path().join("expected.pst");
+        let transaction_path = directory.path().join("transaction.pst");
+        let fixture = FidelityStore::default();
+        let first = fixture.message.clone();
+        let mut external = fixture.message.clone();
+        external.subject = "External property context checkpoint".to_owned();
+        external.raw_properties = scalable_properties();
+        let embedded_attachment = external.attachments.remove(1);
+        external.attachments = vec![embedded_attachment];
+        let AttachmentContent::Embedded(embedded) = &mut external.attachments[0].content else {
+            return Err("expected embedded message fixture".into());
+        };
+        embedded.subject = "Embedded external property context checkpoint".to_owned();
+        embedded.raw_properties = scalable_properties();
+
+        let folder = MailFolderSpec {
+            path: vec!["Inbox".to_owned()],
+            location: MailFolderLocation::IpmSubtree,
+            role: MailFolderRole::Ordinary,
+            container_class: "IPF.Note".to_owned(),
+            messages: vec![first.clone(), external.clone()],
+            associated_messages: Vec::new(),
+        };
+        let expected = MailStoreSpec {
+            store_name: fixture.store_name.clone(),
+            record_key: fixture.record_key,
+            folders: vec![folder.clone()],
+        };
+        create_mail_store(&expected_path, &expected)?;
+
+        let mut catalog = NamedPropertyCatalog::default();
+        catalog.observe_message(&first);
+        catalog.observe_message(&external);
+        let layout = MailStoreSpec {
+            store_name: expected.store_name.clone(),
+            record_key: expected.record_key,
+            folders: vec![MailFolderSpec {
+                messages: Vec::new(),
+                ..folder
+            }],
+        };
+        let mut transaction =
+            TransactionalMailStoreWriter::begin(&transaction_path, layout, &catalog, true, None)?;
+        let first_projected = match transaction.append_message(
+            MailFolderLocation::IpmSubtree,
+            &["Inbox".to_owned()],
+            false,
+            first,
+            u64::MAX,
+            &NEVER_INTERRUPTED,
+        )? {
+            TransactionAppend::Appended { projected_file_eof } => projected_file_eof,
+            TransactionAppend::PartFull { .. } => return Err("first message was rejected".into()),
+        };
+        assert!(matches!(
+            transaction.append_message(
+                MailFolderLocation::IpmSubtree,
+                &["Inbox".to_owned()],
+                false,
+                external.clone(),
+                first_projected.saturating_sub(1),
+                &NEVER_INTERRUPTED,
+            )?,
+            TransactionAppend::PartFull { .. }
+        ));
+        assert_eq!(transaction.message_count(), 1);
+        assert!(matches!(
+            transaction.append_message(
+                MailFolderLocation::IpmSubtree,
+                &["Inbox".to_owned()],
+                false,
+                external,
+                u64::MAX,
+                &NEVER_INTERRUPTED,
+            )?,
+            TransactionAppend::Appended { .. }
+        ));
+        transaction.finalize(&NEVER_INTERRUPTED)?;
+        assert_eq!(
+            Sha256::digest(std::fs::read(&transaction_path)?),
+            Sha256::digest(std::fs::read(expected_path)?)
+        );
+        Ok(())
+    }
+
+    #[test]
     fn arbitrary_nonempty_classes_are_supported_but_calendar_exception_stays_exact() {
         assert!(supported_message_class(
             "IPM.OLE.CLASS.{00061055-0000-0000-C000-000000000046}"
@@ -11530,13 +11811,12 @@ mod tests {
     fn private_message_tables_do_not_retain_template_refcounts()
     -> Result<(), Box<dyn std::error::Error>> {
         let blocks = built_message_block_specs(BuiltTopMessage {
-            property_block: leaf_bid(100)?,
             recipient_block: leaf_bid(101)?,
             attachment_block: leaf_bid(102)?,
             subnode_block: internal_bid(103)?,
             shared_table_blocks: false,
             message: MessageBlocks {
-                property_context: Vec::new(),
+                property_data_block: leaf_bid(100)?,
                 recipient_table: Some(Vec::new()),
                 recipient_table_referenced_by_message: true,
                 attachment_table: Vec::new(),
@@ -11547,8 +11827,8 @@ mod tests {
                 streamed_logical_size: 0,
             },
         });
+        assert_eq!(blocks[0].ref_count, 2);
         assert_eq!(blocks[1].ref_count, 2);
-        assert_eq!(blocks[2].ref_count, 2);
         Ok(())
     }
 
@@ -13403,37 +13683,49 @@ mod tests {
             Err(WriterError::ValueTooLarge("attachment table heap page"))
         ));
 
-        let scalar_properties = |count| {
-            (0..count)
+        let scalable_properties = || {
+            (0..500_u16)
                 .map(|index| RawProperty {
                     id: 0x1100 + index,
                     value: RawPropertyValue::Boolean(true),
                 })
+                .chain((0..5).map(|index| RawProperty {
+                    id: 0x1400 + index,
+                    value: RawPropertyValue::Binary(vec![u8::try_from(index).unwrap_or(0); 1024]),
+                }))
                 .collect::<Vec<_>>()
         };
-        let scalar_boundary = (0..1000_u16)
-            .find(|count| {
-                let mut candidate = FidelityStore::default();
-                candidate.message.raw_properties = scalar_properties(*count);
-                validate_spec(&candidate).is_err()
-            })
-            .and_then(|count| count.checked_sub(1))
-            .ok_or("message property-context boundary was not found")?;
-        let mut scalar_at_limit = FidelityStore::default();
-        scalar_at_limit.message.raw_properties = scalar_properties(scalar_boundary);
+        let mut scalable = FidelityStore::default();
+        scalable.message.raw_properties = scalable_properties();
+        if let AttachmentContent::Embedded(embedded) = &mut scalable.message.attachments[1].content
+        {
+            embedded.raw_properties = scalable_properties();
+        }
         create_fidelity_store(
-            directory.path().join("message-pc-limit.pst"),
-            &scalar_at_limit,
-        )?;
-        let mut scalar_overflow = FidelityStore::default();
-        scalar_overflow.message.raw_properties = scalar_properties(scalar_boundary + 1);
-        assert!(matches!(
-            create_fidelity_store(
-                directory.path().join("message-pc-overflow.pst"),
-                &scalar_overflow
-            ),
-            Err(WriterError::ValueTooLarge("message property context"))
-        ));
+            directory.path().join("message-pc-multi-page.pst"),
+            &scalable,
+        )
+        .map_err(|error| format!("multi-page message property context failed: {error}"))?;
+
+        let mut allocation_limit = FidelityStore::default();
+        allocation_limit.message.raw_properties =
+            (0..MAX_FIDELITY_COLLECTION_ITEMS)
+                .map(|index| {
+                    Ok(RawProperty {
+                        id: 0x1100_u16
+                            .checked_add(u16::try_from(index).map_err(|_| {
+                                WriterError::ValueTooLarge("test property identifier")
+                            })?)
+                            .ok_or(WriterError::ValueTooLarge("test property identifier"))?,
+                        value: RawPropertyValue::Unicode("x".to_owned()),
+                    })
+                })
+                .collect::<Result<Vec<_>, WriterError>>()?;
+        create_fidelity_store(
+            directory.path().join("message-pc-allocation-limit.pst"),
+            &allocation_limit,
+        )
+        .map_err(|error| format!("maximum accepted variable-property count failed: {error}"))?;
 
         let mut empty_attachment = FidelityStore::default();
         if let AttachmentContent::Binary(data) =

@@ -381,11 +381,11 @@ overview reference is replaced by a section-specific reference.
 - **Evidence:** property-context and rich-mail roundtrips; `pffinfo`
 
 ### LTP-03
-- **Status:** Verified: property tags, <=4-byte inline values, heap HIDs, >2,048-byte PSTForge subnodes, object NID/size pairs, supported scalar byte order, and packed fixed-width multivalues agree. Exact-length Unicode remains the accepted EMP-11 interoperability exception.
-- **Requirement:** Property contexts encode each supported property type using the documented inline, heap, or subnode representation
+- **Status:** Verified: property tags, <=4-byte inline values, heap HIDs, >2,048-byte PSTForge subnodes, object NID/size pairs, supported scalar byte order, and packed fixed-width multivalues agree. Compact PCs retain the single-page representation. Scalable PCs place bounded values and the 2-byte-key/6-byte-value PC BTH across HN continuation pages, update root and bitmap fill levels, and expose the ordered heap pages through the node's data tree without imposing a PSTForge property-count cap. Exact-length Unicode remains the accepted EMP-11 interoperability exception.
+- **Requirement:** Property contexts encode each supported property type using the documented inline, heap, or subnode representation; when the PC exceeds one HN page, HIDs identify allocations on continuation pages and the PC BTH uses as many documented leaf and intermediate levels as its records require
 - **Sources:** [MS-PST 2.3.3 PC](https://learn.microsoft.com/en-us/openspecs/office_file_formats/ms-pst/294c83c6-ff92-42f5-b6b6-876c29fa9737), [2.3.3.3 PC BTH record](https://learn.microsoft.com/en-us/openspecs/office_file_formats/ms-pst/7daab6f5-ce65-437e-80d5-1b1be4088bd3), [2.3.3.5 PtypObject](https://learn.microsoft.com/en-us/openspecs/office_file_formats/ms-pst/49457d57-820e-453d-bbc0-1d192a999814), PST-PROPS, and OXCDATA-TYPES
-- **Implementation:** `property_context`, `externalize_large_properties`, `raw_property_value`
-- **Evidence:** `every_supported_raw_value_round_trips`, external-property boundary tests
+- **Implementation:** `property_context`, `property_context_external`, `externalize_large_properties`, `raw_property_value`
+- **Evidence:** `every_supported_raw_value_round_trips`, external-property boundary tests, scalable top-level/embedded PC tests; `pffinfo` accepts the combined r5 candidate and `readpst` 0.6.76 extracts its single-leaf external PC, but that reader hard-rejects the documented level-1 PC BTH header and cannot validate the second message; human acceptance confirms clean ScanPST and successful Outlook consumption of both r5 messages and the embedded child
 
 ### LTP-04
 - **Status:** Verified: RowID/RowVer offsets and bits, 4/2/1-byte regions, HNID column widths, TCINFO boundaries, sorted row BTH, tight row matrix, MSB-first CEB, zero unused bits, and heap/subnode variable values agree.

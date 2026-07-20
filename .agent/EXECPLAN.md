@@ -2315,9 +2315,50 @@ work. Hash and identity evidence show that the source was not modified.
     passes the required Outlook message, recipient-list, and embedded-message
     checks. The canonical full gate passes at
     `.agent/test-results/1784504284-full`.
-  - [ ] Checkpoint 3: remove the general message heap-page limitation for the
+  - [x] (2026-07-19) Checkpoint 3: remove the general message heap-page limitation for the
     five affected candidates without imposing an arbitrary source-property or
     item-count cap. Validate the exact resulting property contexts and tables.
+    The implementation now retains the compact single-page PC when it fits and
+    otherwise packs bounded values into HN continuation-page allocations,
+    builds the documented 2-byte-key/6-byte-value PC BTH across leaf and
+    intermediate levels, fills non-final HN pages, updates root/bitmap fill
+    levels, and points the owning message or attachment node at the resulting
+    data-tree root. Heap data trees now extend through XXBLOCKs rather than
+    stopping at the former 1,021-page helper limit. The same builder owns
+    top-level, associated, embedded, and attachment PCs. Focused regressions
+    cross both the single-page heap boundary and the 447-record BTH-leaf
+    boundary in top-level and embedded messages, then prove transactional
+    rejection rollback/reappend is byte-identical to direct output. The
+    writer suite passes 90 active tests with one existing ignored scale test;
+    the fast gate passes at `.agent/test-results/1784504986-fast`. Fresh
+    adversarial review found one high boundary defect: 2,048 accepted
+    non-empty variable properties could exhaust page-zero HID indexes before
+    the compact serializer reached its page-size fallback. Compact HID
+    exhaustion now takes the same scalable path, and a full-store regression
+    writes and reopens the maximum currently accepted variable-property
+    collection. A fresh final review, repeated gate, and external
+    ScanPST-first acceptance remain. The repeated fast gate passes at
+    `.agent/test-results/1784505308-fast`.
+    The fresh final-state review returned `CLEAN`; it found no remaining
+    blocker, high, or medium issue. The combined external r5 candidate is
+    271,360 bytes with SHA-256
+    `a01e42a39063c63fa3dd982efb47e167f7530eb6e5eb6074ea6b8a10693f85cf`.
+    Its first top-level message and embedded child each force HN continuation
+    pages with ten 1 KiB values. Its second top-level message has 505 custom
+    properties and forces a level-1 PC BTH. `pffinfo` 20231205 accepts the
+    complete file. `readpst` 0.6.76 extracts the first message without
+    diagnostics, then its deep parser rejects the second message solely
+    because the BTH header has the documented `cbKey=2`, `cbEnt=6`,
+    `bIdxLevels=1` form; the same reader extracts the identical 500-property
+    message while it remains a compact single-page PC. This isolates an
+    independent-reader limitation rather than a generic property-count
+    failure. The deliberately larger diagnostics are retained only under
+    ignored `.agent/test-results/v044-general-pc-diagnostics/`; r5 is the sole
+    human acceptance directory. Human acceptance confirms ScanPST is clean
+    and Outlook opens both r5 messages and the embedded child with the expected
+    content. The project owner accepts the isolated `readpst` limitation as
+    non-blocking for this documented structure. The canonical full gate passes
+    at `.agent/test-results/1784506612-full`.
   - [ ] Checkpoint 4: diagnose from durable local evidence, then resolve the
     two raw-property representation failures and one aggregate-recipient
     metadata failure. Recover the embedded item stranded beneath a rejected
@@ -4034,6 +4075,21 @@ work. Hash and identity evidence show that the source was not modified.
   output. Rehashing those mailbox-sized private ranges on every resume adds
   SSD reads without protecting any future write.
   Date/Author: 2026-07-19 / 0.4.3 retained-job resume profiling.
+
+- Decision: Treat `readpst` 0.6.76's rejection of a PC BTH with nonzero
+  `bIdxLevels` as a reader-specific validation limitation, not a reason to
+  remove or flatten the documented multi-level property context. Continue to
+  require `readpst` for structures it supports and record the unsupported
+  message explicitly. Require the normative MS-PST contract, focused
+  round-trip tests, clean ScanPST, and successful Outlook consumption for the
+  multi-level form.
+  Rationale: The reader accepts the same message as a compact PC and accepts
+  external PCs with a level-0 BTH, but rejects the documented
+  `cbKey=2`, `cbEnt=6`, `bIdxLevels=1` header before reading any record.
+  ScanPST reports no error and Outlook consumes both the message and its
+  properties. A third-party reader's missing BTH-level implementation cannot
+  become an artificial PSTForge data-loss boundary.
+  Date/Author: 2026-07-19 / human acceptance after focused r5 comparison.
 
 ## Outcomes & Retrospective
 
