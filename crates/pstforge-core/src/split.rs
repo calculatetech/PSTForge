@@ -1106,7 +1106,6 @@ fn register_direct_mail_streams(
                 attachment.index,
                 &embedded.durable_item_key,
                 provenance,
-                embedded.key.source_node_id,
                 embedded.key.recovery_index,
             )?;
             register_direct_mail_streams(source, embedded)?;
@@ -1127,7 +1126,6 @@ fn register_direct_embedded_bindings(
             candidate.parent_attachment_index,
             &candidate.item_key,
             candidate.provenance,
-            candidate.source_node_id,
             candidate.recovery_index,
         )?;
     }

@@ -165,7 +165,6 @@ pub(crate) struct DirectTopLevelBinding {
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct DirectMessageBase {
     provenance: CatalogProvenance,
-    source_node_id: Option<u32>,
     recovery_index: Option<u64>,
 }
 
@@ -333,7 +332,6 @@ impl<'a> DirectProtocolSource<'a> {
         parent_attachment_index: u32,
         item_key: &str,
         provenance: CatalogProvenance,
-        source_node_id: Option<u32>,
         recovery_index: Option<u64>,
     ) -> Result<(), WriterError> {
         let identity = (
@@ -341,7 +339,6 @@ impl<'a> DirectProtocolSource<'a> {
             parent_attachment_index,
             DirectMessageBase {
                 provenance,
-                source_node_id,
                 recovery_index,
             },
         );
@@ -366,7 +363,6 @@ impl<'a> DirectProtocolSource<'a> {
         let source_id = (id != 0).then_some(id);
         let base = DirectMessageBase {
             provenance,
-            source_node_id: source_id,
             recovery_index,
         };
         let key = match (parent_message_id, parent_attachment_index) {
@@ -2138,8 +2134,10 @@ mod tests {
 
         let top_a = "normal:10:-:0".to_owned();
         let top_b = "normal:10:-:1".to_owned();
-        let child_a = "normal:20:-:0".to_owned();
-        let child_b = "normal:20:-:1".to_owned();
+        // Embedded node IDs are not stable across libpff process traversals.
+        // These durable identities deliberately differ from worker ID 20.
+        let child_a = "normal:99:-:0".to_owned();
+        let child_b = "normal:100:-:0".to_owned();
         let mut input = Cursor::new(bytes);
         let mut source =
             DirectProtocolSource::new(&mut input, HashMap::new(), DirectCandidateBindings::new());
@@ -2161,7 +2159,6 @@ mod tests {
                 4,
                 &child_key,
                 CatalogProvenance::Normal,
-                Some(20),
                 None,
             )?;
             source.register_stream(

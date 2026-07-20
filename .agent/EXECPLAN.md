@@ -2679,6 +2679,18 @@ not modified.
       canonical fast gate passed at
       `.agent/test-results/1784532127-fast`, and a fresh clean-context review
       found no blocker or high milestone-relevant issue.
+    - [x] Identified and contained process-unstable libpff identifiers for
+      embedded messages. The same child beneath source parent node 3283844,
+      attachment zero, appeared as node 3408225810 during the r3 metadata pass
+      and node 3283876 during every r3 full-payload pass; r2 metadata reported
+      node 3075377693. Direct replay now matches embedded messages by the
+      durable parent item key, attachment index, provenance, and recovery
+      index, while top-level messages continue to require their stable source
+      node identity. A regression deliberately routes worker child ID 20 to
+      durable child identities 99 and 100 under distinct parents and verifies
+      both payloads. Reduced-key collisions remain terminal. The complete core
+      suite passes and a fresh clean-context rereview found no blocker or high
+      issue.
   - [ ] Checkpoint 4: complete direct publication and failure behavior. Keep
     one same-filesystem active PST temporary, independently validate and fsync
     it, atomically rename it into `parts/`, preserve finalized parts on
@@ -2757,6 +2769,16 @@ not modified.
   Evidence: `.agent/test-results/1784531559-v045-direct-single-19gb`,
   focused terminal-state regression, and the clean-context review completed on
   2026-07-20.
+
+- Observation: libpff's item identifier is stable enough for top-level PST
+  nodes but is not a cross-process identity for an embedded message. For the
+  same source parent node 3283844 and attachment zero, three independent
+  traversals reported embedded IDs 3075377693, 3408225810, and 3283876.
+  Parent containment and attachment position remained identical. Direct replay
+  must therefore use the durable containment relationship plus recovery
+  provenance, not the embedded node ID, while retaining collision rejection.
+  Evidence: r2/r3 ledger comparison and
+  `.agent/test-results/1784533130-v045-direct-single-r3/stderr.log`.
 
 - Observation: The 0.4.2 fidelity expansion regressed a cold 19 GB split from
   approximately ten minutes in 0.4.1 to more than 57 minutes without
