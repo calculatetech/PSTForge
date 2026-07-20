@@ -134,6 +134,9 @@ enum ControlFrame {
     Complete {
         catalog: WorkerCatalog,
     },
+    ParserBoundary {
+        detail: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -265,6 +268,19 @@ impl<'a> DirectProtocolSource<'a> {
                             "direct worker omitted a durable top-level message",
                         ));
                     }
+                    self.complete = true;
+                    return Ok(None);
+                }
+                ControlFrame::ParserBoundary { detail } => {
+                    if expected.is_some() {
+                        return Err(direct_protocol_error(
+                            "direct worker parser boundary omitted a durable top-level message",
+                        ));
+                    }
+                    tracing::warn!(
+                        error = %detail,
+                        "direct replay accepted parser boundary after the durable catalog"
+                    );
                     self.complete = true;
                     return Ok(None);
                 }
@@ -515,6 +531,11 @@ impl<'a> DirectProtocolSource<'a> {
                     .map_err(worker_writer_error)?;
             }
             ControlFrame::Complete { .. } => self.complete = true,
+            ControlFrame::ParserBoundary { .. } => {
+                return Err(direct_protocol_error(
+                    "direct worker reached a parser boundary inside a top-level message",
+                ));
+            }
             ControlFrame::Error { kind, detail } => {
                 return Err(direct_protocol_error(format!(
                     "worker reported {kind:?}: {detail}"
@@ -903,6 +924,12 @@ impl ProtocolSink<'_> {
         Ok(())
     }
 
+    fn complete_at_parser_boundary(&mut self, detail: String) -> Result<(), WorkerProtocolError> {
+        write_control(self.output, &ControlFrame::ParserBoundary { detail })?;
+        self.output.flush()?;
+        Ok(())
+    }
+
     fn send(&mut self, frame: &ControlFrame) -> Result<(), String> {
         write_control(self.output, frame).map_err(|error| error.to_string())
     }
@@ -1196,6 +1223,16 @@ pub fn run_recovery_worker(
     let catalog = match file.recovery_catalog_skipping(&mut sink, skipped_units, mode) {
         Ok(catalog) => catalog,
         Err(error) => {
+            if writer_order {
+                if let Err(error) = source.verify_unchanged() {
+                    return report_worker_error(
+                        sink.output,
+                        WorkerFailureKind::Source,
+                        error.into(),
+                    );
+                }
+                return sink.complete_at_parser_boundary(error.to_string());
+            }
             return report_worker_error(sink.output, WorkerFailureKind::Parser, error.into());
         }
     };
@@ -1359,7 +1396,9 @@ pub(crate) fn receive_worker_catalog_body_with_progress(
                 ControlFrame::Error { kind, detail } => {
                     return Err(reported_error(kind, detail));
                 }
-                ControlFrame::Complete { .. } | ControlFrame::Hello { .. } => {
+                ControlFrame::Complete { .. }
+                | ControlFrame::ParserBoundary { .. }
+                | ControlFrame::Hello { .. } => {
                     return Err(WorkerProtocolError::Invalid(
                         "worker ended while replaying a candidate".to_owned(),
                     ));
@@ -1432,6 +1471,11 @@ pub(crate) fn receive_worker_catalog_body_with_progress(
                 }
                 require_end_of_stream(input)?;
                 return Ok(catalog);
+            }
+            ControlFrame::ParserBoundary { .. } => {
+                return Err(WorkerProtocolError::Invalid(
+                    "catalog worker emitted a writer-order parser boundary".to_owned(),
+                ));
             }
             ControlFrame::Error { kind, detail } => return Err(reported_error(kind, detail)),
             ControlFrame::AttachmentData {
@@ -1612,6 +1656,7 @@ fn send_control_to_sink(
         | ControlFrame::PropertyData { .. }
         | ControlFrame::Hello { .. }
         | ControlFrame::Error { .. }
+        | ControlFrame::ParserBoundary { .. }
         | ControlFrame::Complete { .. } => {
             return Err(WorkerProtocolError::Invalid(
                 "invalid control frame dispatch".to_owned(),
@@ -2025,6 +2070,49 @@ mod tests {
                     sha256: None,
                 })
                 .is_err()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn direct_parser_boundary_requires_durable_catalog_exhaustion()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut boundary = Vec::new();
+        write_control(
+            &mut boundary,
+            &ControlFrame::ParserBoundary {
+                detail: "damaged recovery tail".to_owned(),
+            },
+        )?;
+
+        let mut accepted_input = Cursor::new(boundary.clone());
+        let mut accepted = DirectProtocolSource::new(
+            &mut accepted_input,
+            HashMap::new(),
+            DirectCandidateBindings::new(),
+        );
+        assert_eq!(accepted.next_top_level_message(None)?, None);
+        assert!(accepted.is_complete());
+        accepted.require_end_of_stream()?;
+
+        let mut rejected_input = Cursor::new(boundary);
+        let mut rejected = DirectProtocolSource::new(
+            &mut rejected_input,
+            HashMap::new(),
+            DirectCandidateBindings::new(),
+        );
+        let error = rejected
+            .next_top_level_message(Some(DirectTopLevelBinding {
+                item_key: "normal:7:-:0".to_owned(),
+                provenance: CatalogProvenance::Normal,
+                source_node_id: Some(7),
+                recovery_index: None,
+            }))
+            .expect_err("parser boundary omitted an expected durable candidate");
+        assert!(
+            error
+                .to_string()
+                .contains("omitted a durable top-level message")
         );
         Ok(())
     }

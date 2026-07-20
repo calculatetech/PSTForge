@@ -138,6 +138,12 @@ drains candidates already assigned to finalized parts and rebuilds only the
 unpublished active part. Exhausting those attempts produces a typed
 `failed-partial` result with the same non-resumable retained-state contract;
 it never reports an unfinished candidate as written.
+If libpff reports a parser failure after writer-order replay has emitted every
+top-level candidate in the durable metadata catalog, the supervisor accepts
+that exact catalog boundary and continues validation instead of rewriting the
+complete unpublished part. The same boundary is a hard protocol failure when
+even one durable candidate remains expected. Source identity is rechecked
+before the worker reports the boundary and again before job completion.
 
 PSTForge owns only ledger-tracked output names. It ignores and preserves
 untracked files placed in the public `parts/` directory, including human

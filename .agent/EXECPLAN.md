@@ -2767,6 +2767,28 @@ not modified.
       references, large-value fallback, size chains, bounds, determinism, or
       test coverage. Independent ScanPST and Outlook acceptance remains
       pending.
+    - [x] Prevented a known corrupt recovery tail from rewriting a complete
+      direct part. In r8, whole-part projection selected an exact
+      19,530,195,968-byte output at 3:37, and the first payload pass streamed
+      that complete extent in about 2:51. Libpff then returned the same global
+      `recover_items` error already contained by metadata recovery. The old
+      protocol treated the post-catalog error as a failed attempt, deleted the
+      complete unpublished PST, and had rewritten 5.39 GiB when the run was
+      stopped at 7:48. Writer-order workers now emit a distinct parser-boundary
+      frame after rechecking source identity. The supervisor accepts it only
+      when its durable top-level cursor is exhausted; a remaining expected
+      candidate, an active message, a metadata worker, or any other placement
+      of the frame remains a protocol error. This preserves retry behavior for
+      actual omissions while eliminating a full-output rewrite caused solely
+      by the already-accounted corrupt tail. A focused regression proves both
+      the exhausted-catalog acceptance and missing-candidate rejection. The
+      core suite passes 84 tests and the writer suite passes 100 tests with one
+      intentional multi-gigabyte test ignored. The canonical fast gate passed
+      at `.agent/test-results/1784539812-fast`; a fresh clean-context review
+      found no blocker or high issue and confirmed that active frames,
+      malformed ownership, payload EOF, trailing data, worker/watchdog failure,
+      nonzero exit, missing durable candidates, and source identity changes
+      remain hard failures.
   - [ ] Checkpoint 4: complete direct publication and failure behavior. Keep
     one same-filesystem active PST temporary, independently validate and fsync
     it, atomically rename it into `parts/`, preserve finalized parts on
@@ -2904,6 +2926,20 @@ not modified.
   Evidence: `.agent/test-results/1784538080-v045-direct-single-r7`, MS-PST
   sections 2.2.2.8.3.3.2.1, 2.2.2.8.3.3.2.2, 2.3.1, and 2.3.4.4.2, plus the
   173,600-small-value writer regression.
+
+- Observation: The 19 GB source's global `libpff_file_recover_items` call
+  fails after normal reachable traversal. Metadata recovery correctly retains
+  the complete reachable catalog and records that parser failure, but
+  writer-order replay formerly required a generic success frame after
+  streaming the same entire catalog. In r8 that mismatch discarded one
+  complete 19.53 GB unpublished PST and began writing it again. Durable-catalog
+  exhaustion is the scientific completion boundary for replay: accepting a
+  parser boundary before exhaustion would lose cataloged data, while requiring
+  libpff success after exhaustion adds no data and causes pure write
+  amplification.
+  Evidence: `.agent/test-results/1784539095-v045-direct-single-r8`, the r8
+  19,530,195,968-byte exact projection, and the direct parser-boundary
+  acceptance/rejection regression.
 
 - Observation: The 0.4.2 fidelity expansion regressed a cold 19 GB split from
   approximately ten minutes in 0.4.1 to more than 57 minutes without
