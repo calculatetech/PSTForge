@@ -7,10 +7,11 @@ use pstforge_job::{
 };
 use pstforge_pst::writer::{
     AttachmentContent, AttachmentReferenceMethod, AttachmentReferenceSpec, AttachmentSpec,
-    FileBlobSpec, MailFolderLocation, MailFolderRole, MailFolderSpec, MailStoreSpec, MessageSpec,
-    NamedProperty, NamedPropertyName, NamedPropertySet, NativeBody, OleAttachmentSpec, OleDataKind,
-    RawProperty, RawPropertyValue, RecipientKind, RecipientSpec, SpooledPropertySpec,
-    UnsupportedProperty, attachment_logical_size,
+    DirectBlobSpec, DirectOleAttachmentSpec, DirectPropertySpec, FileBlobSpec, MailFolderLocation,
+    MailFolderRole, MailFolderSpec, MailStoreSpec, MessageSpec, NamedProperty, NamedPropertyName,
+    NamedPropertySet, NativeBody, OleAttachmentSpec, OleDataKind, RawProperty, RawPropertyValue,
+    RecipientKind, RecipientSpec, SpooledPropertySpec, UnsupportedProperty,
+    attachment_logical_size,
 };
 use sha2::{Digest, Sha256};
 use thiserror::Error;
@@ -398,6 +399,7 @@ fn translate_message(
     let mut raw_properties = Vec::new();
     let mut named_properties = Vec::new();
     let mut spooled_properties = Vec::new();
+    let mut direct_properties = Vec::new();
     let mut unsupported_properties = Vec::new();
     let mut native_body = None;
     let mut rtf_in_sync = false;
@@ -428,6 +430,16 @@ fn translate_message(
                 .property_id
                 .and_then(|value| u16::try_from(value).ok())
                 .unwrap_or(0x8000);
+            if property.direct_id.is_some() {
+                partial = true;
+                omitted_properties = omitted_properties.saturating_add(1);
+                unsupported_properties.push(UnsupportedProperty {
+                    id: transient_id,
+                    property_type,
+                    byte_len: property.declared_byte_len,
+                });
+                continue;
+            }
             let set = named_property_set(identity.guid);
             let name = match &identity.name {
                 libpff_sys::NamedPropertyName::Numeric(value) => NamedPropertyName::Numeric(*value),
@@ -531,6 +543,19 @@ fn translate_message(
                 id,
                 property_type,
                 byte_len: property.blob.byte_len,
+            });
+            continue;
+        }
+        if property.direct_id.is_some()
+            && (matches!(id, 0x0E07 | 0x0E1F | 0x1016 | 0x3007 | 0x3008 | 0x3FDE)
+                || mail.placement == CanonicalMessagePlacement::Associated && id == 0x3001)
+        {
+            partial = true;
+            omitted_properties = omitted_properties.saturating_add(1);
+            unsupported_properties.push(UnsupportedProperty {
+                id,
+                property_type,
+                byte_len: property.declared_byte_len,
             });
             continue;
         }
@@ -664,6 +689,48 @@ fn translate_message(
             omitted_properties = omitted_properties.saturating_add(1);
             continue;
         }
+        if let Some(direct_id) = property.direct_id {
+            if writer_stream_type_is_supported(property_type)
+                && property.declared_byte_len <= i32::MAX as u64
+                && body_type_is_valid(id, property_type)
+            {
+                if omit_malformed(
+                    validate_streamed_property(job, mail, property, id, property_type),
+                    &mut omitted_properties,
+                )?
+                .is_some()
+                {
+                    direct_properties.push(DirectPropertySpec {
+                        id,
+                        property_type,
+                        blob: DirectBlobSpec {
+                            id: direct_id,
+                            byte_len: property.declared_byte_len,
+                            sha256: None,
+                        },
+                    });
+                    if id == 0x1013 {
+                        html_property = Some(property);
+                    }
+                } else {
+                    partial = true;
+                    unsupported_properties.push(UnsupportedProperty {
+                        id,
+                        property_type,
+                        byte_len: property.declared_byte_len,
+                    });
+                }
+            } else {
+                partial = true;
+                omitted_properties = omitted_properties.saturating_add(1);
+                unsupported_properties.push(UnsupportedProperty {
+                    id,
+                    property_type,
+                    byte_len: property.declared_byte_len,
+                });
+            }
+            continue;
+        }
         if copied_contents_property_type(id).is_some() {
             match omit_malformed(
                 materialize_copied_contents_property(job, mail, property, id, property_type),
@@ -716,7 +783,7 @@ fn translate_message(
             Some(Some(value)) => raw_properties.push(RawProperty { id, value }),
             Some(None) => {
                 if writer_stream_type_is_supported(property_type)
-                    && property.blob.byte_len <= i32::MAX as u64
+                    && property.declared_byte_len <= i32::MAX as u64
                     && body_type_is_valid(id, property_type)
                 {
                     if omit_malformed(
@@ -733,11 +800,23 @@ fn translate_message(
                         });
                         continue;
                     }
-                    spooled_properties.push(SpooledPropertySpec {
-                        id,
-                        property_type,
-                        blob: file_blob(job, &property.blob)?,
-                    });
+                    if let Some(direct_id) = property.direct_id {
+                        direct_properties.push(DirectPropertySpec {
+                            id,
+                            property_type,
+                            blob: DirectBlobSpec {
+                                id: direct_id,
+                                byte_len: property.declared_byte_len,
+                                sha256: None,
+                            },
+                        });
+                    } else {
+                        spooled_properties.push(SpooledPropertySpec {
+                            id,
+                            property_type,
+                            blob: file_blob(job, &property.blob)?,
+                        });
+                    }
                     if id == 0x1013 {
                         html_property = Some(property);
                     }
@@ -774,6 +853,7 @@ fn translate_message(
             html_has_utf8_evidence = valid_utf8_property(job, mail, property)?;
             if !html_has_utf8_evidence {
                 spooled_properties.retain(|property| property.id != 0x1013);
+                direct_properties.retain(|property| property.id != 0x1013);
                 partial = true;
                 omitted_properties = omitted_properties.saturating_add(1);
                 unsupported_properties.push(UnsupportedProperty {
@@ -1020,7 +1100,7 @@ fn translate_message(
             named_properties,
             raw_properties,
             spooled_properties,
-            direct_properties: Vec::new(),
+            direct_properties,
             unsupported_properties,
         },
         item_keys,
@@ -1093,6 +1173,7 @@ fn translate_attachment(
     let mut attachment_data_type = None;
     let mut binary_attachment_metadata = Vec::new();
     let mut spooled_attachment_metadata = Vec::new();
+    let mut direct_attachment_metadata = Vec::new();
     let mut raw_properties = Vec::new();
     let mut omitted_properties = 0_u64;
     let mut mapped_property_ids = BTreeSet::new();
@@ -1111,6 +1192,16 @@ fn translate_attachment(
             continue;
         };
         if property.record_set_index != 0 || !mapped_property_ids.insert(property_id) {
+            omitted_properties = omitted_properties.saturating_add(1);
+            continue;
+        }
+        if property.direct_id.is_some()
+            && (attachment_named_property_name(property).is_some()
+                || matches!(
+                    property_id,
+                    0x3705 | 0x3708 | 0x370B | 0x370D | 0x370E | 0x3712 | 0x3713 | 0x3714
+                ))
+        {
             omitted_properties = omitted_properties.saturating_add(1);
             continue;
         }
@@ -1265,7 +1356,7 @@ fn translate_attachment(
                     property_id: id,
                     detail: "attachment metadata identifier is out of range".to_owned(),
                 })?;
-                if property.blob.byte_len <= 16 * 1024 {
+                if property.declared_byte_len <= 16 * 1024 {
                     let Some(value) = omit_malformed(
                         read_blob(job, mail, property, 16 * 1024),
                         &mut omitted_properties,
@@ -1277,12 +1368,24 @@ fn translate_attachment(
                         id,
                         value: RawPropertyValue::Binary(value),
                     });
-                } else if property.blob.byte_len <= i32::MAX as u64 {
-                    spooled_attachment_metadata.push(SpooledPropertySpec {
-                        id,
-                        property_type: 0x0102,
-                        blob: file_blob(job, &property.blob)?,
-                    });
+                } else if property.declared_byte_len <= i32::MAX as u64 {
+                    if let Some(direct_id) = property.direct_id {
+                        direct_attachment_metadata.push(DirectPropertySpec {
+                            id,
+                            property_type: 0x0102,
+                            blob: DirectBlobSpec {
+                                id: direct_id,
+                                byte_len: property.declared_byte_len,
+                                sha256: None,
+                            },
+                        });
+                    } else {
+                        spooled_attachment_metadata.push(SpooledPropertySpec {
+                            id,
+                            property_type: 0x0102,
+                            blob: file_blob(job, &property.blob)?,
+                        });
+                    }
                 } else {
                     omitted_properties = omitted_properties.saturating_add(1);
                 }
@@ -1302,7 +1405,11 @@ fn translate_attachment(
             .data
             .as_ref()
             .filter(|_| attachment.data_complete)
-            .filter(|data| data.byte_len <= i32::MAX as u64)
+            .filter(|_| {
+                attachment
+                    .declared_size
+                    .is_some_and(|size| size <= i32::MAX as u64)
+            })
         else {
             return Ok(Some(TranslatedAttachment {
                 attachment: None,
@@ -1329,7 +1436,7 @@ fn translate_attachment(
                 }));
             }
         };
-        if data_kind == OleDataKind::Object && data.byte_len == 0 {
+        if data_kind == OleDataKind::Object && attachment.declared_size == Some(0) {
             return Ok(Some(TranslatedAttachment {
                 attachment: None,
                 item_keys: Vec::new(),
@@ -1341,26 +1448,33 @@ fn translate_attachment(
             }));
         }
         raw_properties.extend(binary_attachment_metadata);
-        (
+        let content = if let Some(direct_id) = attachment.direct_id {
+            AttachmentContent::DirectOle(DirectOleAttachmentSpec {
+                data: DirectBlobSpec {
+                    id: direct_id,
+                    byte_len: attachment.declared_size.unwrap_or_default(),
+                    sha256: None,
+                },
+                data_kind,
+            })
+        } else {
             AttachmentContent::Ole(OleAttachmentSpec {
                 data: file_blob(job, data)?,
                 data_kind,
-            }),
-            Vec::new(),
-            Vec::new(),
-            false,
-            0,
-            0,
-        )
+            })
+        };
+        (content, Vec::new(), Vec::new(), false, 0, 0)
     } else if let Some(method) = attachment_method
         .and_then(reference_attachment_method)
         .filter(|_| attachment.reference_complete)
     {
         omitted_properties = omitted_properties
             .saturating_add(u64::try_from(binary_attachment_metadata.len()).unwrap_or(u64::MAX))
-            .saturating_add(u64::try_from(spooled_attachment_metadata.len()).unwrap_or(u64::MAX));
+            .saturating_add(u64::try_from(spooled_attachment_metadata.len()).unwrap_or(u64::MAX))
+            .saturating_add(u64::try_from(direct_attachment_metadata.len()).unwrap_or(u64::MAX));
         binary_attachment_metadata.clear();
         spooled_attachment_metadata.clear();
+        direct_attachment_metadata.clear();
         let Some(long_pathname) = long_pathname else {
             return Ok(Some(TranslatedAttachment {
                 attachment: None,
@@ -1404,9 +1518,11 @@ fn translate_attachment(
     } else if let Some(embedded) = &attachment.embedded {
         omitted_properties = omitted_properties
             .saturating_add(u64::try_from(binary_attachment_metadata.len()).unwrap_or(u64::MAX))
-            .saturating_add(u64::try_from(spooled_attachment_metadata.len()).unwrap_or(u64::MAX));
+            .saturating_add(u64::try_from(spooled_attachment_metadata.len()).unwrap_or(u64::MAX))
+            .saturating_add(u64::try_from(direct_attachment_metadata.len()).unwrap_or(u64::MAX));
         binary_attachment_metadata.clear();
         spooled_attachment_metadata.clear();
+        direct_attachment_metadata.clear();
         let message_class = embedded.message_class.as_deref().unwrap_or("IPM.Note");
         let calendar_exception = calendar_exception_message_class(message_class);
         if !supported_message_class(message_class)
@@ -1439,11 +1555,20 @@ fn translate_attachment(
         return Ok(None);
     } else if let Some(data) = &attachment.data {
         raw_properties.extend(binary_attachment_metadata);
-        if data.byte_len > 2_147_483_647 {
+        if attachment
+            .declared_size
+            .is_some_and(|size| size > 2_147_483_647)
+        {
             return Ok(None);
         }
-        let content = if data.byte_len == 0 {
+        let content = if attachment.declared_size == Some(0) {
             AttachmentContent::Binary(Vec::new())
+        } else if let Some(direct_id) = attachment.direct_id {
+            AttachmentContent::Direct(DirectBlobSpec {
+                id: direct_id,
+                byte_len: attachment.declared_size.unwrap_or_default(),
+                sha256: None,
+            })
         } else {
             AttachmentContent::Spooled(file_blob(job, data)?)
         };
@@ -1457,7 +1582,10 @@ fn translate_attachment(
         .clone()
         .filter(|value| !value.is_empty());
     let reference_attachment = matches!(content, AttachmentContent::Reference(_));
-    let ole_attachment = matches!(content, AttachmentContent::Ole(_));
+    let ole_attachment = matches!(
+        content,
+        AttachmentContent::Ole(_) | AttachmentContent::DirectOle(_)
+    );
     let detected_mime = if !reference_attachment
         && !ole_attachment
         && attachment.embedded.is_none()
@@ -1511,7 +1639,7 @@ fn translate_attachment(
         flags,
         raw_properties,
         spooled_properties: spooled_attachment_metadata,
-        direct_properties: Vec::new(),
+        direct_properties: direct_attachment_metadata,
         content,
     };
     if ole_attachment && !ole_attachment_fits_pst_size(&writer_attachment) {
@@ -2149,6 +2277,25 @@ fn validate_streamed_property(
     property_type: u16,
 ) -> Result<(), CanonicalWriteError> {
     const MAX_RTF_CONTAINER_BYTES: u64 = 8 * 1024 * 1024;
+    if property.direct_id.is_some() {
+        if id == 0x1009 {
+            let header = read_blob(job, mail, property, property.blob.byte_len)?;
+            if header.len() < 16 {
+                return invalid(mail, "compressed RTF prefix has no complete header");
+            }
+            let compressed_size = u64::from(u32::from_le_bytes([
+                header[0], header[1], header[2], header[3],
+            ]));
+            let compression_type =
+                u32::from_le_bytes([header[8], header[9], header[10], header[11]]);
+            if compressed_size != property.declared_byte_len.saturating_sub(4)
+                || !matches!(compression_type, 0x7546_5A4C | 0x414C_454D)
+            {
+                return invalid(mail, "compressed RTF prefix header is malformed");
+            }
+        }
+        return Ok(());
+    }
     if id == 0x1009 {
         if property.blob.byte_len > MAX_RTF_CONTAINER_BYTES {
             return invalid(
@@ -2306,6 +2453,20 @@ fn valid_utf8_property(
     property: &CanonicalProperty,
 ) -> Result<bool, CanonicalWriteError> {
     let file = job.open_blob(&property.blob)?;
+    if property.direct_id.is_some() {
+        let mut bytes =
+            Vec::with_capacity(usize::try_from(property.blob.byte_len).unwrap_or_default());
+        file.take(property.blob.byte_len)
+            .read_to_end(&mut bytes)
+            .map_err(|source| CanonicalWriteError::BlobRead {
+                item_key: mail.durable_item_key.clone(),
+                source,
+            })?;
+        return Ok(match std::str::from_utf8(&bytes) {
+            Ok(_) => true,
+            Err(error) => error.error_len().is_none(),
+        });
+    }
     valid_utf8_stream(
         &mut file.take(property.blob.byte_len),
         &mail.durable_item_key,
@@ -2651,10 +2812,122 @@ mod tests {
         attachment_mime::flat_signature as mime_from_signature, load_canonical_mail,
     };
     use pstforge_pst::writer::{
-        AttachmentContent, AttachmentReferenceMethod, MailFolderRole, NamedProperty,
-        NamedPropertyName, NamedPropertySet, NativeBody, OleDataKind, RawPropertyValue,
-        validate_mail_store_input,
+        AttachmentContent, AttachmentReferenceMethod, DirectBlobSpec, MailFolderRole,
+        NamedProperty, NamedPropertyName, NamedPropertySet, NativeBody, OleDataKind,
+        RawPropertyValue, validate_mail_store_input,
     };
+
+    #[test]
+    fn bounded_metadata_catalog_translates_large_values_to_direct_specs()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempdir()?;
+        let job_path = directory.path().join("job");
+        let mut job = DurableCatalogSink::create_direct_metadata(&job_path, 8, 6)?;
+        job.event(CatalogEvent::MessageStart {
+            id: 10,
+            provenance: CatalogProvenance::Recovered,
+            recovery_index: Some(1),
+            folder_id: None,
+            parent_message_id: None,
+            parent_attachment_index: None,
+            embedded_path: Vec::new(),
+            associated: false,
+            item_type: Some(11),
+            message_class: Some("IPM.Note".to_owned()),
+            subject: Some("direct metadata".to_owned()),
+            sender_name: None,
+            sender_email: None,
+            submit_filetime: None,
+            delivery_filetime: None,
+            supported: true,
+        })?;
+        job.event(CatalogEvent::AttachmentStart {
+            message_id: 10,
+            index: 0,
+            attachment_type: Some(i32::from(b'f')),
+            data_size: Some(20),
+            filename: Some("payload.bin".to_owned()),
+        })?;
+        job.event(CatalogEvent::AttachmentData {
+            message_id: 10,
+            index: 0,
+            bytes: b"abcdef",
+        })?;
+        job.event(CatalogEvent::AttachmentEnd {
+            message_id: 10,
+            index: 0,
+        })?;
+        let body = PropertyDescriptor {
+            owner: PropertyOwner::Message(10),
+            record_set_index: 0,
+            entry_index: 0,
+            entry_type: Some(0x1000),
+            value_type: Some(0x001f),
+            data_size: 12,
+        };
+        job.event(CatalogEvent::PropertyStart(body))?;
+        job.event(CatalogEvent::PropertyData {
+            descriptor: body,
+            bytes: &[b'A', 0, b'B', 0, b'C', 0, b'D', 0],
+        })?;
+        job.event(CatalogEvent::PropertyEnd(body))?;
+        let named = PropertyDescriptor {
+            owner: PropertyOwner::Message(10),
+            record_set_index: 0,
+            entry_index: 1,
+            entry_type: Some(0x8000),
+            value_type: Some(0x001f),
+            data_size: 14,
+        };
+        job.event(CatalogEvent::NamedProperty {
+            descriptor: named,
+            identity: NamedPropertyIdentity {
+                guid: [7; 16],
+                name: LibpffNamedPropertyName::String("LargeValue".to_owned()),
+            },
+        })?;
+        job.event(CatalogEvent::PropertyStart(named))?;
+        job.event(CatalogEvent::PropertyData {
+            descriptor: named,
+            bytes: &[b'E', 0, b'F', 0, b'G', 0, b'H', 0],
+        })?;
+        job.event(CatalogEvent::PropertyEnd(named))?;
+        job.event(CatalogEvent::MessageEnd {
+            id: 10,
+            complete: true,
+        })?;
+        job.checkpoint()?;
+
+        let mail = load_canonical_mail(&job)?;
+        assert_eq!(mail[0].spooled_bytes, 46);
+        let input = build_part_writer_input(
+            &job,
+            &[&mail[0]],
+            &"0".repeat(64),
+            "balanced",
+            4_294_967_296,
+            1,
+        )?;
+        let message = &input.store.folders[0].messages[0];
+        assert!(input.partial);
+        assert_eq!(input.omitted_properties, 1);
+        assert!(message.named_properties.is_empty());
+        assert_eq!(message.direct_properties[0].blob.byte_len, 12);
+        assert_eq!(
+            message.attachments[0].content,
+            AttachmentContent::Direct(DirectBlobSpec {
+                id: 1,
+                byte_len: 20,
+                sha256: None,
+            })
+        );
+        assert_eq!(message.direct_properties[0].blob.id, 2);
+        assert_eq!(
+            std::fs::metadata(job_path.join(".pstforge/spool/payload.pack"))?.len(),
+            0
+        );
+        Ok(())
+    }
 
     #[test]
     fn libpff_reserved_mapi_guid_is_normalized() {
@@ -2747,6 +3020,7 @@ mod tests {
                     byte_len: 0,
                     pack_offset: Some(0),
                 }),
+                direct_id: None,
                 data_complete,
                 reference_complete: false,
                 properties: Vec::new(),
@@ -2964,6 +3238,8 @@ mod tests {
                         guid: super::PSETID_ADDRESS,
                         name: LibpffNamedPropertyName::Numeric(0x8055),
                     }),
+                    declared_byte_len: blob.byte_len,
+                    direct_id: None,
                     blob,
                 }],
                 completeness: ContentCompleteness::Complete,
@@ -3473,6 +3749,7 @@ mod tests {
             filename: Some("embedded.msg".to_owned()),
             declared_size: None,
             data: None,
+            direct_id: None,
             data_complete: true,
             reference_complete: false,
             properties: vec![large_metadata],
@@ -3752,6 +4029,7 @@ mod tests {
                     filename: None,
                     declared_size: Some(u64::try_from(payload.len())?),
                     data: Some(blob),
+                    direct_id: None,
                     data_complete: true,
                     reference_complete: false,
                     properties: Vec::new(),
@@ -3763,6 +4041,7 @@ mod tests {
                     filename: None,
                     declared_size: Some(u64::try_from(truncated_jpeg.len())?),
                     data: Some(truncated_blob),
+                    direct_id: None,
                     data_complete: true,
                     reference_complete: false,
                     properties: Vec::new(),
@@ -3774,6 +4053,7 @@ mod tests {
                     filename: None,
                     declared_size: Some(u64::try_from(truncated_jpeg.len())?),
                     data: Some(docx_payload_blob),
+                    direct_id: None,
                     data_complete: true,
                     reference_complete: false,
                     properties: vec![CanonicalProperty {
@@ -3784,6 +4064,8 @@ mod tests {
                         property_id: Some(0x370E),
                         value_type: Some(0x001F),
                         named_property: None,
+                        declared_byte_len: docx_mime_blob.byte_len,
+                        direct_id: None,
                         blob: docx_mime_blob,
                     }],
                     embedded: None,
@@ -3869,6 +4151,8 @@ mod tests {
                 property_id: Some(0x370E),
                 value_type: Some(0x001F),
                 named_property: None,
+                declared_byte_len: source_mime_blob.byte_len,
+                direct_id: None,
                 blob: source_mime_blob,
             });
         let source_input = build_part_writer_input(
@@ -4141,6 +4425,8 @@ mod tests {
                 property_id: Some(0x1013),
                 value_type: Some(0x0102),
                 named_property: None,
+                declared_byte_len: 0,
+                direct_id: None,
                 blob: SpooledBlob {
                     sha256: "0".repeat(64),
                     byte_len: 0,
@@ -4498,6 +4784,7 @@ mod tests {
                     byte_len: 2_147_483_648,
                     pack_offset: None,
                 }),
+                direct_id: None,
                 data_complete: true,
                 reference_complete: false,
                 properties: Vec::new(),
@@ -4595,6 +4882,8 @@ mod tests {
             property_id: Some(property_id),
             value_type: Some(value_type),
             named_property: None,
+            declared_byte_len: byte_len,
+            direct_id: None,
             blob: SpooledBlob {
                 sha256: "0".repeat(64),
                 byte_len,
@@ -4826,6 +5115,7 @@ mod tests {
             filename: Some("original.msg".to_owned()),
             declared_size: None,
             data: None,
+            direct_id: None,
             data_complete: false,
             reference_complete: false,
             properties: [0x0E20, 0x3701, 0x3704, 0x3705, 0x3707]
@@ -4839,6 +5129,8 @@ mod tests {
                     property_id: Some(property_id),
                     value_type: None,
                     named_property: None,
+                    declared_byte_len: 0,
+                    direct_id: None,
                     blob: SpooledBlob {
                         sha256: "0".repeat(64),
                         byte_len: 0,
@@ -4908,6 +5200,8 @@ mod tests {
                 property_id: Some(property_id),
                 value_type: None,
                 named_property: None,
+                declared_byte_len: 0,
+                direct_id: None,
                 blob: SpooledBlob {
                     sha256: "0".repeat(64),
                     byte_len: 0,
@@ -4930,6 +5224,8 @@ mod tests {
                 property_id: Some(0x3709),
                 value_type: Some(0x0102),
                 named_property: None,
+                declared_byte_len: 1_048_577,
+                direct_id: None,
                 blob: SpooledBlob {
                     sha256: "0".repeat(64),
                     byte_len: 1_048_577,
@@ -4968,6 +5264,7 @@ mod tests {
             filename: Some("nested.msg".to_owned()),
             declared_size: None,
             data: None,
+            direct_id: None,
             data_complete: true,
             reference_complete: false,
             properties: Vec::new(),
@@ -5035,6 +5332,7 @@ mod tests {
                         filename: Some("nested.msg".to_owned()),
                         declared_size: None,
                         data: None,
+                        direct_id: None,
                         data_complete: true,
                         reference_complete: false,
                         properties: Vec::new(),

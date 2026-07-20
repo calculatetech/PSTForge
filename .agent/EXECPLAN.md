@@ -2578,6 +2578,22 @@ not modified.
     This deliberately trades a second read-only libpff traversal for removal
     of the payload-spool write, read, allocation, and SSD wear; it does not
     reread or rewrite a payload after that payload has been committed to a PST.
+    - [x] Added a distinct non-resumable metadata capture mode to the existing
+      private SQLite catalog. It stores at most 64 KiB per property and 16 KiB
+      per attachment directly in SQLite, assigns stable direct-stream IDs to
+      uncaptured remainders, preserves declared logical lengths through the
+      canonical model, and leaves `payload.pack` at zero bytes. Canonical
+      translation now emits direct message properties, attachment properties,
+      binary attachments, and OLE attachments while continuing to decode
+      bounded scalar metadata and MIME signatures from captured prefixes.
+      Prefixes are never promoted to complete named or mapped scalar values:
+      values without a direct writer representation are explicitly counted as
+      omitted instead of silently truncated. Worker retry reopen restores the
+      bounded capture policy and continues direct-stream IDs above the durable
+      maximum.
+      Focused tests cover transactional inline capture, logical-size
+      accounting, direct descriptor identity, named-property containment,
+      retry continuity, and zero payload-pack growth.
   - [ ] Checkpoint 4: complete direct publication and failure behavior. Keep
     one same-filesystem active PST temporary, independently validate and fsync
     it, atomically rename it into `parts/`, preserve finalized parts on

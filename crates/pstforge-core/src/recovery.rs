@@ -109,6 +109,7 @@ pub(crate) struct PreparedSplitRecovery<'a> {
     pub resume: bool,
     pub configuration: &'a JobConfiguration,
     pub job: Option<DurableCatalogSink>,
+    pub metadata_only: bool,
 }
 
 pub(crate) fn recover_for_split(
@@ -137,9 +138,14 @@ fn recover_source(
     interrupted: Arc<AtomicBool>,
     prepared: Option<PreparedSplitRecovery<'_>>,
 ) -> Result<(RecoveryReport, DurableCatalogSink), RecoveryError> {
-    let (resume, configuration, prepared_job) = match prepared {
-        Some(prepared) => (prepared.resume, Some(prepared.configuration), prepared.job),
-        None => (false, None, None),
+    let (resume, configuration, prepared_job, metadata_only) = match prepared {
+        Some(prepared) => (
+            prepared.resume,
+            Some(prepared.configuration),
+            prepared.job,
+            prepared.metadata_only,
+        ),
+        None => (false, None, None, false),
     };
     let job_source = JobSourceIdentity {
         canonical_path: source.identity().canonical_path.clone(),
@@ -263,6 +269,8 @@ fn recover_source(
         mode,
         interrupted,
         peak_worker_rss_bytes: Arc::new(AtomicU64::new(0)),
+        metadata_only,
+        writer_order: false,
     };
     tracing::info!(
         resume,
@@ -297,7 +305,15 @@ fn recover_source(
     };
     let mut sink = match resumed_sink.take() {
         Some(sink) => sink,
-        None => match DurableCatalogSink::create(job_directory) {
+        None => match if metadata_only {
+            DurableCatalogSink::create_direct_metadata(
+                job_directory,
+                crate::worker::METADATA_PROPERTY_PREFIX_BYTES,
+                crate::worker::METADATA_ATTACHMENT_PREFIX_BYTES,
+            )
+        } else {
+            DurableCatalogSink::create(job_directory)
+        } {
             Ok(sink) => sink,
             Err(error) => {
                 worker.stop();
@@ -405,6 +421,12 @@ fn recover_source(
                     Err(JobError::Interrupted) => return Err(RecoveryError::Interrupted),
                     Err(error) => return Err(error.into()),
                 };
+                if worker_controls.metadata_only {
+                    sink.enable_direct_metadata_capture(
+                        crate::worker::METADATA_PROPERTY_PREFIX_BYTES,
+                        crate::worker::METADATA_ATTACHMENT_PREFIX_BYTES,
+                    )?;
+                }
                 let failed_unit = failure.unit.as_deref().copied();
                 if (std::env::var_os("PSTFORGE_TEST_ABORT_ON_UNIT_ORDINAL").is_some()
                     || std::env::var_os("PSTFORGE_TEST_ABORT_INSIDE_UNIT_AFTER_CANDIDATES")
@@ -764,6 +786,12 @@ fn spawn_worker(
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null());
+    if controls.metadata_only {
+        command.arg("--metadata-only");
+    }
+    if controls.writer_order {
+        command.arg("--writer-order");
+    }
     command.env(
         "PSTFORGE_INTERNAL_SUPERVISOR_PID",
         std::process::id().to_string(),
@@ -957,6 +985,8 @@ struct WorkerControls {
     mode: RecoveryMode,
     interrupted: Arc<AtomicBool>,
     peak_worker_rss_bytes: Arc<AtomicU64>,
+    metadata_only: bool,
+    writer_order: bool,
 }
 
 fn retryable_worker_failure(error: &RecoveryError) -> bool {

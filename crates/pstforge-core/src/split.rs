@@ -297,6 +297,7 @@ pub fn split(
             resume,
             configuration: &configuration,
             job: resumed_job,
+            metadata_only: false,
         },
     )?;
     if recovery.interrupted {
@@ -2452,6 +2453,7 @@ mod tests {
             filename: None,
             declared_size: None,
             data: None,
+            direct_id: None,
             data_complete: true,
             reference_complete: true,
             properties: Vec::new(),

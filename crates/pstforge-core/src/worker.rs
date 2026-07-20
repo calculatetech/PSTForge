@@ -17,8 +17,8 @@ use crate::{SourceError, SourceFile};
 
 const PROTOCOL_VERSION: u32 = 3;
 const MAX_CONTROL_FRAME_BYTES: usize = 32 * 1024 * 1024;
-const METADATA_PROPERTY_PREFIX_BYTES: u64 = 64 * 1024;
-const METADATA_ATTACHMENT_PREFIX_BYTES: u64 = 16 * 1024;
+pub(crate) const METADATA_PROPERTY_PREFIX_BYTES: u64 = 64 * 1024;
+pub(crate) const METADATA_ATTACHMENT_PREFIX_BYTES: u64 = 16 * 1024;
 
 #[derive(Debug, Error)]
 pub enum WorkerProtocolError {
