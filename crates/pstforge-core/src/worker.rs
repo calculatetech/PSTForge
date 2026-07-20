@@ -387,14 +387,27 @@ impl<'a> DirectProtocolSource<'a> {
                         "direct embedded message names a non-active parent",
                     ));
                 }
+                let identity = (parent.clone(), index, base.clone());
                 self.bindings
                     .embedded
-                    .get(&(parent.clone(), index, base))
+                    .get(&identity)
                     .cloned()
                     .ok_or_else(|| {
-                        direct_protocol_error(
-                            "direct worker message has no embedded catalog identity",
-                        )
+                        let ownership_bindings = self
+                            .bindings
+                            .embedded
+                            .keys()
+                            .filter(|(item_key, attachment_index, _)| {
+                                item_key == parent && *attachment_index == index
+                            })
+                            .count();
+                        direct_protocol_error(format!(
+                            "direct worker message has no embedded catalog identity \
+                             (parent={parent}, attachment={index}, \
+                             ownership_bindings={ownership_bindings}, \
+                             provenance={provenance:?}, source_node_id={source_id:?}, \
+                             recovery_index={recovery_index:?})"
+                        ))
                     })?
             }
             _ => {
