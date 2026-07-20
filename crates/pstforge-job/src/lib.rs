@@ -13,8 +13,8 @@ use std::thread;
 use std::time::Duration;
 
 use libpff_sys::{
-    CatalogEvent, CatalogProvenance, CatalogSink, NamedPropertyIdentity, PropertyDescriptor,
-    PropertyOwner, RecoveryUnit,
+    CatalogEvent, CatalogProvenance, CatalogSink, NamedPropertyIdentity, PayloadRequest,
+    PropertyDescriptor, PropertyOwner, RecoveryUnit,
 };
 use rusqlite::{Connection, ErrorCode, OpenFlags, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
@@ -27,7 +27,8 @@ const JOB_SCHEMA_VERSION: i64 = 19;
 const INLINE_BLOB_MAX_BYTES: u64 = 64 * 1024;
 const INLINE_CACHE_DIRECTORY: &str = ".pstforge-inline-cache";
 const PAYLOAD_PACK_FILENAME: &str = "payload.pack";
-const CANDIDATE_CHECKPOINT_BATCH: u32 = 128;
+pub const CANDIDATE_CHECKPOINT_BATCH: u32 = 128;
+const DIRECT_SQLITE_CACHE_KIB: u64 = 512 * 1024;
 const MAX_RECOVERY_LOG_BYTES: usize = 4 * 1024 * 1024;
 
 #[derive(Debug, Error)]
@@ -156,6 +157,25 @@ pub struct CandidateOwnership {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DirectTopLevelCandidate {
+    pub rowid: i64,
+    pub item_key: String,
+    pub provenance: CatalogProvenance,
+    pub source_node_id: Option<u32>,
+    pub recovery_index: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DirectEmbeddedCandidate {
+    pub item_key: String,
+    pub provenance: CatalogProvenance,
+    pub source_node_id: Option<u32>,
+    pub recovery_index: Option<u64>,
+    pub parent_item_key: String,
+    pub parent_attachment_index: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SpooledCandidateTree {
     pub candidates: Vec<SpooledCandidate>,
     pub ownerships: Vec<CandidateOwnership>,
@@ -172,7 +192,8 @@ pub struct PublishedPart {
     pub index: u32,
     pub filename: String,
     pub byte_len: u64,
-    pub sha256: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sha256: Option<String>,
     pub oversize: bool,
 }
 
@@ -254,7 +275,8 @@ pub struct PartSidecar {
     pub index: u32,
     pub filename: String,
     pub byte_len: u64,
-    pub sha256: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sha256: Option<String>,
     pub store_record_key: String,
     pub folder_count: u64,
     pub message_count: u64,
@@ -281,7 +303,8 @@ pub struct JobSourceIdentity {
     pub inode: u64,
     pub size_bytes: u64,
     pub modified_at: String,
-    pub sha256: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sha256: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -289,10 +312,16 @@ pub struct JobSourceIdentity {
 pub struct JobConfiguration {
     pub tool_compatibility_major: u64,
     pub split_schema_version: String,
+    #[serde(default = "default_execution_mode")]
+    pub execution_mode: String,
     pub recovery_mode: String,
     pub maximum_pst_bytes: u64,
     pub part_size_policy: String,
     pub writer_format: String,
+}
+
+fn default_execution_mode() -> String {
+    "restartable".to_owned()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -314,6 +343,13 @@ pub struct PublishedPartRecord {
     pub item_count: u64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct PayloadPackMetrics {
+    pub current_bytes: u64,
+    pub peak_bytes: u64,
+    pub bytes_written: u64,
+}
+
 pub struct DurableCatalogSink {
     connection: Connection,
     _parent_directory: File,
@@ -327,6 +363,9 @@ pub struct DurableCatalogSink {
     spool: PathBuf,
     payload_pack_path: PathBuf,
     payload_pack: File,
+    payload_pack_position: Cell<u64>,
+    payload_pack_bytes_written: Cell<u64>,
+    payload_pack_peak_bytes: Cell<u64>,
     partial: PathBuf,
     manifests: PathBuf,
     parts: PathBuf,
@@ -341,6 +380,17 @@ pub struct DurableCatalogSink {
     unit: Option<RecoveryUnit>,
     recent_candidates: HashMap<Vec<u32>, String>,
     replayed_source_ids: HashMap<u32, u32>,
+    capture_mode: CatalogCaptureMode,
+    next_direct_blob_id: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CatalogCaptureMode {
+    Full,
+    Bounded {
+        property_prefix_bytes: u64,
+        attachment_prefix_bytes: u64,
+    },
 }
 
 struct ActiveCandidate {
@@ -383,6 +433,7 @@ struct BlobWriter {
     start_offset: u64,
     hasher: Sha256,
     bytes: u64,
+    inline: Option<Vec<u8>>,
 }
 
 impl DurableCatalogSink {
@@ -423,6 +474,27 @@ impl DurableCatalogSink {
     }
 
     pub fn create(job_directory: &Path) -> Result<Self, JobError> {
+        Self::create_with_capture(job_directory, CatalogCaptureMode::Full)
+    }
+
+    pub fn create_direct_metadata(
+        job_directory: &Path,
+        property_prefix_bytes: u64,
+        attachment_prefix_bytes: u64,
+    ) -> Result<Self, JobError> {
+        Self::create_with_capture(
+            job_directory,
+            CatalogCaptureMode::Bounded {
+                property_prefix_bytes,
+                attachment_prefix_bytes,
+            },
+        )
+    }
+
+    fn create_with_capture(
+        job_directory: &Path,
+        capture_mode: CatalogCaptureMode,
+    ) -> Result<Self, JobError> {
         let parent_path = job_parent(job_directory);
         let parent_directory = open_directory(parent_path)?;
         let job_name = job_directory
@@ -490,6 +562,7 @@ impl DurableCatalogSink {
         )?;
         set_mode(&database, 0o600)?;
         configure(&connection)?;
+        configure_capture_mode(&connection, capture_mode)?;
         create_schema(&connection)?;
         connection.execute(
             "INSERT INTO job_metadata(key, value) VALUES ('schema_version', ?1)",
@@ -511,6 +584,9 @@ impl DurableCatalogSink {
             spool,
             payload_pack_path,
             payload_pack,
+            payload_pack_position: Cell::new(0),
+            payload_pack_bytes_written: Cell::new(0),
+            payload_pack_peak_bytes: Cell::new(0),
             partial,
             manifests,
             parts,
@@ -525,6 +601,8 @@ impl DurableCatalogSink {
             unit: None,
             recent_candidates: HashMap::new(),
             replayed_source_ids: HashMap::new(),
+            capture_mode,
+            next_direct_blob_id: 1,
         })
     }
 
@@ -558,6 +636,43 @@ impl DurableCatalogSink {
             Some((source, configuration)),
             Some(interrupted),
         )
+    }
+
+    pub fn enable_direct_metadata_capture(
+        &mut self,
+        property_prefix_bytes: u64,
+        attachment_prefix_bytes: u64,
+    ) -> Result<(), JobError> {
+        if self.active.is_some() || self.property.is_some() || self.attachment.is_some() {
+            return Err(JobError::EventSequence(
+                "cannot change capture mode during an active candidate".to_owned(),
+            ));
+        }
+        let mut statement = self.connection.prepare(
+            "SELECT metadata_json FROM candidate_events \
+             WHERE kind IN ('property_direct', 'attachment_direct')",
+        )?;
+        let mut rows = statement.query([])?;
+        let mut maximum_id = 0_u64;
+        while let Some(row) = rows.next()? {
+            let metadata: serde_json::Value = serde_json::from_str(&row.get::<_, String>(0)?)?;
+            let id = metadata
+                .get("direct_id")
+                .and_then(serde_json::Value::as_u64)
+                .ok_or_else(|| {
+                    JobError::Integrity("direct metadata event has no stream identifier".to_owned())
+                })?;
+            maximum_id = maximum_id.max(id);
+        }
+        self.next_direct_blob_id = maximum_id
+            .checked_add(1)
+            .ok_or_else(|| JobError::Integrity("direct blob identifier overflow".to_owned()))?;
+        self.capture_mode = CatalogCaptureMode::Bounded {
+            property_prefix_bytes,
+            attachment_prefix_bytes,
+        };
+        configure_capture_mode(&self.connection, self.capture_mode)?;
+        Ok(())
     }
 
     fn open_expected(
@@ -660,6 +775,10 @@ impl DurableCatalogSink {
             .open(&payload_pack_path)
             .map_err(|source| io_error(&payload_pack_path, source))?;
         reconcile_payload_pack(&connection, &mut payload_pack, &payload_pack_path)?;
+        let payload_pack_position = payload_pack
+            .metadata()
+            .map_err(|source| io_error(&payload_pack_path, source))?
+            .len();
         run_sql_interruptible(&mut connection, interrupted, |connection| {
             reconcile_publications(
                 connection,
@@ -692,6 +811,9 @@ impl DurableCatalogSink {
             spool,
             payload_pack_path,
             payload_pack,
+            payload_pack_position: Cell::new(payload_pack_position),
+            payload_pack_bytes_written: Cell::new(0),
+            payload_pack_peak_bytes: Cell::new(payload_pack_position),
             partial,
             manifests,
             parts,
@@ -706,12 +828,28 @@ impl DurableCatalogSink {
             unit: None,
             recent_candidates: HashMap::new(),
             replayed_source_ids: HashMap::new(),
+            capture_mode: CatalogCaptureMode::Full,
+            next_direct_blob_id: 1,
         })
     }
 
     pub fn allocated_bytes(&self) -> Result<u64, JobError> {
         Ok(allocated_private_bytes(&self.private_root)?
             .saturating_add(allocated_tracked_part_bytes(&self.connection, &self.parts)?))
+    }
+
+    pub fn payload_pack_metrics(&self) -> Result<PayloadPackMetrics, JobError> {
+        let current_bytes = self.payload_pack_len()?;
+        if current_bytes != self.payload_pack_position.get() {
+            return Err(JobError::Integrity(
+                "payload pack length disagrees with the append cursor".to_owned(),
+            ));
+        }
+        Ok(PayloadPackMetrics {
+            current_bytes,
+            peak_bytes: self.payload_pack_peak_bytes.get(),
+            bytes_written: self.payload_pack_bytes_written.get(),
+        })
     }
 
     pub fn available_part_filename(&self, part_index: u32) -> Result<String, JobError> {
@@ -737,12 +875,25 @@ impl DurableCatalogSink {
         sync_directory(&self.private_root)
     }
 
+    pub fn reconcile_pending_publications(&mut self) -> Result<(), JobError> {
+        self.commit_candidate_batch()?;
+        reconcile_publications(
+            &mut self.connection,
+            &self._partial_directory,
+            &self._manifests_directory,
+            &self.partial,
+            &self.parts,
+            &self.manifests,
+            None,
+        )
+    }
+
     fn begin_candidate(&self) -> Result<(), JobError> {
         if !self.batch_open.get() {
             self.connection.execute_batch("BEGIN IMMEDIATE")?;
             self.batch_open.set(true);
             self.batch_candidates.set(0);
-            self.batch_pack_start.set(self.payload_pack_len()?);
+            self.batch_pack_start.set(self.payload_pack_position.get());
         }
         self.connection
             .execute_batch("SAVEPOINT active_candidate")?;
@@ -753,7 +904,9 @@ impl DurableCatalogSink {
         self.connection.execute_batch("RELEASE active_candidate")?;
         let candidates = self.batch_candidates.get().saturating_add(1);
         self.batch_candidates.set(candidates);
-        if candidates >= CANDIDATE_CHECKPOINT_BATCH {
+        if matches!(self.capture_mode, CatalogCaptureMode::Full)
+            && candidates >= CANDIDATE_CHECKPOINT_BATCH
+        {
             self.commit_candidate_batch()?;
         }
         Ok(())
@@ -770,10 +923,15 @@ impl DurableCatalogSink {
             self.payload_pack
                 .sync_all()
                 .map_err(|source| io_error(&self.payload_pack_path, source))?;
+            if self.payload_pack_len()? != self.payload_pack_position.get() {
+                return Err(JobError::Integrity(
+                    "payload pack length changed before durable batch commit".to_owned(),
+                ));
+            }
             self.connection.execute_batch("COMMIT")?;
             self.batch_open.set(false);
             self.batch_candidates.set(0);
-            self.batch_pack_start.set(self.payload_pack_len()?);
+            self.batch_pack_start.set(self.payload_pack_position.get());
         }
         Ok(())
     }
@@ -785,6 +943,13 @@ impl DurableCatalogSink {
             .map_err(|source| io_error(&self.payload_pack_path, source))
     }
 
+    fn new_blob_writer(&mut self) -> Result<BlobWriter, JobError> {
+        match self.capture_mode {
+            CatalogCaptureMode::Full => Ok(BlobWriter::new(self.payload_pack_position.get())),
+            CatalogCaptureMode::Bounded { .. } => Ok(BlobWriter::new_inline()),
+        }
+    }
+
     fn truncate_payload_pack(&mut self, length: u64) -> Result<(), JobError> {
         self.payload_pack
             .set_len(length)
@@ -792,6 +957,7 @@ impl DurableCatalogSink {
         self.payload_pack
             .seek(std::io::SeekFrom::Start(length))
             .map_err(|source| io_error(&self.payload_pack_path, source))?;
+        self.payload_pack_position.set(length);
         Ok(())
     }
 
@@ -1123,6 +1289,25 @@ impl DurableCatalogSink {
         Ok(())
     }
 
+    pub fn record_direct_terminal_failure(&self, category: &str) -> Result<(), JobError> {
+        if self.active.is_some()
+            || !matches!(
+                category,
+                "worker_crash" | "worker_stall" | "worker_protocol"
+            )
+        {
+            return Err(JobError::EventSequence(
+                "cannot record invalid direct terminal failure".to_owned(),
+            ));
+        }
+        self.connection.execute(
+            "INSERT OR REPLACE INTO job_metadata(key, value) \
+             VALUES ('direct_terminal_failure', ?1)",
+            [category],
+        )?;
+        Ok(())
+    }
+
     pub fn worker_supervision(&self) -> Result<(u32, u32), JobError> {
         let attempts = read_optional_metadata_u32(&self.connection, "worker_attempts")?;
         let failures = read_optional_metadata_u32(&self.connection, "worker_failures")?;
@@ -1230,6 +1415,122 @@ impl DurableCatalogSink {
                 })
             })
             .collect()
+    }
+
+    pub fn candidate_is_terminal(&self, item_key: &str) -> Result<bool, JobError> {
+        let status = self
+            .connection
+            .query_row(
+                "SELECT status FROM candidates WHERE item_key = ?1 \
+                 AND status IN ('spooled', 'written', 'unsupported')",
+                [item_key],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?
+            .ok_or_else(|| {
+                JobError::Integrity(format!(
+                    "direct worker candidate {item_key} is absent from the catalog"
+                ))
+            })?;
+        Ok(matches!(status.as_str(), "written" | "unsupported"))
+    }
+
+    pub fn next_direct_top_level_candidate(
+        &self,
+        after_rowid: i64,
+    ) -> Result<Option<DirectTopLevelCandidate>, JobError> {
+        let row = self
+            .connection
+            .query_row(
+                "SELECT rowid, item_key, provenance, source_node_id, recovery_index \
+                 FROM candidates WHERE rowid > ?1 AND parent_item_key IS NULL \
+                 AND status IN ('spooled', 'written', 'unsupported') \
+                 ORDER BY rowid LIMIT 1",
+                [after_rowid],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, Option<i64>>(3)?,
+                        row.get::<_, Option<i64>>(4)?,
+                    ))
+                },
+            )
+            .optional()?;
+        row.map(
+            |(rowid, item_key, provenance, source_node_id, recovery_index)| {
+                Ok(DirectTopLevelCandidate {
+                    rowid,
+                    item_key,
+                    provenance: parse_provenance(&provenance)?,
+                    source_node_id: source_node_id
+                        .map(|value| checked_u32(value, "candidate source node id"))
+                        .transpose()?,
+                    recovery_index: recovery_index
+                        .map(|value| checked_u64(value, "candidate recovery index"))
+                        .transpose()?,
+                })
+            },
+        )
+        .transpose()
+    }
+
+    pub fn direct_embedded_candidates_interruptible(
+        &self,
+        root_item_key: &str,
+        interrupted: &AtomicBool,
+    ) -> Result<Vec<DirectEmbeddedCandidate>, JobError> {
+        check_job_interrupted(Some(interrupted))?;
+        let mut statement = self.connection.prepare(
+            "WITH RECURSIVE tree(item_key) AS (\
+                SELECT item_key FROM candidates \
+                WHERE item_key = ?1 AND parent_item_key IS NULL \
+                  AND status IN ('spooled', 'written', 'unsupported') \
+                UNION \
+                SELECT child.item_key FROM candidates child \
+                JOIN tree parent ON child.parent_item_key = parent.item_key \
+                WHERE child.status IN ('spooled', 'written', 'unsupported')\
+             ) \
+             SELECT child.item_key, child.provenance, child.source_node_id, \
+                    child.recovery_index, child.parent_item_key, \
+                    child.parent_attachment_index \
+             FROM tree member JOIN candidates child ON child.item_key = member.item_key \
+             WHERE child.parent_item_key IS NOT NULL \
+             ORDER BY child.embedded_path_json, child.item_key",
+        )?;
+        let mut query = statement.query([root_item_key])?;
+        let mut candidates = Vec::new();
+        while let Some(row) = query.next()? {
+            check_job_interrupted(Some(interrupted))?;
+            candidates.push(DirectEmbeddedCandidate {
+                item_key: row.get(0)?,
+                provenance: parse_provenance(&row.get::<_, String>(1)?)?,
+                source_node_id: row
+                    .get::<_, Option<i64>>(2)?
+                    .map(|value| checked_u32(value, "candidate source node id"))
+                    .transpose()?,
+                recovery_index: row
+                    .get::<_, Option<i64>>(3)?
+                    .map(|value| checked_u64(value, "candidate recovery index"))
+                    .transpose()?,
+                parent_item_key: row.get::<_, Option<String>>(4)?.ok_or_else(|| {
+                    JobError::Integrity(
+                        "direct embedded candidate has no parent item key".to_owned(),
+                    )
+                })?,
+                parent_attachment_index: row
+                    .get::<_, Option<i64>>(5)?
+                    .map(|value| checked_u32(value, "parent attachment index"))
+                    .transpose()?
+                    .ok_or_else(|| {
+                        JobError::Integrity(
+                            "direct embedded candidate has no parent attachment index".to_owned(),
+                        )
+                    })?,
+            });
+        }
+        Ok(candidates)
     }
 
     pub fn record_worker_event(
@@ -2167,6 +2468,24 @@ impl DurableCatalogSink {
         )
     }
 
+    pub fn publish_constructed_part_interruptible(
+        &mut self,
+        staged_filename: &str,
+        part: &PublishedPart,
+        sidecar: &PartSidecar,
+        item_keys: &[String],
+        interrupted: &AtomicBool,
+    ) -> Result<(), JobError> {
+        self.publish_part_with_interrupt(
+            staged_filename,
+            part,
+            sidecar,
+            item_keys,
+            Some(interrupted),
+            false,
+        )
+    }
+
     fn publish_validated_part_with_interrupt(
         &mut self,
         staged_filename: &str,
@@ -2175,11 +2494,32 @@ impl DurableCatalogSink {
         item_keys: &[String],
         interrupted: Option<&AtomicBool>,
     ) -> Result<(), JobError> {
+        self.publish_part_with_interrupt(
+            staged_filename,
+            part,
+            sidecar,
+            item_keys,
+            interrupted,
+            true,
+        )
+    }
+
+    fn publish_part_with_interrupt(
+        &mut self,
+        staged_filename: &str,
+        part: &PublishedPart,
+        sidecar: &PartSidecar,
+        item_keys: &[String],
+        interrupted: Option<&AtomicBool>,
+        verify_content: bool,
+    ) -> Result<(), JobError> {
         self.commit_candidate_batch()?;
         validate_part_record(part)?;
         validate_sidecar(part, sidecar)?;
         let staged = self.staged_part_path(staged_filename)?;
-        verify_part_artifact(&staged, part, interrupted)?;
+        if verify_content {
+            verify_part_artifact(&staged, part, interrupted)?;
+        }
         check_interrupted(interrupted)?;
         let final_path = self.parts.join(&part.filename);
         let sidecar_filename = part.filename.trim_end_matches(".pst").to_owned() + ".json";
@@ -2203,7 +2543,9 @@ impl DurableCatalogSink {
         )?;
         sync_file(&self._parts_directory, &self.parts)?;
         check_interrupted(interrupted)?;
-        verify_part_artifact(&final_path, part, interrupted)?;
+        if verify_content {
+            verify_part_artifact(&final_path, part, interrupted)?;
+        }
         check_interrupted(interrupted)?;
         rename_noclobber(
             &self._partial_directory,
@@ -2421,7 +2763,7 @@ impl DurableCatalogSink {
             .map(|unit| serde_json::to_string(&unit))
             .transpose()?;
         let embedded_path_json = serde_json::to_string(&embedded_path)?;
-        let pack_start = self.payload_pack_len()?;
+        let pack_start = self.payload_pack_position.get();
         self.begin_candidate()?;
         let result = self.connection.execute(
             "INSERT INTO candidates(\
@@ -2499,10 +2841,27 @@ impl DurableCatalogSink {
             ));
         }
         if active.record {
-            let blob = self.finish_blob(active.blob, Some(descriptor.data_size))?;
+            let captured_size = self.captured_property_bytes(descriptor.data_size);
+            let blob = self.finish_blob(active.blob, Some(captured_size))?;
+            let stream_type = descriptor
+                .value_type
+                .is_some_and(|value| matches!(value, 0x001E | 0x001F | 0x0102));
+            let direct_id = (matches!(self.capture_mode, CatalogCaptureMode::Bounded { .. })
+                && (captured_size < descriptor.data_size
+                    || (active.named_property.is_none() && stream_type)))
+                .then(|| self.take_direct_blob_id())
+                .transpose()?;
+            let mut metadata = property_json(descriptor, active.named_property.as_ref());
+            if let Some(direct_id) = direct_id {
+                metadata["direct_id"] = json!(direct_id);
+            }
             self.record_event(
-                "property",
-                property_json(descriptor, active.named_property.as_ref()),
+                if direct_id.is_some() {
+                    "property_direct"
+                } else {
+                    "property"
+                },
+                metadata,
                 Some(blob),
             )
         } else {
@@ -2516,9 +2875,26 @@ impl DurableCatalogSink {
         };
         if let Some(blob) = active.blob {
             let actual = blob.bytes;
-            let blob = self.finish_blob(blob, complete.then_some(active.expected).flatten())?;
-            self.record_event(
+            let captured_expected = active.expected.map(|expected| {
                 if complete {
+                    self.captured_attachment_bytes(expected)
+                } else {
+                    actual
+                }
+            });
+            let blob = self.finish_blob(blob, captured_expected)?;
+            let direct_id = if matches!(self.capture_mode, CatalogCaptureMode::Bounded { .. })
+                && complete
+                && active.expected != Some(0)
+            {
+                Some(self.take_direct_blob_id()?)
+            } else {
+                None
+            };
+            self.record_event(
+                if direct_id.is_some() {
+                    "attachment_direct"
+                } else if complete {
                     "attachment_data"
                 } else {
                     "attachment_partial"
@@ -2528,6 +2904,7 @@ impl DurableCatalogSink {
                     "index": active.index,
                     "declared_size": active.expected,
                     "actual_size": actual,
+                    "direct_id": direct_id,
                 }),
                 Some(blob),
             )?;
@@ -2544,7 +2921,7 @@ impl DurableCatalogSink {
                 None,
             )?;
         } else if complete && active.expected == Some(0) {
-            let blob = BlobWriter::new(&mut self.payload_pack, &self.payload_pack_path)?;
+            let blob = self.new_blob_writer()?;
             let blob = self.finish_blob(blob, Some(0))?;
             self.record_event(
                 "attachment_data",
@@ -2588,11 +2965,45 @@ impl DurableCatalogSink {
             }
         }
         let sha256 = digest_hex(blob.hasher.clone().finalize().as_slice());
+        if let Some(data) = blob.inline {
+            verify_blob_bytes(&sha256, blob.bytes, &data)?;
+            let stored = self
+                .connection
+                .prepare_cached("SELECT byte_len FROM blobs WHERE sha256 = ?1")?
+                .query_row([&sha256], |row| row.get::<_, u64>(0))
+                .optional()?;
+            if let Some(stored_len) = stored {
+                if stored_len != blob.bytes {
+                    return Err(JobError::Integrity(format!(
+                        "blob {sha256} length disagrees with the ledger"
+                    )));
+                }
+                let stored_data = self.connection.query_row(
+                    "SELECT data FROM inline_blobs WHERE sha256 = ?1",
+                    [&sha256],
+                    |row| row.get::<_, Vec<u8>>(0),
+                )?;
+                verify_blob_bytes(&sha256, blob.bytes, &stored_data)?;
+            } else {
+                self.connection
+                    .prepare_cached(
+                        "INSERT INTO blobs(sha256, byte_len, pack_offset) VALUES (?1, ?2, NULL)",
+                    )?
+                    .execute(params![&sha256, blob.bytes])?;
+                self.connection
+                    .prepare_cached("INSERT INTO inline_blobs(sha256, data) VALUES (?1, ?2)")?
+                    .execute(params![&sha256, data])?;
+            }
+            return Ok(BlobRef {
+                sha256,
+                bytes: blob.bytes,
+            });
+        }
         let expected_end = blob
             .start_offset
             .checked_add(blob.bytes)
             .ok_or_else(|| JobError::Integrity("payload pack offset overflow".to_owned()))?;
-        if self.payload_pack_len()? != expected_end {
+        if self.payload_pack_position.get() != expected_end {
             return Err(JobError::Integrity(
                 "payload pack changed during an active blob".to_owned(),
             ));
@@ -2665,7 +3076,11 @@ impl DurableCatalogSink {
                 actual: blob.bytes,
             });
         }
-        self.truncate_payload_pack(blob.start_offset)
+        if blob.inline.is_some() {
+            Ok(())
+        } else {
+            self.truncate_payload_pack(blob.start_offset)
+        }
     }
 
     fn rollback(&mut self) {
@@ -2683,9 +3098,67 @@ impl DurableCatalogSink {
             self.batch_candidates.set(0);
         }
     }
+
+    fn captured_property_bytes(&self, declared: u64) -> u64 {
+        match self.capture_mode {
+            CatalogCaptureMode::Full => declared,
+            CatalogCaptureMode::Bounded {
+                property_prefix_bytes,
+                ..
+            } => declared.min(property_prefix_bytes),
+        }
+    }
+
+    fn captured_attachment_bytes(&self, declared: u64) -> u64 {
+        match self.capture_mode {
+            CatalogCaptureMode::Full => declared,
+            CatalogCaptureMode::Bounded {
+                attachment_prefix_bytes,
+                ..
+            } => declared.min(attachment_prefix_bytes),
+        }
+    }
+
+    fn take_direct_blob_id(&mut self) -> Result<u64, JobError> {
+        let id = self.next_direct_blob_id;
+        self.next_direct_blob_id = self
+            .next_direct_blob_id
+            .checked_add(1)
+            .ok_or_else(|| JobError::Integrity("direct blob identifier overflow".to_owned()))?;
+        Ok(id)
+    }
 }
 
 impl CatalogSink for DurableCatalogSink {
+    fn property_payload(&self, descriptor: PropertyDescriptor) -> PayloadRequest {
+        match self.capture_mode {
+            CatalogCaptureMode::Full => PayloadRequest::Full,
+            CatalogCaptureMode::Bounded {
+                property_prefix_bytes,
+                ..
+            } => PayloadRequest::Prefix(descriptor.data_size.min(property_prefix_bytes)),
+        }
+    }
+
+    fn attachment_payload(
+        &self,
+        _message_id: u32,
+        _index: u32,
+        declared_size: Option<u64>,
+    ) -> PayloadRequest {
+        match self.capture_mode {
+            CatalogCaptureMode::Full => PayloadRequest::Full,
+            CatalogCaptureMode::Bounded {
+                attachment_prefix_bytes,
+                ..
+            } => PayloadRequest::Prefix(
+                declared_size
+                    .unwrap_or_default()
+                    .min(attachment_prefix_bytes),
+            ),
+        }
+    }
+
     fn event(&mut self, event: CatalogEvent<'_>) -> Result<(), String> {
         self.handle_event(event).map_err(|error| error.to_string())
     }
@@ -2908,6 +3381,11 @@ impl DurableCatalogSink {
                 bytes,
             } => {
                 require_message(self.active.as_ref(), message_id)?;
+                let needs_blob = self
+                    .attachment
+                    .as_ref()
+                    .is_some_and(|attachment| attachment.blob.is_none());
+                let new_blob = needs_blob.then(|| self.new_blob_writer()).transpose()?;
                 let attachment = self.attachment.as_mut().ok_or_else(|| {
                     JobError::EventSequence("attachment data without metadata".to_owned())
                 })?;
@@ -2916,17 +3394,21 @@ impl DurableCatalogSink {
                         "attachment data does not match active attachment".to_owned(),
                     ));
                 }
-                if attachment.blob.is_none() {
-                    attachment.blob = Some(BlobWriter::new(
-                        &mut self.payload_pack,
-                        &self.payload_pack_path,
-                    )?);
+                if let Some(blob) = new_blob {
+                    attachment.blob = Some(blob);
                 }
                 attachment
                     .blob
                     .as_mut()
                     .ok_or_else(|| JobError::EventSequence("attachment blob missing".to_owned()))?
-                    .write(&mut self.payload_pack, &self.payload_pack_path, bytes)?;
+                    .write(
+                        &mut self.payload_pack,
+                        &self.payload_pack_path,
+                        &self.payload_pack_position,
+                        &self.payload_pack_bytes_written,
+                        &self.payload_pack_peak_bytes,
+                        bytes,
+                    )?;
             }
             CatalogEvent::AttachmentEnd { message_id, index } => {
                 require_message(self.active.as_ref(), message_id)?;
@@ -2975,7 +3457,7 @@ impl DurableCatalogSink {
                 self.property = Some(ActiveProperty {
                     descriptor,
                     named_property,
-                    blob: BlobWriter::new(&mut self.payload_pack, &self.payload_pack_path)?,
+                    blob: self.new_blob_writer()?,
                     record: !matches!(descriptor.owner, PropertyOwner::Folder(_)),
                 });
             }
@@ -3004,9 +3486,14 @@ impl DurableCatalogSink {
                         "property data does not match active property".to_owned(),
                     ));
                 }
-                property
-                    .blob
-                    .write(&mut self.payload_pack, &self.payload_pack_path, bytes)?;
+                property.blob.write(
+                    &mut self.payload_pack,
+                    &self.payload_pack_path,
+                    &self.payload_pack_position,
+                    &self.payload_pack_bytes_written,
+                    &self.payload_pack_peak_bytes,
+                    bytes,
+                )?;
             }
             CatalogEvent::PropertyEnd(descriptor) => self.finish_property(descriptor)?,
             CatalogEvent::PropertyAbort { descriptor, reason } => {
@@ -3104,6 +3591,14 @@ impl DurableCatalogSink {
                 self.recent_candidates
                     .insert(active.embedded_path, active.key.clone());
             }
+            CatalogEvent::DeferredPropertyData { .. }
+            | CatalogEvent::DeferredAttachmentData { .. }
+            | CatalogEvent::TopLevelMetadataEnd
+            | CatalogEvent::TopLevelPayloadEnd => {
+                return Err(JobError::EventSequence(
+                    "deferred direct payload event reached the durable metadata sink".to_owned(),
+                ));
+            }
         }
         Ok(())
     }
@@ -3116,20 +3611,57 @@ impl Drop for DurableCatalogSink {
 }
 
 impl BlobWriter {
-    fn new(pack: &mut File, path: &Path) -> Result<Self, JobError> {
-        let start_offset = pack
-            .seek(std::io::SeekFrom::End(0))
-            .map_err(|source| io_error(path, source))?;
-        Ok(Self {
+    fn new(start_offset: u64) -> Self {
+        Self {
             start_offset,
             hasher: Sha256::new(),
             bytes: 0,
-        })
+            inline: None,
+        }
     }
 
-    fn write(&mut self, pack: &mut File, path: &Path, bytes: &[u8]) -> Result<(), JobError> {
-        write_hashed(pack, &mut self.hasher, &mut self.bytes, bytes)
-            .map_err(|source| io_error(path, source))
+    fn new_inline() -> Self {
+        Self {
+            start_offset: 0,
+            hasher: Sha256::new(),
+            bytes: 0,
+            inline: Some(Vec::new()),
+        }
+    }
+
+    fn write(
+        &mut self,
+        pack: &mut File,
+        path: &Path,
+        pack_position: &Cell<u64>,
+        pack_bytes_written: &Cell<u64>,
+        pack_peak_bytes: &Cell<u64>,
+        bytes: &[u8],
+    ) -> Result<(), JobError> {
+        if let Some(inline) = self.inline.as_mut() {
+            inline.extend_from_slice(bytes);
+            self.hasher.update(bytes);
+            self.bytes = self
+                .bytes
+                .checked_add(
+                    u64::try_from(bytes.len())
+                        .map_err(|_| JobError::Integrity("inline length overflow".to_owned()))?,
+                )
+                .ok_or_else(|| JobError::Integrity("inline length overflow".to_owned()))?;
+            Ok(())
+        } else {
+            let before = self.bytes;
+            let result = write_hashed(pack, &mut self.hasher, &mut self.bytes, bytes);
+            let written = self.bytes.saturating_sub(before);
+            let position = pack_position
+                .get()
+                .checked_add(written)
+                .ok_or_else(|| JobError::Integrity("payload pack offset overflow".to_owned()))?;
+            pack_position.set(position);
+            pack_bytes_written.set(pack_bytes_written.get().saturating_add(written));
+            pack_peak_bytes.set(pack_peak_bytes.get().max(position));
+            result.map_err(|source| io_error(path, source))
+        }
     }
 }
 
@@ -3275,6 +3807,9 @@ fn validate_resume_metadata(
     }
     if stored_configuration.split_schema_version != configuration.split_schema_version {
         return Err(JobError::ResumeMismatch("split report schema version"));
+    }
+    if stored_configuration.execution_mode != configuration.execution_mode {
+        return Err(JobError::ResumeMismatch("execution mode"));
     }
     if stored_configuration.recovery_mode != configuration.recovery_mode {
         return Err(JobError::ResumeMismatch("recovery mode"));
@@ -3450,6 +3985,18 @@ fn configure(connection: &Connection) -> Result<(), JobError> {
          PRAGMA trusted_schema = OFF;\
          PRAGMA busy_timeout = 5000;",
     )?;
+    Ok(())
+}
+
+fn configure_capture_mode(
+    connection: &Connection,
+    capture_mode: CatalogCaptureMode,
+) -> Result<(), JobError> {
+    if matches!(capture_mode, CatalogCaptureMode::Bounded { .. }) {
+        connection.execute_batch(&format!(
+            "PRAGMA cache_size = -{DIRECT_SQLITE_CACHE_KIB}; PRAGMA cache_spill = ON;"
+        ))?;
+    }
     Ok(())
 }
 
@@ -3639,9 +4186,9 @@ fn create_schema(connection: &Connection) -> Result<(), JobError> {
             part_index INTEGER PRIMARY KEY CHECK(part_index > 0),\
             filename TEXT NOT NULL UNIQUE,\
             byte_len INTEGER NOT NULL CHECK(byte_len > 0),\
-            sha256 TEXT NOT NULL CHECK(\
+            sha256 TEXT CHECK(sha256 IS NULL OR (\
                 length(sha256) = 64 AND sha256 NOT GLOB '*[^0-9a-f]*'\
-            ),\
+            )),\
             oversize INTEGER NOT NULL CHECK(oversize IN (0, 1)),\
             sidecar_json TEXT NOT NULL\
          ) STRICT;\
@@ -3851,11 +4398,12 @@ fn validate_part_record(part: &PublishedPart) -> Result<(), JobError> {
             .and_then(|name| name.to_str())
             != Some(part.filename.as_str())
         || !part.filename.ends_with(".pst")
-        || part.sha256.len() != 64
-        || !part
-            .sha256
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        || part.sha256.as_ref().is_some_and(|sha256| {
+            sha256.len() != 64
+                || !sha256
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        })
     {
         return Err(JobError::Integrity(
             "invalid published part accounting record".to_owned(),
@@ -4497,6 +5045,9 @@ fn verify_part_artifact(
             part.filename
         )));
     }
+    let Some(expected) = part.sha256.as_deref() else {
+        return Ok(());
+    };
     let mut hasher = Sha256::new();
     let mut buffer = vec![0_u8; 1024 * 1024];
     loop {
@@ -4511,7 +5062,7 @@ fn verify_part_artifact(
         }
         hasher.update(&buffer[..read]);
     }
-    if digest_hex(hasher.finalize().as_slice()) != part.sha256 {
+    if digest_hex(hasher.finalize().as_slice()) != expected {
         return Err(JobError::Integrity(format!(
             "published part {} failed SHA-256 validation",
             part.filename
@@ -4900,7 +5451,7 @@ fn io_error(path: &Path, source: std::io::Error) -> JobError {
 
 #[cfg(test)]
 mod tests {
-    use std::fs::OpenOptions;
+    use std::fs::{self, OpenOptions};
     use std::io::Write as _;
     use std::io::{BufRead, BufReader, Read as _};
     use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
@@ -4912,7 +5463,7 @@ mod tests {
 
     use libpff_sys::{
         CatalogEvent, CatalogProvenance, CatalogSink, NamedPropertyIdentity, NamedPropertyName,
-        PropertyDescriptor, PropertyOwner,
+        PayloadRequest, PropertyDescriptor, PropertyOwner,
     };
     use rusqlite::Connection;
     use serde_json::json;
@@ -4921,11 +5472,11 @@ mod tests {
     use sha2::{Digest, Sha256};
 
     use super::{
-        CANDIDATE_CHECKPOINT_BATCH, CandidateRejectionCategory, DurableCatalogSink,
-        INLINE_BLOB_MAX_BYTES, INLINE_CACHE_DIRECTORY, JobConfiguration, JobError,
-        JobSourceIdentity, PAYLOAD_PACK_FILENAME, PartSidecar, PublishedPart, WorkerEvent,
-        digest_hex, private_state_attributes_valid, run_sql_interruptible, validate_blob_store,
-        write_hashed, write_sidecar_partial,
+        CANDIDATE_CHECKPOINT_BATCH, CandidateRejectionCategory, DIRECT_SQLITE_CACHE_KIB,
+        DirectEmbeddedCandidate, DurableCatalogSink, INLINE_BLOB_MAX_BYTES, INLINE_CACHE_DIRECTORY,
+        JobConfiguration, JobError, JobSourceIdentity, PAYLOAD_PACK_FILENAME, PartSidecar,
+        PayloadPackMetrics, PublishedPart, WorkerEvent, digest_hex, private_state_attributes_valid,
+        run_sql_interruptible, validate_blob_store, write_hashed, write_sidecar_partial,
     };
 
     struct PrefixThenError {
@@ -4944,11 +5495,12 @@ mod tests {
             inode: 2,
             size_bytes: 3,
             modified_at: "2026-07-16T00:00:00Z".to_owned(),
-            sha256: "a".repeat(64),
+            sha256: Some("a".repeat(64)),
         };
         let configuration = JobConfiguration {
             tool_compatibility_major: 0,
             split_schema_version: "0.4.4".to_owned(),
+            execution_mode: "restartable".to_owned(),
             recovery_mode: "balanced".to_owned(),
             maximum_pst_bytes: 4_294_967_296,
             part_size_policy: "hard-maximum-v1".to_owned(),
@@ -4976,14 +5528,34 @@ mod tests {
             DurableCatalogSink::open_resume(&job, &source, &mismatch),
             Err(JobError::ResumeMismatch("part-size policy"))
         ));
+        let mut mismatch = configuration.clone();
+        mismatch.execution_mode = "direct".to_owned();
+        assert!(matches!(
+            DurableCatalogSink::validate_resume(&job, &source, &mismatch),
+            Err(JobError::ResumeMismatch("execution mode"))
+        ));
         let mut wrong_source = source.clone();
-        wrong_source.sha256 = "b".repeat(64);
+        wrong_source.sha256 = Some("b".repeat(64));
         assert!(matches!(
             DurableCatalogSink::validate_resume(&job, &wrong_source, &configuration),
             Err(JobError::ResumeMismatch("source identity or SHA-256"))
         ));
         let after = Sha256::digest(std::fs::read(&database)?);
         assert_eq!(before, after);
+        Ok(())
+    }
+
+    #[test]
+    fn legacy_job_configuration_defaults_to_restartable() -> Result<(), serde_json::Error> {
+        let configuration: JobConfiguration = serde_json::from_value(serde_json::json!({
+            "tool_compatibility_major": 0,
+            "split_schema_version": "0.4.4",
+            "recovery_mode": "balanced",
+            "maximum_pst_bytes": 4_294_967_296_u64,
+            "part_size_policy": "hard-maximum-v1",
+            "writer_format": "unicode-pst-v23"
+        }))?;
+        assert_eq!(configuration.execution_mode, "restartable");
         Ok(())
     }
 
@@ -4999,11 +5571,12 @@ mod tests {
             inode: 2,
             size_bytes: 3,
             modified_at: "2026-07-16T00:00:00Z".to_owned(),
-            sha256: "a".repeat(64),
+            sha256: Some("a".repeat(64)),
         };
         let configuration = JobConfiguration {
             tool_compatibility_major: 0,
             split_schema_version: "0.4.4".to_owned(),
+            execution_mode: "restartable".to_owned(),
             recovery_mode: "balanced".to_owned(),
             maximum_pst_bytes: 4_294_967_296,
             part_size_policy: "hard-maximum-v1".to_owned(),
@@ -5128,11 +5701,12 @@ mod tests {
             inode: 2,
             size_bytes: 3,
             modified_at: "2026-07-16T00:00:00Z".to_owned(),
-            sha256: "a".repeat(64),
+            sha256: Some("a".repeat(64)),
         };
         let configuration = JobConfiguration {
             tool_compatibility_major: 0,
             split_schema_version: "0.4.4".to_owned(),
+            execution_mode: "restartable".to_owned(),
             recovery_mode: "balanced".to_owned(),
             maximum_pst_bytes: 4_294_967_296,
             part_size_policy: "hard-maximum-v1".to_owned(),
@@ -5202,11 +5776,12 @@ mod tests {
             inode: 2,
             size_bytes: 3,
             modified_at: "2026-07-16T00:00:00Z".to_owned(),
-            sha256: "a".repeat(64),
+            sha256: Some("a".repeat(64)),
         };
         let configuration = JobConfiguration {
             tool_compatibility_major: 0,
             split_schema_version: "0.4.4".to_owned(),
+            execution_mode: "restartable".to_owned(),
             recovery_mode: "balanced".to_owned(),
             maximum_pst_bytes: 4_294_967_296,
             part_size_policy: "hard-maximum-v1".to_owned(),
@@ -5492,6 +6067,112 @@ mod tests {
     }
 
     #[test]
+    fn direct_metadata_catalog_keeps_bounded_prefixes_out_of_payload_pack()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempdir()?;
+        let job = directory.path().join("job");
+        let mut sink = DurableCatalogSink::create_direct_metadata(&job, 4, 3)?;
+        message_start(&mut sink, 10)?;
+        let property = PropertyDescriptor {
+            owner: PropertyOwner::Message(10),
+            record_set_index: 0,
+            entry_index: 0,
+            entry_type: Some(0x1000),
+            value_type: Some(0x001f),
+            data_size: 9,
+        };
+        assert_eq!(sink.property_payload(property), PayloadRequest::Prefix(4));
+        sink.event(CatalogEvent::PropertyStart(property))?;
+        sink.event(CatalogEvent::PropertyData {
+            descriptor: property,
+            bytes: b"abcd",
+        })?;
+        sink.event(CatalogEvent::PropertyEnd(property))?;
+        sink.event(CatalogEvent::AttachmentStart {
+            message_id: 10,
+            index: 0,
+            attachment_type: Some(i32::from(b'f')),
+            data_size: Some(8),
+            filename: Some("payload.bin".to_owned()),
+        })?;
+        assert_eq!(
+            sink.attachment_payload(10, 0, Some(8)),
+            PayloadRequest::Prefix(3)
+        );
+        sink.event(CatalogEvent::AttachmentData {
+            message_id: 10,
+            index: 0,
+            bytes: b"xyz",
+        })?;
+        sink.event(CatalogEvent::AttachmentEnd {
+            message_id: 10,
+            index: 0,
+        })?;
+        sink.event(CatalogEvent::MessageEnd {
+            id: 10,
+            complete: true,
+        })?;
+        sink.checkpoint()?;
+
+        assert_eq!(
+            fs::metadata(job.join(".pstforge/spool/payload.pack"))?.len(),
+            0
+        );
+        let events = sink
+            .spooled_candidates()?
+            .pop()
+            .ok_or("direct metadata candidate is absent")?
+            .events;
+        assert_eq!(events[0].kind, "property_direct");
+        assert_eq!(events[0].metadata["direct_id"].as_u64(), Some(1));
+        assert_eq!(events[0].blob.as_ref().map(|blob| blob.byte_len), Some(4));
+        assert_eq!(events[2].kind, "attachment_direct");
+        assert_eq!(events[2].metadata["direct_id"].as_u64(), Some(2));
+        assert_eq!(events[2].metadata["declared_size"].as_u64(), Some(8));
+        assert_eq!(events[2].blob.as_ref().map(|blob| blob.byte_len), Some(3));
+        let mut property_prefix = Vec::new();
+        sink.open_blob(events[0].blob.as_ref().ok_or("property prefix absent")?)?
+            .read_to_end(&mut property_prefix)?;
+        assert_eq!(property_prefix, b"abcd");
+        drop(sink);
+
+        let mut reopened = DurableCatalogSink::open(&job)?;
+        reopened.enable_direct_metadata_capture(4, 3)?;
+        message_start(&mut reopened, 11)?;
+        let property = PropertyDescriptor {
+            owner: PropertyOwner::Message(11),
+            record_set_index: 0,
+            entry_index: 0,
+            entry_type: Some(0x1000),
+            value_type: Some(0x001f),
+            data_size: 5,
+        };
+        reopened.event(CatalogEvent::PropertyStart(property))?;
+        reopened.event(CatalogEvent::PropertyData {
+            descriptor: property,
+            bytes: b"next",
+        })?;
+        reopened.event(CatalogEvent::PropertyEnd(property))?;
+        reopened.event(CatalogEvent::MessageEnd {
+            id: 11,
+            complete: true,
+        })?;
+        reopened.checkpoint()?;
+        let retry_event = reopened
+            .spooled_candidates()?
+            .into_iter()
+            .find(|candidate| candidate.source_node_id == Some(11))
+            .and_then(|candidate| candidate.events.into_iter().next())
+            .ok_or("retry direct metadata event is absent")?;
+        assert_eq!(retry_event.metadata["direct_id"].as_u64(), Some(3));
+        assert_eq!(
+            fs::metadata(job.join(".pstforge/spool/payload.pack"))?.len(),
+            0
+        );
+        Ok(())
+    }
+
+    #[test]
     fn unsupported_candidate_has_distinct_durable_status() -> Result<(), Box<dyn std::error::Error>>
     {
         let directory = tempdir()?;
@@ -5692,6 +6373,29 @@ mod tests {
             &interrupted,
         )?;
         assert!(end.tree.candidates.is_empty());
+
+        sink.connection.execute(
+            "UPDATE candidates SET status = 'written' WHERE item_key = 'normal:1:-:0'",
+            [],
+        )?;
+        sink.connection.execute(
+            "UPDATE candidates SET status = 'unsupported' \
+             WHERE item_key = 'normal:2000:-:0'",
+            [],
+        )?;
+        let embedded =
+            sink.direct_embedded_candidates_interruptible("normal:1:-:0", &interrupted)?;
+        assert_eq!(
+            embedded,
+            vec![DirectEmbeddedCandidate {
+                item_key: "normal:2000:-:0".to_owned(),
+                provenance: CatalogProvenance::Normal,
+                source_node_id: Some(2_000),
+                recovery_index: None,
+                parent_item_key: "normal:1:-:0".to_owned(),
+                parent_attachment_index: 0,
+            }]
+        );
         Ok(())
     }
 
@@ -5927,7 +6631,7 @@ mod tests {
             index: 1,
             filename: "part-0001.pst".to_owned(),
             byte_len: 1024,
-            sha256: digest_hex(Sha256::digest(&part_bytes).as_slice()),
+            sha256: Some(digest_hex(Sha256::digest(&part_bytes).as_slice())),
             oversize: false,
         };
         let interrupted = AtomicBool::new(true);
@@ -6229,7 +6933,7 @@ mod tests {
                 index: 1,
                 filename: "part-0001.pst".to_owned(),
                 byte_len: bytes.len() as u64,
-                sha256: digest_hex(Sha256::digest(bytes).as_slice()),
+                sha256: Some(digest_hex(Sha256::digest(bytes).as_slice())),
                 oversize: false,
             };
             let sidecar = PartSidecar {
@@ -7308,6 +8012,118 @@ mod tests {
         assert_eq!(
             reopened.summary()?.committed_candidates,
             u64::from(CANDIDATE_CHECKPOINT_BATCH)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn direct_candidates_commit_only_at_explicit_boundaries()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempdir()?;
+        let uncommitted_job = directory.path().join("uncommitted");
+        let mut sink = DurableCatalogSink::create_direct_metadata(&uncommitted_job, 4, 3)?;
+        for id in 1..=CANDIDATE_CHECKPOINT_BATCH + 1 {
+            message_start(&mut sink, id)?;
+            sink.event(CatalogEvent::MessageEnd { id, complete: true })?;
+        }
+        drop(sink);
+        assert_eq!(
+            DurableCatalogSink::open(&uncommitted_job)?
+                .summary()?
+                .committed_candidates,
+            0
+        );
+
+        let committed_job = directory.path().join("committed");
+        let mut sink = DurableCatalogSink::create_direct_metadata(&committed_job, 4, 3)?;
+        for id in 1..=CANDIDATE_CHECKPOINT_BATCH + 1 {
+            message_start(&mut sink, id)?;
+            sink.event(CatalogEvent::MessageEnd { id, complete: true })?;
+        }
+        sink.checkpoint()?;
+        drop(sink);
+        assert_eq!(
+            DurableCatalogSink::open(&committed_job)?
+                .summary()?
+                .committed_candidates,
+            u64::from(CANDIDATE_CHECKPOINT_BATCH + 1)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn direct_capture_uses_large_bounded_cache_with_spill_enabled()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempdir()?;
+        let restartable_job = directory.path().join("restartable");
+        let restartable = DurableCatalogSink::create(&restartable_job)?;
+        let restartable_spill =
+            restartable
+                .connection
+                .query_row("PRAGMA cache_spill", [], |row| row.get::<_, i64>(0))?;
+        assert_ne!(restartable_spill, 0);
+
+        let direct_job = directory.path().join("direct");
+        let direct = DurableCatalogSink::create_direct_metadata(&direct_job, 4, 3)?;
+        let direct_spill = direct
+            .connection
+            .query_row("PRAGMA cache_spill", [], |row| row.get::<_, i64>(0))?;
+        let direct_cache = direct
+            .connection
+            .query_row("PRAGMA cache_size", [], |row| row.get::<_, i64>(0))?;
+        assert_ne!(direct_spill, 0);
+        assert_eq!(direct_cache, -i64::try_from(DIRECT_SQLITE_CACHE_KIB)?);
+
+        let converted_job = directory.path().join("converted");
+        let mut converted = DurableCatalogSink::create(&converted_job)?;
+        converted.enable_direct_metadata_capture(4, 3)?;
+        let converted_spill = converted
+            .connection
+            .query_row("PRAGMA cache_spill", [], |row| row.get::<_, i64>(0))?;
+        let converted_cache = converted
+            .connection
+            .query_row("PRAGMA cache_size", [], |row| row.get::<_, i64>(0))?;
+        assert_ne!(converted_spill, 0);
+        assert_eq!(converted_cache, -i64::try_from(DIRECT_SQLITE_CACHE_KIB)?);
+        Ok(())
+    }
+
+    #[test]
+    fn payload_pack_cursor_tracks_append_dedup_and_reopen() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let directory = tempdir()?;
+        let job = directory.path().join("job");
+        let mut sink = DurableCatalogSink::create(&job)?;
+        for id in [10, 20] {
+            message_start(&mut sink, id)?;
+            let descriptor = body_descriptor(id, 3);
+            sink.event(CatalogEvent::PropertyStart(descriptor))?;
+            sink.event(CatalogEvent::PropertyData {
+                descriptor,
+                bytes: b"abc",
+            })?;
+            sink.event(CatalogEvent::PropertyEnd(descriptor))?;
+            sink.event(CatalogEvent::MessageEnd { id, complete: true })?;
+        }
+        sink.checkpoint()?;
+        assert_eq!(
+            sink.payload_pack_metrics()?,
+            PayloadPackMetrics {
+                current_bytes: 3,
+                peak_bytes: 6,
+                bytes_written: 6,
+            }
+        );
+        drop(sink);
+
+        let reopened = DurableCatalogSink::open(&job)?;
+        assert_eq!(
+            reopened.payload_pack_metrics()?,
+            PayloadPackMetrics {
+                current_bytes: 3,
+                peak_bytes: 3,
+                bytes_written: 0,
+            }
         );
         Ok(())
     }

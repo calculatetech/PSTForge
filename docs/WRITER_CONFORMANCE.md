@@ -326,8 +326,14 @@ overview reference is replaced by a section-specific reference.
 - **Status:** Verified: nonempty leaf/XBLOCK/XXBLOCK levels, 8,176-byte payloads, 1,021-entry limits, `lcbTotal`, ordering, and streamed hashing match. Empty binary/Unicode values use the inline empty-value path; a zero-byte spool descriptor is rejected in preflight and can no longer create the prohibited zero-length NDB block.
 - **Requirement:** Data trees and extended blocks represent bounded and streamed values without truncation
 - **Sources:** [MS-PST 2.2.2.8.3.1 Data Blocks](https://learn.microsoft.com/en-us/openspecs/office_file_formats/ms-pst/d0e6fbaf-00e3-4d4d-bea8-8ab3cdb4fde6); [MS-PST 2.2.2.8.3.2.1 XBLOCK](https://learn.microsoft.com/en-us/openspecs/office_file_formats/ms-pst/5b7a6935-e83d-4917-9f62-6ce3707f09e0); [MS-PST 2.2.2.8.3.2.2 XXBLOCK](https://learn.microsoft.com/en-us/openspecs/office_file_formats/ms-pst/061b6ac4-d1da-468c-b75d-0303a0a8f468)
-- **Implementation:** `append_data_tree*`, `append_spooled_data_tree`, `externalize_large_properties`, `validate_message`
-- **Evidence:** `spooled_attachment_streams_across_data_tree_groups`, empty-value/preflight and boundary tests; `pffinfo`
+- **Implementation:** `append_data_tree*`, `append_spooled_data_tree`, the
+  0.4.5 direct-source data-tree path, `externalize_large_properties`, and
+  `validate_message`
+- **Evidence:** `spooled_attachment_streams_across_data_tree_groups`; 0.4.5
+  direct-source chunk-boundary, declared-length, interruption, and exact-hash
+  tests; recursive aggregate over-limit rejection before source open;
+  direct-body and embedded direct-body tests; spooled and direct inline-empty
+  binary OLE tests; empty-value, preflight, and boundary tests; `pffinfo`
 
 ### NDB-04
 - **Status:** Verified: sorted local NIDs, entry widths, data/subnode BIDs, nonempty SLBLOCKs, level-0 leaves, and the single permitted level-1 SIBLOCK agree. The exact 340-by-510 capacity is checked before mutation, so 173,401 entries return a bounded error instead of emitting an invalid level-2 SIBLOCK.
@@ -344,25 +350,41 @@ overview reference is replaced by a section-specific reference.
 - **Evidence:** `btree_leaf_planning_splits_at_ms_pst_capacity`, shared-table reference-count regressions; ScanPST 19 GB parts
 
 ### NDB-06
-- **Status:** Verified for the DList allocation mode used by supported Outlook generations: first offsets, recurring intervals, reserved pages, AMap self-allocation, extent bits/free counts, page conventions/checksums, and large-file rebuild match. Deprecated PMap/FMap/FPMap pages are retained at required intervals and are not used for allocation, consistent with MS-PST product behavior.
+- **Status:** Implementation checkpoint in progress. The DList allocation mode used by supported Outlook generations is verified for first offsets, recurring intervals, reserved pages, AMap self-allocation, extent bits/free counts, page conventions/checksums, and large-file layout. Version 0.4.5 moves the adapted allocation-map construction into initial writer finalization so production publication does not reopen and rewrite the PST. Deprecated PMap/FMap/FPMap pages remain at required intervals and are not used for allocation, consistent with MS-PST product behavior.
 - **Requirement:** AMap/PMap/FMap/FPMap/DList pages occur at required intervals and allocation bits cover exactly written extents
 - **Sources:** [MS-PST 2.2.2.7.2 AMap](https://learn.microsoft.com/en-us/openspecs/office_file_formats/ms-pst/60466ef4-af15-49b6-8413-b3a72f0e9bdb); [2.2.2.7.3 PMap](https://learn.microsoft.com/en-us/openspecs/office_file_formats/ms-pst/e0c59db8-970a-40df-9547-c136e8858291); MS-PST 2.2.2.7.4-2.2.2.7.5; [2.2.2.7.6 FPMap](https://learn.microsoft.com/en-us/openspecs/office_file_formats/ms-pst/dd913b8e-5113-4b83-a5ea-351a08b4237b); PST-PB notes 14-17
-- **Implementation:** `write_fixed_pages`, `reserved_map_page_count`, `allocate_extent`, `allocation_file_eof`, adapted allocation-map rebuild
+- **Implementation:** `write_fixed_pages`, `reserved_map_page_count`, `allocate_extent`, `allocation_file_eof`, construction-time allocation-map finalization
 - **Evidence:** allocation-map and FPMap-boundary tests; ScanPST 4 GB parts
 
 ### NDB-07
-- **Status:** Verified: PSTForge builds a new private file rather than modifying a published PST, syncs it, completes any allocation-map rebuild and resync, validates all owned relationships, requires `pffinfo` and `readpst`, atomically renames without replacement, syncs the held destination directory, and verifies the published device/inode. Failure before rename leaves no public part; post-rename durability uncertainty is reported distinctly.
-- **Requirement:** File publication occurs only after internal and independent validation, file `fsync`, atomic no-clobber rename, and directory `fsync`
+- **Status:** Verified. PSTForge builds a structurally complete private file by construction, syncs it once, atomically renames without replacement, syncs the held destination directory, and verifies the published device/inode. Production does not reopen, hash, extract, or independently read the completed PST. Internal structural assertions and independent readers remain mandatory in focused tests, CI gates, and release acceptance. Failure before rename leaves no public part; post-rename durability uncertainty is reported distinctly.
+- **Requirement:** The writer completes every documented relationship and allocation structure before file `fsync`, atomic no-clobber rename, and directory `fsync`; production publication does not depend on rereading its output
 - **Sources:** PST-INT 2.6; the verified NDB/LTP/Messaging rows above; POSIX durability is a PSTForge safety requirement
-- **Implementation:** `create_flat_store`, `validate_completed_store`, `validate_completed_folder_store`, `validate_with_independent_readers`, `publish_noclobber`, `sync_published_directory`, `verify_published_destination`
-- **Evidence:** publication, timeout, retained-candidate, moved-directory, no-clobber, and validator-scratch tests
+- **Implementation:** `create_flat_store`, transactional construction finalization, `publish_noclobber`, `sync_published_directory`, `verify_published_destination`; `validate_completed_store`, `validate_completed_folder_store`, and `validate_with_independent_readers` are test/acceptance utilities
+- **Evidence:** construction-invariant, publication, moved-directory, no-clobber, independent-reader gate, ScanPST, and Outlook tests
 
 ### NDB-08
-- **Status:** Verified; the transactional writer emits each accepted message block once before final NBT, BBT, allocation-map, and header construction. Bounded private batches amortize exact finalized-size projection while exact replay fixes every part boundary.
-- **Requirement:** Transactional construction may append complete message nodes and their referenced blocks before finalization, provided final NBT and BBT entries remain sorted and complete, allocation maps cover exactly retained extents, the header references only the final roots and high-water marks, and no pre-finalized file is published. Folder hierarchy and metadata validation is independent of any recovered message, so an unrepresentable candidate cannot suppress otherwise valid or empty source folders. A provisional batch may defer finalized-size projection; its primary bound scales from the requested part size and the bytes actually allocated in the private PST, with a message-count ceiling only to bound latency for very small items. The batch is accepted only after one exact projection. If that projection exceeds the part limit, the complete batch is rolled back to its byte-for-byte private checkpoint and replayed one message at a time with exact projection so the published part remains at the last fitting message.
+- **Status:** Verified; the transactional writer emits each accepted message block once before final NBT, BBT, allocation-map, and header construction. Restartable mode uses bounded private batches to amortize exact finalized-size projection while exact replay fixes every part boundary. Direct mode always performs bounded structural preflight for one top-level graph and returns its exact private allocation EOF without opening an unread payload remainder. Outside the final `part_size / 16` boundary region, that private extent is the cheap admission signal; inside the boundary region, direct mode also computes the exact finalized EOF before consuming the payload. The append verifies the private EOF token without rebuilding the complete final tables. Finalization independently reconstructs the exact finalized EOF and refuses an over-limit part before publication, including the fail-closed case where an abnormal final-index ratio exceeded the measured boundary reserve. Physical message-block order is independent of final folder-table membership and NBT order. Transactional folder node identities are fixed when their paths are first observed and do not shift when a lexicographically earlier folder is discovered later in the same one-pass construction.
+- **Requirement:** Transactional construction may append complete message nodes and their referenced blocks in source traversal order before finalization, provided final NBT and BBT entries remain sorted and complete, each message row is assigned to the contents or associated-contents table of its actual parent folder, and a folder node identity already referenced by a streamed message remains stable when later source folders are observed. Allocation maps cover exactly retained extents, the header references only the final roots and high-water marks, and no pre-finalized file is published. Folder hierarchy and metadata validation is independent of any recovered message, so an unrepresentable candidate cannot suppress otherwise valid or empty source folders. A provisional batch may defer finalized-size projection; its primary bound scales from the requested part size and the bytes actually allocated in the private PST, with a message-count ceiling only to bound latency for very small items. The batch is accepted only after one exact projection. If that projection exceeds the part limit, the complete batch is rolled back to its byte-for-byte private checkpoint and replayed one message at a time with exact projection so the published part remains at the last fitting message.
 - **Sources:** NDB-01 through NDB-07; MS-PST 2.2.2.1 defines the NDB as nodes and blocks addressed through the NBT and BBT, and PST-INT 2.6 requires the final database relationships and allocation state to be internally consistent
-- **Implementation:** `validate_mail_store_layout`, `TransactionalMailStoreWriter::begin`, `begin_batch`, `append_message_deferred`, `projected_file_eof`, `rollback_batch`, `append_message`, and `finalize`; `write_bbt`, `write_nbt`, `write_fixed_pages`, `write_header`, and the NDB-07 publication path remain authoritative
-- **Evidence:** focused append, batch rollback, exact-boundary, and byte-comparison tests; independent `pffinfo` and `readpst`; all five 19 GB qualification parts pass ScanPST and open in Outlook
+- **Implementation:** `validate_mail_store_layout`,
+  `TransactionalMailStoreWriter::begin`, `begin_batch`,
+  `append_message_deferred`, the 0.4.5 exact-private and boundary-exact
+  one-pass direct-source append APIs and metadata/payload protocol boundaries,
+  `projected_file_eof`, `rollback_batch`, `append_message`, and `finalize`;
+  `write_bbt`, `write_nbt`, `write_fixed_pages`, `write_header`, and the NDB-07
+  publication path remain authoritative
+- **Evidence:** focused exact-private projection rollback and append parity,
+  exact private/final boundary append and mismatch rollback, proportional
+  boundary-selection tests for 64 MiB and 4 GiB limits, late-discovered
+  earlier-folder identity and contents-count regression, direct-source failure rollback/reappend, batch
+  rollback, interleaved source-folder and normal/associated placement,
+  exact and mismatched direct projection, one-traversal prefix/remainder
+  concatenation, nested-graph metadata ordering, message-atomic direct
+  completion, projection metadata immutability, recursive normal/associated
+  identity rejection, exact-boundary, and byte-comparison tests; independent
+  `pffinfo` and `readpst`; all five 19 GB qualification parts pass ScanPST and
+  open in Outlook
 
 ## LTP Structures
 
@@ -370,7 +392,7 @@ overview reference is replaced by a section-specific reference.
 - **Status:** Verified: signatures, client types, root HID, page-header cadence, 2-byte map alignment, allocation/free counts, offset endpoints, 3,580-byte allocation maximum, and root/bitmap fill-level ranges agree.
 - **Requirement:** Heap-on-node headers, allocation maps, page maps, fill levels, HIDs, and continuation pages are structurally valid
 - **Sources:** [MS-PST 2.3.1.2 HNHDR](https://learn.microsoft.com/en-us/openspecs/office_file_formats/ms-pst/8e4ae05c-3c24-4103-b7e5-ffef6f244834), 2.3.1.3-2.3.1.4 continuation headers, [2.3.1.5 HNPAGEMAP](https://learn.microsoft.com/en-us/openspecs/office_file_formats/ms-pst/291653c0-b347-4c5b-ba41-85ad780b4ba4), and 2.3.1.6; [2.6.2.1.2 allocation](https://learn.microsoft.com/en-us/openspecs/office_file_formats/ms-pst/5b30032e-8cbc-4f03-a6bd-c21a7f1c54ea)
-- **Implementation:** `heap_page`, `heap_continuation_page`, `fill_heap_page`, `update_heap_fill_levels`
+- **Implementation:** `heap_page`, `heap_continuation_page_allocations`, `push_heap_allocation`, `fill_heap_page`, `update_heap_fill_levels`
 - **Evidence:** `property_context_heap_round_trips`, `external_table_fills_every_non_final_heap_page`; ScanPST
 
 ### LTP-02
@@ -388,11 +410,11 @@ overview reference is replaced by a section-specific reference.
 - **Evidence:** `every_supported_raw_value_round_trips`, external-property boundary tests, scalable top-level/embedded PC tests, large named-binary tests, one-shot and transactional top-level/embedded 338/339 external-property message-subnode boundaries with rollback/reappend, and whole-item aggregate-budget traversal/arithmetic boundaries; `pffinfo` accepts the combined r5 candidate and `readpst` 0.6.76 extracts its single-leaf external PC, but that reader hard-rejects the documented level-1 PC BTH header and cannot validate the second message; human acceptance confirms clean ScanPST and successful Outlook consumption of both r5 messages and the embedded child
 
 ### LTP-04
-- **Status:** Verified: RowID/RowVer offsets and bits, 4/2/1-byte regions, HNID column widths, TCINFO boundaries, sorted row BTH, tight row matrix, MSB-first CEB, zero unused bits, and heap/subnode variable values agree. Recipient tables use the same documented external-value representation, so aggregate display/address bytes are not constrained by one HN page; each row value remains independently bounded by its property representation.
-- **Requirement:** Table-context column descriptors, row index, existence bitmap, row matrix, and external values agree; scalable recipient tables preserve all representable rows and variable values without an artificial aggregate single-page byte limit
+- **Status:** Verified: RowID/RowVer offsets and bits, 4/2/1-byte regions, HNID column widths, TCINFO boundaries, sorted row BTH, tight row matrix, MSB-first CEB, zero unused bits, and HID/subnode variable values agree. External TCs place each nonempty variable value of at most 3,580 bytes in a bounded allocation on a multi-page HN and use a subnode NID only for larger values. BTH records share the same documented continuation-page allocator. This keeps small contents and recipient values out of the finite 340-by-510 SLBLOCK/SIBLOCK namespace without inventing a prohibited level-2 SIBLOCK. Recipient and large contents tables are therefore bounded by documented HN page-index, HID-allocation, data-tree, and subnode limits rather than one heap page or an unnecessary subnode per small value.
+- **Requirement:** Table-context column descriptors, row index, existence bitmap, row matrix, and external values agree; an HNID is a heap HID when the value fits a valid HN allocation and a subnode NID otherwise; scalable contents and recipient tables preserve all representable rows and variable values without an artificial aggregate single-page or small-value subnode-count limit
 - **Sources:** PST-TCINFO; [MS-PST 2.3.4.2 TCOLDESC](https://learn.microsoft.com/en-us/openspecs/office_file_formats/ms-pst/3a2f63cf-bb40-4559-910c-e55ec43d9cbb); [2.3.4.4.1 Row Data](https://learn.microsoft.com/en-us/openspecs/office_file_formats/ms-pst/c48fa6b4-bfd4-49d7-80f8-8718bc4bcddc); [2.3.4.4.2 variable data](https://learn.microsoft.com/en-us/openspecs/office_file_formats/ms-pst/a8da3d66-6051-4e30-8b8c-2b7d3c373834)
-- **Implementation:** `table_context*`, singleton contents/associated compact-to-external fallback, `schema_columns`, `write_table_value`, `mark_column`
-- **Evidence:** multi-page contents plus singleton-external normal and associated contents, rich-mail, scalable-recipient, and aggregate-recipient tests; retained-spool part 7 is accepted by `pffinfo` 20231205 and `readpst` 0.6.76 extracts all three recovered messages with zero skipped; human acceptance confirms clean ScanPST and successful Outlook consumption of all three messages
+- **Implementation:** `table_context*`, `write_external_table_value`, `push_heap_allocation`, singleton contents/associated compact-to-external fallback, `schema_columns`, `write_table_value`, `mark_column`
+- **Evidence:** multi-page contents plus singleton-external normal and associated contents, rich-mail, scalable-recipient, aggregate-recipient, bitmap fill-level, and 173,600-small-value regressions; retained-spool part 7 is accepted by `pffinfo` 20231205 and `readpst` 0.6.76 extracts all three recovered messages with zero skipped; human acceptance confirms clean ScanPST and successful Outlook consumption of all three messages; the 0.4.5 single-PST acceptance remains pending
 
 ## Messaging Objects And Tables
 
@@ -405,10 +427,10 @@ overview reference is replaced by a section-specific reference.
 
 ### MSG-02
 - **Status:** Accepted mixed conformance: normative folder relationships and ordinary counts are verified; fixed-root counts use EMP-07
-- **Requirement:** Folder PCs and hierarchy/contents/associated table nodes agree on parentage, counts, unread state, and child rows
+- **Requirement:** Folder PCs and hierarchy/contents/associated table nodes agree on parentage, counts, unread state, and child rows. Contents-table membership is derived from each message node's explicit parent folder, not from physical message serialization order.
 - **Sources:** PST-FOLDER-PC; MS-PST 2.4.4; MAPI-FOLDERS; MAPI-CONTENTS
-- **Implementation:** `plan_folders`, `folder_properties_with_unread`, `folder_table_row_with_unread`, `node_entries`
-- **Evidence:** nested/root folder tests; Outlook 19 GB parts
+- **Implementation:** `plan_folders`, `folder_properties_with_unread`, `folder_table_row_with_unread`, `MessageStreamState` parent-tagged rows, `node_entries`
+- **Evidence:** nested/root folder tests, interleaved transactional folder/placement regression; Outlook 19 GB parts
 
 ### MSG-03
 - **Status:** Verified for required Message-PC fields and recipient containment; optional empty attachment-table output is retained pending procedural audit
@@ -426,7 +448,7 @@ overview reference is replaced by a section-specific reference.
 
 ### MSG-05
 - **Status:** Verified for the required template column ID/type set and multi-page recipient tables. The corrected 0.4.4 candidate passes independent readers, ScanPST, and Outlook. Optional recipient values remain class-specific.
-- **Requirement:** Recipient table is always present, has required columns, and preserves recipient type and address properties. When its row index, row matrix, or variable values do not fit one heap page, the table uses the same documented multi-page HN, BTH, data-tree row matrix, and subnode-backed HNID values as any other TC; one heap page is not a recipient-table limit.
+- **Requirement:** Recipient table is always present, has required columns, and preserves recipient type and address properties. When its row index, row matrix, or variable values do not fit one heap page, the table uses the same documented multi-page HN, BTH, data-tree row matrix, and HID-or-subnode HNID values as any other TC; one heap page is not a recipient-table limit.
 - **Sources:** PST-RECIP-TC; PST-MESSAGE 2.4.5.3; LTP-01; LTP-02; LTP-04
 - **Implementation:** `recipient_columns`, `recipient_table_row`, `display_recipient_properties`, `table_context_external`, `build_message_blocks`
 - **Evidence:** rich-mail roundtrip; prior Outlook fidelity acceptance; 0.4.4 long-value, 448-row multi-leaf, transactional rollback/reappend, and recursive embedded exact-row regressions; completed normal/associated/embedded recipient validation; corrected r2 acceptance in `pffinfo`, `readpst`, ScanPST, and Outlook

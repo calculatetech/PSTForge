@@ -32,6 +32,8 @@ pub struct CanonicalProperty {
     pub value_type: Option<u32>,
     pub named_property: Option<NamedPropertyIdentity>,
     pub blob: SpooledBlob,
+    pub declared_byte_len: u64,
+    pub direct_id: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -41,6 +43,7 @@ pub struct CanonicalAttachment {
     pub filename: Option<String>,
     pub declared_size: Option<u64>,
     pub data: Option<SpooledBlob>,
+    pub direct_id: Option<u64>,
     pub data_complete: bool,
     pub reference_complete: bool,
     pub properties: Vec<CanonicalProperty>,
@@ -603,8 +606,16 @@ fn build_mail_inner(
     let mut spooled_bytes = 0_u64;
     for event in &candidate.events {
         if let Some(blob) = &event.blob {
+            let logical_bytes = match event.kind.as_str() {
+                "property_direct" => required_u64(candidate, event, "data_size")?,
+                "attachment_direct" => optional_u64(candidate, event, "declared_size")?
+                    .ok_or_else(|| {
+                        invalid_error(candidate, "direct attachment has no declared size")
+                    })?,
+                _ => blob.byte_len,
+            };
             spooled_bytes = spooled_bytes
-                .checked_add(blob.byte_len)
+                .checked_add(logical_bytes)
                 .ok_or(CanonicalError::SizeOverflow)?;
         }
         match event.kind.as_str() {
@@ -638,6 +649,7 @@ fn build_mail_inner(
                             filename: optional_string(candidate, event, "filename")?,
                             declared_size: optional_u64(candidate, event, "data_size")?,
                             data: None,
+                            direct_id: None,
                             data_complete: false,
                             reference_complete: false,
                             properties: Vec::new(),
@@ -649,7 +661,7 @@ fn build_mail_inner(
                     return invalid(candidate, "duplicate attachment index");
                 }
             }
-            "attachment_data" | "attachment_partial" => {
+            "attachment_data" | "attachment_partial" | "attachment_direct" => {
                 let index = required_u32(candidate, event, "index")?;
                 validate_event_message(candidate, event)?;
                 if attachment_terminals
@@ -689,7 +701,12 @@ fn build_mail_inner(
                     return invalid(candidate, "duplicate attachment data");
                 }
                 attachment.data = event.blob.clone();
-                attachment.data_complete = event.kind == "attachment_data";
+                attachment.direct_id = optional_u64(candidate, event, "direct_id")?;
+                if event.kind == "attachment_direct" && attachment.direct_id.is_none() {
+                    return invalid(candidate, "direct attachment has no stream identifier");
+                }
+                attachment.data_complete =
+                    matches!(event.kind.as_str(), "attachment_data" | "attachment_direct");
             }
             "attachment_missing" | "attachment_reference" => {
                 let index = required_u32(candidate, event, "index")?;
@@ -715,7 +732,7 @@ fn build_mail_inner(
                 attachment.data_complete = false;
                 attachment.reference_complete = terminal == AttachmentTerminal::Reference;
             }
-            "property" => {
+            "property" | "property_direct" => {
                 let property = canonical_property(candidate, event)?;
                 match property.owner.as_str() {
                     "attachment" => {
@@ -1083,6 +1100,8 @@ fn canonical_property(
         property_id: optional_u32(candidate, event, "entry_type")?,
         value_type: optional_u32(candidate, event, "value_type")?,
         named_property,
+        declared_byte_len: required_u64(candidate, event, "data_size")?,
+        direct_id: optional_u64(candidate, event, "direct_id")?,
         blob: event
             .blob
             .clone()

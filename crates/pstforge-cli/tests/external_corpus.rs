@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 
 use libpff_sys::{
     CatalogEvent, CatalogSink, NamedPropertyIdentity, NamedPropertyName, PropertyDescriptor,
-    PropertyOwner,
+    PropertyOwner, TraversalOrder,
 };
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
@@ -19,6 +19,111 @@ use sha2::{Digest, Sha256};
 const WRITER_MANDATORY_FOLDER_COUNT: u64 = 5;
 const NID_IPM_SUBTREE: u32 = 0x8022;
 type MatchedSourceMessages = (Vec<Vec<String>>, usize);
+
+#[derive(Default)]
+struct WriterOrderSink {
+    message_stack: Vec<u32>,
+    attachments: Vec<(u32, u32)>,
+    nested_messages: u64,
+    attachment_payloads: u64,
+    attachment_properties: u64,
+    message_properties: u64,
+}
+
+impl CatalogSink for WriterOrderSink {
+    fn traversal_order(&self) -> TraversalOrder {
+        TraversalOrder::Writer
+    }
+
+    fn event(&mut self, event: CatalogEvent<'_>) -> Result<(), String> {
+        match event {
+            CatalogEvent::MessageStart {
+                id,
+                parent_message_id,
+                parent_attachment_index,
+                ..
+            } => {
+                if let (Some(parent), Some(index)) = (parent_message_id, parent_attachment_index) {
+                    if self.message_stack.last().copied() != Some(parent)
+                        || !self
+                            .attachments
+                            .last()
+                            .is_some_and(|active| active.0 == parent && active.1 == index)
+                    {
+                        return Err("embedded message is outside its parent attachment".to_owned());
+                    }
+                    self.nested_messages = self.nested_messages.saturating_add(1);
+                } else if !self.message_stack.is_empty() {
+                    return Err("top-level message was nested".to_owned());
+                }
+                self.message_stack.push(id);
+            }
+            CatalogEvent::MessageEnd { id, .. } => {
+                if self.message_stack.pop() != Some(id) {
+                    return Err("message end is not properly nested".to_owned());
+                }
+            }
+            CatalogEvent::AttachmentStart {
+                message_id, index, ..
+            } => {
+                if self.message_stack.last().copied() != Some(message_id)
+                    || self
+                        .attachments
+                        .last()
+                        .is_some_and(|active| active.0 == message_id)
+                {
+                    return Err("attachment start is outside its message".to_owned());
+                }
+                self.attachments.push((message_id, index));
+            }
+            CatalogEvent::AttachmentData {
+                message_id, index, ..
+            } => {
+                let Some(active) = self.attachments.last() else {
+                    return Err("attachment payload has no active attachment".to_owned());
+                };
+                if active.0 != message_id || active.1 != index {
+                    return Err("attachment payload is outside its attachment".to_owned());
+                }
+                self.attachment_payloads = self.attachment_payloads.saturating_add(1);
+            }
+            CatalogEvent::PropertyStart(descriptor) => match descriptor.owner {
+                PropertyOwner::Attachment { message_id, index } => {
+                    let Some(active) = self.attachments.last() else {
+                        return Err("attachment property has no active attachment".to_owned());
+                    };
+                    if active.0 != message_id
+                        || active.1 != index
+                        || self.message_stack.last().copied() != Some(message_id)
+                    {
+                        return Err("attachment property is outside writer order".to_owned());
+                    }
+                    self.attachment_properties = self.attachment_properties.saturating_add(1);
+                }
+                PropertyOwner::Message(message_id) => {
+                    if self.message_stack.last().copied() != Some(message_id)
+                        || self
+                            .attachments
+                            .last()
+                            .is_some_and(|active| active.0 == message_id)
+                    {
+                        return Err("message property preceded attachment completion".to_owned());
+                    }
+                    self.message_properties = self.message_properties.saturating_add(1);
+                }
+                _ => {}
+            },
+            CatalogEvent::AttachmentEnd { message_id, index }
+            | CatalogEvent::AttachmentAbort { message_id, index } => {
+                if self.attachments.pop() != Some((message_id, index)) {
+                    return Err("attachment end does not match its start".to_owned());
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 struct RecipientFingerprint {
@@ -1321,6 +1426,7 @@ fn root_and_associated_data_roundtrip_through_the_supervised_split()
         .arg(&source)
         .arg("--output")
         .arg(&output)
+        .arg("--restartable")
         .arg("--max-pst-size")
         .arg("4GiB")
         .arg("--json")
@@ -1640,7 +1746,7 @@ fn milestone_0_4_2_named_properties_roundtrip_through_libpff()
     let identity = pstforge_core::SourceFile::open(&case.path)?
         .identity()
         .clone();
-    if identity.sha256 != case.sha256 {
+    if identity.sha256.as_deref() != Some(case.sha256.as_str()) {
         return Err("named-property source SHA-256 does not match its manifest".into());
     }
 
@@ -1731,7 +1837,7 @@ fn milestone_0_4_2_empty_folders_roundtrip_through_libpff() -> Result<(), Box<dy
     let identity = pstforge_core::SourceFile::open(&case.path)?
         .identity()
         .clone();
-    if identity.sha256 != case.sha256 {
+    if identity.sha256.as_deref() != Some(case.sha256.as_str()) {
         return Err("empty-folder source SHA-256 does not match its manifest".into());
     }
 
@@ -1810,7 +1916,7 @@ fn milestone_0_4_2_contacts_roundtrip_through_libpff() -> Result<(), Box<dyn std
     let identity = pstforge_core::SourceFile::open(&case.path)?
         .identity()
         .clone();
-    if identity.sha256 != case.sha256 {
+    if identity.sha256.as_deref() != Some(case.sha256.as_str()) {
         return Err("contact source SHA-256 does not match its manifest".into());
     }
 
@@ -1925,7 +2031,7 @@ fn milestone_0_4_2_appointments_roundtrip_through_libpff() -> Result<(), Box<dyn
     let identity = pstforge_core::SourceFile::open(&case.path)?
         .identity()
         .clone();
-    if identity.sha256 != case.sha256 {
+    if identity.sha256.as_deref() != Some(case.sha256.as_str()) {
         return Err("appointment source SHA-256 does not match its manifest".into());
     }
 
@@ -2039,7 +2145,7 @@ fn milestone_0_4_2_meetings_roundtrip_through_libpff() -> Result<(), Box<dyn std
     let identity = pstforge_core::SourceFile::open(&case.path)?
         .identity()
         .clone();
-    if identity.sha256 != case.sha256 {
+    if identity.sha256.as_deref() != Some(case.sha256.as_str()) {
         return Err("meeting source SHA-256 does not match its manifest".into());
     }
 
@@ -2179,7 +2285,7 @@ fn milestone_0_4_2_pim_items_roundtrip_through_libpff() -> Result<(), Box<dyn st
     let identity = pstforge_core::SourceFile::open(&case.path)?
         .identity()
         .clone();
-    if identity.sha256 != case.sha256 {
+    if identity.sha256.as_deref() != Some(case.sha256.as_str()) {
         return Err("PIM source SHA-256 does not match its manifest".into());
     }
 
@@ -2352,7 +2458,7 @@ fn milestone_0_4_2_distribution_list_roundtrip_through_libpff()
     let identity = pstforge_core::SourceFile::open(&case.path)?
         .identity()
         .clone();
-    if identity.sha256 != case.sha256 {
+    if identity.sha256.as_deref() != Some(case.sha256.as_str()) {
         return Err("distribution-list source SHA-256 does not match its manifest".into());
     }
 
@@ -2462,7 +2568,7 @@ fn milestone_0_4_2_document_object_roundtrip_through_libpff()
     let identity = pstforge_core::SourceFile::open(&case.path)?
         .identity()
         .clone();
-    if identity.sha256 != case.sha256 {
+    if identity.sha256.as_deref() != Some(case.sha256.as_str()) {
         return Err("Document source SHA-256 does not match its manifest".into());
     }
 
@@ -2586,7 +2692,7 @@ fn milestone_0_4_2_reference_attachments_roundtrip_through_libpff()
     let identity = pstforge_core::SourceFile::open(&case.path)?
         .identity()
         .clone();
-    if identity.sha256 != case.sha256 {
+    if identity.sha256.as_deref() != Some(case.sha256.as_str()) {
         return Err("reference attachment source SHA-256 does not match its manifest".into());
     }
 
@@ -2774,7 +2880,7 @@ fn milestone_0_4_2_ole_attachments_roundtrip_through_libpff()
     let identity = pstforge_core::SourceFile::open(&case.path)?
         .identity()
         .clone();
-    if identity.sha256 != case.sha256 {
+    if identity.sha256.as_deref() != Some(case.sha256.as_str()) {
         return Err("OLE attachment source SHA-256 does not match its manifest".into());
     }
 
@@ -2887,7 +2993,7 @@ fn milestone_0_4_2_outlook_ole_objects_roundtrip_through_libpff()
     let identity = pstforge_core::SourceFile::open(&case.path)?
         .identity()
         .clone();
-    if identity.sha256 != case.sha256 {
+    if identity.sha256.as_deref() != Some(case.sha256.as_str()) {
         return Err("Outlook OLE source SHA-256 does not match its manifest".into());
     }
 
@@ -3013,7 +3119,7 @@ fn milestone_0_4_2_calendar_exceptions_roundtrip_through_libpff()
     let identity = pstforge_core::SourceFile::open(&case.path)?
         .identity()
         .clone();
-    if identity.sha256 != case.sha256 {
+    if identity.sha256.as_deref() != Some(case.sha256.as_str()) {
         return Err("calendar-exception source SHA-256 does not match its manifest".into());
     }
 
@@ -3113,7 +3219,7 @@ fn milestone_0_4_real_pst_splits_deterministically_without_mutation()
         let before = pstforge_core::SourceFile::open(&case.path)?
             .identity()
             .clone();
-        if before.sha256 != case.sha256 {
+        if before.sha256.as_deref() != Some(case.sha256.as_str()) {
             return Err(format!("{} SHA-256 does not match its manifest", case.name).into());
         }
         let source_messages = independent_messages(&case.path)?;
@@ -3132,6 +3238,7 @@ fn milestone_0_4_real_pst_splits_deterministically_without_mutation()
                 .arg(&job)
                 .arg("--max-pst-size")
                 .arg(case.milestone_0_4_max_pst_bytes.to_string())
+                .arg("--restartable")
                 .arg("--json")
                 .arg("--color")
                 .arg("never")
@@ -3202,7 +3309,7 @@ fn milestone_0_4_real_pst_splits_deterministically_without_mutation()
                 }
                 let path = job.join("parts").join(filename);
                 let identity = pstforge_core::SourceFile::open(&path)?.identity().clone();
-                if identity.size_bytes != byte_len || identity.sha256 != sha256 {
+                if identity.size_bytes != byte_len || identity.sha256.as_deref() != Some(sha256) {
                     return Err(format!("{} part identity mismatch", case.name).into());
                 }
                 let inventory = pstforge_core::verify(&path)?;
@@ -3238,7 +3345,7 @@ fn milestone_0_4_real_pst_splits_deterministically_without_mutation()
                     || u64::from(sidecar.index) != part["index"].as_u64().unwrap_or_default()
                     || sidecar.filename != filename
                     || sidecar.byte_len != byte_len
-                    || sidecar.sha256 != sha256
+                    || sidecar.sha256.as_deref() != Some(sha256)
                     || sidecar.oversize != oversize
                     || Some(sidecar.folder_count) != part["folder_count"].as_u64()
                     || Some(sidecar.message_count) != part["message_count"].as_u64()
@@ -3300,6 +3407,7 @@ fn milestone_0_4_real_pst_splits_deterministically_without_mutation()
                 .arg(&job)
                 .arg("--max-pst-size")
                 .arg(case.milestone_0_4_max_pst_bytes.to_string())
+                .arg("--restartable")
                 .arg("--resume")
                 .arg("--json")
                 .arg("--color")
@@ -3339,6 +3447,7 @@ fn milestone_0_4_real_pst_splits_deterministically_without_mutation()
                         .saturating_add(1)
                         .to_string(),
                 )
+                .arg("--restartable")
                 .arg("--resume")
                 .arg("--json")
                 .arg("--color")
@@ -3397,6 +3506,7 @@ fn milestone_0_4_1_interruption_and_sigkill_resume_without_orphan_worker()
             .arg(&job)
             .arg("--max-pst-size")
             .arg(case.milestone_0_4_max_pst_bytes.to_string())
+            .arg("--restartable")
             .arg("--json")
             .arg("--color")
             .arg("never")
@@ -3460,6 +3570,7 @@ fn milestone_0_4_1_interruption_and_sigkill_resume_without_orphan_worker()
             .arg(&job)
             .arg("--max-pst-size")
             .arg(case.milestone_0_4_max_pst_bytes.to_string())
+            .arg("--restartable")
             .arg("--resume")
             .arg("--json")
             .arg("--color")
@@ -3484,6 +3595,7 @@ fn milestone_0_4_1_interruption_and_sigkill_resume_without_orphan_worker()
         .arg(&job)
         .arg("--max-pst-size")
         .arg(case.milestone_0_4_max_pst_bytes.to_string())
+        .arg("--restartable")
         .arg("--json")
         .arg("--color")
         .arg("never")
@@ -3524,6 +3636,7 @@ fn milestone_0_4_1_interruption_and_sigkill_resume_without_orphan_worker()
         .arg(&job)
         .arg("--max-pst-size")
         .arg(case.milestone_0_4_max_pst_bytes.to_string())
+        .arg("--restartable")
         .arg("--resume")
         .arg("--json")
         .arg("--color")
@@ -3550,6 +3663,7 @@ fn milestone_0_4_1_interruption_and_sigkill_resume_without_orphan_worker()
         .arg(&job)
         .arg("--max-pst-size")
         .arg("4GiB")
+        .arg("--restartable")
         .arg("--json")
         .arg("--color")
         .arg("never")
@@ -3586,6 +3700,7 @@ fn milestone_0_4_1_interruption_and_sigkill_resume_without_orphan_worker()
         .arg(&job)
         .arg("--max-pst-size")
         .arg("4GiB")
+        .arg("--restartable")
         .arg("--resume")
         .arg("--json")
         .arg("--color")
@@ -3607,6 +3722,7 @@ fn milestone_0_4_1_interruption_and_sigkill_resume_without_orphan_worker()
         .arg(&job)
         .arg("--max-pst-size")
         .arg("4GiB")
+        .arg("--restartable")
         .arg("--json")
         .arg("--color")
         .arg("never")
@@ -3643,6 +3759,7 @@ fn milestone_0_4_1_interruption_and_sigkill_resume_without_orphan_worker()
         .arg(&job)
         .arg("--max-pst-size")
         .arg("4GiB")
+        .arg("--restartable")
         .arg("--resume")
         .arg("--json")
         .arg("--color")
@@ -3736,7 +3853,7 @@ fn milestone_0_3_external_recovery_spools_without_mutation()
             .identity()
             .sha256
             .clone();
-        if before_hash != case.sha256 {
+        if before_hash.as_deref() != Some(case.sha256.as_str()) {
             return Err(format!("{} SHA-256 does not match its manifest", case.name).into());
         }
         let directory = tempfile::tempdir()?;
@@ -3813,7 +3930,7 @@ fn milestone_0_3_aggressive_recovery_is_distinct_and_non_mutating()
     let before = pstforge_core::SourceFile::open(&case.path)?
         .identity()
         .clone();
-    if before.sha256 != case.sha256 {
+    if before.sha256.as_deref() != Some(case.sha256.as_str()) {
         return Err(format!("{} SHA-256 does not match its manifest", case.name).into());
     }
     let directory = tempfile::tempdir()?;
@@ -4189,6 +4306,48 @@ fn milestone_0_3_sigint_and_sigterm_leave_durable_partial_jobs()
 
 #[test]
 #[ignore = "requires PSTFORGE_CORPUS_MANIFEST with external real PST files"]
+fn milestone_0_4_5_writer_order_traversal_matches_direct_stream_contract()
+-> Result<(), Box<dyn std::error::Error>> {
+    let manifest_path = std::env::var_os("PSTFORGE_CORPUS_MANIFEST")
+        .ok_or("PSTFORGE_CORPUS_MANIFEST is required")?;
+    let manifest: Manifest = toml::from_str(&fs::read_to_string(&manifest_path)?)?;
+    let mut totals = WriterOrderSink::default();
+    for case in &manifest.cases {
+        let source = pstforge_core::SourceFile::open(&case.path)?;
+        if source.identity().sha256.as_deref() != Some(case.sha256.as_str()) {
+            return Err(format!("{} SHA-256 does not match its manifest", case.name).into());
+        }
+        let file = fs::File::open(&case.path)?;
+        let native = libpff_sys::PffFile::open_fd(file.as_fd())?;
+        let mut sink = WriterOrderSink::default();
+        native.catalog(&mut sink)?;
+        if !sink.message_stack.is_empty() || !sink.attachments.is_empty() {
+            return Err(format!("{} left writer-order state open", case.name).into());
+        }
+        totals.nested_messages = totals.nested_messages.saturating_add(sink.nested_messages);
+        totals.attachment_payloads = totals
+            .attachment_payloads
+            .saturating_add(sink.attachment_payloads);
+        totals.attachment_properties = totals
+            .attachment_properties
+            .saturating_add(sink.attachment_properties);
+        totals.message_properties = totals
+            .message_properties
+            .saturating_add(sink.message_properties);
+        source.verify_unchanged()?;
+    }
+    if totals.nested_messages == 0
+        || totals.attachment_payloads == 0
+        || totals.attachment_properties == 0
+        || totals.message_properties == 0
+    {
+        return Err(format!("external corpus lacks writer-order coverage: nested={}, attachment_payloads={}, attachment_properties={}, message_properties={}", totals.nested_messages, totals.attachment_payloads, totals.attachment_properties, totals.message_properties).into());
+    }
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires PSTFORGE_CORPUS_MANIFEST with external real PST files"]
 fn milestone_0_1_external_psts_are_inspected_without_mutation()
 -> Result<(), Box<dyn std::error::Error>> {
     let manifest_path = std::env::var_os("PSTFORGE_CORPUS_MANIFEST")
@@ -4219,7 +4378,7 @@ fn milestone_0_1_external_psts_are_inspected_without_mutation()
             .identity()
             .sha256
             .clone();
-        if before_hash != case.sha256 {
+        if before_hash.as_deref() != Some(case.sha256.as_str()) {
             return Err(format!("{} SHA-256 does not match its manifest", case.name).into());
         }
 

@@ -21,7 +21,7 @@ use crate::{
 };
 use libpff_sys::{RecoveryMode, RecoveryUnit};
 
-pub const RECOVERY_SCHEMA_VERSION: &str = "0.4.4";
+pub const RECOVERY_SCHEMA_VERSION: &str = "0.4.5";
 const MAX_WORKER_RETRIES: u32 = 3;
 const MAX_UNIT_RETRIES: u32 = 0;
 
@@ -109,6 +109,7 @@ pub(crate) struct PreparedSplitRecovery<'a> {
     pub resume: bool,
     pub configuration: &'a JobConfiguration,
     pub job: Option<DurableCatalogSink>,
+    pub metadata_only: bool,
 }
 
 pub(crate) fn recover_for_split(
@@ -137,9 +138,14 @@ fn recover_source(
     interrupted: Arc<AtomicBool>,
     prepared: Option<PreparedSplitRecovery<'_>>,
 ) -> Result<(RecoveryReport, DurableCatalogSink), RecoveryError> {
-    let (resume, configuration, prepared_job) = match prepared {
-        Some(prepared) => (prepared.resume, Some(prepared.configuration), prepared.job),
-        None => (false, None, None),
+    let (resume, configuration, prepared_job, metadata_only) = match prepared {
+        Some(prepared) => (
+            prepared.resume,
+            Some(prepared.configuration),
+            prepared.job,
+            prepared.metadata_only,
+        ),
+        None => (false, None, None, false),
     };
     let job_source = JobSourceIdentity {
         canonical_path: source.identity().canonical_path.clone(),
@@ -263,6 +269,8 @@ fn recover_source(
         mode,
         interrupted,
         peak_worker_rss_bytes: Arc::new(AtomicU64::new(0)),
+        metadata_only,
+        writer_order: false,
     };
     tracing::info!(
         resume,
@@ -297,7 +305,15 @@ fn recover_source(
     };
     let mut sink = match resumed_sink.take() {
         Some(sink) => sink,
-        None => match DurableCatalogSink::create(job_directory) {
+        None => match if metadata_only {
+            DurableCatalogSink::create_direct_metadata(
+                job_directory,
+                crate::worker::METADATA_PROPERTY_PREFIX_BYTES,
+                crate::worker::METADATA_ATTACHMENT_PREFIX_BYTES,
+            )
+        } else {
+            DurableCatalogSink::create(job_directory)
+        } {
             Ok(sink) => sink,
             Err(error) => {
                 worker.stop();
@@ -405,6 +421,12 @@ fn recover_source(
                     Err(JobError::Interrupted) => return Err(RecoveryError::Interrupted),
                     Err(error) => return Err(error.into()),
                 };
+                if worker_controls.metadata_only {
+                    sink.enable_direct_metadata_capture(
+                        crate::worker::METADATA_PROPERTY_PREFIX_BYTES,
+                        crate::worker::METADATA_ATTACHMENT_PREFIX_BYTES,
+                    )?;
+                }
                 let failed_unit = failure.unit.as_deref().copied();
                 if (std::env::var_os("PSTFORGE_TEST_ABORT_ON_UNIT_ORDINAL").is_some()
                     || std::env::var_os("PSTFORGE_TEST_ABORT_INSIDE_UNIT_AFTER_CANDIDATES")
@@ -613,6 +635,91 @@ struct WorkerProcess {
     watchdog: AttemptWatchdog,
 }
 
+pub(crate) struct DirectWorkerProcess {
+    worker: WorkerProcess,
+}
+
+#[derive(Clone)]
+pub(crate) struct WorkerProgress {
+    sender: SyncSender<WatchdogSignal>,
+}
+
+impl WorkerProgress {
+    pub(crate) fn notify(&self) {
+        match self.sender.try_send(WatchdogSignal::Progress) {
+            Ok(()) | Err(TrySendError::Full(_)) | Err(TrySendError::Disconnected(_)) => {}
+        }
+    }
+}
+
+impl DirectWorkerProcess {
+    pub(crate) fn output(&mut self) -> &mut ChildStdout {
+        self.worker.watchdog.progress();
+        &mut self.worker.output
+    }
+
+    pub(crate) fn progress(&self) {
+        self.worker.watchdog.progress();
+    }
+
+    pub(crate) fn progress_token(&self) -> WorkerProgress {
+        WorkerProgress {
+            sender: self.worker.watchdog.sender.clone(),
+        }
+    }
+
+    pub(crate) fn finish(mut self) -> Result<(), RecoveryError> {
+        let status = self.worker.child.wait();
+        if status.is_ok() {
+            self.worker.reaped = true;
+        }
+        match self.worker.watchdog.stop() {
+            WatchdogOutcome::Stalled => {
+                self.worker.stop();
+                return Err(RecoveryError::WorkerStalled);
+            }
+            WatchdogOutcome::Interrupted => {
+                self.worker.stop();
+                return Err(RecoveryError::Interrupted);
+            }
+            WatchdogOutcome::Stopped => {}
+        }
+        let status = status.map_err(RecoveryError::WorkerSpawn)?;
+        if !status.success() {
+            return Err(RecoveryError::WorkerExit { status });
+        }
+        Ok(())
+    }
+}
+
+pub(crate) fn spawn_direct_worker(
+    worker_executable: &Path,
+    source: &SourceIdentity,
+    mode: RecoveryMode,
+    skipped_units: &HashSet<RecoveryUnit>,
+    interrupted: Arc<AtomicBool>,
+    attempt: u32,
+) -> Result<DirectWorkerProcess, RecoveryError> {
+    let expected_identity = serde_json::to_string(source).map_err(WorkerProtocolError::Json)?;
+    let controls = WorkerControls {
+        mode,
+        interrupted,
+        peak_worker_rss_bytes: Arc::new(AtomicU64::new(0)),
+        metadata_only: false,
+        writer_order: true,
+    };
+    spawn_worker(
+        worker_executable,
+        source,
+        &expected_identity,
+        skipped_units,
+        None,
+        attempt,
+        &controls,
+    )
+    .map(|worker| DirectWorkerProcess { worker })
+}
+
 impl WorkerProcess {
     fn stop(&mut self) {
         if self.reaped {
@@ -764,11 +871,32 @@ fn spawn_worker(
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null());
+    if controls.metadata_only {
+        command.arg("--metadata-only");
+    }
+    if controls.writer_order {
+        command.arg("--writer-order");
+    }
+    if controls.writer_order
+        && attempt == 1
+        && let Some(byte_count) =
+            std::env::var_os("PSTFORGE_TEST_DIRECT_ABORT_MID_PAYLOAD_AFTER_BYTES")
+    {
+        command.env(
+            "PSTFORGE_INTERNAL_ABORT_MID_PAYLOAD_AFTER_BYTES",
+            byte_count,
+        );
+    }
     command.env(
         "PSTFORGE_INTERNAL_SUPERVISOR_PID",
         std::process::id().to_string(),
     );
-    let abort_after = std::env::var_os("PSTFORGE_TEST_ABORT_EVERY_ATTEMPT_AFTER_CANDIDATES")
+    let direct_abort_after = controls
+        .writer_order
+        .then(|| std::env::var_os("PSTFORGE_TEST_DIRECT_ABORT_EVERY_ATTEMPT_AFTER_CANDIDATES"))
+        .flatten();
+    let abort_after = direct_abort_after
+        .or_else(|| std::env::var_os("PSTFORGE_TEST_ABORT_EVERY_ATTEMPT_AFTER_CANDIDATES"))
         .or_else(|| {
             (attempt == 1)
                 .then(|| std::env::var_os("PSTFORGE_TEST_ABORT_AFTER_CANDIDATES"))
@@ -957,6 +1085,8 @@ struct WorkerControls {
     mode: RecoveryMode,
     interrupted: Arc<AtomicBool>,
     peak_worker_rss_bytes: Arc<AtomicU64>,
+    metadata_only: bool,
+    writer_order: bool,
 }
 
 fn retryable_worker_failure(error: &RecoveryError) -> bool {
@@ -987,6 +1117,7 @@ impl InterruptHandler {
         for signal in [
             signal_hook::consts::signal::SIGINT,
             signal_hook::consts::signal::SIGTERM,
+            signal_hook::consts::signal::SIGIO,
         ] {
             match signal_hook::flag::register(signal, Arc::clone(&interrupted)) {
                 Ok(registration) => registrations.push(registration),

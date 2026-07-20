@@ -2498,32 +2498,657 @@ not modified.
     payload loss. The owner accepted the existing ScanPST/Outlook evidence and
     this final current-code reconciliation as completion of version 0.4.4.
 - [ ] Milestone 0.4.5: Direct-Write Performance.
-  - [ ] Make direct output the default `split` mode. Feed parser output through
-    bounded backpressure into canonical translation and the transactional PST
-    writer without first creating a mailbox-sized payload pack. Retain a
-    compact metadata ledger with source/configuration identity, bounded
-    per-candidate status and completeness, part assignments, manifests,
-    aggregate omission/reconstruction counts, and terminal job state so
-    `report` and exact reconciliation remain reproducible.
-  - [ ] Keep the current durable ledger/payload-spool implementation behind an
+  - [x] Started `milestone/v0.4.5-direct-write` in sibling worktree
+    `../pstforge-worktrees/v0.4.5-direct-write` from approved and pushed
+    `main` commit `036fb53`.
+  - [x] Checkpoint 1: established the versioned execution-mode contract. Bumped
+    every producer/package version to 0.4.5, added `--restartable`, rejected
+    `--resume` and `--keep-work` without it before creating output, persisted
+    the selected mode in job identity and reports, and retained compatibility
+    for explicitly restartable pre-0.4.5 jobs. The fast gate passed at
+    `.agent/test-results/1784520407-fast`; focused tests prove read-only direct
+    refusal, restartable-only option refusal, persisted mode mismatch refusal,
+    legacy missing-mode interpretation, and an actual 0.4.4 ledger reopen.
+    Clean-context review found and resolved the skipped 0.4.4 schema fallback;
+    final clean-context review reported no blocker or high finding.
+  - [x] Checkpoint 2: added documented writer primitives for a preflighted
+    streamed external value. Derive physical allocation from declared property
+    and attachment lengths plus PST block/table framing before consuming
+    payload bytes; stream chunks directly into the active message transaction;
+    hash and length-check at end; and roll back the exact message transaction
+    on abort. Add boundary, empty, huge, interrupted, malformed-length, and
+    rollback/reappend writer tests plus conformance references. Direct
+    projection now runs the writer's real block-allocation and final-index
+    calculation without opening a payload stream or modifying the private
+    file. The subsequent append requires an identical projected final EOF.
+    Direct hashes are returned as one message-atomic completion result only
+    after the actual finalized EOF matches the preflight token; the source
+    interface has no completion callback that could release data before
+    acceptance. Aggregate message-size bounds are checked before projection or
+    opening any direct stream. Any read, length, hash, projection, or
+    interruption failure restores the exact private checkpoint. Focused tests
+    cover XBLOCK/XXBLOCK boundaries, direct OLE, message and attachment
+    properties, empty and
+    over-limit declarations, aggregate over-limit messages, short/long streams,
+    bad hashes, mid-stream interruption, exact and mismatched projections, and
+    rollback/reappend. The complete writer suite passed 96 tests with its
+    existing multi-gigabyte test ignored. The
+    first fast gate exposed and corrected an adjacent-range spool regression.
+    A clean-context review then found premature per-blob completion and a
+    missing aggregate direct-message bound; both were corrected as described
+    above. A second clean-context review found that the bound omitted nested
+    attachment payloads and that native-body checks recognized only spooled
+    body properties. Recursive attachment accounting and shared
+    spooled/direct plain-text, HTML, RTF, and RTF-sync handling now cover top
+    and embedded messages, with zero-open nested-overflow and direct-body
+    regressions. A third clean-context review found direct/spooled parity gaps
+    for inline empty binary OLE and recursive completed-store identity checks.
+    Direct mode now emits empty binary OLE inline without opening a stream at
+    both top and embedded levels, and recursive validation verifies direct
+    property type, length, and hash. A negative embedded-identity regression
+    proves a mismatch blocks validation. A fourth clean-context review found
+    that an inline empty direct OLE descriptor could declare a contradictory
+    hash; preflight now requires an optional hash to equal SHA-256 of empty
+    content, with top-level and embedded negative regressions. The post-fix
+    state was reviewed again: projection rollback still issued a same-length
+    `ftruncate`, and completed identity validation was not recursive for every
+    normal and associated message. Projection now restores only in-memory
+    state and a metadata regression proves no file timestamp, allocation, or
+    length change. One recursive validator now covers every accepted message;
+    negative tests cover a first associated direct attachment and a later
+    message's nested direct attachment. The complete writer suite passes 97
+    tests with its existing multi-gigabyte test ignored. The post-fix fast gate
+    passed at `.agent/test-results/1784523711-fast`.
+  - [x] Checkpoint 3: implement the direct supervisor/sink. Perform bounded
+    per-item structural preflight, select the destination part before payload
+    streaming, translate parser events without a payload pack, and keep only
+    compact accounting needed for reports and exact reconciliation. Permit
+    arbitrary source traversal while producing deterministic folder tables
+    and identifiers. A boundary decision must not require rereading or
+    rewriting a completed payload.
+    The completed direct supervisor uses one contained parser traversal. For
+    each top-level message graph it captures only bounded property and
+    attachment prefixes, declared lengths, and structural metadata, chooses
+    the destination part, then streams every unread payload remainder from the
+    still-open native handle exactly once. Parent metadata is committed before
+    buffered embedded descendants so the transactional ledger remains flat;
+    the payload phase retains native writer order. Memory is bounded to one
+    message graph and its configured prefixes rather than the mailbox.
+    Restartable mode retains the existing durable full-payload protocol.
+    - [x] Added a distinct non-resumable metadata capture mode to the existing
+      private SQLite catalog. It stores at most 64 KiB per property and 16 KiB
+      per attachment directly in SQLite, assigns stable direct-stream IDs to
+      uncaptured remainders, preserves declared logical lengths through the
+      canonical model, and leaves `payload.pack` at zero bytes. Canonical
+      translation now emits direct message properties, attachment properties,
+      binary attachments, and OLE attachments while continuing to decode
+      bounded scalar metadata and MIME signatures from captured prefixes.
+      Prefixes are never promoted to complete named or mapped scalar values:
+      values without a direct writer representation are explicitly counted as
+      omitted instead of silently truncated. Worker retry reopen restores the
+      bounded capture policy and continues direct-stream IDs above the durable
+      maximum.
+      Focused tests cover transactional inline capture, logical-size
+      accounting, direct descriptor identity, named-property containment,
+      retry continuity, and zero payload-pack growth.
+    - [x] Added the bounded second-pass protocol reader. It reconstructs the
+      same durable message identities as the metadata pass, skips payload
+      streams the writer did not select, exposes a requested stream as a
+      bounded `Read`, and stops exactly at the next protocol control frame.
+      The transactional writer no longer assumes messages arrive grouped by
+      folder: normal and associated contents rows retain their explicit parent
+      folder node and finalization groups them by that relationship. Completed
+      validation obtains message node IDs from the emitted table rows rather
+      than predicting IDs from folder iteration. Focused regressions cover
+      omitted-stream skipping and interleaved `A, B, A` source traversal with
+      normal and associated messages; the complete writer and core suites pass
+      (98 writer tests plus one ignored multi-gigabyte case, and 82 core
+      tests).
+    - [x] Connected the default direct path for both balanced and aggressive
+      PST output. The bounded metadata pass fixes the folder and named-property
+      catalogs; the supervised writer-order pass registers each selected
+      direct stream, projects exact final EOF before opening it, streams it
+      once into the active transactional PST, and publishes through the
+      existing independent-validation and atomic-ledger path. Direct output
+      refreshes the worker watchdog during payload and discard chunks, refuses
+      a requested stream that is absent before the current top-level message
+      ends, requires protocol EOF, and rechecks filesystem capacity against
+      exact incremental PST growth. Fully captured metadata remains inline;
+      replay-required properties and attachments use direct IDs without
+      changing native-body containment. Real external document, named
+      property, OLE, and reference-attachment cases are byte-identical to
+      restartable output and have complete accounting. The public Enron and
+      focused PIM fixtures cannot serve as boundary evidence because both the
+      accepted restartable path and direct path hit the same pre-existing deep
+      embedded validation failures before publication; no milestone conclusion
+      is drawn from those cases. The complete job/core/writer suites pass, and
+      the fast gate passed at `.agent/test-results/1784528600-fast`.
+    - [x] Closed the direct-stream supervision review findings. The full-payload
+      pass now binds every embedded message through its durable parent item key
+      and attachment index, while top-level duplicates retain their cataloged
+      occurrence; it no longer reconstructs embedded keys from traversal
+      order. The watchdog remains active until the child is reaped, so a worker
+      that emits completion and then hangs is still killed. Direct parsing gets
+      at most three clean attempts: later attempts drain already-written and
+      already-unsupported top-level candidates, rebuild only the unpublished
+      active part, and retain atomically published parts. Exhaustion is a typed
+      `failed-partial` terminal result with a retained compact ledger and
+      recovery log, not an opaque error or a resumable state. A one-time
+      injected abort on the external document case recovered on the second
+      metadata pass and second direct pass, wrote its sole candidate exactly
+      once, and completed without omissions. A direct-only abort on every
+      attempt stopped after three failures with zero published candidates,
+      exit status 1, unchanged source identity, and
+      `Terminal failure: worker_protocol` in `recovery.log`. A follow-up
+      clean-context review found that raw pipe EOF inside an opened payload
+      escaped as an ordinary writer I/O error and that all-candidate identity
+      maps were retained unnecessarily. Worker payload I/O now carries a typed
+      marker into the retry classifier. An injected abort one byte into a real
+      OLE payload failed the first full-payload pass, rebuilt the unpublished
+      part, and completed on the second pass with one exact candidate, no
+      omissions, and no terminal failure. Top-level identity is resolved
+      incrementally from an indexed, scalar SQLite row cursor; ledger terminal
+      status is queried by durable key, and embedded/message stream bindings
+      are registered only for the current top-level tree and cleared when it
+      drains. No all-candidate identity, terminal-key, or occurrence map remains
+      in supervisor RAM. A staged-file cleanup guard removes the unpublished
+      active PST on retry, exhaustion, interruption, or any other unwind;
+      every-attempt failure evidence retains only compact ledger state and a
+      zero-byte payload pack. Ledger interruption during publication now
+      reconciles the intent and rename state before building the terminal
+      interrupted snapshot, so an atomically published part cannot be omitted
+      from the report or assigned twice.
+      The affected suites pass (83 core, 53 job, 98 writer plus the intentional
+      ignored multi-gigabyte case, and 8 CLI tests), and the canonical fast gate
+      passed at `.agent/test-results/1784531283-fast`. A final fresh
+      clean-context adversarial review found no blocker or high
+      milestone-relevant issue.
+    - [x] Corrected the first 19 GB direct qualification failure without
+      retaining payload data. The metadata pass cataloged all readable
+      candidates in about three minutes with roughly 260 MiB worker RSS and a
+      zero-byte payload pack, but every full-payload attempt stopped because an
+      unsupported embedded child was absent from the old spooled-only binding
+      tree. Direct binding now traverses the durable catalog beneath the
+      current top-level item for spooled, written, and unsupported descendants,
+      and registers those bindings before a terminal root is drained on retry.
+      A focused regression covers an unsupported child beneath an
+      already-written root. The job and core suites pass (53 and 83 tests), the
+      canonical fast gate passed at
+      `.agent/test-results/1784532127-fast`, and a fresh clean-context review
+      found no blocker or high milestone-relevant issue.
+    - [x] Identified and contained process-unstable libpff identifiers for
+      embedded messages. The same child beneath source parent node 3283844,
+      attachment zero, appeared as node 3408225810 during the r3 metadata pass
+      and node 3283876 during every r3 full-payload pass; r2 metadata reported
+      node 3075377693. Direct replay now matches embedded messages by the
+      durable parent item key, attachment index, provenance, and recovery
+      index, while top-level messages continue to require their stable source
+      node identity. A regression deliberately routes worker child ID 20 to
+      durable child identities 99 and 100 under distinct parents and verifies
+      both payloads. Reduced-key collisions remain terminal. The complete core
+      suite passes and a fresh clean-context rereview found no blocker or high
+      issue.
+    - [x] Aligned damaged embedded-item acquisition across the two direct
+      passes without violating the metadata ledger's flat event contract. The
+      r4 writer passed the former identity failure, wrote a 656 MiB active PST,
+      then found a nested child that the source-order metadata pass had omitted
+      after attachment-property decoding left its embedded parent partial.
+      Direct metadata now uses a third `EmbeddedFirst` traversal policy: obtain
+      and queue the child before decoding attachment properties, close the
+      parent attachment and message, then emit the queued child. The full
+      writer pass remains recursive and restartable recovery retains source
+      order. Readable attachment properties are still attempted exactly once
+      before every contained attachment abort. The libpff and core suites pass,
+      the canonical fast gate passed at
+      `.agent/test-results/1784534926-fast`, and final clean-context review
+      found no blocker or high issue.
+    - [x] Retained each queued embedded item's owning native attachment handle
+      until that child finishes. r5 proved that a queued child header could
+      remain readable after its parent closed while later native attachment
+      access failed; the recursive payload pass succeeded only while the
+      container stayed alive. On r6 the metadata catalog increased from 37,400
+      candidates and 311 embedded descendants to 37,413 and 324, cleared both
+      earlier zero-binding writer failures, and reached the 19-minute
+      performance ceiling with a 3.54 GiB active PST before controlled
+      interruption. Peak aggregate RSS remained 323,600 KiB and the active PST
+      cleanup left only the compact ledger and zero-byte payload pack.
+      The pending traversal already retained one native child handle per queued
+      embedded item; retaining its container doubles that bounded-by-source
+      handle set but does not add payload retention or change asymptotic
+      breadth. Worker supervision contains native allocation failure. Wider
+      pending-handle budgeting remains measurable parser hardening, not a
+      reason to discard the additional readable children recovered here.
+    - [x] Removed quadratic final-size planning from the single-part direct
+      path. Qualification r6 spent 19:07 producing only a 3.54 GiB active PST
+      while one supervisor core remained saturated and the NVMe device was
+      mostly idle. The direct loop had rebuilt the finalized tables and B-tree
+      plan twice for every appended message, making final-size calculation
+      O(n²) in the message count. When the requested part limit is at least the
+      source file size, PSTForge now performs one metadata-only, whole-part
+      allocation projection, rolls that projected state back without touching
+      the temporary PST, preflights disk space once, streams every accepted
+      payload once, and verifies one final projection before publication.
+      Projection and actual writing use the same writer allocation path; any
+      byte-length divergence blocks publication. If the complete projected PST
+      does not fit, the existing exact incremental split path remains active.
+      A two-message direct regression proves that projection opens no payload,
+      changes no temporary-file metadata, rolls back to the initial private
+      state, and predicts the exact finalized byte length. The writer and core
+      suites pass (99 writer tests plus one ignored multi-gigabyte case, and
+      83 core tests), and the canonical fast gate passed at
+      `.agent/test-results/1784537731-fast`. A fresh clean-context adversarial
+      review found no blocker or high milestone-relevant issue in hard-limit
+      enforcement, projection/write parity, payload isolation, memory bounds,
+      cleanup, retry behavior, disk preflight, interruption, or publication
+      safety.
+    - [x] Corrected the first whole-part projection failure without violating
+      the PST subnode format. Qualification r7 completed metadata capture in
+      3:45 at 340,112 KiB peak RSS with a zero-byte payload pack, then stopped
+      before payload streaming because one contents table exceeded the
+      documented 173,400-entry SLBLOCK/SIBLOCK capacity. MS-PST requires
+      `SIBLOCK.cLevel` to be exactly 1 and each SIENTRY to address an SLBLOCK,
+      so a deeper subnode tree is prohibited. The external TC writer had
+      unnecessarily assigned a subnode to every nonempty variable cell.
+      Values at or below the documented 3,580-byte HN allocation maximum now
+      use HIDs in packed continuation pages; only larger values consume
+      subnodes. TC BTH records use the same allocator, page packing reserves
+      structural fill-map space, bitmap fill levels reflect each actual page,
+      and message/attachment size properties follow the smaller exact
+      representation. A 24,800-row regression serializes 173,600 small
+      variable values that the old representation necessarily rejected. The
+      complete writer suite passes 100 tests with one intentional
+      multi-gigabyte test ignored, and the core suite passes 83 tests. The
+      canonical fast gate passed at `.agent/test-results/1784538763-fast`; a
+      fresh clean-context adversarial review found no blocker or high issue in
+      HNID selection, HID page/allocation numbering, bitmap cadence, BTH
+      references, large-value fallback, size chains, bounds, determinism, or
+      test coverage. Independent ScanPST and Outlook acceptance remains
+      pending.
+    - [x] Prevented a known corrupt recovery tail from rewriting a complete
+      direct part. In r8, whole-part projection selected an exact
+      19,530,195,968-byte output at 3:37, and the first payload pass streamed
+      that complete extent in about 2:51. Libpff then returned the same global
+      `recover_items` error already contained by metadata recovery. The old
+      protocol treated the post-catalog error as a failed attempt, deleted the
+      complete unpublished PST, and had rewritten 5.39 GiB when the run was
+      stopped at 7:48. Writer-order workers now emit a distinct parser-boundary
+      frame after rechecking source identity. The supervisor accepts it only
+      when its durable top-level cursor is exhausted; a remaining expected
+      candidate, an active message, a metadata worker, or any other placement
+      of the frame remains a protocol error. This preserves retry behavior for
+      actual omissions while eliminating a full-output rewrite caused solely
+      by the already-accounted corrupt tail. A focused regression proves both
+      the exhausted-catalog acceptance and missing-candidate rejection. The
+      core suite passes 84 tests and the writer suite passes 100 tests with one
+      intentional multi-gigabyte test ignored. The canonical fast gate passed
+      at `.agent/test-results/1784539812-fast`; a fresh clean-context review
+      found no blocker or high issue and confirmed that active frames,
+      malformed ownership, payload EOF, trailing data, worker/watchdog failure,
+      nonzero exit, missing durable candidates, and source identity changes
+      remain hard failures.
+    - [x] Proved the direct single-file performance and memory targets, then
+      corrected a completed-store validator catalog mismatch exposed by the
+      full source. Qualification r9 completed one catalog pass, one exact
+      19,530,195,968-byte projection, and one payload write in 6:50.59 at
+      467,584 KiB peak RSS. Qualification r10 repeated the same work in
+      6:57.26 at 467,784 KiB peak RSS. Both kept `payload.pack` at zero bytes,
+      accepted the known parser boundary only after durable catalog
+      exhaustion, and cleaned the unpublished PST when validation failed.
+      The writer correctly used the complete source-wide NAMEID catalog,
+      including identities whose damaged or unsupported values could not be
+      serialized. The final streamed-identity validator incorrectly rebuilt a
+      smaller catalog from written values, shifted later mapped property IDs,
+      and reported an existing Boolean property as absent. Final validation
+      now receives the writer's authoritative catalog instead. A focused
+      regression reserves an unused source identity before a written named
+      property and proves transactional finalization retains the exact mapping.
+      Privacy-safe mismatch diagnostics identify only the output message node,
+      attachment index path, mapped property ID, and expected/actual MAPI
+      types. The writer suite passes 101 tests with one intentional
+      multi-gigabyte test ignored, and the core suite passes all 84 tests.
+      Evidence is retained at
+      `.agent/test-results/1784540039-v045-direct-single-r9` and
+      `.agent/test-results/1784541051-v045-direct-single-r10`; the failed job
+      directories contain no published PST and are removed after diagnosis.
+    - [x] Removed runtime source/output digest passes and output-reader
+      validation from the default direct path. Direct source identity now
+      carries no SHA-256; supervised workers match stable descriptor/path
+      metadata without hashing. Restartable source and part identities retain
+      SHA-256. Direct manifests represent an uncalculated part digest as absent,
+      and publication performs no content reread.
+    - [x] Replaced the large-file reopen/rebuild with construction-time
+      AMap/PMap/FMap/FPMap, DList, header free-map, free-count, and valid-status
+      serialization. The writer performs one final file `fsync`; the job layer
+      then uses same-filesystem atomic renames and directory `fsync` without
+      rewriting the PST. The 129 MiB attachment regression crosses recurring
+      FMap regions and passes the independent writer readers. The writer, core,
+      and job suites pass, and the fast gate is retained at
+      `.agent/test-results/1784552328-fast`.
+    - [x] Added Linux source mutation protection before parsing: a read lease
+      where supported, plus nonblocking whole-file OFD record and `flock`
+      shared locks. A process-scoped POSIX record lock is used only when OFD
+      locking is unavailable. `SIGIO` lease breaks feed the existing interrupt
+      supervisor; conflicting locks refuse recovery, and unsupported leases
+      retain both advisory protections plus final descriptor/path identity
+      checks. Focused `flock` and record-lock conflict tests and the fast gate
+      pass at `.agent/test-results/1784552889-fast`.
+    - [x] The first post-change full corpus run exposed ordinary attachment
+      payloads being streamed before their duplicate `PR_ATTACH_DATA_BIN`
+      property in metadata/writer order. libpff shares stream state between
+      those views, so the later property read returned zero bytes and falsely
+      marked document and OLE candidates partial. Non-embedded attachment
+      properties are again read before attachment payloads; embedded-message
+      properties remain deferred only for the recursive writer ordering they
+      require. Direct document and OLE fidelity cases now pass. Legacy
+      determinism and interruption/resume cases explicitly select
+      `--restartable`, matching the 0.4.5 CLI contract.
+    - [x] The construction, publication, source-protection, optional-digest,
+      dynamic NAMEID/folder, and attachment-order checkpoint passed the
+      canonical full gate at `.agent/test-results/1784555196-full`, including
+      all 26 external corpus cases and independent `pffinfo`/`readpst`
+      acceptance. A fresh focused adversarial review reported no blocker or
+      high-severity milestone-relevant findings.
+    - [x] Collapsed metadata capture and payload replay into one libpff
+      traversal. A top-level metadata/payload boundary retains native record
+      and attachment handles only until that graph drains. Prefix bytes are
+      consumed once and concatenated with the unread native remainder; neither
+      source payload nor completed output is reread. Construction-time
+      allocation maps, one final file `fsync`, and atomic no-clobber
+      publication remain unchanged. Nested calendar-exception metadata is
+      committed parent-first from a bounded graph buffer while native payloads
+      retain recursive writer order. Late-discovered empty folders are
+      observed before finalization. Parser-boundary accounting comes from the
+      committed ledger if the optional completion frame is unavailable.
+      The canonical full gate passed at
+      `.agent/test-results/1784557059-full` after the calendar-exception
+      regression exposed and verified the nested ordering correction.
+      The final documented state passed the canonical full gate at
+      `.agent/test-results/1784557519-full`. An injected direct worker abort
+      after one complete candidate returned exit status 1 with one attempt,
+      one failure, `worker_protocol`, zero written candidates, no published
+      PST, a zero-byte payload pack, and only compact ledger/log state.
+      The first clean-context review found one applicable high issue: bounded
+      individual prefixes could aggregate without a graph-wide ceiling and
+      were briefly retained in two representations. Direct metadata now
+      charges serialized control bytes, twice the prefix length, and
+      conservative per-frame overhead against a checked 256 MiB/262,144-frame
+      per-graph budget before creating the second prefix copy. Exact-boundary,
+      byte-overflow, and frame-overflow tests cover the limit; exhaustion is a
+      recorded terminal partial result rather than supervisor OOM.
+      The post-fix fast and canonical full gates pass at
+      `.agent/test-results/1784557946-fast` and
+      `.agent/test-results/1784557989-full`.
+      A fresh clean-context adversarial rereview returned `CLEAN`: the prior
+      aggregate-memory high finding is closed, and no blocker/high issue
+      remains in FFI lifetime, one-pass fidelity, nested identity/order, hard
+      limits, parser containment, cleanup, folder/NAMEID handling,
+      publication/accounting, or source immutability.
+    - [x] Completed the current-source single-part construction checkpoint.
+      Qualification exposed that a libpff record entry borrows its record-set
+      owner and that attachment data/property views share native cursor state.
+      Record entries now retain their record set through the deferred payload
+      phase; top-level and embedded message owners remain alive until that
+      graph drains. Ordinary attachment data is streamed through the
+      attachment API once, while duplicate `PR_ATTACH_DATA_BIN` property
+      capture remains prefix-only. Reacquired attachment handles use the
+      documented native seek operation to begin at the captured prefix.
+      A source-size-plus-25-percent capacity check selects the single-part
+      append path without per-message final-table projection; final byte size
+      is still checked before publication. Final sidecar folder accounting
+      uses the complete observed source-folder set because one-pass
+      construction begins before later empty folders are discovered.
+      An isolated full worker traversal completed in 180 seconds after the
+      former native crash point. Qualification r10 then published one
+      19,532,989,440-byte PST in 7:02.35 at 462,380 KiB peak RSS, with a
+      zero-byte payload pack, one worker attempt, and unchanged source
+      identity. The current source catalog contains 37,413 candidates and the
+      output contains the same 37,413, with zero unsupported candidates, zero
+      omitted attachments, zero omitted folders, and no unfinished items.
+      The known post-catalog libpff recovery-tail error remains one contained
+      issue. Automated acceptance is complete through the fast gate at
+      `.agent/test-results/1784561084-fast` and the refreshed canonical full
+      gate at `.agent/test-results/1784561714-full`, including every external
+      corpus and independent `pffinfo`/`readpst` check. The documented diff
+      then passed the fast gate at `.agent/test-results/1784561857-fast`; a
+      fresh clean-context adversarial review returned `CLEAN`, with no
+      milestone-relevant blocker or high finding. Human ScanPST/Outlook
+      acceptance is the remaining checkpoint gate.
+    - [x] Corrected the folder-identity defect exposed by the first human
+      single-file gate. ScanPST found 149 folders and 37,060 items in r10, then
+      reported two BBT reference-count mismatches, widespread swapped
+      `PR_CONTENT_COUNT`/`PR_CONTENT_UNREAD` values, 38 orphaned messages, and
+      hierarchy repairs. Transactional message rows had stored a folder node
+      calculated from the currently known sorted path set; observing a
+      lexicographically earlier folder later shifted existing node identities.
+      Final folder properties used the complete sorted set, so rows, folder
+      properties, shared empty-table selection, and BBT reference counts
+      disagreed. Transactional folder nodes now follow append-stable first
+      observation order, and final folder plans reuse those exact nodes.
+      Construction additionally refuses any final folder whose expected normal
+      or associated message count differs from the streamed rows bound to its
+      node, preventing publication without a completed-file reread. A focused
+      late-earlier-folder regression validates names, properties, contents
+      rows, and messages through the independent writer reader; an injected
+      shifted parent proves the construction-time refusal. The complete writer
+      suite passes 104 tests with one intentional multi-gigabyte case ignored,
+      and the fast gate passes at
+      `.agent/test-results/1784562422-fast`.
+      Qualification r11 published one 19,533,751,296-byte PST in 6:55.18 at
+      462,420 KiB peak RSS. It again writes all 37,413 current-source
+      candidates, reports 145 representable folders, zero omitted attachments
+      or folders, one contained parser-tail issue, unchanged source identity,
+      and a zero-byte payload pack. The refreshed canonical full gate passes
+      every external corpus and independent `pffinfo`/`readpst` check at
+      `.agent/test-results/1784562960-full`. A fresh clean-context adversarial
+      review returned `CLEAN`, confirming stable uniqueness across folder
+      locations, implicit parents, Deleted Items, empty-folder policies,
+      rollback/projection, and independent parts, plus pre-BBT refusal of
+      row/plan mismatch. The human owner then reported a clean ScanPST result
+      and successful Outlook use of the r11 PST, completing the single-file
+      direct-write acceptance gate.
+  - [x] Checkpoint 4: complete direct publication and failure behavior. Keep
+    one same-filesystem active PST temporary, construct every documented PST
+    relationship and allocation structure before one final file `fsync`, then
+    atomically rename it into `parts/` without a runtime reopen, output hash,
+    or reader-validation pass. Preserve finalized parts on
+    interruption, mark the direct job terminal partial, refuse resume, and
+    require a new empty output directory for another attempt. Add disk
+    exhaustion, worker crash, signal, output conflict, construction failure, and
+    source-identity recheck tests. Construction-time allocation maps, final
+    `fsync`, atomic no-replace publication, source locks and final identity
+    checks, terminal direct failure accounting, partial cleanup, output
+    conflict refusal, capacity refusal, worker abort/stall/protocol containment,
+    and signal behavior are covered by the focused suites and canonical full
+    gate recorded above. The accepted r11 proves the completed publication
+    behavior through ScanPST and Outlook.
+  - [x] Checkpoint 5: optimize the explicit restartable path without changing
+    its recovery semantics. Buffer worker protocol control traffic and payload
+    pack appends at durable candidate-batch boundaries, eliminate redundant
+    metadata/seek syscalls from the append hot path, retain per-blob SHA-256
+    and transactional truncation, and benchmark cold recovery plus retained
+    replay. Treat the 0.4.4 9:30.47 cold run as the no-regression baseline.
+    Worker protocol output now uses a 1 MiB buffer with an immediate hello
+    flush and terminal flush, coalescing control and payload writes without
+    weakening startup or completion supervision. The payload pack maintains a
+    checked append cursor across each durable batch instead of issuing
+    `seek(END)` and `metadata()` for every blob. Batch `sync_all` verifies the
+    cursor against the filesystem before SQLite commit; SHA-256,
+    deduplication, rollback truncation, resume reconciliation, and the
+    128-candidate durability bound remain unchanged. Focused
+    append/dedup/reopen tests and the fast gate at
+    `.agent/test-results/1784564861-fast` pass. An initial clean-context review
+    correctly found that generic buffering hid unit and durable-batch
+    boundaries. Unit starts and each shared 128-candidate boundary now flush,
+    and a buffered-protocol regression proves their immediate visibility. A
+    second review questioned zero direct validator input, but that finding was
+    challenged as inapplicable: direct calls `finalize_constructed`, whose
+    false validation policy returns before either independent reader. A final
+    fresh review confirmed the control flow and returned `CLEAN`. The 19 GB
+    cold benchmark remains part of Checkpoint 7.
+  - [x] Checkpoint 6: expose mode-specific telemetry for logical source bytes,
+    payload-pack bytes, active-PST bytes, finalized bytes, validator reads,
+    peak temporary allocation, peak RSS, elapsed time, and throughput. Keep
+    user content out of logs and bound detailed recovery output. Reports now
+    separate cumulative and peak payload-pack allocation, published active-PST
+    serialization, finalized output, scheduled validator input, peak
+    payload-plus-active allocation, RSS, elapsed time, and throughput. Linux
+    `/proc/self/io` deltas provide measured supervisor physical reads and
+    writes so logical workload is not presented as SSD traffic. Direct mode
+    reports zero payload-pack and validator workload; restartable mode retains
+    its logical validation workload. The fields contain no mailbox content.
+  - [x] Checkpoint 7: run the canonical full gate and first qualify the 19 GB
+    source as one default-direct PST by selecting a part limit above its
+    recovered output size. Require exact current-source candidate assignment
+    (37,413-to-37,413 for the 2026-07-20 source identity),
+    unchanged descriptor/path identity, less than 2 GiB RSS, no more than one
+    minute per source GiB, a clean ScanPST result, and Outlook content/folder
+    acceptance before testing boundary packing. Then run the 4 GiB direct
+    split regression and explicit `--restartable` mode; require identical
+    aggregate results and independently valid outputs. Direct mode must show
+    no mailbox-sized payload-pack allocation; restartable mode must improve or
+    at least not regress the accepted 9:30.47 cold baseline.
+    - [x] The accepted r11 single-file run completed the first half of this
+      checkpoint as recorded above.
+    - [x] The first current-code 4 GiB run
+      `qualification-v045-one-pass-direct-4g-r1` wrote all 37,413 candidates
+      once into five parts totaling 19,534,074,880 bytes, with zero unsupported
+      candidates, omitted attachments, omitted folders, or payload-pack bytes.
+      The four non-final parts were respectively 113,664, 2,653,184,
+      1,383,424, and 113,664 bytes below 4 GiB. The final remainder was
+      2,358,469,632 bytes. Source identity was unchanged and the known
+      contained libpff recovery-tail issue remained the sole parser issue.
+      This run is not accepted: it took 38:40.61, versus the 19-minute ceiling,
+      and Linux reported 64,572,559,360 supervisor filesystem write bytes.
+      Direct splitting rebuilt the complete finalization plan before and after
+      every message, creating quadratic CPU work, while non-restartable bounded
+      metadata incorrectly inherited restartable 128-candidate SQLite commits.
+      Preflight now returns exact private and finalized extents; append verifies
+      the private extent without rebuilding every final table, while finalization
+      still independently enforces the exact finalized EOF before publication.
+      Finalization groups streamed rows by parent once instead of rescanning
+      every row for every folder. Direct metadata now commits at explicit
+      worker/part/checkpoint boundaries; restartable mode retains the
+      128-candidate durability bound. Focused extent-mismatch, folder-row,
+      direct-boundary, and restartable durability tests pass, followed by the
+      fast gate at `.agent/test-results/1784567988-fast`. Qualification r2
+      was stopped after 12 minutes with two valid-size parts published because
+      part 0002 alone still required about six minutes. Removing the second
+      final-plan rebuild did not remove the first per-candidate rebuild, so the
+      split remained above the one-minute-per-GiB ceiling. Its rejected output
+      was deleted. Direct split projection now always computes the candidate's
+      exact private allocation without opening payload streams, but constructs
+      the complete final tables only in the proportional final
+      `part_size / 16` boundary region. The append verifies the private extent;
+      finalization independently recomputes the exact EOF and refuses any
+      abnormal over-limit multi-message part before publication. Focused
+      private-projection, direct-stream parity, and 64 MiB/4 GiB proportional
+      boundary tests pass, followed by the fast gate at
+      `.agent/test-results/1784569402-fast`. Qualification r3 must prove the
+      runtime, exact boundary, and physical-write corrections before human
+      ScanPST/Outlook work.
+    - [x] Qualification r3 wrote the same five exact boundaries and all 37,413
+      candidates in 9:21.78 at 328,712 KiB aggregate peak RSS. It reports zero
+      unsupported candidates, omitted attachments, omitted folders, payload
+      pack, or validator input; the sole issue is the known contained libpff
+      recovery tail, and source identity is unchanged. This meets the
+      one-minute-per-source-GiB target and reduces r1 runtime by 75.8%.
+      Telemetry nevertheless measured 47,919,583,232 supervisor filesystem
+      write bytes for 19,534,074,880 output bytes. The remaining amplification
+      comes from SQLite spilling repeatedly modified direct-catalog pages
+      during its intentionally long transaction. Bounded/direct capture now
+      uses a fixed 512 MiB SQLite cache with dirty-page spilling still enabled.
+      A first review correctly rejected disabling spill for an entire mailbox
+      because memory would grow with the catalog. A proposed coarse automatic
+      commit was also rejected: it could persist unpublished direct candidates
+      and misalign a fresh one-pass worker retry. The fixed cache instead
+      preserves the existing transaction and retry boundaries, covers roughly
+      twice the observed per-part catalog growth, and bounds the SQLite cache
+      well below the 2 GiB aggregate RSS ceiling. Explicit worker, part,
+      signal, and completion checkpoints still commit, truncate the WAL, and
+      sync the private directory. Restartable capture retains its default
+      cache and 128-candidate durability boundary. Focused cache-mode and both
+      commit-policy regressions pass. Qualification r4 then reproduced all five
+      exact r3 boundaries and all 37,413-to-37,413 candidate assignments in
+      8:37.05 with zero unsupported candidates, omitted attachments, omitted
+      folders, payload pack, or validator input. The known contained parser
+      tail remains the sole issue and source identity is unchanged. Supervisor
+      peak RSS was 1,179,557,888 bytes, below the 2 GiB ceiling even with the
+      worker, and measured supervisor filesystem writes fell to
+      44,564,631,552 bytes. This cache-only reduction is modest; eliminating
+      the remaining direct-ledger amplification requires a later catalog
+      storage redesign rather than weakening transaction/retry correctness.
+      All five r4 parts pass `pffinfo` and bounded one-part-at-a-time `readpst`
+      extraction, with decoded scratch removed after every part. The canonical
+      full gate passes at `.agent/test-results/1784571784-full`. Human
+      ScanPST-first and Outlook aggregate acceptance then passed for all five
+      r4 parts.
+    - [x] Explicit restartable r1 wrote the same 37,413 durable item keys in
+      five parts in 8:41.06, improving the accepted 9:30.47 baseline. It used
+      an 11,013,437,088-byte peak payload pack and measured 120,416,735,232
+      supervisor filesystem write bytes, versus direct r4's zero-byte pack and
+      44,564,631,552 writes. Direct therefore saves substantial capacity and
+      SSD traffic but only four seconds on this host. The restartable adaptive
+      writer amortizes final-size projection, while direct still performs one
+      exact private allocation simulation per candidate; a one-pass
+      replay-free equivalent is the remaining split-performance opportunity.
+      Ledger comparison found the exact same item-key set but 127 direct
+      candidates marked partial that restartable marked complete. Every
+      difference was a parent containing an embedded message, and both modes
+      retained identical property, recipient, and attachment event counts for
+      those candidates. Direct/writer-order recursion processed each child
+      before the parent's `MessageEnd`, and the global issue delta incorrectly
+      attributed child-local issues to the parent. Completeness now compares
+      issues attributed to the current message ID; message-identifier failures
+      and issue-log overflow remain conservatively partial. The libpff suite
+      and fast gate pass at `.agent/test-results/1784574626-fast`. A bounded
+      direct single-file r5 then reproduced the exact 37,413-key set in 6:08,
+      upgraded 110 embedded parents from partial to complete, and introduced no
+      completeness regression. Its 14,918 complete total differs from the
+      separate restartable traversal's 14,935 by the already-observed libpff
+      run-to-run classification variance; r5 retained six more writable
+      properties than restartable r1. The duplicate r5 PST and the
+      restartable spool/output were deleted after bounded evidence was
+      retained. This closes Checkpoint 7 with exact item identity/accounting,
+      independently valid direct parts, accepted ScanPST/Outlook behavior, and
+      measured direct/restartable performance and write cost. The post-fix
+      canonical full gate passes at
+      `.agent/test-results/1784575346-full`. Direct split did not demonstrate
+      a material wall-time advantage over restartable split on the current
+      host: 8:37 versus 8:41. Its accepted benefits are lower write traffic
+      and no mailbox-sized payload pack. Single-file direct recovery completed
+      in 6:08, localizing the remaining split cost to per-candidate part
+      projection. A future performance milestone must replace that projection
+      with an equivalent bounded one-pass packing decision; it must not weaken
+      the exact part-size or independent-validity guarantees.
+  - [x] Make direct output the default for every supported PST-output recovery
+    policy. Feed parser output through bounded backpressure into canonical
+    translation and the transactional PST writer without first creating a
+    mailbox-sized payload pack. Balanced and aggressive continue to select
+    recovery breadth, not persistence. Retain a compact metadata ledger with
+    source/configuration identity, bounded per-candidate status and
+    completeness, part assignments, manifests, aggregate
+    omission/reconstruction counts, and terminal job state so `report` and
+    exact reconciliation remain reproducible.
+  - [x] Keep the current durable ledger/payload-spool implementation behind an
     explicit `--restartable` flag. Permit `--resume` and `--keep-work` only in
     restartable mode and refuse incompatible combinations before creating the
     output directory.
-  - [ ] Write only the active PST part to a same-filesystem temporary file
-    beside its destination. Validate and `fsync` it, then publish with atomic
+  - [x] Write only the active PST part to a same-filesystem temporary file
+    beside its destination. Complete it by construction and `fsync` it, then
+    publish with atomic
     rename; never rewrite the completed dataset to move from temporary to
     final storage, including disk-to-disk recovery paths.
-  - [ ] Bound parser-to-writer queues, candidate metadata, attachment chunks,
+  - [x] Bound parser-to-writer queues, candidate metadata, attachment chunks,
     and the active transaction independently of source or attachment size.
     Preserve finalized parts on interruption. An interrupted direct job is a
     terminal partial result that remains reportable but cannot resume; a new
     run requires a different empty output directory. This prevents duplicate
     candidate publication without retaining recovered payloads.
-  - [ ] Report logical source bytes, bytes written to active PST temporaries,
-    finalized output bytes, validator read bytes where measurable, peak
+  - [x] Report logical source bytes, bytes written to active PST temporaries,
+    finalized output bytes, zero production validator reads, peak
     temporary allocation, and peak RSS. Prove the default path avoids one
     readable-mailbox-sized spool write and allocation.
-  - [ ] Preserve the 0.4.4 exact 37,402-to-37,402 reconciliation, one
+  - [x] Preserve the 0.4.4 exact 37,402-to-37,402 reconciliation, one
     serialization per normal part, independent readers, ScanPST/Outlook
     interoperability, less than 2 GiB RSS, and no more than one minute per
     source GiB on the 19 GB qualification.
@@ -2534,6 +3159,140 @@ not modified.
 - [ ] Milestone 1.0.0: MailPlus-Ready Release.
 
 ## Surprises & Discoveries
+
+- Observation: The first default-direct 19 GB qualification reached the full
+  writer pass with no mailbox-sized payload spool, but all three attempts
+  failed with `direct worker message has no embedded catalog identity`.
+  Unsupported embedded descendants remained valid protocol ownership facts
+  even though they were intentionally excluded from PST output; the previous
+  spooled-tree read model omitted them. Retry also requires the same binding
+  facts beneath an already-written top-level root before its replay is drained.
+  A dedicated durable-catalog traversal supplies both cases without loading
+  mailbox-wide identity state.
+  Evidence: `.agent/test-results/1784531559-v045-direct-single-19gb`,
+  focused terminal-state regression, and the clean-context review completed on
+  2026-07-20.
+
+- Observation: libpff's item identifier is stable enough for top-level PST
+  nodes but is not a cross-process identity for an embedded message. For the
+  same source parent node 3283844 and attachment zero, three independent
+  traversals reported embedded IDs 3075377693, 3408225810, and 3283876.
+  Parent containment and attachment position remained identical. Direct replay
+  must therefore use the durable containment relationship plus recovery
+  provenance, not the embedded node ID, while retaining collision rejection.
+  Evidence: r2/r3 ledger comparison and
+  `.agent/test-results/1784533130-v045-direct-single-r3/stderr.log`.
+
+- Observation: Direct metadata and payload traversal need the same native
+  embedded-item acquisition order, but not the same event nesting. On r4,
+  source-order metadata committed nested parent `normal:283401542:-:0` as
+  partial with no attachment events, while all three writer-order passes found
+  its child under attachment zero after the active PST had reached 656 MiB.
+  Recursive metadata events cannot be sent to the single-active durable sink.
+  Acquiring and queueing the child before attachment-property decoding, then
+  emitting it only after the parent closes, preserves both readability and the
+  flat transactional catalog.
+  Evidence:
+  `.agent/test-results/1784533900-v045-direct-single-r4/stderr.log`, read-only
+  r4 ledger inspection, and focused clean-context reviews on 2026-07-20.
+
+- Observation: A libpff embedded `PffItem` can outlive the Rust attachment
+  wrapper enough to expose its header while later child attachment access
+  fails after that container is freed. Retaining the owning attachment beside
+  queued child work exposed 13 additional nested messages on the 19 GB source
+  and cleared the prior direct replay mismatch without retaining payload bytes.
+  The measured peak remained about 316 MiB, well below the 2 GiB acceptance
+  ceiling. The pending traversal already retained one child item per queued
+  embedded attachment; the container handle changes the constant factor, not
+  the existing source-controlled breadth.
+  Evidence: `.agent/test-results/1784536000-v045-direct-single-r6`, r5/r6
+  ledger comparison, and controlled `SIGTERM` at 19:07.
+
+- Observation: Exact per-message final-size projection became the dominant
+  cost in a large single direct PST. Each candidate caused the writer to plan
+  final folders, tables, and B-trees for all messages accepted so far, and the
+  real append repeated that projection. This is O(n²) CPU work even though
+  payload writing itself is sequential. During r6 one supervisor core remained
+  saturated while active-PST throughput decayed below 3 MiB/s on a host with
+  idle multi-GiB/s NVMe capacity. One whole-part projection followed by one
+  streaming write reduces this planning work to O(n) for the single-output
+  qualification without increasing payload retention or write amplification.
+  Evidence: `.agent/test-results/1784536000-v045-direct-single-r6`, process and
+  disk telemetry from that run, and the whole-part direct projection
+  regression.
+
+- Observation: A valid Unicode SIBLOCK cannot be made deeper to accommodate a
+  large table: MS-PST fixes `cLevel` at 1 and defines SIENTRY as a pointer to an
+  SLBLOCK. The 19 GB single-store projection instead exposed inefficient HNID
+  selection: small contents-table strings and identifiers were all stored as
+  subnodes even though each fits a normal HN heap allocation. Using documented
+  HIDs for those values preserves the same table cells while avoiding the
+  finite subnode namespace and reducing structural/message-size overhead.
+  Evidence: `.agent/test-results/1784538080-v045-direct-single-r7`, MS-PST
+  sections 2.2.2.8.3.3.2.1, 2.2.2.8.3.3.2.2, 2.3.1, and 2.3.4.4.2, plus the
+  173,600-small-value writer regression.
+
+- Observation: The 19 GB source's global `libpff_file_recover_items` call
+  fails after normal reachable traversal. Metadata recovery correctly retains
+  the complete reachable catalog and records that parser failure, but
+  writer-order replay formerly required a generic success frame after
+  streaming the same entire catalog. In r8 that mismatch discarded one
+  complete 19.53 GB unpublished PST and began writing it again. Durable-catalog
+  exhaustion is the scientific completion boundary for replay: accepting a
+  parser boundary before exhaustion would lose cataloged data, while requiring
+  libpff success after exhaustion adds no data and causes pure write
+  amplification.
+  Evidence: `.agent/test-results/1784539095-v045-direct-single-r8`, the r8
+  19,530,195,968-byte exact projection, and the direct parser-boundary
+  acceptance/rejection regression.
+
+- Observation: A completed-store validator must use the exact NAMEID catalog
+  used to write the store, not reconstruct it from successfully serialized
+  values. The durable source catalog intentionally retains identities whose
+  values are omitted as damaged or unsupported so every later named-property
+  ID remains stable. Reconstructing from output messages removes those
+  reserved identities and makes valid later properties appear absent or
+  mismatched. Qualification r10 isolated this at output message node
+  `0x0031AE44`; no invalid PST was published.
+  Evidence: `.agent/test-results/1784541051-v045-direct-single-r10` and
+  `transactional_validation_retains_unused_source_named_property_ids`.
+
+- Observation: A libpff record entry is not independently owned by its Rust
+  wrapper. Retaining the raw entry after freeing its record set caused a native
+  `memmove` crash at source candidate 24,966. Reopening the entry avoided the
+  invalid pointer but did not provide an independent cursor: a previously read
+  64 KiB prefix remained consumed in libpff's shared stream state, so the
+  34,342-byte remainder of a 99,878-byte property was absent. The safe,
+  single-read model is to retain the record-set owner with the original entry
+  until its remainder drains. Attachment handles are reacquired only because
+  libpff exposes an explicit attachment-data seek API.
+  Evidence: the r6 native core backtrace, isolated full-worker completion in
+  180 seconds after the ownership correction, focused document/OLE round
+  trips, and qualification r10.
+
+- Observation: One-pass direct construction can begin before the traversal has
+  discovered later empty folders. The initial part layout therefore had zero
+  reportable source folders even though the completed ledger contained 164
+  source folder records and the output retained 145 representable folders.
+  Using the initial count made the otherwise completed r9 part fail sidecar
+  integrity and correctly prevented publication. Publication accounting must
+  use the final observed folder set, while the writer continues to observe
+  late folders before finalization.
+  Evidence: r9 ledger counts, the sidecar integrity refusal, and r10's
+  atomically published 145-folder manifest.
+
+- Observation: A folder node derived from the sorted set of paths currently
+  known to a streaming writer is not stable. Adding a lexicographically earlier
+  path shifts every later index even though previously written message rows
+  retain their old parent node. In r10, final folder properties described the
+  correct source counts while the contents rows belonged to different folders;
+  shared empty-table selection then understated two BBT reference counts.
+  Append-stable first-observation node assignment fixes the causal ownership
+  error. A finalization-time row/plan equality check is required so any future
+  identity divergence blocks publication without relying on output rereads.
+  Evidence: human r10 ScanPST log, including folder count swaps, BBT entries 14
+  and 34, and orphan recovery; focused late-folder and injected-shift
+  regressions; qualification r11.
 
 - Observation: The 0.4.2 fidelity expansion regressed a cold 19 GB split from
   approximately ten minutes in 0.4.1 to more than 57 minutes without
@@ -3190,6 +3949,48 @@ not modified.
 
 ## Decision Log
 
+- Decision: Defer any PSTForge-maintained libpff fork until after 1.0. Keep
+  using replaceable dynamic linking to the system library for the 1.0 product.
+  Retain evidence of traversal classification variance, corrupt-tail behavior,
+  and native recovery limitations as the input to that later investigation.
+  Rationale: The accumulated evidence justifies focused upstream/native parser
+  work, but current containment and accounting satisfy the pre-1.0 recovery
+  contract. Forking the LGPL component now would expand correctness,
+  distribution-source, and maintenance scope without closing the remaining
+  application-level acceptance work.
+  Date/Author: 2026-07-20 / project owner.
+
+- Decision: Default direct output performs one supervised libpff traversal and
+  one destination construction. It buffers only one top-level message graph's
+  bounded metadata prefixes, commits parent metadata before embedded
+  descendants, then streams unread payload remainders from the retained native
+  handles. It does not retry a failed direct worker because reconstructing an
+  unpublished one-pass stream would require rereading source content. A worker
+  failure aborts the active ledger transaction, removes the unpublished PST,
+  preserves finalized parts, and returns a terminal partial result.
+  `--restartable` remains the deliberate choice for durable replay and retry.
+  Rationale: Direct mode exists to minimize source reads, SSD write
+  amplification, elapsed time, and retained state. Claiming transparent retry
+  while restarting traversal would contradict that contract and can duplicate
+  catalog occurrences. Bounded one-graph metadata is sufficient for canonical
+  translation and hard part selection without mailbox-scale RAM.
+  Date/Author: 2026-07-20 / project owner performance direction and Codex
+  implementation evidence.
+
+- Decision: Native deferred-property ownership follows libpff's actual
+  lifetime and cursor behavior. A record entry retains its record-set owner
+  and continues from the bounded prefix on the same handle. It is neither
+  reopened nor reread. Message items remain alive for the graph lifetime.
+  Attachment data may use a freshly acquired attachment handle only with an
+  explicit checked seek to the already captured prefix. Duplicate
+  `PR_ATTACH_DATA_BIN` property data is not read a second time when the same
+  bytes are available through the attachment stream.
+  Rationale: The 19 GB source supplied both a deterministic use-after-owner
+  crash and a shared-cursor counterexample to reopen-based continuation.
+  Retained RAII ownership is bounded to one top-level graph, preserves the
+  one-read direct contract, and matches the native API's proven semantics.
+  Date/Author: 2026-07-20 / qualification evidence and Codex.
+
 - Decision: Close 0.4.2 at the owner-approved focused data-correctness
   boundary and move the failed final 19 GB scale reconciliation to an immediate
   0.4.3 performance milestone. Do not represent the aborted run as passing.
@@ -3251,8 +4052,9 @@ not modified.
   Date/Author: 2026-07-19 / project owner and Codex; performance target
   clarified by the owner after final 0.4.4 qualification.
 
-- Decision: Version 0.4.5 makes low-write direct splitting the default and
-  keeps restartable persistence behind explicit `--restartable`.
+- Decision: Version 0.4.5 makes low-write direct writing the default for every
+  supported PST-output recovery policy and keeps restartable persistence
+  behind explicit `--restartable`.
   `--resume` and `--keep-work` require that flag. Direct mode keeps a compact
   metadata ledger and manifests for exact accounting and `report`, but never a
   recovered-payload pack. If interrupted, its published parts and reporting
@@ -3265,6 +4067,38 @@ not modified.
   the recovery option without charging every run. Compact accounting remains
   necessary for trust, privacy-safe reporting, and one-to-one reconciliation.
   Date/Author: 2026-07-19 / project owner direction and closeout review.
+
+- Decision: Use one exact whole-part projection when the requested part limit
+  can contain the source file; otherwise retain exact incremental split
+  projection until a separately qualified batched boundary algorithm replaces
+  it.
+  Rationale: A recovered PST cannot exceed the source-size limit check without
+  first failing this fast eligibility test, so the optimization cannot weaken
+  the requested hard maximum. The projection consumes only bounded catalog
+  metadata and writer allocation state, opens no payload streams, and writes
+  no PST blocks. Actual output still streams once to a same-filesystem
+  temporary, is compared with the projected final EOF, independently
+  validated, synced, and atomically published. This removes the measured O(n²)
+  planning defect for the immediate single-file acceptance while leaving the
+  already-qualified 4 GiB split boundary behavior unchanged.
+  Date/Author: 2026-07-20 / measured r6 evidence and Codex implementation.
+
+- Decision: For default-direct splitting, use exact private allocation as the
+  per-candidate admission signal and reserve the final `part_size / 16` for
+  exact finalized-size projection. This scales the exact region to every
+  supported limit rather than hard-coding a 4 GiB batch. Each admitted append
+  must reproduce its projected private EOF. Finalization remains an independent
+  exact calculation and refuses an over-limit multi-message part before atomic
+  publication if a pathological final-index ratio exceeds the boundary
+  reserve.
+  Rationale: The rejected 4 GiB r1 and r2 runs showed that rebuilding every
+  folder table and NBT/BBT plan for each candidate is quadratic CPU work even
+  when the second rebuild is removed. The measured finalization overhead for a
+  4 GiB part is about 32 MiB, while the proportional boundary is 256 MiB.
+  Candidate-private projection uses the writer's real block allocation without
+  reading payload data. The final exact refusal preserves the hard maximum
+  without making a heuristic authoritative.
+  Date/Author: 2026-07-20 / measured r1-r2 evidence and Codex implementation.
 
 - Decision: Reference attachment classification comes from the readable
   `PidTagAttachMethod` property, not libpff's narrower convenience type API.
@@ -4196,14 +5030,36 @@ not modified.
   Date/Author: 2026-07-19 / clean-context review followed by focused writer
   regression and independent completed-store evidence.
 
-- Decision: Make low-write non-restartable streaming the default `split`
-  mode. Add `--restartable` as the deliberate opt-in for durable payload
-  recovery; `--resume` resumes only such a job and `--keep-work` is invalid
-  otherwise. Direct mode still retains compact SQLite accounting, but no
+- Observation: Parser traversal order is not a durable message identity.
+  Metadata traversal may defer embedded messages while writer traversal emits
+  them recursively, so occurrence counts over a mixed traversal can bind a
+  corrupt duplicate to the wrong payload. Direct streaming now resolves a
+  child from its already-resolved durable parent plus attachment index and
+  source identity; only top-level duplicates use their stable catalog
+  occurrence.
+  Date/Author: 2026-07-20 / clean-context adversarial review and focused
+  duplicate-parent protocol regression.
+
+- Observation: `Read` errors from a worker pipe and I/O errors writing the
+  destination PST share the writer's public I/O error variant. Without a typed
+  inner marker, a mid-payload native crash bypasses parser retry while a broad
+  retry rule would incorrectly retry disk failures. Direct payload readers now
+  wrap only worker-stream I/O with a private typed marker; output I/O remains a
+  terminal output failure.
+  Date/Author: 2026-07-20 / clean-context adversarial review and injected OLE
+  payload abort.
+
+- Decision: Make low-write non-restartable streaming the default PST-output
+  execution mode for every supported recovery policy. Balanced and aggressive
+  select source-recovery breadth, not persistence. Add `--restartable` as the
+  deliberate opt-in for durable payload recovery; `--resume` resumes only such
+  a job and `--keep-work` is invalid otherwise. Direct mode still retains
+  compact SQLite accounting, but no
   payload pack. Deleting a spool after success does not
   reduce device writes and therefore is not an acceptable implementation of
   streaming mode. Both modes build each PST under a private name on the output
-  filesystem, `fsync` and independently validate it, and publish it with an
+  filesystem, complete it by documented construction, `fsync` it once, and
+  publish it with an
   atomic no-replace rename that never falls back to a cross-filesystem copy.
   Report the selected mode plus conservative estimated and measured temporary
   writes/disk use. Direct mode retains bounded per-candidate accounting,
@@ -4217,21 +5073,68 @@ not modified.
   affecting QLC endurance on 19 GB, 50 GB, and 83 GB recovery jobs. The owner
   requires that tradeoff to be explicit rather than the default.
   Date/Author: 2026-07-19 / human owner direction after measured 0.4.3
-  retained-job write amplification.
+  retained-job write amplification; clarified 2026-07-20 for every supported
+  recovery policy. The first scale acceptance is one direct PST from the 19 GB
+  source with exact 1:1 content accounting and clean ScanPST/Outlook results.
 
-- Decision: Hash the complete source once at invocation open, match that hash
-  before trusting resume state, and use held-descriptor/path identity including
-  Linux ctime for the completion recheck instead of rereading the entire source
-  for a second SHA-256.
+- Decision: Direct mode performs one source-content traversal and one
+  destination PST construction. It does not pre-hash source bytes, rehash
+  output bytes, reopen output to rebuild allocation maps, or invoke internal or
+  independent PST readers before publication. The writer must emit final NBT,
+  BBT, allocation maps, density list, header, and all client relationships
+  correctly as bytes land. It then performs one file `fsync`, an atomic
+  no-replace rename, and a directory `fsync`. Independent validation remains a
+  mandatory CI, adversarial-review, ScanPST, Outlook, and MailPlus acceptance
+  layer, not a production transformation stage. Restartable mode retains
+  source and payload SHA-256 because persisted state must be matched on a later
+  invocation.
+  Rationale: Runtime self-reading cannot make a structurally incorrect writer
+  trustworthy and multiplied the 19 GB job's reads and elapsed time. A direct
+  job has no resume state whose identity requires a content digest.
+  Date/Author: 2026-07-20 / human owner direction after the 19 GB r11 timing
+  analysis.
+
+- Decision: Hold the source through one read-only, no-follow descriptor and
+  request every applicable Linux read-side protection: a kernel read lease,
+  whole-file open-file-description record read lock, and shared file lock. A
+  process-scoped POSIX record lock is used only when OFD locking is unavailable.
+  A lease-break signal interrupts the supervised job. Unsupported lease
+  semantics are reported and fall back to the advisory protections; a
+  conflicting lock or existing writer is a refusal. Recheck descriptor/path
+  device, inode, size, mtime, and ctime before publication in all cases.
+  Rationale: A read lease prevents new write opens on supporting local
+  filesystems, while OFD/flock locks protect against cooperating software.
+  Linux cannot make advisory locks constrain an arbitrary writer, so unchanged
+  identity remains the final mixed-snapshot guard.
+  Date/Author: 2026-07-20 / human owner direction.
+
+- Decision: A direct full-payload worker failure receives at most three clean
+  parser attempts. Finalized parts and terminal candidate classifications are
+  drained on a later attempt; the unpublished active part is discarded and
+  rebuilt. If all attempts fail, preserve finalized output and compact ledger
+  state, emit a typed `failed-partial` report and recovery log, refuse resume,
+  and require a new empty output directory.
+  Rationale: Direct mode deliberately avoids mailbox-sized restart state, but
+  native parser faults must remain contained and observable. Replaying only
+  the current unpublished part gives bounded fault recovery without duplicating
+  published candidates or reintroducing payload-spool write amplification.
+  Date/Author: 2026-07-20 / clean-context adversarial review.
+
+- Decision: In restartable mode, hash the complete source once at invocation
+  open, match that hash before trusting resume state, and use
+  held-descriptor/path identity including Linux ctime for the completion
+  recheck instead of rereading the entire source for a second SHA-256. Direct
+  mode does not perform this pre-hash.
   Rationale: PSTForge never writes through the held read-only descriptor. Any
   filesystem-mediated content or metadata write changes ctime even when an
   actor restores the original size and mtime. Comparing device, inode, size,
   mtime, and ctime on both the held descriptor and pathname therefore detects
   an in-run source change without another 19/50/83 GB read. Full SHA-256 remains
-  mandatory before recovery and on every later invocation before a durable job
-  is trusted.
+  mandatory before restartable recovery and on every later invocation before a
+  durable job is trusted.
   Date/Author: 2026-07-19 / 0.4.3 measured resume optimization under the
-  repository's source-identity recheck contract.
+  repository's source-identity recheck contract; narrowed 2026-07-20 by human
+  owner direction to restartable execution.
 
 - Decision: On durable open, hash-verify payload blobs only when at least one
   `pending`, `spooled`, or `failed` candidate can still consume them. Continue
@@ -4435,12 +5338,22 @@ omissions correspond exactly to source `attachment_missing` events. The owner
 accepted the current automated reconciliation and prior ScanPST/Outlook
 evidence as completing the version.
 
-Version 0.4.5 next removes restartable persistence write amplification from the
-default workflow. Direct mode streams through bounded queues into one active
-same-filesystem PST temporary and atomically renames the validated file;
-`--restartable` deliberately selects the existing durable ledger and payload
-spool. This makes recoverability an operator choice and prevents a
-mailbox-sized private spool from being the default SSD cost.
+Version 0.4.5 now defaults every supported PST-output recovery policy to
+bounded one-traversal direct construction. Human ScanPST rejected
+qualification r10 because late folder discovery shifted folder nodes already
+referenced by streamed message rows. The corrected r11 assigns append-stable
+folder nodes and refuses final row/plan disagreement before publication. It
+wrote the current 19 GB source into one 19,533,751,296-byte PST in 6:55.18 at
+462,420 KiB peak RSS. It assigned all 37,413 currently readable candidates
+exactly once, left `payload.pack` at zero bytes, omitted no attachment or
+folder, published no digest, and retained the unchanged source identity plus
+one known contained libpff recovery-tail issue. Record entries retain their
+native record-set owners through deferred streaming and attachment
+continuations use checked native seek. The human owner reported a clean
+ScanPST result and successful Outlook use of r11. `--restartable` deliberately
+retains the existing durable ledger and payload spool; its performance
+optimization and the 4 GiB direct regression remain later 0.4.5 checkpoints
+after single-file acceptance.
 
 ## Context and Orientation
 

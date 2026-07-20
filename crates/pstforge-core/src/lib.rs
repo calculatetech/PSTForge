@@ -28,8 +28,8 @@ pub use packing::{
 pub use recovery::{RecoveryError, RecoveryReport, recover};
 pub use source::{SourceError, SourceFile, SourceIdentity, validate_output_relationship};
 pub use split::{
-    DiskPreflight, ExecutionMetrics, PartReport, SplitError, SplitFailureKind, SplitReport, split,
-    split_recovered_job,
+    DiskPreflight, ExecutionMetrics, PartReport, SplitError, SplitFailureKind, SplitOptions,
+    SplitReport, split, split_recovered_job,
 };
 pub use worker::{WorkerProtocolError, run_recovery_worker};
 pub(crate) use worker::{receive_worker_catalog_body_with_progress, receive_worker_hello};

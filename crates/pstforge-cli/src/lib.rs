@@ -73,6 +73,9 @@ pub enum Command {
         max_pst_size: u64,
         #[arg(long, value_enum, default_value_t = RecoveryModeArg::Balanced)]
         recovery: RecoveryModeArg,
+        /// Retain a durable payload spool so an interrupted job can resume.
+        #[arg(long)]
+        restartable: bool,
         #[arg(long)]
         resume: bool,
         #[arg(long)]
@@ -87,6 +90,10 @@ pub enum Command {
         skipped_units: String,
         #[arg(value_enum)]
         recovery: RecoveryModeArg,
+        #[arg(long, hide = true)]
+        metadata_only: bool,
+        #[arg(long, hide = true)]
+        writer_order: bool,
     },
     #[command(name = "__validator", hide = true)]
     Validator {
@@ -262,6 +269,7 @@ pub fn execute(cli: &Cli, output: &mut dyn Write) -> Result<CommandStatus, CliEr
             output: job_directory,
             max_pst_size,
             recovery,
+            restartable,
             resume,
             keep_work,
             json,
@@ -272,9 +280,12 @@ pub fn execute(cli: &Cli, output: &mut dyn Write) -> Result<CommandStatus, CliEr
                 job_directory,
                 &executable,
                 (*recovery).into(),
-                *max_pst_size,
-                *resume,
-                *keep_work,
+                pstforge_core::SplitOptions {
+                    maximum_pst_bytes: *max_pst_size,
+                    restartable: *restartable,
+                    resume: *resume,
+                    keep_work: *keep_work,
+                },
             )?;
             if *json {
                 write_json(output, &report)?;
@@ -294,6 +305,8 @@ pub fn execute(cli: &Cli, output: &mut dyn Write) -> Result<CommandStatus, CliEr
             expected_identity,
             skipped_units,
             recovery,
+            metadata_only,
+            writer_order,
         } => {
             let expected_identity = serde_json::from_str(expected_identity)?;
             let skipped_units = serde_json::from_str(skipped_units)?;
@@ -302,6 +315,8 @@ pub fn execute(cli: &Cli, output: &mut dyn Write) -> Result<CommandStatus, CliEr
                 &expected_identity,
                 &skipped_units,
                 (*recovery).into(),
+                *metadata_only,
+                *writer_order,
                 output,
             )?;
             Ok(CommandStatus::Complete)
@@ -381,7 +396,7 @@ fn write_info(output: &mut dyn Write, report: &InfoReport) -> Result<(), std::io
 fn write_verify(output: &mut dyn Write, report: &VerifyReport) -> Result<(), std::io::Error> {
     writeln!(output, "PSTForge verification")?;
     writeln!(output, "Source: {}", report.source.canonical_path)?;
-    writeln!(output, "SHA-256: {}", report.source.sha256)?;
+    write_source_hash(output, report.source.sha256.as_deref())?;
     writeln!(output, "Size: {} bytes", report.source.size_bytes)?;
     writeln!(output, "Format: {}", format_name(report.pst.format))?;
     writeln!(output, "Content type: {}", report.pst.content_type)?;
@@ -448,7 +463,7 @@ fn write_verify(output: &mut dyn Write, report: &VerifyReport) -> Result<(), std
 fn write_recovery(output: &mut dyn Write, report: &RecoveryReport) -> Result<(), std::io::Error> {
     writeln!(output, "PSTForge recovery")?;
     writeln!(output, "Source: {}", report.source.canonical_path)?;
-    writeln!(output, "SHA-256: {}", report.source.sha256)?;
+    write_source_hash(output, report.source.sha256.as_deref())?;
     writeln!(output, "Job: {}", report.job_directory)?;
     writeln!(output, "Mode: {}", report.mode)?;
     writeln!(output, "Normal items: {}", report.normal_items)?;
@@ -499,13 +514,14 @@ fn write_recovery(output: &mut dyn Write, report: &RecoveryReport) -> Result<(),
 fn write_split(output: &mut dyn Write, report: &SplitReport) -> Result<(), std::io::Error> {
     writeln!(output, "PSTForge split")?;
     writeln!(output, "Source: {}", report.recovery.source.canonical_path)?;
-    writeln!(output, "SHA-256: {}", report.recovery.source.sha256)?;
+    write_source_hash(output, report.recovery.source.sha256.as_deref())?;
     writeln!(output, "Job: {}", report.recovery.job_directory)?;
     writeln!(
         output,
         "Maximum part size: {} bytes",
         report.maximum_pst_bytes
     )?;
+    writeln!(output, "Execution mode: {}", report.execution_mode)?;
     writeln!(output, "Resumed: {}", yes_no(report.resumed))?;
     writeln!(output, "Keep private work: {}", yes_no(report.keep_work))?;
     writeln!(
@@ -524,10 +540,48 @@ fn write_split(output: &mut dyn Write, report: &SplitReport) -> Result<(), std::
     writeln!(output, "Output bytes: {}", report.metrics.output_bytes)?;
     writeln!(
         output,
+        "Payload pack: {} bytes written, {} bytes peak",
+        report.metrics.payload_pack_bytes_written, report.metrics.peak_payload_pack_bytes
+    )?;
+    writeln!(
+        output,
+        "Active PST bytes written: {}",
+        report.metrics.active_pst_bytes_written
+    )?;
+    writeln!(
+        output,
+        "Finalized output bytes: {}",
+        report.metrics.finalized_output_bytes
+    )?;
+    writeln!(
+        output,
+        "Validator input bytes: {}",
+        report.metrics.validator_input_bytes
+    )?;
+    writeln!(
+        output,
+        "Peak payload plus active PST bytes: {}",
+        report.metrics.peak_payload_and_active_pst_bytes
+    )?;
+    write_optional_metric(
+        output,
+        "Supervisor filesystem read bytes",
+        report.metrics.supervisor_filesystem_read_bytes,
+    )?;
+    write_optional_metric(
+        output,
+        "Supervisor filesystem write bytes",
+        report.metrics.supervisor_filesystem_write_bytes,
+    )?;
+    writeln!(
+        output,
         "Peak process RSS: {} bytes",
         report.metrics.peak_process_rss_bytes
     )?;
     writeln!(output, "Written candidates: {}", report.written_candidates)?;
+    if let Some(category) = report.terminal_failure {
+        writeln!(output, "Terminal failure: {category}")?;
+    }
     writeln!(output, "Parts: {}", report.parts.len())?;
     for part in &report.parts {
         writeln!(
@@ -535,7 +589,7 @@ fn write_split(output: &mut dyn Write, report: &SplitReport) -> Result<(), std::
             "  {}: {} bytes, SHA-256 {}, messages {}, folders {}, oversize {}, partial {}",
             part.filename,
             part.byte_len,
-            part.sha256,
+            part.sha256.as_deref().unwrap_or("not calculated"),
             part.message_count,
             part.folder_count,
             yes_no(part.oversize),
@@ -548,6 +602,17 @@ fn write_split(output: &mut dyn Write, report: &SplitReport) -> Result<(), std::
         yes_no(report.recovery.source_unchanged)
     )?;
     Ok(())
+}
+
+fn write_optional_metric(
+    output: &mut dyn Write,
+    name: &str,
+    value: Option<u64>,
+) -> Result<(), std::io::Error> {
+    match value {
+        Some(value) => writeln!(output, "{name}: {value}"),
+        None => writeln!(output, "{name}: unavailable"),
+    }
 }
 
 fn parse_byte_size(value: &str) -> Result<u64, String> {
@@ -584,7 +649,7 @@ fn parse_byte_size(value: &str) -> Result<u64, String> {
 
 fn write_common(output: &mut dyn Write, report: &InfoReport) -> Result<(), std::io::Error> {
     writeln!(output, "Source: {}", report.source.canonical_path)?;
-    writeln!(output, "SHA-256: {}", report.source.sha256)?;
+    write_source_hash(output, report.source.sha256.as_deref())?;
     writeln!(output, "Size: {} bytes", report.source.size_bytes)?;
     writeln!(output, "Modified: {}", report.source.modified_at)?;
     writeln!(output, "Content type: {}", report.pst.content_type)?;
@@ -610,6 +675,13 @@ fn write_common(output: &mut dyn Write, report: &InfoReport) -> Result<(), std::
         yes_no(report.source_unchanged)
     )?;
     Ok(())
+}
+
+fn write_source_hash(output: &mut dyn Write, sha256: Option<&str>) -> Result<(), std::io::Error> {
+    match sha256 {
+        Some(value) => writeln!(output, "SHA-256: {value}"),
+        None => writeln!(output, "SHA-256: not calculated (direct mode)"),
+    }
 }
 
 fn format_name(format: FileFormat) -> &'static str {
@@ -732,6 +804,7 @@ mod tests {
             Command::Split {
                 max_pst_size: 4_294_967_296,
                 recovery: RecoveryModeArg::Balanced,
+                restartable: false,
                 ..
             }
         ));
@@ -745,12 +818,14 @@ mod tests {
             "mail.pst",
             "--output",
             "job",
+            "--restartable",
             "--resume",
             "--keep-work",
         ])?;
         assert!(matches!(
             resume.command,
             Command::Split {
+                restartable: true,
                 resume: true,
                 keep_work: true,
                 ..
