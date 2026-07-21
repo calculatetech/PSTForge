@@ -712,10 +712,10 @@ impl DirectWorkerProcess {
             WatchdogOutcome::Interrupted => return Err(RecoveryError::Interrupted),
             WatchdogOutcome::Stopped => {}
         }
-        if let Some(status) = status
-            && !status.success()
-        {
-            return Err(RecoveryError::WorkerExit { status });
+        if let Some(status) = status {
+            if !status.success() {
+                return Err(RecoveryError::WorkerExit { status });
+            }
         }
         Ok(())
     }
