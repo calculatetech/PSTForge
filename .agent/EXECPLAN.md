@@ -3428,7 +3428,7 @@ not modified.
     metadata, version execution, dynamic `libpff.so.1` without RPATH/RUNPATH,
     lintian with error failure, and isolated `dpkg` install/removal that leaves
     an operator-job sentinel intact. On Ubuntu 26.04 the package SHA-256 is
-    `95a1608b2aee54988c261276cc9206ebbec6a7798406d0ebc5045e140b34f769` and
+    `770405a66dce211ddaf83d7aefaf47d67d2929cb15ee76837a87ea8c9bcdf1c4` and
     its generated dependencies are `libc6 (>= 2.39), libgcc-s1 (>= 4.2),
     libpff1t64 (>= 20180714)`. The checkpoint passes the fast gate at
     `.agent/test-results/1784594750-fast`. Adversarial review found that the
@@ -3448,7 +3448,7 @@ not modified.
     accuracy. The final bundle covers 89 executable dependencies and lintian
     remains clean. The licensing-remediated checkpoint passes the fast gate at
     `.agent/test-results/1784595555-fast`.
-  - [ ] Checkpoint 4: replace the stale README with current features,
+  - [x] Checkpoint 4: replace the stale README with current features,
     limitations, basic usage, source compilation, Ubuntu development packages,
     Debian installation/removal, exit statuses, privacy, recovery modes, and
     restartability tradeoffs. Run the fast/full/release gates on Ubuntu 26.04
@@ -3456,6 +3456,34 @@ not modified.
     environment. Record any host package prerequisite by its verified Ubuntu
     package name. No MailPlus or Outlook check is required unless this milestone
     changes PST writer behavior.
+    README now covers supported data classes, direct/restartable behavior,
+    hard limitations, safe output handling, basic commands, output layout,
+    exit statuses, privacy, external-corpus testing, verified Ubuntu 26.04
+    build/development packages, source compilation, and Debian package
+    installation/removal. Focused review corrected the private manifest path
+    and restored documented usage status 2 in both README and manpage. The fast
+    documentation gate passes at `.agent/test-results/1784595852-fast`.
+    The first release attempt exposed stale canonical-manifest paths for five
+    focused fixtures intentionally removed after acceptance and a determinism
+    assertion that compared run-specific published inode/device fields. Full
+    gates now regenerate six documented writer fixtures only in a
+    temporary directory, update a temporary structured manifest, fail closed
+    for any other missing case, and include a deterministic five-object OLE
+    source matching the removed human fixture's structural contract. Cross-run
+    comparison omits only published filesystem
+    identity while each persisted sidecar still must match its real artifact.
+    The canonical release gate then passed all external tests, `pffinfo`,
+    `readpst`, licenses, advisories, writer acceptance, docs, and the locked
+    release build at `.agent/test-results/1784596839-release`. Adversarial
+    review rejected an intermediate design that skipped the missing human OLE
+    case; the six-fixture generator closes that gap without repopulating the
+    acceptance archive. The final
+    reproducible package has SHA-256
+    `770405a66dce211ddaf83d7aefaf47d67d2929cb15ee76837a87ea8c9bcdf1c4`.
+    In an ephemeral bubblewrap tmpfs, the packaged binary loaded with signed
+    Debian 13 (trixie) `libc6`, `libgcc-s1`, `libpff1t64`, `libbfio1`, and zlib,
+    reported version 0.5.0, and completed `info --json` against the external
+    healthy Unicode PST. The temporary compatibility root disappeared on exit.
 - [ ] Milestone 0.5.1: GitHub CI and Private-Corpus Automation; the remote is
   reachable, and work begins after the approved baseline is pushed.
 - [ ] Milestone 0.6.0: Interoperability Release Candidate.

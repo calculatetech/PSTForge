@@ -3996,11 +3996,14 @@ fn milestone_0_4_real_pst_splits_deterministically_without_mutation()
                 {
                     return Err(format!("{} part sidecar mismatch", case.name).into());
                 }
+                let mut deterministic_sidecar = sidecar;
+                deterministic_sidecar.published_device = None;
+                deterministic_sidecar.published_inode = None;
                 identities.push((
                     filename.to_owned(),
                     sha256.to_owned(),
                     byte_len,
-                    sidecar_bytes,
+                    serde_json::to_vec(&deterministic_sidecar)?,
                 ));
             }
             if reconstructions.is_empty() {

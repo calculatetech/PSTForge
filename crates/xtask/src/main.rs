@@ -11,17 +11,17 @@ use std::process::{Command, ExitCode, Output};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use base64::Engine;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct CorpusManifest {
     schema_version: u32,
     cases: Vec<CorpusCase>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct CorpusCase {
     name: String,
@@ -108,6 +108,12 @@ struct CargoDependencyKind {
 struct Gate {
     root: PathBuf,
     evidence: PathBuf,
+}
+
+struct PreparedCorpus {
+    manifest: CorpusManifest,
+    manifest_path: PathBuf,
+    _scratch: tempfile::TempDir,
 }
 
 #[derive(Default)]
@@ -2135,6 +2141,79 @@ fn qualify_ole_attachments(root: &Path, output: &Path) -> Result<(), String> {
     publish_fidelity_qualification(root, output, &fixture, 1)
 }
 
+fn qualify_outlook_ole_objects(root: &Path, output: &Path) -> Result<(), String> {
+    use std::io::{Cursor, Write as _};
+
+    use pstforge_pst::writer::{
+        AttachmentContent, AttachmentSpec, FidelityStore, FileBlobSpec, OleAttachmentSpec,
+        OleDataKind, RawProperty, RawPropertyValue,
+    };
+
+    let parent = output
+        .parent()
+        .filter(|path| path.is_dir())
+        .ok_or_else(|| "qualification output parent must already exist".to_owned())?;
+    let payloads = tempfile::tempdir_in(parent)
+        .map_err(|error| format!("cannot create Outlook OLE staging directory: {error}"))?;
+    let mut compound =
+        cfb::CompoundFile::create_with_version(cfb::Version::V3, Cursor::new(Vec::new()))
+            .map_err(|error| format!("cannot create Outlook OLE compound file: {error}"))?;
+    compound
+        .create_storage("/PSTForge")
+        .map_err(|error| format!("cannot create Outlook OLE storage: {error}"))?;
+    compound
+        .create_stream("/PSTForge/Contents")
+        .and_then(|mut stream| stream.write_all(b"PSTForge Outlook OLE object checkpoint"))
+        .map_err(|error| format!("cannot create Outlook OLE content stream: {error}"))?;
+    let payload = compound.into_inner().into_inner();
+    cfb::CompoundFile::open_strict(Cursor::new(payload.clone()))
+        .map_err(|error| format!("generated Outlook OLE fixture is invalid: {error}"))?;
+
+    let mut fixture = FidelityStore {
+        store_name: "PSTForge Outlook OLE source".to_owned(),
+        folder_name: "OLE Objects".to_owned(),
+        ..FidelityStore::default()
+    };
+    fixture.message.subject = "Outlook OLE object fidelity checkpoint".to_owned();
+    fixture.message.attachments.clear();
+    for index in 0_u8..5 {
+        let path = payloads.path().join(format!("object-{index}.bin"));
+        fs::write(&path, &payload)
+            .map_err(|error| format!("cannot write Outlook OLE payload: {error}"))?;
+        fixture.message.attachments.push(AttachmentSpec {
+            filename: format!("object-{index}.bin"),
+            mime_type: None,
+            content_id: None,
+            content_location: None,
+            rendering_position: Some(-1),
+            flags: 0,
+            raw_properties: vec![
+                RawProperty {
+                    id: 0x3702,
+                    value: RawPropertyValue::Binary(vec![0x01, index]),
+                },
+                RawProperty {
+                    id: 0x370A,
+                    value: RawPropertyValue::Binary(vec![0x2A, 0x86, 0x48, index]),
+                },
+            ],
+            spooled_properties: Vec::new(),
+            direct_properties: Vec::new(),
+            content: AttachmentContent::Ole(OleAttachmentSpec {
+                data: FileBlobSpec {
+                    path,
+                    offset: 0,
+                    byte_len: u64::try_from(payload.len())
+                        .map_err(|_| "Outlook OLE payload length is out of range".to_owned())?,
+                    sha256: Sha256::digest(&payload).into(),
+                },
+                data_kind: OleDataKind::Object,
+            }),
+        });
+    }
+    publish_fidelity_qualification(root, output, &fixture, 1)
+}
+
 fn qualify_calendar_exceptions(root: &Path, output: &Path) -> Result<(), String> {
     use pstforge_pst::writer::{
         AttachmentContent, AttachmentSpec, FidelityStore, MailFolderRole, MailFolderSpec,
@@ -2428,7 +2507,8 @@ impl Gate {
                 .to_owned()
         })?;
         let manifest = self.load_manifest(Path::new(&manifest_path))?;
-        self.command(
+        let prepared = self.prepare_full_corpus(manifest)?;
+        self.command_with_env(
             "external-corpus",
             "cargo",
             &[
@@ -2443,8 +2523,10 @@ impl Gate {
                 "--ignored",
                 "--nocapture",
             ],
+            "PSTFORGE_CORPUS_MANIFEST",
+            prepared.manifest_path.as_os_str(),
         )?;
-        self.run_independent_readers(&manifest)?;
+        self.run_independent_readers(&prepared.manifest)?;
         println!("full gate passed; evidence: {}", self.evidence.display());
         Ok(())
     }
@@ -2467,6 +2549,35 @@ impl Gate {
         print!("{name} ... ");
         let output = Command::new(program)
             .args(args)
+            .current_dir(&self.root)
+            .output()
+            .map_err(|error| format!("cannot run {program}: {error}"))?;
+        self.record(name, program, args, &output)?;
+        if output.status.success() {
+            println!("ok");
+            Ok(())
+        } else {
+            println!("FAILED");
+            Err(format!(
+                "{name} failed with {}; see {}",
+                output.status,
+                self.evidence.join(format!("{name}.log")).display()
+            ))
+        }
+    }
+
+    fn command_with_env(
+        &self,
+        name: &str,
+        program: &str,
+        args: &[&str],
+        key: &str,
+        value: &OsStr,
+    ) -> Result<(), String> {
+        print!("{name} ... ");
+        let output = Command::new(program)
+            .args(args)
+            .env(key, value)
             .current_dir(&self.root)
             .output()
             .map_err(|error| format!("cannot run {program}: {error}"))?;
@@ -2792,6 +2903,66 @@ impl Gate {
             );
         }
         Ok(())
+    }
+
+    fn prepare_full_corpus(&self, mut manifest: CorpusManifest) -> Result<PreparedCorpus, String> {
+        type Generator = fn(&Path, &Path) -> Result<(), String>;
+        let generators: [(&str, Generator); 6] = [
+            (
+                "v042-calendar-exception-source",
+                qualify_calendar_exceptions,
+            ),
+            ("v042-distribution-list-source", qualify_distribution_list),
+            ("v042-document-source", qualify_document_object),
+            ("v042-ole-attachments-source", qualify_ole_attachments),
+            (
+                "v042-outlook-ole-object-source",
+                qualify_outlook_ole_objects,
+            ),
+            (
+                "v042-reference-attachments-source",
+                qualify_reference_attachments,
+            ),
+        ];
+        let scratch = tempfile::tempdir()
+            .map_err(|error| format!("cannot create generated corpus scratch: {error}"))?;
+        for case in &mut manifest.cases {
+            if case.path.is_file() {
+                continue;
+            }
+            let Some((_, generator)) = generators.iter().find(|(name, _)| *name == case.name)
+            else {
+                return Err(format!(
+                    "corpus case {} is missing and has no deterministic generator: {}",
+                    case.name,
+                    case.path.display()
+                ));
+            };
+            let output = scratch.path().join(&case.name);
+            generator(&self.root, &output)?;
+            let generated = output.join("parts/part-0001.pst");
+            let identity = pstforge_core::SourceFile::open(&generated)
+                .map_err(|error| format!("cannot inspect generated {}: {error}", case.name))?
+                .identity()
+                .clone();
+            case.path = generated;
+            case.sha256 = identity
+                .sha256
+                .ok_or_else(|| format!("generated {} has no SHA-256", case.name))?;
+        }
+        self.validate_manifest(&manifest)?;
+        let manifest_path = scratch.path().join("full-manifest.toml");
+        fs::write(
+            &manifest_path,
+            toml::to_string(&manifest)
+                .map_err(|error| format!("cannot encode prepared corpus manifest: {error}"))?,
+        )
+        .map_err(|error| format!("cannot write prepared corpus manifest: {error}"))?;
+        Ok(PreparedCorpus {
+            manifest,
+            manifest_path,
+            _scratch: scratch,
+        })
     }
 
     fn run_independent_readers(&self, manifest: &CorpusManifest) -> Result<(), String> {
