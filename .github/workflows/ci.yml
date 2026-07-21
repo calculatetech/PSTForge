@@ -48,9 +48,9 @@ jobs:
         run: cargo audit --deny warnings
       - name: Run public CI gate
         run: cargo xtask gate ci
-      - name: Show bounded public test failure
+      - name: Show bounded public gate failure
         if: failure()
-        run: find .agent/test-results -name tests.log -exec tail --lines=250 {} \;
+        run: find .agent/test-results \( -name tests.log -o -name diff-check.log \) -exec tail --lines=250 {} \;
 
   debian:
     name: Debian 13 package
@@ -75,8 +75,8 @@ jobs:
           components: rustfmt, clippy
       - name: Run public CI gate
         run: cargo xtask gate ci
-      - name: Show bounded public test failure
+      - name: Show bounded public gate failure
         if: failure()
-        run: find .agent/test-results -name tests.log -exec tail --lines=250 {} \;
+        run: find .agent/test-results \( -name tests.log -o -name diff-check.log \) -exec tail --lines=250 {} \;
       - name: Build and validate Debian package
         run: cargo xtask package deb

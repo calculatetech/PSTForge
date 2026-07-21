@@ -2524,7 +2524,12 @@ impl Gate {
         )?;
         self.documentation()?;
         self.validate_documents_and_schemas()?;
-        self.command("diff-check", "git", &["diff", "--check"])?;
+        let safe_directory = format!("safe.directory={}", self.root.display());
+        self.command(
+            "diff-check",
+            "git",
+            &["-c", &safe_directory, "diff", "--check"],
+        )?;
         println!("fast gate passed; evidence: {}", self.evidence.display());
         Ok(())
     }
@@ -2833,7 +2838,7 @@ impl Gate {
             "actionlint_1.7.12_linux_amd64.tar.gz",
             "8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8",
             "./actionlint -color",
-            "find .agent/test-results -name tests.log -exec tail --lines=250",
+            "find .agent/test-results \\( -name tests.log -o -name diff-check.log \\) -exec tail --lines=250",
         ] {
             if !ci.contains(required) {
                 return Err(format!(
