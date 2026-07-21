@@ -310,10 +310,8 @@ fn run() -> Result<(), String> {
         let format = arguments
             .next()
             .ok_or_else(|| "missing package format: deb".to_owned())?;
-        if format != OsStr::new("deb") || arguments.next().is_some() {
-            return Err("usage: cargo xtask package deb".to_owned());
-        }
-        return package_deb(&root);
+        let validate = package_validation_option(format.as_os_str(), arguments)?;
+        return package_deb(&root, validate);
     }
     if command == std::ffi::OsStr::new("qualify") {
         let checkpoint = arguments
@@ -376,23 +374,40 @@ fn run() -> Result<(), String> {
 }
 
 fn usage() -> String {
-    "usage: cargo xtask gate <fast|ci|full|release> | package deb | qualify <embedded-attachments|named-properties|empty-folders|contacts|appointments|meetings|pim-items|distribution-list|document-object|ole-attachments|reference-attachments|calendar-exceptions|associated-data> <output>"
+    "usage: cargo xtask gate <fast|ci|full|release> | package deb [--validate] | qualify <embedded-attachments|named-properties|empty-folders|contacts|appointments|meetings|pim-items|distribution-list|document-object|ole-attachments|reference-attachments|calendar-exceptions|associated-data> <output>"
         .to_owned()
 }
 
-fn package_deb(root: &Path) -> Result<(), String> {
+fn package_validation_option(
+    format: &OsStr,
+    mut arguments: impl Iterator<Item = OsString>,
+) -> Result<bool, String> {
+    let option = arguments.next();
+    let known_option = option
+        .as_deref()
+        .is_none_or(|value| value == OsStr::new("--validate"));
+    if format != OsStr::new("deb") || !known_option || arguments.next().is_some() {
+        return Err("usage: cargo xtask package deb [--validate]".to_owned());
+    }
+    Ok(option.is_some())
+}
+
+fn package_deb(root: &Path, validate: bool) -> Result<(), String> {
     for program in [
         "dpkg",
         "dpkg-deb",
         "dpkg-shlibdeps",
         "find",
         "gzip",
-        "lintian",
-        "readelf",
         "strip",
         "touch",
     ] {
         require_program(program)?;
+    }
+    if validate {
+        for program in ["lintian", "readelf"] {
+            require_program(program)?;
+        }
     }
     let architecture = command_stdout(root, "dpkg", &["--print-architecture"])?;
     if architecture.trim() != "amd64" {
@@ -407,52 +422,58 @@ fn package_deb(root: &Path) -> Result<(), String> {
     prepare_generated_directory(root, &package_root)?;
     fs::create_dir_all(&package_root)
         .map_err(|error| format!("cannot create {}: {error}", package_root.display()))?;
-    let first_target = package_root.join("build-one");
-    let second_target = package_root.join("build-two");
-    build_release_binary(root, &first_target, &epoch)?;
-    build_release_binary(root, &second_target, &epoch)?;
-    let first_binary = first_target.join("release/pstforge");
-    let second_binary = second_target.join("release/pstforge");
-    let dependencies = debian_runtime_dependencies(&package_root, &first_binary)?;
+    let build_target = package_root.join("build");
+    build_release_binary(root, &build_target, &epoch)?;
+    let binary = build_target.join("release/pstforge");
+    let dependencies = debian_runtime_dependencies(&package_root, &binary)?;
     let rust_licenses = rust_dependency_licenses(root)?;
-    let first = package_root.join(format!("pstforge_{version}_amd64.first.deb"));
-    let second = package_root.join(format!("pstforge_{version}_amd64.second.deb"));
+    let candidate = package_root.join(format!(".pstforge_{version}_amd64.candidate.deb"));
     build_deb_archive(
         root,
-        &first_binary,
+        &binary,
         &dependencies,
         &rust_licenses,
         &epoch,
-        "one",
-        &first,
+        "package",
+        &candidate,
     )?;
-    build_deb_archive(
-        root,
-        &second_binary,
-        &dependencies,
-        &rust_licenses,
-        &epoch,
-        "two",
-        &second,
-    )?;
-    let first_bytes =
-        fs::read(&first).map_err(|error| format!("cannot read {}: {error}", first.display()))?;
-    if first_bytes
-        != fs::read(&second)
-            .map_err(|error| format!("cannot read {}: {error}", second.display()))?
-    {
-        return Err("two Debian package builds were not byte-for-byte reproducible".to_owned());
+
+    if validate {
+        let validation_target = package_root.join("validation-build");
+        build_release_binary(root, &validation_target, &epoch)?;
+        let validation_binary = validation_target.join("release/pstforge");
+        let validation_package =
+            package_root.join(format!(".pstforge_{version}_amd64.validation.deb"));
+        build_deb_archive(
+            root,
+            &validation_binary,
+            &dependencies,
+            &rust_licenses,
+            &epoch,
+            "validation",
+            &validation_package,
+        )?;
+        if fs::read(&candidate)
+            .map_err(|error| format!("cannot read {}: {error}", candidate.display()))?
+            != fs::read(&validation_package)
+                .map_err(|error| format!("cannot read {}: {error}", validation_package.display()))?
+        {
+            return Err("two Debian package builds were not byte-for-byte reproducible".to_owned());
+        }
+        validate_deb_package(root, &package_root, &candidate, version, &dependencies)?;
+        fs::remove_file(&validation_package)
+            .map_err(|error| format!("cannot remove {}: {error}", validation_package.display()))?;
     }
-    validate_deb_package(root, &package_root, &first, version, &dependencies)?;
+
+    let package_bytes = fs::read(&candidate)
+        .map_err(|error| format!("cannot read {}: {error}", candidate.display()))?;
     let package = package_root.join(format!("pstforge_{version}_amd64.deb"));
-    fs::rename(&first, &package)
+    fs::rename(&candidate, &package)
         .map_err(|error| format!("cannot publish {}: {error}", package.display()))?;
-    fs::remove_file(&second)
-        .map_err(|error| format!("cannot remove {}: {error}", second.display()))?;
     println!(
         "Debian package: {}\nsha256: {:x}\ndepends: {}",
         package.display(),
-        Sha256::digest(&first_bytes),
+        Sha256::digest(&package_bytes),
         dependencies
     );
     Ok(())
@@ -2586,7 +2607,7 @@ impl Gate {
             "cargo",
             &["build", "--workspace", "--release", "--locked"],
         )?;
-        package_deb(&self.root)?;
+        package_deb(&self.root, true)?;
         println!(
             "release gate foundation passed; evidence: {}",
             self.evidence.display()
@@ -2705,10 +2726,8 @@ impl Gate {
             "docs/debian-changelog",
             "docs/debian-copyright",
             "docs/pstforge.1",
-            ".github/actionlint.yaml",
             ".github/workflows/ci.yml",
             ".github/workflows/fuzz.yml",
-            ".github/workflows/private-corpus.yml",
             ".github/workflows/release-build.yml",
             ".github/workflows/security.yml",
             "fuzz/Cargo.lock",
@@ -2773,22 +2792,18 @@ impl Gate {
     }
 
     fn validate_github_workflows(&self) -> Result<(), String> {
-        const WORKFLOWS: [&str; 5] = [
-            "ci.yml",
-            "fuzz.yml",
-            "private-corpus.yml",
-            "release-build.yml",
-            "security.yml",
-        ];
+        const WORKFLOWS: [&str; 4] = ["ci.yml", "fuzz.yml", "release-build.yml", "security.yml"];
         for filename in WORKFLOWS {
             let path = self.root.join(".github/workflows").join(filename);
             let text = fs::read_to_string(&path)
                 .map_err(|error| format!("cannot read {}: {error}", path.display()))?;
             serde_yaml_ng::from_str::<serde_yaml_ng::Value>(&text)
                 .map_err(|error| format!("{} is not valid YAML: {error}", path.display()))?;
-            if text.contains("pull_request:") || !text.contains("permissions:\n  contents: read") {
+            if (filename != "ci.yml" && text.contains("pull_request:"))
+                || !text.contains("permissions:\n  contents: read")
+            {
                 return Err(format!(
-                    "{filename} must be push/manual/scheduled automation with read-only contents permission"
+                    "{filename} has an unexpected trigger or lacks read-only contents permission"
                 ));
             }
             for line in text.lines().map(str::trim) {
@@ -2805,37 +2820,10 @@ impl Gate {
                 }
             }
         }
-        let private = fs::read_to_string(self.root.join(".github/workflows/private-corpus.yml"))
-            .map_err(|error| format!("cannot read private corpus workflow: {error}"))?;
-        for forbidden in ["upload-artifact", "actions/cache", "pull_request"] {
-            if private.contains(forbidden) {
-                return Err(format!(
-                    "private corpus workflow contains forbidden upload/trigger token {forbidden}"
-                ));
-            }
-        }
-        for required in [
-            "pstforge-private-corpus",
-            "if: github.ref == 'refs/heads/main'",
-            "secrets.PSTFORGE_CORPUS_MANIFEST",
-            "> .agent/test-results/github-private-console.log 2>&1",
-            "PSTs, job state, reader output, and detailed logs were not uploaded.",
-        ] {
-            if !private.contains(required) {
-                return Err(format!(
-                    "private corpus workflow is missing privacy requirement {required}"
-                ));
-            }
-        }
         let fuzz = fs::read_to_string(self.root.join(".github/workflows/fuzz.yml"))
             .map_err(|error| format!("cannot read fuzz workflow: {error}"))?;
         if !fuzz.contains("cargo install cargo-fuzz --version 0.13.2 --locked") {
             return Err("fuzz workflow must install the reviewed cargo-fuzz version".to_owned());
-        }
-        let actionlint = fs::read_to_string(self.root.join(".github/actionlint.yaml"))
-            .map_err(|error| format!("cannot read actionlint configuration: {error}"))?;
-        if !actionlint.contains("pstforge-private-corpus") {
-            return Err("actionlint configuration is missing the private runner label".to_owned());
         }
         let ci = fs::read_to_string(self.root.join(".github/workflows/ci.yml"))
             .map_err(|error| format!("cannot read CI workflow: {error}"))?;
@@ -2844,6 +2832,8 @@ impl Gate {
             "8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8",
             "./actionlint -color",
             "find .agent/test-results \\( -name tests.log -o -name diff-check.log \\) -exec tail --lines=250",
+            "pull_request:",
+            "      - main",
         ] {
             if !ci.contains(required) {
                 return Err(format!(
@@ -2868,6 +2858,17 @@ impl Gate {
             "CI Ubuntu job",
             ubuntu_steps.steps.as_slice(),
             "cargo audit --deny warnings",
+            None,
+        )?;
+        let debian_steps = ci_workflow
+            .jobs
+            .get("debian")
+            .ok_or_else(|| "CI workflow is missing the Debian package job".to_owned())?;
+        require_unmodified_workflow_execution("CI Debian job", &ci_workflow, debian_steps)?;
+        require_workflow_command(
+            "CI Debian job",
+            debian_steps.steps.as_slice(),
+            "cargo xtask package deb --validate",
             None,
         )?;
         let security = fs::read_to_string(self.root.join(".github/workflows/security.yml"))
@@ -2916,6 +2917,23 @@ impl Gate {
                 ));
             }
         }
+        let release_workflow: GithubWorkflow = serde_yaml_ng::from_str(&release)
+            .map_err(|error| format!("release workflow cannot be inspected: {error}"))?;
+        let package_steps = release_workflow
+            .jobs
+            .get("package")
+            .ok_or_else(|| "release workflow is missing the package job".to_owned())?;
+        require_unmodified_workflow_execution(
+            "release package job",
+            &release_workflow,
+            package_steps,
+        )?;
+        require_workflow_command(
+            "release package job",
+            package_steps.steps.as_slice(),
+            "cargo xtask package deb --validate",
+            None,
+        )?;
         Ok(())
     }
 
@@ -3500,9 +3518,41 @@ mod tests {
     use std::os::unix::fs::symlink;
 
     use super::{
-        GithubWorkflow, document_checkpoint_payload, prepare_generated_directory,
-        require_workflow_command, rust_dependency_licenses,
+        GithubWorkflow, document_checkpoint_payload, package_validation_option,
+        prepare_generated_directory, require_workflow_command, rust_dependency_licenses,
     };
+
+    #[test]
+    fn package_validation_is_explicit_and_rejects_unknown_arguments() {
+        assert!(
+            !package_validation_option(std::ffi::OsStr::new("deb"), std::iter::empty()).unwrap()
+        );
+        assert!(
+            package_validation_option(
+                std::ffi::OsStr::new("deb"),
+                [std::ffi::OsString::from("--validate")].into_iter()
+            )
+            .unwrap()
+        );
+        assert!(
+            package_validation_option(
+                std::ffi::OsStr::new("deb"),
+                [std::ffi::OsString::from("--unknown")].into_iter()
+            )
+            .is_err()
+        );
+        assert!(
+            package_validation_option(
+                std::ffi::OsStr::new("deb"),
+                [
+                    std::ffi::OsString::from("--validate"),
+                    std::ffi::OsString::from("extra")
+                ]
+                .into_iter()
+            )
+            .is_err()
+        );
+    }
 
     #[test]
     fn workflow_command_validation_uses_executable_steps_and_scope()

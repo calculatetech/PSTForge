@@ -80,6 +80,12 @@ Do not create a milestone branch until the previous milestone is approved.
 Do not push, merge, tag, publish, or rename the default branch without explicit
 human approval. Approval for a commit is not approval to push or merge.
 
+Integrate every milestone and documentation branch through a GitHub pull
+request. Never push commits directly to `main`. Before merge, require the
+configured Ubuntu and Debian status checks to pass and resolve every actionable
+review thread. Agents may create the pull request, remediate its comments, and
+merge it only when the human owner has explicitly authorized those actions.
+
 The repository has a reachable GitHub remote at
 `git@github.com:calculatetech/PSTForge.git`, with `main` as the approved baseline
 and default branch. Add GitHub Actions, branch protection, release environments,
@@ -217,10 +223,29 @@ tests proportional to its risk.
   crashes, forced termination, corrupt durable state, resume mismatch, and an
   item larger than the part limit.
 
-Use `cargo xtask gate fast` during development, `cargo xtask gate full` before
-a milestone commit, and `cargo xtask gate release` for release candidates.
-Exact contents and expected evidence for these tiers are specified in the
-ExecPlan.
+Use `cargo xtask gate fast` during development and `cargo xtask gate release`
+for release candidates. Before a milestone commit, use `cargo xtask gate ci`
+when the complete diff cannot affect recovered content or generated PST output;
+use the local external-manifest `full` gate when it can. Exact contents and
+expected evidence for these tiers are specified in the ExecPlan.
+
+GitHub-hosted CI uses only public tests and generated fixtures. Do not require,
+configure, or document a self-hosted runner for the private PST corpus. Run the
+external `full` or `release` gate locally with the explicitly configured corpus
+manifest when a change can affect which source content is recovered or the PST
+bytes written for that content.
+
+ScanPST is a required human acceptance gate for any change to writer behavior,
+source-to-destination translation, recovery selection or classification,
+folder/item placement, packing, replay, rollback, finalization, or a dependency
+or toolchain change whose generated output is not proven byte-identical. Run
+ScanPST before Outlook or MailPlus checks and record only the artifact SHA-256
+and bounded conclusions. Documentation, GitHub workflow, packaging, reporting,
+diagnostic, and test-harness-only changes do not require ScanPST when they cannot
+affect PST output. A refactor may skip ScanPST only when focused qualification
+proves its output artifact is byte-identical to the accepted baseline. For an
+ambiguous change, compare a focused qualification artifact first; any
+unexplained byte or semantic difference requires ScanPST.
 
 On the current development host, the canonical combined external manifest is
 `$HOME/.local/share/pstforge-test-corpus/full-manifest.toml`. It contains the

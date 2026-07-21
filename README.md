@@ -68,13 +68,21 @@ before 1.0.
 
 ### Debian package
 
-Build the reproducible package, then install it with APT so runtime dependencies
-are resolved:
+Build one package with one release compilation, then install it with APT so
+runtime dependencies are resolved:
 
 ```bash
 cargo xtask package deb
 sudo apt install ./target/debian/pstforge_0.5.1_amd64.deb
 pstforge --version
+```
+
+The default command produces one `.deb` and does not perform a second build or
+simulate an installation. Maintainers can opt into reproducibility, package
+contents, linkage, lintian, and isolated install/removal checks:
+
+```bash
+cargo xtask package deb --validate
 ```
 
 The package targets `amd64` and dynamically links the replaceable system
@@ -238,15 +246,18 @@ PSTForge never scans user directories to discover test PSTs. Detailed gate
 evidence is written beneath the ignored `.agent/test-results/` directory, and
 independent-reader output is redacted because it can contain mailbox data.
 
-GitHub runs the public CI gate on `main` and `milestone/**` pushes in Ubuntu
-24.04 and Debian 13. Scheduled jobs run RustSec and a bounded parser fuzz
-target. The private PST corpus workflow is manual, runs only from `main`, and
-requires a self-hosted
-runner labeled `pstforge-private-corpus`; it publishes only a bounded job
-summary and never uploads PSTs, spools, mail metadata, reader output, or gate
-logs. Release automation accepts only the existing tag matching the package
-version, requires approval through the `release` environment, and retains a
-Debian build artifact without creating a GitHub release.
+GitHub runs the public CI gate on pull requests and pushes to `main` in Ubuntu
+24.04 and Debian 13. Protected `main` requires both jobs and resolved
+review threads before merge. Scheduled jobs run RustSec and a bounded parser
+fuzz target. Private-corpus `full` and `release` gates run only on the local
+machine holding the explicitly configured corpus; PST files, paths, reader
+output, and detailed evidence are never uploaded to GitHub. Changes that can
+affect output PST bytes or recovered content also require a focused
+ScanPST-first human gate. Documentation, automation, packaging, reporting, and
+proven byte-identical refactors do not. Release automation accepts only the
+existing tag matching the package version, requires approval through the
+`release` environment, and retains a Debian build artifact without creating a
+GitHub release.
 
 See [`docs/PRODUCT_SPEC.md`](docs/PRODUCT_SPEC.md) for the authoritative
 behavior contract, [`docs/ATTACHMENT_RECOVERY.md`](docs/ATTACHMENT_RECOVERY.md)
