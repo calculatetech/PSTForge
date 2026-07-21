@@ -3664,6 +3664,13 @@ not modified.
     `8856cb625e765b071ba65e416dd9c6d5dd1e12015b241954122f0720bb714814`,
     and `b7d35c9cf0c1bc247fe075db08f51386fdad93ddad79e38c37fb8ddc91f5446c`.
     The detailed logs remain external to the repository.
+  - [x] (2026-07-21) Submitted protected pull request #2. Its first hosted run
+    exposed one Rust 1.85 incompatibility: the local Rust 1.93 compiler had
+    accepted a let-chain that remains unstable at the declared MSRV. Replaced
+    it with behavior-equivalent nested conditionals in focused commit
+    `8a431a6`; local fast gate `.agent/test-results/1784668203-fast` and the
+    replacement Ubuntu, Debian 13 package, and CodeQL checks all pass. The PR
+    has no comments, reviews, or unresolved review threads.
   - [ ] (2026-07-21) Run the bounded five-minute `pst_reader` fuzz target in
     hosted CI or a true nightly local toolchain. The pinned cargo-fuzz 0.13.2
     tool installed successfully, but this host supplies distro Rust 1.93.1
@@ -3745,6 +3752,15 @@ not modified.
   Evidence: final elapsed time was 1,565,341 ms, while all four final part files
   were present earlier; the parser-only original and repaired traversals took
   5:07.74 and 5:03.51 respectively.
+
+- Observation: A local compiler newer than the declared MSRV can hide use of
+  syntax that hosted Rust 1.85 rejects. The initial pull-request lanes both
+  failed with E0658 at the new worker-exit conditional while all local gates on
+  Rust 1.93 passed. Rewriting the let-chain as nested conditionals preserves
+  behavior and made both hosted lanes green.
+  Evidence: pull request #2 Actions runs `29868529338` (failed) and
+  `29868904959` (passed), plus focused local fast evidence
+  `.agent/test-results/1784668203-fast`.
 
 - Observation: direct traversal order initially made bounded diagnostic
   saturation affect parent completeness. Once the 1,024 retained issue slots
@@ -7055,4 +7071,6 @@ no-follow directory descriptors, contained the damaged-source direct worker
 failure, and proved direct/restartable semantic consistency. The owner's clean
 ScanPST result and the repaired-reference comparison close the 50 GB content-
 loss question without another large generation run; the measured direct-ledger
-write amplification remains explicit performance follow-up evidence.
+write amplification remains explicit performance follow-up evidence. Protected
+pull request #2 is locally and hosted-CI green after one Rust 1.85 syntax-only
+remediation.
