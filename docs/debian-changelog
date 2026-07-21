@@ -1,0 +1,6 @@
+pstforge (0.5.0) unstable; urgency=medium
+
+  * Add operational reporting, stable JSON schemas, and Debian packaging.
+  * Preserve the direct and restartable recovery modes introduced in 0.4.x.
+
+ -- PSTForge Maintainers <noreply@pstforge.invalid>  Mon, 20 Jul 2026 00:00:00 +0000

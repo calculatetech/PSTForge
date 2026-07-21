@@ -1,0 +1,16 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "info.schema.json",
+  "title": "PSTForge info result",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "command", "producer", "source", "pst", "source_unchanged"],
+  "properties": {
+    "schema_version": { "const": "1.1.0" },
+    "command": { "const": "info" },
+    "producer": { "$ref": "common.schema.json#/$defs/producer" },
+    "source": { "$ref": "common.schema.json#/$defs/source" },
+    "pst": { "$ref": "common.schema.json#/$defs/pst" },
+    "source_unchanged": { "type": "boolean" }
+  }
+}

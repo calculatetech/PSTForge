@@ -1,0 +1,40 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "common.schema.json",
+  "$defs": {
+    "producer": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["pstforge_version", "libpff_version"],
+      "properties": {
+        "pstforge_version": { "type": "string" },
+        "libpff_version": { "type": "string" }
+      }
+    },
+    "source": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["canonical_path", "device", "inode", "size_bytes", "modified_at"],
+      "properties": {
+        "canonical_path": { "type": "string" },
+        "device": { "type": "integer", "minimum": 0 },
+        "inode": { "type": "integer", "minimum": 0 },
+        "size_bytes": { "type": "integer", "minimum": 0 },
+        "modified_at": { "type": "string", "format": "date-time" },
+        "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" }
+      }
+    },
+    "pst": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["content_type", "format", "page_size_bytes", "encryption", "corruption_observed"],
+      "properties": {
+        "content_type": { "type": "string" },
+        "format": { "enum": ["ansi32", "unicode64", "unicode64_with4k_pages", "unknown"] },
+        "page_size_bytes": { "type": ["integer", "null"], "minimum": 0 },
+        "encryption": { "enum": ["none", "compressible", "high", "unknown"] },
+        "corruption_observed": { "type": "boolean" }
+      }
+    }
+  }
+}

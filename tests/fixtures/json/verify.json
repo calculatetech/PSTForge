@@ -1,0 +1,40 @@
+{
+  "schema_version": "1.1.0",
+  "command": "verify",
+  "mode": "recovery",
+  "producer": { "pstforge_version": "0.5.0", "libpff_version": "20231205" },
+  "source": {
+    "canonical_path": "/external/example.pst",
+    "device": 1,
+    "inode": 2,
+    "size_bytes": 4096,
+    "modified_at": "2026-07-20T00:00:00Z",
+    "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+  },
+  "pst": {
+    "content_type": "personal folder file",
+    "format": "unicode64",
+    "page_size_bytes": 512,
+    "encryption": "compressible",
+    "corruption_observed": true
+  },
+  "inventory": {
+    "scope": "reachable_and_recovery_catalog",
+    "folders": 3,
+    "normal_items": 8,
+    "recipients": 10,
+    "attachments": 2,
+    "embedded_messages": 1,
+    "unsupported_messages": 0,
+    "raw_properties": 30,
+    "property_bytes": 1024,
+    "body_bytes": 2048,
+    "attachment_bytes": 512,
+    "peak_stream_chunk_bytes": 256,
+    "recovered_items": 1,
+    "orphan_items": 0,
+    "issues": [],
+    "issues_dropped": 0
+  },
+  "source_unchanged": true
+}

@@ -1,0 +1,21 @@
+{
+  "schema_version": "1.1.0",
+  "command": "info",
+  "producer": { "pstforge_version": "0.5.0", "libpff_version": "20231205" },
+  "source": {
+    "canonical_path": "/external/example.pst",
+    "device": 1,
+    "inode": 2,
+    "size_bytes": 4096,
+    "modified_at": "2026-07-20T00:00:00Z",
+    "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+  },
+  "pst": {
+    "content_type": "personal folder file",
+    "format": "unicode64",
+    "page_size_bytes": 512,
+    "encryption": "compressible",
+    "corruption_observed": false
+  },
+  "source_unchanged": true
+}

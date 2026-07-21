@@ -1,17 +1,18 @@
 #![deny(unsafe_code)]
 
 use std::ffi::OsString;
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::PathBuf;
+use std::process::{Command as ProcessCommand, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use clap::{ArgAction, Parser, Subcommand, ValueEnum};
 use pstforge_core::{
-    EncryptionMode, FileFormat, InfoReport, InspectionError, RecoveryError, RecoveryMode,
-    RecoveryReport, SourceError, SplitError, SplitFailureKind, SplitReport, VerifyReport,
-    WorkerProtocolError,
+    EncryptionMode, FileFormat, InfoReport, InspectionError, JobReport, RecoveryError,
+    RecoveryMode, RecoveryReport, ReportError, SourceError, SourceFile, SplitError,
+    SplitFailureKind, SplitReport, VerifyReport, WorkerProtocolError,
 };
 use thiserror::Error;
 
@@ -51,6 +52,12 @@ pub enum Command {
         source: PathBuf,
         #[arg(long, value_enum, default_value_t = VerifyMode::Full)]
         mode: VerifyMode,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Recreate a validated summary from an existing PSTForge job.
+    Report {
+        job_directory: PathBuf,
         #[arg(long)]
         json: bool,
     },
@@ -103,6 +110,11 @@ pub enum Command {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         arguments: Vec<OsString>,
     },
+    #[command(name = "__verify-worker", hide = true)]
+    VerifyWorker {
+        source: PathBuf,
+        expected_identity: String,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -121,6 +133,7 @@ pub enum LogFormat {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum VerifyMode {
     Full,
+    Recovery,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -151,6 +164,8 @@ pub enum CliError {
     #[error(transparent)]
     Recovery(#[from] RecoveryError),
     #[error(transparent)]
+    Report(#[from] ReportError),
+    #[error(transparent)]
     Split(#[from] SplitError),
     #[error(transparent)]
     Worker(#[from] WorkerProtocolError),
@@ -162,6 +177,12 @@ pub enum CliError {
     Executable(std::io::Error),
     #[error("cannot supervise the independent PST validator: {0}")]
     Validator(std::io::Error),
+    #[error("cannot start or supervise recovery verification: {0}")]
+    VerifyWorkerIo(std::io::Error),
+    #[error("recovery verification worker failed: {0}")]
+    VerifyWorkerExit(String),
+    #[error("recovery verification worker protocol failed: {0}")]
+    VerifyWorkerProtocol(String),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -187,10 +208,13 @@ impl CliError {
                 | InspectionError::UnsupportedContentType { .. },
             ) => 3,
             Self::Recovery(RecoveryError::Job(_))
+            | Self::Report(ReportError::Job(_))
+            | Self::Report(ReportError::InvalidSnapshot(_))
             | Self::Recovery(RecoveryError::WorkerProtocol(WorkerProtocolError::Sink(_)))
             | Self::Recovery(RecoveryError::Source(SourceError::UnsafeOutput(_)))
             | Self::Output(_) => 4,
             Self::Recovery(RecoveryError::Source(_))
+            | Self::VerifyWorkerExit(_)
             | Self::Recovery(RecoveryError::WorkerProtocol(WorkerProtocolError::ReportedSource(
                 _,
             ))) => 3,
@@ -209,7 +233,16 @@ impl CliError {
             | Self::Worker(_)
             | Self::Json(_)
             | Self::Executable(_)
-            | Self::Validator(_) => 6,
+            | Self::Validator(_)
+            | Self::VerifyWorkerIo(_)
+            | Self::VerifyWorkerProtocol(_) => 6,
+        }
+    }
+
+    pub fn installation_hint(&self) -> Option<&'static str> {
+        match self {
+            Self::Split(error) => error.installation_hint(),
+            _ => None,
         }
     }
 }
@@ -225,17 +258,44 @@ pub fn execute(cli: &Cli, output: &mut dyn Write) -> Result<CommandStatus, CliEr
             }
             Ok(CommandStatus::Complete)
         }
-        Command::Verify { source, json, .. } => {
-            let report = pstforge_core::verify(source)?;
+        Command::Verify { source, mode, json } => {
+            let report = match mode {
+                VerifyMode::Full => pstforge_core::verify(source)?,
+                VerifyMode::Recovery => {
+                    let executable = std::env::current_exe().map_err(CliError::Executable)?;
+                    supervised_recovery_verify(source, &executable)?
+                }
+            };
             if *json {
                 write_json(output, &report)?;
             } else {
                 write_verify(output, &report)?;
             }
-            if report.inventory.issues.is_empty() && report.inventory.issues_dropped == 0 {
+            if report.inventory.unsupported_messages == 0
+                && report.inventory.issues.is_empty()
+                && report.inventory.issues_dropped == 0
+            {
                 Ok(CommandStatus::Complete)
             } else {
                 Ok(CommandStatus::Partial)
+            }
+        }
+        Command::Report {
+            job_directory,
+            json,
+        } => {
+            let report = pstforge_core::report(job_directory)?;
+            if *json {
+                write_json(output, &report)?;
+            } else {
+                write_job_report(output, &report)?;
+            }
+            if report.split.recovery.interrupted {
+                Ok(CommandStatus::Interrupted)
+            } else if report.split.partial {
+                Ok(CommandStatus::Partial)
+            } else {
+                Ok(CommandStatus::Complete)
             }
         }
         Command::Recover {
@@ -376,7 +436,140 @@ pub fn execute(cli: &Cli, output: &mut dyn Write) -> Result<CommandStatus, CliEr
                 std::thread::sleep(Duration::from_millis(10));
             }
         }
+        Command::VerifyWorker {
+            source,
+            expected_identity,
+        } => {
+            arm_verify_worker_parent_death_signal()?;
+            if std::env::var_os("PSTFORGE_TEST_VERIFY_WORKER_ABORT").is_some() {
+                std::process::abort();
+            }
+            if std::env::var_os("PSTFORGE_TEST_VERIFY_WORKER_STALL").is_some() {
+                loop {
+                    std::thread::sleep(Duration::from_secs(60));
+                }
+            }
+            let expected: pstforge_core::SourceIdentity = serde_json::from_str(expected_identity)?;
+            let source =
+                SourceFile::open(source).map_err(pstforge_core::InspectionError::Source)?;
+            if source.identity() != &expected {
+                return Err(pstforge_core::InspectionError::Source(SourceError::Changed(
+                    PathBuf::from(&expected.canonical_path),
+                ))
+                .into());
+            }
+            let report = pstforge_core::verify_recovery_source(&source)?;
+            write_json(output, &report)?;
+            if report.inventory.unsupported_messages == 0
+                && report.inventory.issues.is_empty()
+                && report.inventory.issues_dropped == 0
+            {
+                Ok(CommandStatus::Complete)
+            } else {
+                Ok(CommandStatus::Partial)
+            }
+        }
     }
+}
+
+fn supervised_recovery_verify(
+    source_path: &std::path::Path,
+    executable: &std::path::Path,
+) -> Result<VerifyReport, CliError> {
+    let source =
+        SourceFile::open_protected(source_path).map_err(pstforge_core::InspectionError::Source)?;
+    let result = run_recovery_verify_worker(source_path, executable, source.identity());
+    let unchanged = source
+        .verify_unchanged()
+        .map_err(pstforge_core::InspectionError::Source);
+    match (result, unchanged) {
+        (_, Err(error)) => Err(error.into()),
+        (Ok(report), Ok(())) => Ok(report),
+        (Err(error), Ok(())) => Err(error),
+    }
+}
+
+fn run_recovery_verify_worker(
+    source_path: &std::path::Path,
+    executable: &std::path::Path,
+    source_identity: &pstforge_core::SourceIdentity,
+) -> Result<VerifyReport, CliError> {
+    const MAX_WORKER_REPORT_BYTES: u64 = 16 * 1024 * 1024;
+
+    let expected_identity = serde_json::to_string(source_identity)?;
+    let mut child = ProcessCommand::new(executable)
+        .arg("__verify-worker")
+        .arg(source_path)
+        .arg(expected_identity)
+        .arg("--quiet")
+        .arg("--color")
+        .arg("never")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .env(
+            "PSTFORGE_INTERNAL_SUPERVISOR_PID",
+            std::process::id().to_string(),
+        )
+        .spawn()
+        .map_err(CliError::VerifyWorkerIo)?;
+    let mut stdout = child.stdout.take().ok_or_else(|| {
+        CliError::VerifyWorkerProtocol("worker stdout was unavailable".to_owned())
+    })?;
+    let mut bytes = Vec::new();
+    if let Err(error) = stdout
+        .by_ref()
+        .take(MAX_WORKER_REPORT_BYTES.saturating_add(1))
+        .read_to_end(&mut bytes)
+    {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(CliError::VerifyWorkerIo(error));
+    }
+    if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > MAX_WORKER_REPORT_BYTES {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(CliError::VerifyWorkerProtocol(
+            "worker report exceeded the bounded protocol limit".to_owned(),
+        ));
+    }
+    let status = child.wait().map_err(CliError::VerifyWorkerIo)?;
+    if !status.success() && status.code() != Some(1) {
+        return Err(CliError::VerifyWorkerExit(status.to_string()));
+    }
+    let report: VerifyReport = serde_json::from_slice(&bytes).map_err(|error| {
+        CliError::VerifyWorkerProtocol(format!("worker returned invalid JSON: {error}"))
+    })?;
+    if report.mode != "recovery"
+        || report.command != "verify"
+        || report.source != *source_identity
+        || !report.source_unchanged
+    {
+        return Err(CliError::VerifyWorkerProtocol(
+            "worker report identity or scope did not match the request".to_owned(),
+        ));
+    }
+    Ok(report)
+}
+
+fn arm_verify_worker_parent_death_signal() -> Result<(), CliError> {
+    let expected_parent = std::env::var("PSTFORGE_INTERNAL_SUPERVISOR_PID")
+        .map_err(|_| {
+            CliError::VerifyWorkerProtocol("worker supervisor identity is absent".to_owned())
+        })?
+        .parse::<i32>()
+        .map_err(|_| {
+            CliError::VerifyWorkerProtocol("worker supervisor identity is invalid".to_owned())
+        })?;
+    rustix::process::set_parent_process_death_signal(Some(rustix::process::Signal::KILL))
+        .map_err(|source| CliError::VerifyWorkerIo(source.into()))?;
+    let actual_parent = rustix::process::Pid::as_raw(rustix::process::getppid());
+    if actual_parent != expected_parent {
+        return Err(CliError::VerifyWorkerProtocol(
+            "worker supervisor exited during startup".to_owned(),
+        ));
+    }
+    Ok(())
 }
 
 fn write_json<T: serde::Serialize + ?Sized>(
@@ -513,6 +706,15 @@ fn write_recovery(output: &mut dyn Write, report: &RecoveryReport) -> Result<(),
 
 fn write_split(output: &mut dyn Write, report: &SplitReport) -> Result<(), std::io::Error> {
     writeln!(output, "PSTForge split")?;
+    write_split_details(output, report)
+}
+
+fn write_job_report(output: &mut dyn Write, report: &JobReport) -> Result<(), std::io::Error> {
+    writeln!(output, "PSTForge job report")?;
+    write_split_details(output, &report.split)
+}
+
+fn write_split_details(output: &mut dyn Write, report: &SplitReport) -> Result<(), std::io::Error> {
     writeln!(output, "Source: {}", report.recovery.source.canonical_path)?;
     write_source_hash(output, report.recovery.source.sha256.as_deref())?;
     writeln!(output, "Job: {}", report.recovery.job_directory)?;
@@ -754,9 +956,29 @@ mod tests {
     }
 
     #[test]
-    fn recovery_mode_is_not_exposed_before_implementation() {
-        let cli = Cli::try_parse_from(["pstforge", "verify", "mail.pst", "--mode", "recovery"]);
-        assert!(cli.is_err());
+    fn verify_accepts_recovery_mode() -> Result<(), clap::Error> {
+        let cli = Cli::try_parse_from(["pstforge", "verify", "mail.pst", "--mode", "recovery"])?;
+        assert!(matches!(
+            cli.command,
+            Command::Verify {
+                mode: VerifyMode::Recovery,
+                ..
+            }
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn parses_read_only_job_report() -> Result<(), clap::Error> {
+        let cli = Cli::try_parse_from(["pstforge", "report", "recovery-job", "--json"])?;
+        assert!(matches!(
+            cli.command,
+            Command::Report {
+                job_directory,
+                json: true,
+            } if job_directory.as_path() == std::path::Path::new("recovery-job")
+        ));
+        Ok(())
     }
 
     #[test]

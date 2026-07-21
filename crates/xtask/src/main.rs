@@ -1,5 +1,7 @@
 #![deny(unsafe_code)]
 
+use std::collections::BTreeSet;
+use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::io::Read as _;
 use std::os::fd::AsFd;
@@ -9,17 +11,17 @@ use std::process::{Command, ExitCode, Output};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use base64::Engine;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct CorpusManifest {
     schema_version: u32,
     cases: Vec<CorpusCase>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct CorpusCase {
     name: String,
@@ -66,18 +68,52 @@ fn default_split_limit() -> u64 {
 #[derive(Debug, Deserialize)]
 struct CargoMetadata {
     packages: Vec<CargoPackage>,
+    resolve: Option<CargoResolve>,
 }
 
 #[derive(Debug, Deserialize)]
 struct CargoPackage {
+    id: String,
     name: String,
     version: String,
     license: Option<String>,
+    #[serde(default)]
+    authors: Vec<String>,
+    manifest_path: PathBuf,
+    source: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CargoResolve {
+    nodes: Vec<CargoNode>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CargoNode {
+    id: String,
+    deps: Vec<CargoNodeDependency>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CargoNodeDependency {
+    pkg: String,
+    dep_kinds: Vec<CargoDependencyKind>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CargoDependencyKind {
+    kind: Option<String>,
 }
 
 struct Gate {
     root: PathBuf,
     evidence: PathBuf,
+}
+
+struct PreparedCorpus {
+    manifest: CorpusManifest,
+    manifest_path: PathBuf,
+    _scratch: tempfile::TempDir,
 }
 
 #[derive(Default)]
@@ -239,6 +275,15 @@ fn run() -> Result<(), String> {
         .ok_or_else(|| "cannot locate workspace root".to_owned())?
         .to_path_buf();
     let command = arguments.next().ok_or_else(usage)?;
+    if command == OsStr::new("package") {
+        let format = arguments
+            .next()
+            .ok_or_else(|| "missing package format: deb".to_owned())?;
+        if format != OsStr::new("deb") || arguments.next().is_some() {
+            return Err("usage: cargo xtask package deb".to_owned());
+        }
+        return package_deb(&root);
+    }
     if command == std::ffi::OsStr::new("qualify") {
         let checkpoint = arguments
             .next()
@@ -299,8 +344,751 @@ fn run() -> Result<(), String> {
 }
 
 fn usage() -> String {
-    "usage: cargo xtask gate <fast|full|release> | qualify <embedded-attachments|named-properties|empty-folders|contacts|appointments|meetings|pim-items|distribution-list|document-object|ole-attachments|reference-attachments|calendar-exceptions|associated-data> <output>"
+    "usage: cargo xtask gate <fast|full|release> | package deb | qualify <embedded-attachments|named-properties|empty-folders|contacts|appointments|meetings|pim-items|distribution-list|document-object|ole-attachments|reference-attachments|calendar-exceptions|associated-data> <output>"
         .to_owned()
+}
+
+fn package_deb(root: &Path) -> Result<(), String> {
+    for program in [
+        "dpkg",
+        "dpkg-deb",
+        "dpkg-shlibdeps",
+        "find",
+        "gzip",
+        "lintian",
+        "readelf",
+        "strip",
+        "touch",
+    ] {
+        require_program(program)?;
+    }
+    let architecture = command_stdout(root, "dpkg", &["--print-architecture"])?;
+    if architecture.trim() != "amd64" {
+        return Err(format!(
+            "Debian packaging currently supports amd64, not {}",
+            architecture.trim()
+        ));
+    }
+    let version = env!("CARGO_PKG_VERSION");
+    let epoch = source_date_epoch(root)?;
+    let package_root = root.join("target/debian");
+    prepare_generated_directory(root, &package_root)?;
+    fs::create_dir_all(&package_root)
+        .map_err(|error| format!("cannot create {}: {error}", package_root.display()))?;
+    let first_target = package_root.join("build-one");
+    let second_target = package_root.join("build-two");
+    build_release_binary(root, &first_target, &epoch)?;
+    build_release_binary(root, &second_target, &epoch)?;
+    let first_binary = first_target.join("release/pstforge");
+    let second_binary = second_target.join("release/pstforge");
+    let dependencies = debian_runtime_dependencies(&package_root, &first_binary)?;
+    let rust_licenses = rust_dependency_licenses(root)?;
+    let first = package_root.join(format!("pstforge_{version}_amd64.first.deb"));
+    let second = package_root.join(format!("pstforge_{version}_amd64.second.deb"));
+    build_deb_archive(
+        root,
+        &first_binary,
+        &dependencies,
+        &rust_licenses,
+        &epoch,
+        "one",
+        &first,
+    )?;
+    build_deb_archive(
+        root,
+        &second_binary,
+        &dependencies,
+        &rust_licenses,
+        &epoch,
+        "two",
+        &second,
+    )?;
+    let first_bytes =
+        fs::read(&first).map_err(|error| format!("cannot read {}: {error}", first.display()))?;
+    if first_bytes
+        != fs::read(&second)
+            .map_err(|error| format!("cannot read {}: {error}", second.display()))?
+    {
+        return Err("two Debian package builds were not byte-for-byte reproducible".to_owned());
+    }
+    validate_deb_package(root, &package_root, &first, version, &dependencies)?;
+    let package = package_root.join(format!("pstforge_{version}_amd64.deb"));
+    fs::rename(&first, &package)
+        .map_err(|error| format!("cannot publish {}: {error}", package.display()))?;
+    fs::remove_file(&second)
+        .map_err(|error| format!("cannot remove {}: {error}", second.display()))?;
+    println!(
+        "Debian package: {}\nsha256: {:x}\ndepends: {}",
+        package.display(),
+        Sha256::digest(&first_bytes),
+        dependencies
+    );
+    Ok(())
+}
+
+fn build_release_binary(root: &Path, target: &Path, epoch: &str) -> Result<(), String> {
+    let remap = format!("--remap-path-prefix={}=/usr/src/pstforge", root.display());
+    let status = Command::new("cargo")
+        .args(["build", "--locked", "--release", "-p", "pstforge-cli"])
+        .env("CARGO_INCREMENTAL", "0")
+        .env("CARGO_TARGET_DIR", target)
+        .env("RUSTFLAGS", remap)
+        .env("SOURCE_DATE_EPOCH", epoch)
+        .current_dir(root)
+        .status()
+        .map_err(|error| format!("cannot run reproducible Cargo build: {error}"))?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!("reproducible Cargo build failed with {status}"))
+    }
+}
+
+fn require_program(program: &str) -> Result<(), String> {
+    let status = Command::new(program)
+        .arg("--version")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map_err(|error| format!("required packaging tool {program} is unavailable: {error}"))?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!("required packaging tool {program} is not usable"))
+    }
+}
+
+fn source_date_epoch(root: &Path) -> Result<String, String> {
+    if let Some(value) = std::env::var_os("SOURCE_DATE_EPOCH") {
+        let value = value
+            .into_string()
+            .map_err(|_| "SOURCE_DATE_EPOCH is not valid UTF-8".to_owned())?;
+        value
+            .parse::<u64>()
+            .map_err(|_| "SOURCE_DATE_EPOCH must be an unsigned Unix timestamp".to_owned())?;
+        return Ok(value);
+    }
+    Ok(command_stdout(root, "git", &["log", "-1", "--format=%ct"])?
+        .trim()
+        .to_owned())
+}
+
+fn debian_runtime_dependencies(package_root: &Path, binary: &Path) -> Result<String, String> {
+    let work = package_root.join("shlibdeps");
+    fs::create_dir_all(work.join("debian"))
+        .map_err(|error| format!("cannot create dependency workspace: {error}"))?;
+    fs::write(
+        work.join("debian/control"),
+        "Source: pstforge\nSection: utils\nPriority: optional\nMaintainer: PSTForge Maintainers <noreply@pstforge.invalid>\nStandards-Version: 4.7.0\n\nPackage: pstforge\nArchitecture: any\nDepends: ${shlibs:Depends}\nDescription: PST recovery utility\n",
+    )
+    .map_err(|error| format!("cannot create dependency control file: {error}"))?;
+    let output = command_stdout_os(
+        &work,
+        OsStr::new("dpkg-shlibdeps"),
+        &[
+            OsString::from("-O"),
+            OsString::from(format!("-e{}", binary.display())),
+        ],
+    )?;
+    let generated = output
+        .trim()
+        .strip_prefix("shlibs:Depends=")
+        .ok_or_else(|| "dpkg-shlibdeps returned an unexpected result".to_owned())?;
+    let mut dependencies = generated
+        .split(',')
+        .map(str::trim)
+        .filter(|dependency| !dependency.starts_with("libpff1t64 "))
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    dependencies.push("libpff1t64 (>= 20180714)".to_owned());
+    dependencies.sort();
+    Ok(dependencies.join(", "))
+}
+
+fn rust_dependency_licenses(root: &Path) -> Result<String, String> {
+    let metadata: CargoMetadata = serde_json::from_str(&command_stdout(
+        root,
+        "cargo",
+        &[
+            "metadata",
+            "--format-version",
+            "1",
+            "--locked",
+            "--filter-platform",
+            "x86_64-unknown-linux-gnu",
+        ],
+    )?)
+    .map_err(|error| format!("cannot parse Cargo metadata for licenses: {error}"))?;
+    let resolve = metadata
+        .resolve
+        .as_ref()
+        .ok_or_else(|| "Cargo metadata omitted the dependency graph".to_owned())?;
+    let root_id = metadata
+        .packages
+        .iter()
+        .find(|package| package.name == "pstforge-cli" && package.source.is_none())
+        .map(|package| package.id.clone())
+        .ok_or_else(|| "cannot locate pstforge-cli in Cargo metadata".to_owned())?;
+    let nodes = resolve
+        .nodes
+        .iter()
+        .map(|node| (node.id.as_str(), node))
+        .collect::<std::collections::BTreeMap<_, _>>();
+    let mut pending = vec![root_id];
+    let mut closure = BTreeSet::new();
+    while let Some(id) = pending.pop() {
+        if !closure.insert(id.clone()) {
+            continue;
+        }
+        let node = nodes
+            .get(id.as_str())
+            .ok_or_else(|| format!("Cargo dependency graph has no node for {id}"))?;
+        pending.extend(
+            node.deps
+                .iter()
+                .filter(|dependency| dependency.dep_kinds.iter().any(|kind| kind.kind.is_none()))
+                .map(|dependency| dependency.pkg.clone()),
+        );
+    }
+    let mut packages = metadata
+        .packages
+        .iter()
+        .filter(|package| closure.contains(&package.id) && package.source.is_some())
+        .collect::<Vec<_>>();
+    packages.sort_by(|left, right| {
+        (&left.name, &left.version, &left.id).cmp(&(&right.name, &right.version, &right.id))
+    });
+
+    let mut output = String::from(
+        "Rust dependency licenses bundled with PSTForge\n================================================\n\nThis file covers third-party Rust crates linked into the pstforge executable.\n\n",
+    );
+    for package in packages {
+        let directory = package
+            .manifest_path
+            .parent()
+            .ok_or_else(|| format!("{} has no package directory", package.name))?;
+        let mut license_files = fs::read_dir(directory)
+            .map_err(|error| format!("cannot read {} license directory: {error}", package.name))?
+            .filter_map(Result::ok)
+            .filter(|entry| {
+                let name = entry.file_name().to_string_lossy().to_ascii_lowercase();
+                entry.path().is_file()
+                    && (name.starts_with("license")
+                        || name.starts_with("copying")
+                        || name.starts_with("notice")
+                        || name.starts_with("copyright"))
+            })
+            .collect::<Vec<_>>();
+        license_files.sort_by_key(|entry| entry.file_name());
+        output.push_str(&format!(
+            "{} {}\nLicense expression: {}\nAuthors: {}\nSource: {}\n",
+            package.name,
+            package.version,
+            package.license.as_deref().unwrap_or("UNSPECIFIED"),
+            if package.authors.is_empty() {
+                "not stated".to_owned()
+            } else {
+                package.authors.join(", ")
+            },
+            package.source.as_deref().unwrap_or("workspace")
+        ));
+        if license_files.is_empty() {
+            let expression = package.license.as_deref().unwrap_or("UNSPECIFIED");
+            if !expression
+                .split(|character: char| !character.is_ascii_alphanumeric() && character != '-')
+                .any(|token| token == "MIT")
+            {
+                return Err(format!(
+                    "Rust dependency {} {} ships no license file and has no selectable MIT grant",
+                    package.name, package.version
+                ));
+            }
+            let authors = if package.authors.is_empty() {
+                "the crate authors".to_owned()
+            } else {
+                package.authors.join(", ")
+            };
+            let mit = fs::read_to_string(root.join("LICENSE-MIT"))
+                .map_err(|error| format!("cannot read MIT license template: {error}"))?
+                .replace(
+                    "Copyright (c) 2026 PSTForge contributors",
+                    &format!("Copyright (c) {authors}"),
+                );
+            output.push_str(&format!(
+                "\n--- GENERATED-MIT-LICENSE ---\n{}\n",
+                mit.trim_end()
+            ));
+        }
+        for entry in license_files {
+            let bytes = fs::read(entry.path()).map_err(|error| {
+                format!(
+                    "cannot read {} for {}: {error}",
+                    entry.path().display(),
+                    package.name
+                )
+            })?;
+            let text = String::from_utf8(bytes).map_err(|_| {
+                format!("{} contains non-UTF-8 license text", entry.path().display())
+            })?;
+            output.push_str(&format!(
+                "\n--- {} ---\n{}\n",
+                entry.file_name().to_string_lossy(),
+                text.replace("\r\n", "\n").trim_end()
+            ));
+        }
+        output.push_str("\n================================================\n\n");
+    }
+    Ok(output)
+}
+
+fn build_deb_archive(
+    root: &Path,
+    binary: &Path,
+    dependencies: &str,
+    rust_licenses: &str,
+    epoch: &str,
+    suffix: &str,
+    output: &Path,
+) -> Result<(), String> {
+    let package_root = output
+        .parent()
+        .ok_or_else(|| "Debian output path has no parent".to_owned())?;
+    let stage = package_root.join(format!("stage-{suffix}"));
+    stage_deb_tree(root, &stage, binary, dependencies, rust_licenses)?;
+    normalize_tree_timestamps(&stage, epoch)?;
+    let status = Command::new("dpkg-deb")
+        .args(["--root-owner-group", "-Zxz", "-z9", "--build"])
+        .arg(&stage)
+        .arg(output)
+        .env("SOURCE_DATE_EPOCH", epoch)
+        .current_dir(root)
+        .status()
+        .map_err(|error| format!("cannot run dpkg-deb: {error}"))?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!("dpkg-deb failed with {status}"))
+    }
+}
+
+fn stage_deb_tree(
+    root: &Path,
+    stage: &Path,
+    binary: &Path,
+    dependencies: &str,
+    rust_licenses: &str,
+) -> Result<(), String> {
+    for relative in [
+        "DEBIAN",
+        "usr",
+        "usr/bin",
+        "usr/share",
+        "usr/share/doc",
+        "usr/share/doc/pstforge",
+        "usr/share/man",
+        "usr/share/man/man1",
+        "usr/share/pstforge",
+        "usr/share/pstforge/schemas",
+    ] {
+        let directory = stage.join(relative);
+        fs::create_dir_all(&directory)
+            .map_err(|error| format!("cannot create package staging directory: {error}"))?;
+        fs::set_permissions(&directory, fs::Permissions::from_mode(0o755))
+            .map_err(|error| format!("cannot set package directory permissions: {error}"))?;
+    }
+    let packaged_binary = stage.join("usr/bin/pstforge");
+    copy_with_mode(binary, &packaged_binary, 0o755)?;
+    run_checked_os(
+        root,
+        OsStr::new("strip"),
+        &[
+            OsString::from("--strip-unneeded"),
+            packaged_binary.as_os_str().to_owned(),
+        ],
+    )?;
+    for (source, destination) in [
+        ("README.md", "usr/share/doc/pstforge/README.md"),
+        (
+            "docs/PRODUCT_SPEC.md",
+            "usr/share/doc/pstforge/PRODUCT_SPEC.md",
+        ),
+        ("LICENSE-APACHE", "usr/share/doc/pstforge/LICENSE-APACHE"),
+        ("LICENSE-MIT", "usr/share/doc/pstforge/LICENSE-MIT"),
+        (
+            "THIRD_PARTY_LICENSES.md",
+            "usr/share/doc/pstforge/THIRD_PARTY_LICENSES.md",
+        ),
+        (
+            "crates/pstforge-pst/LICENSE",
+            "usr/share/doc/pstforge/WRITER-LICENSE-MIT",
+        ),
+        ("docs/debian-copyright", "usr/share/doc/pstforge/copyright"),
+    ] {
+        copy_with_mode(&root.join(source), &stage.join(destination), 0o644)?;
+    }
+    let rust_license_path = stage.join("usr/share/doc/pstforge/RUST-DEPENDENCY-LICENSES.txt");
+    fs::write(&rust_license_path, rust_licenses)
+        .map_err(|error| format!("cannot write Rust dependency licenses: {error}"))?;
+    fs::set_permissions(&rust_license_path, fs::Permissions::from_mode(0o644))
+        .map_err(|error| format!("cannot set Rust dependency license permissions: {error}"))?;
+    for entry in fs::read_dir(root.join("docs/schemas"))
+        .map_err(|error| format!("cannot read public schemas: {error}"))?
+    {
+        let entry = entry.map_err(|error| format!("cannot read public schema entry: {error}"))?;
+        if entry.path().extension() == Some(OsStr::new("json")) {
+            copy_with_mode(
+                &entry.path(),
+                &stage
+                    .join("usr/share/pstforge/schemas")
+                    .join(entry.file_name()),
+                0o644,
+            )?;
+        }
+    }
+    let manpage = stage.join("usr/share/man/man1/pstforge.1");
+    copy_with_mode(&root.join("docs/pstforge.1"), &manpage, 0o644)?;
+    let changelog = stage.join("usr/share/doc/pstforge/changelog");
+    copy_with_mode(&root.join("docs/debian-changelog"), &changelog, 0o644)?;
+    run_checked_os(
+        root,
+        OsStr::new("gzip"),
+        &[
+            OsString::from("-n"),
+            OsString::from("-9"),
+            manpage.as_os_str().to_owned(),
+        ],
+    )?;
+    run_checked_os(
+        root,
+        OsStr::new("gzip"),
+        &[
+            OsString::from("-n"),
+            OsString::from("-9"),
+            changelog.as_os_str().to_owned(),
+        ],
+    )?;
+    let installed_size = tree_file_bytes(stage)?.div_ceil(1024);
+    fs::write(
+        stage.join("DEBIAN/control"),
+        format!(
+            "Package: pstforge\nVersion: {}\nArchitecture: amd64\nMaintainer: PSTForge Maintainers <noreply@pstforge.invalid>\nInstalled-Size: {installed_size}\nDepends: {dependencies}\nSection: utils\nPriority: optional\nHomepage: https://github.com/calculatetech/PSTForge\nDescription: read-only recovery and splitting of damaged PST files\n PSTForge reads a source PST without modifying it and writes independently\n importable Unicode PST output for recovery and checkpointed migration.\n",
+            env!("CARGO_PKG_VERSION")
+        ),
+    )
+    .map_err(|error| format!("cannot write Debian control metadata: {error}"))?;
+    Ok(())
+}
+
+fn validate_deb_package(
+    root: &Path,
+    package_root: &Path,
+    package: &Path,
+    version: &str,
+    dependencies: &str,
+) -> Result<(), String> {
+    let package_text = package
+        .to_str()
+        .ok_or_else(|| "package path is not UTF-8".to_owned())?;
+    let fields = command_stdout(root, "dpkg-deb", &["--field", package_text])?;
+    for required in [
+        "Package: pstforge".to_owned(),
+        format!("Version: {version}"),
+        "Architecture: amd64".to_owned(),
+        format!("Depends: {dependencies}"),
+    ] {
+        if !fields.contains(&required) {
+            return Err(format!("Debian metadata is missing {required}"));
+        }
+    }
+    let contents = command_stdout(root, "dpkg-deb", &["--contents", package_text])?;
+    let expected_paths = [
+        "./",
+        "./usr/",
+        "./usr/bin/",
+        "./usr/bin/pstforge",
+        "./usr/share/",
+        "./usr/share/doc/",
+        "./usr/share/doc/pstforge/",
+        "./usr/share/doc/pstforge/LICENSE-APACHE",
+        "./usr/share/doc/pstforge/LICENSE-MIT",
+        "./usr/share/doc/pstforge/PRODUCT_SPEC.md",
+        "./usr/share/doc/pstforge/RUST-DEPENDENCY-LICENSES.txt",
+        "./usr/share/man/man1/pstforge.1.gz",
+        "./usr/share/doc/pstforge/README.md",
+        "./usr/share/doc/pstforge/THIRD_PARTY_LICENSES.md",
+        "./usr/share/doc/pstforge/WRITER-LICENSE-MIT",
+        "./usr/share/doc/pstforge/changelog.gz",
+        "./usr/share/doc/pstforge/copyright",
+        "./usr/share/man/",
+        "./usr/share/man/man1/",
+        "./usr/share/pstforge/",
+        "./usr/share/pstforge/schemas/",
+        "./usr/share/pstforge/schemas/common.schema.json",
+        "./usr/share/pstforge/schemas/info.schema.json",
+        "./usr/share/pstforge/schemas/recover.schema.json",
+        "./usr/share/pstforge/schemas/report.schema.json",
+        "./usr/share/pstforge/schemas/split.schema.json",
+        "./usr/share/pstforge/schemas/verify.schema.json",
+    ]
+    .into_iter()
+    .collect::<BTreeSet<_>>();
+    let actual_paths = contents
+        .lines()
+        .filter_map(|line| line.split_whitespace().last())
+        .collect::<BTreeSet<_>>();
+    if actual_paths != expected_paths {
+        return Err(format!(
+            "Debian package path set differs from the declared set: expected {expected_paths:?}, got {actual_paths:?}"
+        ));
+    }
+    let extracted = package_root.join("extracted");
+    fs::create_dir_all(&extracted)
+        .map_err(|error| format!("cannot create package extraction directory: {error}"))?;
+    run_checked(
+        root,
+        "dpkg-deb",
+        &[
+            "--extract",
+            package_text,
+            extracted
+                .to_str()
+                .ok_or_else(|| "package extraction path is not UTF-8".to_owned())?,
+        ],
+    )?;
+    let installed_binary = extracted.join("usr/bin/pstforge");
+    if fs::metadata(&installed_binary)
+        .map_err(|error| format!("cannot inspect packaged binary: {error}"))?
+        .permissions()
+        .mode()
+        & 0o777
+        != 0o755
+    {
+        return Err("packaged pstforge binary mode is not 0755".to_owned());
+    }
+    let reported = command_stdout_os(
+        root,
+        installed_binary.as_os_str(),
+        &[OsString::from("--version")],
+    )?;
+    if reported.trim() != format!("pstforge {version}") {
+        return Err(format!(
+            "packaged binary reported unexpected version: {}",
+            reported.trim()
+        ));
+    }
+    let linkage = command_stdout_os(
+        root,
+        OsStr::new("readelf"),
+        &[
+            OsString::from("-d"),
+            installed_binary.as_os_str().to_owned(),
+        ],
+    )?;
+    if !linkage.contains("Shared library: [libpff.so.1]")
+        || linkage.contains("(RPATH)")
+        || linkage.contains("(RUNPATH)")
+    {
+        return Err(
+            "packaged binary has unexpected libpff linkage or runtime search path".to_owned(),
+        );
+    }
+    validate_isolated_install_remove(root, package_root, package)?;
+    run_checked(root, "lintian", &["--fail-on", "error", package_text])
+}
+
+fn validate_isolated_install_remove(
+    root: &Path,
+    package_root: &Path,
+    package: &Path,
+) -> Result<(), String> {
+    let install_root = package_root.join("install-root");
+    let admin = install_root.join("var/lib/dpkg");
+    let sentinel = install_root.join("home/operator/recovery-job/keep");
+    fs::create_dir_all(&admin)
+        .and_then(|()| fs::create_dir_all(sentinel.parent().unwrap_or(&install_root)))
+        .map_err(|error| format!("cannot create isolated install root: {error}"))?;
+    fs::write(admin.join("status"), b"")
+        .and_then(|()| fs::write(&sentinel, b"operator data\n"))
+        .map_err(|error| format!("cannot initialize isolated install root: {error}"))?;
+    let root_argument = OsString::from(format!("--root={}", install_root.display()));
+    let admin_argument = OsString::from(format!("--admindir={}", admin.display()));
+    let common = [
+        OsString::from("--force-not-root"),
+        OsString::from("--force-depends"),
+        OsString::from("--log=/dev/null"),
+        root_argument,
+        admin_argument,
+    ];
+    let mut install = common.to_vec();
+    install.push(OsString::from("--install"));
+    install.push(package.as_os_str().to_owned());
+    run_checked_os(root, OsStr::new("dpkg"), &install)?;
+    if !install_root.join("usr/bin/pstforge").is_file() {
+        return Err("isolated dpkg install did not install pstforge".to_owned());
+    }
+    let mut remove = common.to_vec();
+    remove.push(OsString::from("--remove"));
+    remove.push(OsString::from("pstforge"));
+    run_checked_os(root, OsStr::new("dpkg"), &remove)?;
+    if install_root.join("usr/bin/pstforge").exists() || !sentinel.is_file() {
+        return Err(
+            "isolated dpkg removal changed operator data or retained the binary".to_owned(),
+        );
+    }
+    Ok(())
+}
+
+fn prepare_generated_directory(root: &Path, path: &Path) -> Result<(), String> {
+    let expected_parent = root.join("target");
+    match fs::symlink_metadata(&expected_parent) {
+        Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {}
+        Ok(_) => {
+            return Err(format!(
+                "refusing unsafe generated parent {}",
+                expected_parent.display()
+            ));
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            fs::create_dir(&expected_parent)
+                .map_err(|error| format!("cannot create {}: {error}", expected_parent.display()))?;
+        }
+        Err(error) => {
+            return Err(format!(
+                "cannot inspect {}: {error}",
+                expected_parent.display()
+            ));
+        }
+    }
+    if !path.starts_with(&expected_parent) || path == expected_parent {
+        return Err(format!(
+            "refusing to clean unsafe generated path {}",
+            path.display()
+        ));
+    }
+    if path.symlink_metadata().is_ok() {
+        let metadata = fs::symlink_metadata(path)
+            .map_err(|error| format!("cannot inspect {}: {error}", path.display()))?;
+        if !metadata.is_dir() || metadata.file_type().is_symlink() {
+            return Err(format!(
+                "refusing non-directory generated path {}",
+                path.display()
+            ));
+        }
+        fs::remove_dir_all(path)
+            .map_err(|error| format!("cannot clean {}: {error}", path.display()))?;
+    }
+    Ok(())
+}
+
+fn copy_with_mode(source: &Path, destination: &Path, mode: u32) -> Result<(), String> {
+    fs::copy(source, destination).map_err(|error| {
+        format!(
+            "cannot copy {} to {}: {error}",
+            source.display(),
+            destination.display()
+        )
+    })?;
+    fs::set_permissions(destination, fs::Permissions::from_mode(mode)).map_err(|error| {
+        format!(
+            "cannot set permissions on {}: {error}",
+            destination.display()
+        )
+    })
+}
+
+fn tree_file_bytes(root: &Path) -> Result<u64, String> {
+    let mut pending = vec![root.to_path_buf()];
+    let mut bytes = 0_u64;
+    while let Some(directory) = pending.pop() {
+        for entry in fs::read_dir(&directory)
+            .map_err(|error| format!("cannot read {}: {error}", directory.display()))?
+        {
+            let entry = entry.map_err(|error| format!("cannot read package entry: {error}"))?;
+            let metadata = entry
+                .metadata()
+                .map_err(|error| format!("cannot inspect {}: {error}", entry.path().display()))?;
+            if metadata.is_dir() {
+                pending.push(entry.path());
+            } else if metadata.is_file() {
+                bytes = bytes
+                    .checked_add(metadata.len())
+                    .ok_or_else(|| "package installed-size overflow".to_owned())?;
+            }
+        }
+    }
+    Ok(bytes)
+}
+
+fn normalize_tree_timestamps(root: &Path, epoch: &str) -> Result<(), String> {
+    run_checked_os(
+        root,
+        OsStr::new("find"),
+        &[
+            root.as_os_str().to_owned(),
+            OsString::from("-exec"),
+            OsString::from("touch"),
+            OsString::from("-h"),
+            OsString::from("-d"),
+            OsString::from(format!("@{epoch}")),
+            OsString::from("{}"),
+            OsString::from("+"),
+        ],
+    )
+}
+
+fn command_stdout(root: &Path, program: &str, arguments: &[&str]) -> Result<String, String> {
+    command_stdout_os(
+        root,
+        OsStr::new(program),
+        &arguments.iter().map(OsString::from).collect::<Vec<_>>(),
+    )
+}
+
+fn command_stdout_os(
+    root: &Path,
+    program: &OsStr,
+    arguments: &[OsString],
+) -> Result<String, String> {
+    let output = Command::new(program)
+        .args(arguments)
+        .current_dir(root)
+        .output()
+        .map_err(|error| format!("cannot run {}: {error}", program.to_string_lossy()))?;
+    if !output.status.success() {
+        return Err(format!(
+            "{} failed with {}: {}",
+            program.to_string_lossy(),
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    String::from_utf8(output.stdout)
+        .map_err(|_| format!("{} returned non-UTF-8 output", program.to_string_lossy()))
+}
+
+fn run_checked(root: &Path, program: &str, arguments: &[&str]) -> Result<(), String> {
+    run_checked_os(
+        root,
+        OsStr::new(program),
+        &arguments.iter().map(OsString::from).collect::<Vec<_>>(),
+    )
+}
+
+fn run_checked_os(root: &Path, program: &OsStr, arguments: &[OsString]) -> Result<(), String> {
+    let status = Command::new(program)
+        .args(arguments)
+        .current_dir(root)
+        .status()
+        .map_err(|error| format!("cannot run {}: {error}", program.to_string_lossy()))?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!(
+            "{} failed with {status}",
+            program.to_string_lossy()
+        ))
+    }
 }
 
 fn qualify_embedded_attachments(root: &Path, output: &Path) -> Result<(), String> {
@@ -1353,6 +2141,79 @@ fn qualify_ole_attachments(root: &Path, output: &Path) -> Result<(), String> {
     publish_fidelity_qualification(root, output, &fixture, 1)
 }
 
+fn qualify_outlook_ole_objects(root: &Path, output: &Path) -> Result<(), String> {
+    use std::io::{Cursor, Write as _};
+
+    use pstforge_pst::writer::{
+        AttachmentContent, AttachmentSpec, FidelityStore, FileBlobSpec, OleAttachmentSpec,
+        OleDataKind, RawProperty, RawPropertyValue,
+    };
+
+    let parent = output
+        .parent()
+        .filter(|path| path.is_dir())
+        .ok_or_else(|| "qualification output parent must already exist".to_owned())?;
+    let payloads = tempfile::tempdir_in(parent)
+        .map_err(|error| format!("cannot create Outlook OLE staging directory: {error}"))?;
+    let mut compound =
+        cfb::CompoundFile::create_with_version(cfb::Version::V3, Cursor::new(Vec::new()))
+            .map_err(|error| format!("cannot create Outlook OLE compound file: {error}"))?;
+    compound
+        .create_storage("/PSTForge")
+        .map_err(|error| format!("cannot create Outlook OLE storage: {error}"))?;
+    compound
+        .create_stream("/PSTForge/Contents")
+        .and_then(|mut stream| stream.write_all(b"PSTForge Outlook OLE object checkpoint"))
+        .map_err(|error| format!("cannot create Outlook OLE content stream: {error}"))?;
+    let payload = compound.into_inner().into_inner();
+    cfb::CompoundFile::open_strict(Cursor::new(payload.clone()))
+        .map_err(|error| format!("generated Outlook OLE fixture is invalid: {error}"))?;
+
+    let mut fixture = FidelityStore {
+        store_name: "PSTForge Outlook OLE source".to_owned(),
+        folder_name: "OLE Objects".to_owned(),
+        ..FidelityStore::default()
+    };
+    fixture.message.subject = "Outlook OLE object fidelity checkpoint".to_owned();
+    fixture.message.attachments.clear();
+    for index in 0_u8..5 {
+        let path = payloads.path().join(format!("object-{index}.bin"));
+        fs::write(&path, &payload)
+            .map_err(|error| format!("cannot write Outlook OLE payload: {error}"))?;
+        fixture.message.attachments.push(AttachmentSpec {
+            filename: format!("object-{index}.bin"),
+            mime_type: None,
+            content_id: None,
+            content_location: None,
+            rendering_position: Some(-1),
+            flags: 0,
+            raw_properties: vec![
+                RawProperty {
+                    id: 0x3702,
+                    value: RawPropertyValue::Binary(vec![0x01, index]),
+                },
+                RawProperty {
+                    id: 0x370A,
+                    value: RawPropertyValue::Binary(vec![0x2A, 0x86, 0x48, index]),
+                },
+            ],
+            spooled_properties: Vec::new(),
+            direct_properties: Vec::new(),
+            content: AttachmentContent::Ole(OleAttachmentSpec {
+                data: FileBlobSpec {
+                    path,
+                    offset: 0,
+                    byte_len: u64::try_from(payload.len())
+                        .map_err(|_| "Outlook OLE payload length is out of range".to_owned())?,
+                    sha256: Sha256::digest(&payload).into(),
+                },
+                data_kind: OleDataKind::Object,
+            }),
+        });
+    }
+    publish_fidelity_qualification(root, output, &fixture, 1)
+}
+
 fn qualify_calendar_exceptions(root: &Path, output: &Path) -> Result<(), String> {
     use pstforge_pst::writer::{
         AttachmentContent, AttachmentSpec, FidelityStore, MailFolderRole, MailFolderSpec,
@@ -1551,7 +2412,7 @@ fn publish_qualification(
         .filter(|path| path.is_dir())
         .ok_or_else(|| "qualification output parent must already exist".to_owned())?;
     let temporary = tempfile::Builder::new()
-        .prefix(".pstforge-0.4.6-")
+        .prefix(".pstforge-0.5.0-")
         .tempdir_in(parent)
         .map_err(|error| format!("cannot create qualification staging directory: {error}"))?;
     let parts = temporary.path().join("parts");
@@ -1646,7 +2507,8 @@ impl Gate {
                 .to_owned()
         })?;
         let manifest = self.load_manifest(Path::new(&manifest_path))?;
-        self.command(
+        let prepared = self.prepare_full_corpus(manifest)?;
+        self.command_with_env(
             "external-corpus",
             "cargo",
             &[
@@ -1661,8 +2523,10 @@ impl Gate {
                 "--ignored",
                 "--nocapture",
             ],
+            "PSTFORGE_CORPUS_MANIFEST",
+            prepared.manifest_path.as_os_str(),
         )?;
-        self.run_independent_readers(&manifest)?;
+        self.run_independent_readers(&prepared.manifest)?;
         println!("full gate passed; evidence: {}", self.evidence.display());
         Ok(())
     }
@@ -1685,6 +2549,35 @@ impl Gate {
         print!("{name} ... ");
         let output = Command::new(program)
             .args(args)
+            .current_dir(&self.root)
+            .output()
+            .map_err(|error| format!("cannot run {program}: {error}"))?;
+        self.record(name, program, args, &output)?;
+        if output.status.success() {
+            println!("ok");
+            Ok(())
+        } else {
+            println!("FAILED");
+            Err(format!(
+                "{name} failed with {}; see {}",
+                output.status,
+                self.evidence.join(format!("{name}.log")).display()
+            ))
+        }
+    }
+
+    fn command_with_env(
+        &self,
+        name: &str,
+        program: &str,
+        args: &[&str],
+        key: &str,
+        value: &OsStr,
+    ) -> Result<(), String> {
+        print!("{name} ... ");
+        let output = Command::new(program)
+            .args(args)
+            .env(key, value)
             .current_dir(&self.root)
             .output()
             .map_err(|error| format!("cannot run {program}: {error}"))?;
@@ -1760,8 +2653,22 @@ impl Gate {
             ".agent/PLANS.md",
             "docs/PRODUCT_SPEC.md",
             "docs/ROADMAP.md",
+            "docs/debian-changelog",
+            "docs/debian-copyright",
+            "docs/pstforge.1",
+            "docs/schemas/common.schema.json",
+            "docs/schemas/info.schema.json",
+            "docs/schemas/verify.schema.json",
+            "docs/schemas/recover.schema.json",
+            "docs/schemas/split.schema.json",
+            "docs/schemas/report.schema.json",
             "tests/corpus-schema.json",
             "tests/corpus-manifest.example.toml",
+            "tests/fixtures/json/info.json",
+            "tests/fixtures/json/verify.json",
+            "tests/fixtures/json/recover.json",
+            "tests/fixtures/json/split.json",
+            "tests/fixtures/json/report.json",
         ] {
             if !self.root.join(relative).is_file() {
                 return Err(format!(
@@ -1773,6 +2680,25 @@ impl Gate {
             .map_err(|error| format!("cannot read corpus schema: {error}"))?;
         serde_json::from_str::<serde_json::Value>(&schema)
             .map_err(|error| format!("corpus schema is not valid JSON: {error}"))?;
+        for relative in [
+            "docs/schemas/common.schema.json",
+            "docs/schemas/info.schema.json",
+            "docs/schemas/verify.schema.json",
+            "docs/schemas/recover.schema.json",
+            "docs/schemas/split.schema.json",
+            "docs/schemas/report.schema.json",
+            "tests/fixtures/json/info.json",
+            "tests/fixtures/json/verify.json",
+            "tests/fixtures/json/recover.json",
+            "tests/fixtures/json/split.json",
+            "tests/fixtures/json/report.json",
+        ] {
+            let document = fs::read_to_string(self.root.join(relative))
+                .map_err(|error| format!("cannot read {relative}: {error}"))?;
+            serde_json::from_str::<serde_json::Value>(&document)
+                .map_err(|error| format!("{relative} is not valid JSON: {error}"))?;
+        }
+        self.validate_public_json_schemas()?;
         let example = fs::read_to_string(self.root.join("tests/corpus-manifest.example.toml"))
             .map_err(|error| format!("cannot read example manifest: {error}"))?;
         let example: CorpusManifest = toml::from_str(&example)
@@ -1784,6 +2710,68 @@ impl Gate {
         )
         .map_err(|error| format!("cannot record artifact validation: {error}"))?;
         println!("artifacts ... ok");
+        Ok(())
+    }
+
+    fn validate_public_json_schemas(&self) -> Result<(), String> {
+        const SCHEMAS: &[&str] = &[
+            "common.schema.json",
+            "info.schema.json",
+            "verify.schema.json",
+            "recover.schema.json",
+            "split.schema.json",
+            "report.schema.json",
+        ];
+        const COMMANDS: &[(&str, &str)] = &[
+            ("info.schema.json", "info.json"),
+            ("verify.schema.json", "verify.json"),
+            ("recover.schema.json", "recover.json"),
+            ("split.schema.json", "split.json"),
+            ("report.schema.json", "report.json"),
+        ];
+
+        let mut schemas = Vec::with_capacity(SCHEMAS.len());
+        let mut registry = jsonschema::Registry::new();
+        for filename in SCHEMAS {
+            let path = self.root.join("docs/schemas").join(filename);
+            let value: serde_json::Value = serde_json::from_str(
+                &fs::read_to_string(&path)
+                    .map_err(|error| format!("cannot read {}: {error}", path.display()))?,
+            )
+            .map_err(|error| format!("{} is not valid JSON: {error}", path.display()))?;
+            let uri = format!("file:///pstforge-schemas/{filename}");
+            registry = registry
+                .add(uri, value.clone())
+                .map_err(|error| format!("cannot register {filename}: {error}"))?;
+            schemas.push((*filename, value));
+        }
+        let registry = registry
+            .prepare()
+            .map_err(|error| format!("cannot prepare public schema registry: {error}"))?;
+
+        for (schema_filename, fixture_filename) in COMMANDS {
+            let schema = schemas
+                .iter()
+                .find_map(|(filename, value)| (*filename == *schema_filename).then_some(value))
+                .ok_or_else(|| format!("public schema {schema_filename} was not loaded"))?;
+            let base_uri = format!("file:///pstforge-schemas/{schema_filename}");
+            let validator = jsonschema::options()
+                .with_registry(&registry)
+                .with_base_uri(&base_uri)
+                .build(schema)
+                .map_err(|error| format!("cannot compile {schema_filename}: {error}"))?;
+            let fixture_path = self.root.join("tests/fixtures/json").join(fixture_filename);
+            let fixture: serde_json::Value = serde_json::from_str(
+                &fs::read_to_string(&fixture_path)
+                    .map_err(|error| format!("cannot read {}: {error}", fixture_path.display()))?,
+            )
+            .map_err(|error| format!("{} is not valid JSON: {error}", fixture_path.display()))?;
+            if let Err(error) = validator.validate(&fixture) {
+                return Err(format!(
+                    "{fixture_filename} violates {schema_filename}: {error}"
+                ));
+            }
+        }
         Ok(())
     }
 
@@ -1915,6 +2903,66 @@ impl Gate {
             );
         }
         Ok(())
+    }
+
+    fn prepare_full_corpus(&self, mut manifest: CorpusManifest) -> Result<PreparedCorpus, String> {
+        type Generator = fn(&Path, &Path) -> Result<(), String>;
+        let generators: [(&str, Generator); 6] = [
+            (
+                "v042-calendar-exception-source",
+                qualify_calendar_exceptions,
+            ),
+            ("v042-distribution-list-source", qualify_distribution_list),
+            ("v042-document-source", qualify_document_object),
+            ("v042-ole-attachments-source", qualify_ole_attachments),
+            (
+                "v042-outlook-ole-object-source",
+                qualify_outlook_ole_objects,
+            ),
+            (
+                "v042-reference-attachments-source",
+                qualify_reference_attachments,
+            ),
+        ];
+        let scratch = tempfile::tempdir()
+            .map_err(|error| format!("cannot create generated corpus scratch: {error}"))?;
+        for case in &mut manifest.cases {
+            if case.path.is_file() {
+                continue;
+            }
+            let Some((_, generator)) = generators.iter().find(|(name, _)| *name == case.name)
+            else {
+                return Err(format!(
+                    "corpus case {} is missing and has no deterministic generator: {}",
+                    case.name,
+                    case.path.display()
+                ));
+            };
+            let output = scratch.path().join(&case.name);
+            generator(&self.root, &output)?;
+            let generated = output.join("parts/part-0001.pst");
+            let identity = pstforge_core::SourceFile::open(&generated)
+                .map_err(|error| format!("cannot inspect generated {}: {error}", case.name))?
+                .identity()
+                .clone();
+            case.path = generated;
+            case.sha256 = identity
+                .sha256
+                .ok_or_else(|| format!("generated {} has no SHA-256", case.name))?;
+        }
+        self.validate_manifest(&manifest)?;
+        let manifest_path = scratch.path().join("full-manifest.toml");
+        fs::write(
+            &manifest_path,
+            toml::to_string(&manifest)
+                .map_err(|error| format!("cannot encode prepared corpus manifest: {error}"))?,
+        )
+        .map_err(|error| format!("cannot write prepared corpus manifest: {error}"))?;
+        Ok(PreparedCorpus {
+            manifest,
+            manifest_path,
+            _scratch: scratch,
+        })
     }
 
     fn run_independent_readers(&self, manifest: &CorpusManifest) -> Result<(), String> {
@@ -2194,8 +3242,43 @@ fn sanitize(name: &str) -> String {
 #[cfg(test)]
 mod tests {
     use std::io::{Cursor, Read as _};
+    use std::os::unix::fs::symlink;
 
-    use super::document_checkpoint_payload;
+    use super::{
+        document_checkpoint_payload, prepare_generated_directory, rust_dependency_licenses,
+    };
+
+    #[test]
+    fn packaged_rust_licenses_cover_only_the_executable_closure()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(std::path::Path::parent)
+            .ok_or("cannot locate workspace root")?
+            .to_path_buf();
+        let licenses = rust_dependency_licenses(&root)?;
+        assert!(licenses.contains("serde "));
+        assert!(licenses.contains("rusqlite "));
+        assert!(!licenses.contains("jsonschema "));
+        assert!(licenses.contains("--- LICENSE"));
+        Ok(())
+    }
+
+    #[test]
+    fn package_cleanup_refuses_symlinked_target() -> Result<(), Box<dyn std::error::Error>> {
+        let workspace = tempfile::tempdir()?;
+        let outside = tempfile::tempdir()?;
+        let sentinel = outside.path().join("keep");
+        std::fs::write(&sentinel, b"operator data\n")?;
+        symlink(outside.path(), workspace.path().join("target"))?;
+
+        assert!(
+            prepare_generated_directory(workspace.path(), &workspace.path().join("target/debian"))
+                .is_err()
+        );
+        assert_eq!(std::fs::read(&sentinel)?, b"operator data\n");
+        Ok(())
+    }
 
     #[test]
     fn document_checkpoint_is_a_complete_minimal_opc_package()

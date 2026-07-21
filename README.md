@@ -1,82 +1,240 @@
 # PSTForge
 
-PSTForge is a Linux command-line utility for recovery of large or damaged
-Outlook PST files. Version 0.3.0 adds balanced normal, recovered, and orphan
-mail extraction into a private transactional job spool. The accepted 0.2.1
-writer provides the template-free mail-fidelity PST structures used by later
-size-limited packing milestones.
+PSTForge is a Linux-native command-line utility for recovering large or damaged
+Outlook PST files without modifying the source. It writes new, independently
+importable Unicode PST files, normally capped at 4 GiB, for checkpointed import
+into Synology MailPlus Server. Microsoft Outlook is the secondary compatibility
+target.
 
-## Ubuntu Dependencies
+PSTForge is pre-1.0 software. The output writer and recovery pipeline have been
+validated with real damaged PSTs, ScanPST, Outlook, MailPlus, `libpff`,
+`pffinfo`, and `readpst`, but the command and report contracts may still change
+before 1.0.
 
-The verified Ubuntu package names for development and local acceptance are:
+## Features
+
+- Opens the source read-only, refuses source symlinks and unsafe output paths,
+  and rechecks source identity before reporting completion.
+- Reads healthy and damaged ANSI and Unicode PST input supported by `libpff`.
+- Preserves readable mail, contacts, distribution lists, appointments,
+  meetings, tasks, notes, documents, unknown message classes, recipients,
+  attachments, recursively embedded messages, named/raw properties, folder and
+  store metadata, and hidden associated items.
+- Recovers reachable, deleted, recovered, and orphan items in balanced mode;
+  aggressive mode also asks `libpff` to ignore allocation data and scan for
+  fragments.
+- Writes complete Unicode PST parts with the original source folder layout.
+  The configured size is a hard target unless one indivisible item is larger.
+- Streams directly by default: one source traversal, no payload spool, no
+  completed-part hash pass, and atomic publication of each finished part.
+- Offers opt-in restartable recovery with durable payload state and strict
+  source/configuration matching on resume.
+- Produces bounded `recovery.log` accounting and versioned human or JSON
+  reports without logging message subjects, addresses, bodies, or attachment
+  contents.
+- Provides read-only `info`, streaming `verify`, durable-spool `recover`, PST
+  producing `split`, and persisted-job `report` commands.
+
+## Limitations
+
+- PSTForge can recover only data that remains readable through `libpff` and can
+  be represented safely in a PST. Omitted or damaged content is counted by
+  reason; it is never silently reported as written.
+- Direct mode is intentionally not resumable. An interrupted direct job keeps
+  finalized parts and reporting state, but a retry must use a new empty output
+  directory.
+- Restartable mode adds approximately one complete readable-payload write and
+  requires conservative free space of three times the source size. It also
+  requires `pffinfo` and `readpst`; direct mode does not.
+- Direct mode retains bounded control metadata for one top-level item graph.
+  Its supervisor limit is 256 MiB and 262,144 frames; attachment/property bytes
+  themselves are streamed.
+- A single item larger than `--max-pst-size` is preserved alone in a marked
+  oversize part and produces partial-success status.
+- Existing output is never overwritten. A nonempty new-job directory or a
+  conflicting `part-NNNN.pst` filename causes a refusal.
+- Mail clients do not expose every native PST class or embedded object in the
+  same way. A client display/import limitation does not imply the underlying
+  PST object was omitted; use the reports and an independent reader when
+  investigating a discrepancy.
+- PSTForge 1.0 does not include in-place repair, PST merging, OST conversion,
+  password cracking, general attachment export, EML/Maildir/PDF output, a GUI,
+  date-range splitting, or folder-based splitting.
+
+## Installation
+
+### Debian package
+
+Build the reproducible package, then install it with APT so runtime dependencies
+are resolved:
 
 ```bash
-sudo apt install build-essential pkg-config cargo rustc rustfmt rust-clippy \
-  libpff-dev pff-tools pst-utils
+cargo xtask package deb
+sudo apt install ./target/debian/pstforge_0.5.0_amd64.deb
+pstforge --version
+```
+
+The package targets `amd64` and dynamically links the replaceable system
+`libpff.so.1`. It installs the binary, manpage, product documentation, public
+JSON schemas, and all applicable license notices. Remove the program without
+touching source PSTs or recovery jobs:
+
+```bash
+sudo apt remove pstforge
+```
+
+### Compile from source
+
+The minimum supported Rust version is 1.85. On Ubuntu 26.04, the verified build
+packages are:
+
+```bash
+sudo apt update
+sudo apt install build-essential pkg-config cargo rustc libpff-dev
+cargo build --locked --release -p pstforge-cli
+./target/release/pstforge --version
+```
+
+To install that source build outside the package manager:
+
+```bash
+sudo install -Dm755 target/release/pstforge /usr/local/bin/pstforge
+```
+
+Development and full acceptance use these additional verified Ubuntu packages:
+
+```bash
+sudo apt install rustfmt rust-clippy pff-tools pst-utils dpkg-dev lintian \
+  binutils gzip findutils coreutils
 cargo install cargo-audit --locked
 ```
 
-`libpff-dev` supplies the dynamically linked parser and headers. `pff-tools`
-supplies `pffinfo`; `pst-utils` supplies the independent `readpst` validator.
-The project MSRV is Rust 1.85.
+`libpff-dev` supplies the dynamically linked parser headers/library,
+`pff-tools` supplies `pffinfo`, and `pst-utils` supplies `readpst`. The Debian
+builder additionally uses `dpkg-dev`, `lintian`, `binutils`, `gzip`, `findutils`,
+and `coreutils`.
 
-## Usage
+## Basic Usage
+
+Inspect a source without traversing its items:
 
 ```bash
-cargo run -p pstforge-cli -- info /data/mail.pst
-cargo run -p pstforge-cli -- info /data/mail.pst --json
-cargo run -p pstforge-cli -- verify /data/mail.pst --mode full
-cargo run -p pstforge-cli -- recover /data/mail.pst --output /data/recovery-job
+pstforge info /storage/damaged.pst
 ```
 
-PSTForge refuses source symlinks and opens the source with Linux read-only,
-no-follow, no-atime flags. `info` hashes the file and reports format metadata.
-`verify` additionally streams the reachable mail catalog, including recipients,
-bodies, raw properties, attachments, and embedded-message relationships. It
-reports byte totals and the peak stream chunk without retaining an unbounded
-property or attachment in memory.
+Account for reachable content, or include balanced recovery collections:
 
-`recover` traverses reachable mail first, invokes balanced `libpff` recovery,
-then spools recovered and orphan candidates. It creates a private SQLite ledger
-and content-addressed blobs under `OUTPUT/.pstforge`; it does not yet create
-importable PST parts. A fresh run refuses a nonempty output directory. Exit
-status `1` means durable candidates were produced but some source content was
-partial or damaged.
+```bash
+pstforge verify /storage/damaged.pst --mode full
+pstforge verify /storage/damaged.pst --mode recovery --json > verify.json
+```
 
-## Local Gates
+Split directly using the default 4 GiB target:
+
+```bash
+pstforge split /storage/damaged.pst --output /recovery/job-001
+```
+
+Use another hard part target or aggressive recovery:
+
+```bash
+pstforge split /storage/damaged.pst \
+  --output /recovery/job-002 \
+  --max-pst-size 2GiB \
+  --recovery aggressive
+```
+
+Choose restartability deliberately when its disk/write cost is acceptable:
+
+```bash
+pstforge split /storage/damaged.pst \
+  --output /recovery/job-003 \
+  --restartable
+
+pstforge split /storage/damaged.pst \
+  --output /recovery/job-003 \
+  --restartable \
+  --resume
+```
+
+`--keep-work` retains restartable payload state after success. Without it,
+payload storage is removed after finalized parts and accounting are durable.
+
+Create canonical restartable recovery state without writing PST parts, or
+recreate a report from an existing split job:
+
+```bash
+pstforge recover /storage/damaged.pst --output /recovery/spool-only
+pstforge report /recovery/job-001
+pstforge report /recovery/job-001 --json > report.json
+```
+
+Final command results go to stdout. Progress and diagnostics go to stderr.
+`--json` selects one versioned JSON result; `--log-format json` separately
+selects structured stderr diagnostics. All commands also accept `--quiet`,
+`--color auto|always|never`, and repeatable `-v`.
+
+## Output
+
+A split job contains:
+
+```text
+job-001/
+  parts/part-0001.pst
+  recovery.log
+  .pstforge/manifests/part-0001.json
+```
+
+Parts are created beside their destination under temporary names, flushed, and
+atomically renamed only after writer validation. `.pstforge` is private durable
+state. Restartable payload data exists there only when `--restartable` is used.
+Do not place the source PST inside the job directory.
+
+Public JSON schemas are in [`docs/schemas`](docs/schemas) and install to
+`/usr/share/pstforge/schemas`. `recovery.log` is intentionally aggregate and
+bounded; detailed private test/run evidence should be kept separately.
+
+## Exit Status
+
+| Status | Meaning |
+| ---: | --- |
+| `0` | Complete success |
+| `1` | Partial success with usable, explicitly accounted output |
+| `2` | Invalid command-line usage |
+| `3` | Source or parser failure |
+| `4` | Output or durable-state failure |
+| `5` | Generated PST conformance failure |
+| `6` | Internal or supervision failure |
+| `130` | Interrupted by `SIGINT` or `SIGTERM` |
+
+Automation must treat status `1` as requiring review of `recovery.log` and the
+JSON report, not as complete success.
+
+## Testing
+
+Fast tests use generated fixtures and do not need private PST data:
 
 ```bash
 cargo xtask gate fast
-PSTFORGE_CORPUS_MANIFEST=/absolute/external/manifest.toml \
+```
+
+Real PST files must live outside the repository and are referenced only by an
+explicit manifest. On the established development host, run the full gate with
+the canonical combined manifest:
+
+```bash
+test -r "$HOME/.local/share/pstforge-test-corpus/full-manifest.toml"
+PSTFORGE_CORPUS_MANIFEST="$HOME/.local/share/pstforge-test-corpus/full-manifest.toml" \
   cargo xtask gate full
 ```
 
-Real PST files and their manifest must remain outside the repository. Start
-from [`tests/corpus-manifest.example.toml`](tests/corpus-manifest.example.toml).
-The full gate verifies source hash and timestamps before and after inspection
-and recovery commands, creates a rich Unicode PST without a runtime template, round-trips it
-through `libpff`, `pffinfo`, and independent `readpst`, and validates healthy
-external corpus cases.
-Detailed logs are written under the ignored `.agent/test-results/` directory;
+Start a new external manifest from
+[`tests/corpus-manifest.example.toml`](tests/corpus-manifest.example.toml).
+PSTForge never scans user directories to discover test PSTs. Detailed gate
+evidence is written beneath the ignored `.agent/test-results/` directory, and
 independent-reader output is redacted because it can contain mailbox data.
-The release-facing [attachment recovery matrix](docs/ATTACHMENT_RECOVERY.md)
-documents which missing MIME types can be proven from complete payload bytes,
-which damaged containers receive only a generic label, and which unknown data
-is retained for later analysis.
 
-Writer developers can generate the 0.2.1 acceptance store directly:
-
-```bash
-cargo run -p pstforge-pst --example create_fidelity -- /tmp/pstforge-fidelity.pst
-```
-
-The current public writer boundary emits one deterministic mail folder and one
-top-level message per call. It supports multiple To/Cc/Bcc recipients,
-by-value attachments, inline content metadata, custom named-property GUID
-sets, typed raw properties, and one attachment level of embedded messages.
-Version 0.2.1 externalizes individual property payloads above the heap limit
-through 16 KiB and rejects larger values before publication; the 0.4.x packer
-removes that bounded-fixture limit as part of arbitrary size-limited output.
-The
-0.3.x pipeline supplies recovered canonical items; 0.4.x generalizes folder
-and message packing across size-limited parts.
+See [`docs/PRODUCT_SPEC.md`](docs/PRODUCT_SPEC.md) for the authoritative
+behavior contract, [`docs/ATTACHMENT_RECOVERY.md`](docs/ATTACHMENT_RECOVERY.md)
+for attachment-recovery confidence, and [`THIRD_PARTY_LICENSES.md`](THIRD_PARTY_LICENSES.md)
+for licensing and upstream provenance.

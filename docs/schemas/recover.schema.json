@@ -1,0 +1,33 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "recover.schema.json",
+  "title": "PSTForge recover result",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "command", "mode", "source", "job_directory", "normal_items", "recovered_items", "orphan_items", "fragment_items", "committed_candidates", "complete_candidates", "partial_candidates", "unsupported_candidates", "blob_count", "blob_bytes", "issues", "issues_dropped", "worker_attempts", "worker_failures", "isolated_units", "peak_worker_rss_bytes", "interrupted", "source_unchanged"],
+  "properties": {
+    "schema_version": { "const": "0.5.0" },
+    "command": { "const": "recover" },
+    "mode": { "enum": ["balanced", "aggressive"] },
+    "source": { "$ref": "common.schema.json#/$defs/source" },
+    "job_directory": { "type": "string" },
+    "normal_items": { "type": "integer", "minimum": 0 },
+    "recovered_items": { "type": "integer", "minimum": 0 },
+    "orphan_items": { "type": "integer", "minimum": 0 },
+    "fragment_items": { "type": "integer", "minimum": 0 },
+    "committed_candidates": { "type": "integer", "minimum": 0 },
+    "complete_candidates": { "type": "integer", "minimum": 0 },
+    "partial_candidates": { "type": "integer", "minimum": 0 },
+    "unsupported_candidates": { "type": "integer", "minimum": 0 },
+    "blob_count": { "type": "integer", "minimum": 0 },
+    "blob_bytes": { "type": "integer", "minimum": 0 },
+    "issues": { "type": "integer", "minimum": 0 },
+    "issues_dropped": { "type": "integer", "minimum": 0 },
+    "worker_attempts": { "type": "integer", "minimum": 0 },
+    "worker_failures": { "type": "integer", "minimum": 0 },
+    "isolated_units": { "type": "integer", "minimum": 0 },
+    "peak_worker_rss_bytes": { "type": "integer", "minimum": 0 },
+    "interrupted": { "type": "boolean" },
+    "source_unchanged": { "type": "boolean" }
+  }
+}

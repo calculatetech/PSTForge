@@ -11,7 +11,7 @@ use pstforge_job::{
     DurableCatalogSink, JobConfiguration, JobError, JobSourceIdentity, JobSummary,
     RecoveryCompletion,
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::worker::WorkerCatalog;
@@ -21,7 +21,7 @@ use crate::{
 };
 use libpff_sys::{RecoveryMode, RecoveryUnit};
 
-pub const RECOVERY_SCHEMA_VERSION: &str = "0.4.6";
+pub const RECOVERY_SCHEMA_VERSION: &str = "0.5.0";
 const MAX_WORKER_RETRIES: u32 = 3;
 const MAX_UNIT_RETRIES: u32 = 0;
 
@@ -51,7 +51,7 @@ pub enum RecoveryError {
     ResumeConfigurationRequired,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RecoveryReport {
     pub schema_version: String,
     pub command: String,

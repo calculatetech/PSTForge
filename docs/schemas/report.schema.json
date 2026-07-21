@@ -1,0 +1,14 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "report.schema.json",
+  "title": "PSTForge persisted job report",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "command", "producer_version", "split"],
+  "properties": {
+    "schema_version": { "const": "1.0.0" },
+    "command": { "const": "report" },
+    "producer_version": { "type": "string" },
+    "split": { "$ref": "split.schema.json" }
+  }
+}

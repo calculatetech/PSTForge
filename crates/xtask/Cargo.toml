@@ -8,6 +8,7 @@ license.workspace = true
 [dependencies]
 base64.workspace = true
 cfb.workspace = true
+jsonschema.workspace = true
 libpff-sys = { path = "../libpff-sys" }
 pstforge-core = { path = "../pstforge-core" }
 pstforge-pst = { path = "../pstforge-pst" }

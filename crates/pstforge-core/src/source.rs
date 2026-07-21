@@ -75,6 +75,10 @@ impl SourceFile {
         Self::open_with_interrupt(path, None, false, true)
     }
 
+    pub fn open_protected(path: &Path) -> Result<Self, SourceError> {
+        Self::open_with_interrupt(path, None, true, true)
+    }
+
     pub(crate) fn open_interruptible(
         path: &Path,
         interrupted: &AtomicBool,
