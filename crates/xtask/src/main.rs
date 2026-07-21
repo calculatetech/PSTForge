@@ -320,7 +320,7 @@ fn run() -> Result<(), String> {
     }
     let tier = arguments
         .next()
-        .ok_or_else(|| "missing gate tier: fast, full, or release".to_owned())?;
+        .ok_or_else(|| "missing gate tier: fast, ci, full, or release".to_owned())?;
     if arguments.next().is_some() {
         return Err("unexpected arguments after gate tier".to_owned());
     }
@@ -337,14 +337,15 @@ fn run() -> Result<(), String> {
 
     match tier.to_str() {
         Some("fast") => gate.fast(),
+        Some("ci") => gate.ci(),
         Some("full") => gate.full(),
         Some("release") => gate.release(),
-        _ => Err("unknown gate tier; expected fast, full, or release".to_owned()),
+        _ => Err("unknown gate tier; expected fast, ci, full, or release".to_owned()),
     }
 }
 
 fn usage() -> String {
-    "usage: cargo xtask gate <fast|full|release> | package deb | qualify <embedded-attachments|named-properties|empty-folders|contacts|appointments|meetings|pim-items|distribution-list|document-object|ole-attachments|reference-attachments|calendar-exceptions|associated-data> <output>"
+    "usage: cargo xtask gate <fast|ci|full|release> | package deb | qualify <embedded-attachments|named-properties|empty-folders|contacts|appointments|meetings|pim-items|distribution-list|document-object|ole-attachments|reference-attachments|calendar-exceptions|associated-data> <output>"
         .to_owned()
 }
 
@@ -2498,10 +2499,8 @@ impl Gate {
     }
 
     fn full(&self) -> Result<(), String> {
-        self.fast()?;
-        self.validate_licenses()?;
+        self.ci()?;
         self.command("advisories", "cargo", &["audit", "--deny", "warnings"])?;
-        self.validate_generated_store()?;
         let manifest_path = std::env::var_os("PSTFORGE_CORPUS_MANIFEST").ok_or_else(|| {
             "PSTFORGE_CORPUS_MANIFEST must point to an external corpus manifest for the full gate"
                 .to_owned()
@@ -2531,6 +2530,14 @@ impl Gate {
         Ok(())
     }
 
+    fn ci(&self) -> Result<(), String> {
+        self.fast()?;
+        self.validate_licenses()?;
+        self.validate_generated_store()?;
+        println!("CI gate passed; evidence: {}", self.evidence.display());
+        Ok(())
+    }
+
     fn release(&self) -> Result<(), String> {
         self.full()?;
         self.command(
@@ -2538,6 +2545,7 @@ impl Gate {
             "cargo",
             &["build", "--workspace", "--release", "--locked"],
         )?;
+        package_deb(&self.root)?;
         println!(
             "release gate foundation passed; evidence: {}",
             self.evidence.display()
@@ -2656,6 +2664,15 @@ impl Gate {
             "docs/debian-changelog",
             "docs/debian-copyright",
             "docs/pstforge.1",
+            ".github/actionlint.yaml",
+            ".github/workflows/ci.yml",
+            ".github/workflows/fuzz.yml",
+            ".github/workflows/private-corpus.yml",
+            ".github/workflows/release-build.yml",
+            ".github/workflows/security.yml",
+            "fuzz/Cargo.lock",
+            "fuzz/Cargo.toml",
+            "fuzz/fuzz_targets/pst_reader.rs",
             "docs/schemas/common.schema.json",
             "docs/schemas/info.schema.json",
             "docs/schemas/verify.schema.json",
@@ -2699,6 +2716,7 @@ impl Gate {
                 .map_err(|error| format!("{relative} is not valid JSON: {error}"))?;
         }
         self.validate_public_json_schemas()?;
+        self.validate_github_workflows()?;
         let example = fs::read_to_string(self.root.join("tests/corpus-manifest.example.toml"))
             .map_err(|error| format!("cannot read example manifest: {error}"))?;
         let example: CorpusManifest = toml::from_str(&example)
@@ -2710,6 +2728,102 @@ impl Gate {
         )
         .map_err(|error| format!("cannot record artifact validation: {error}"))?;
         println!("artifacts ... ok");
+        Ok(())
+    }
+
+    fn validate_github_workflows(&self) -> Result<(), String> {
+        const WORKFLOWS: [&str; 5] = [
+            "ci.yml",
+            "fuzz.yml",
+            "private-corpus.yml",
+            "release-build.yml",
+            "security.yml",
+        ];
+        for filename in WORKFLOWS {
+            let path = self.root.join(".github/workflows").join(filename);
+            let text = fs::read_to_string(&path)
+                .map_err(|error| format!("cannot read {}: {error}", path.display()))?;
+            serde_yaml_ng::from_str::<serde_yaml_ng::Value>(&text)
+                .map_err(|error| format!("{} is not valid YAML: {error}", path.display()))?;
+            if text.contains("pull_request:") || !text.contains("permissions:\n  contents: read") {
+                return Err(format!(
+                    "{filename} must be push/manual/scheduled automation with read-only contents permission"
+                ));
+            }
+            for line in text.lines().map(str::trim) {
+                let Some(action) = line.strip_prefix("uses:") else {
+                    continue;
+                };
+                let Some((_, revision)) = action.trim().rsplit_once('@') else {
+                    return Err(format!("{filename} has an unversioned action: {action}"));
+                };
+                if revision.len() != 40 || !revision.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+                    return Err(format!(
+                        "{filename} action is not pinned to a full commit: {action}"
+                    ));
+                }
+            }
+        }
+        let private = fs::read_to_string(self.root.join(".github/workflows/private-corpus.yml"))
+            .map_err(|error| format!("cannot read private corpus workflow: {error}"))?;
+        for forbidden in ["upload-artifact", "actions/cache", "pull_request"] {
+            if private.contains(forbidden) {
+                return Err(format!(
+                    "private corpus workflow contains forbidden upload/trigger token {forbidden}"
+                ));
+            }
+        }
+        for required in [
+            "pstforge-private-corpus",
+            "if: github.ref == 'refs/heads/main'",
+            "secrets.PSTFORGE_CORPUS_MANIFEST",
+            "> .agent/test-results/github-private-console.log 2>&1",
+            "PSTs, job state, reader output, and detailed logs were not uploaded.",
+        ] {
+            if !private.contains(required) {
+                return Err(format!(
+                    "private corpus workflow is missing privacy requirement {required}"
+                ));
+            }
+        }
+        let fuzz = fs::read_to_string(self.root.join(".github/workflows/fuzz.yml"))
+            .map_err(|error| format!("cannot read fuzz workflow: {error}"))?;
+        if !fuzz.contains("cargo install cargo-fuzz --version 0.13.2 --locked") {
+            return Err("fuzz workflow must install the reviewed cargo-fuzz version".to_owned());
+        }
+        let actionlint = fs::read_to_string(self.root.join(".github/actionlint.yaml"))
+            .map_err(|error| format!("cannot read actionlint configuration: {error}"))?;
+        if !actionlint.contains("pstforge-private-corpus") {
+            return Err("actionlint configuration is missing the private runner label".to_owned());
+        }
+        let ci = fs::read_to_string(self.root.join(".github/workflows/ci.yml"))
+            .map_err(|error| format!("cannot read CI workflow: {error}"))?;
+        for required in [
+            "actionlint_1.7.12_linux_amd64.tar.gz",
+            "8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8",
+            "./actionlint -color",
+        ] {
+            if !ci.contains(required) {
+                return Err(format!(
+                    "CI workflow is missing actionlint requirement {required}"
+                ));
+            }
+        }
+        let release = fs::read_to_string(self.root.join(".github/workflows/release-build.yml"))
+            .map_err(|error| format!("cannot read release workflow: {error}"))?;
+        for required in [
+            "environment: release",
+            "git tag --points-at HEAD",
+            "v*)",
+            "cargo metadata --locked --no-deps --format-version 1",
+            "test \"$RELEASE_TAG\" = \"v$PACKAGE_VERSION\"",
+        ] {
+            if !release.contains(required) {
+                return Err(format!(
+                    "release workflow is missing approval/tag requirement {required}"
+                ));
+            }
+        }
         Ok(())
     }
 

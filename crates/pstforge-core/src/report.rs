@@ -128,18 +128,19 @@ fn validate_split_snapshot(
             "recovery summary disagrees with the durable ledger".to_owned(),
         ));
     }
-    if let Some(completion) = &evidence.recovery_completion
-        && (recovery.normal_items != completion.normal_items
+    if let Some(completion) = &evidence.recovery_completion {
+        if recovery.normal_items != completion.normal_items
             || recovery.recovered_items != completion.recovered_items
             || recovery.orphan_items != completion.orphan_items
             || recovery.fragment_items != completion.fragment_items
             || recovery.issues != completion.issues
             || recovery.issues_dropped != completion.issues_dropped
-            || recovery.peak_worker_rss_bytes != completion.peak_worker_rss_bytes)
-    {
-        return Err(ReportError::InvalidSnapshot(
-            "recovery completion disagrees with the durable ledger".to_owned(),
-        ));
+            || recovery.peak_worker_rss_bytes != completion.peak_worker_rss_bytes
+        {
+            return Err(ReportError::InvalidSnapshot(
+                "recovery completion disagrees with the durable ledger".to_owned(),
+            ));
+        }
     }
     Ok(())
 }

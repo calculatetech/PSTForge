@@ -1,0 +1,23 @@
+[package]
+name = "pstforge-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4.10"
+pstforge-pst = { path = "../crates/pstforge-pst" }
+tempfile = "3.20.0"
+
+[[bin]]
+name = "pst_reader"
+path = "fuzz_targets/pst_reader.rs"
+test = false
+doc = false
+bench = false
+
+[workspace]
+members = ["."]

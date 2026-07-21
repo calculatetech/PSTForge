@@ -1,3 +1,9 @@
+pstforge (0.5.1) unstable; urgency=medium
+
+  * Add public CI, scheduled security/fuzz checks, and private-corpus automation.
+
+ -- PSTForge Maintainers <noreply@pstforge.invalid>  Mon, 20 Jul 2026 00:00:00 +0000
+
 pstforge (0.5.0) unstable; urgency=medium
 
   * Add operational reporting, stable JSON schemas, and Debian packaging.

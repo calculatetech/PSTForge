@@ -2748,10 +2748,10 @@ impl DurableCatalogSink {
                     })
             })
             .transpose()?;
-        if let Some(parent_id) = parent_message_id
-            && let Some(durable_parent_id) = self.replayed_source_ids.get(&parent_id)
-        {
-            metadata["parent_message_id"] = serde_json::json!(durable_parent_id);
+        if let Some(parent_id) = parent_message_id {
+            if let Some(durable_parent_id) = self.replayed_source_ids.get(&parent_id) {
+                metadata["parent_message_id"] = serde_json::json!(durable_parent_id);
+            }
         }
         if parent_item_key.is_some() != parent_attachment_index.is_some() {
             return Err(JobError::EventSequence(

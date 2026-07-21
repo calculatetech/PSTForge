@@ -1,3 +1,6 @@
 /target/
+/fuzz/artifacts/
+/fuzz/corpus/
+/fuzz/target/
 /.agent/test-results/
 *.partial

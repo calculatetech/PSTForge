@@ -877,15 +877,15 @@ fn spawn_worker(
     if controls.writer_order {
         command.arg("--writer-order");
     }
-    if controls.writer_order
-        && attempt == 1
-        && let Some(byte_count) =
+    if controls.writer_order && attempt == 1 {
+        if let Some(byte_count) =
             std::env::var_os("PSTFORGE_TEST_DIRECT_ABORT_MID_PAYLOAD_AFTER_BYTES")
-    {
-        command.env(
-            "PSTFORGE_INTERNAL_ABORT_MID_PAYLOAD_AFTER_BYTES",
-            byte_count,
-        );
+        {
+            command.env(
+                "PSTFORGE_INTERNAL_ABORT_MID_PAYLOAD_AFTER_BYTES",
+                byte_count,
+            );
+        }
     }
     command.env(
         "PSTFORGE_INTERNAL_SUPERVISOR_PID",
@@ -914,24 +914,21 @@ fn spawn_worker(
     if let Some(candidate_count) = stall_after {
         command.env("PSTFORGE_INTERNAL_STALL_AFTER_CANDIDATES", candidate_count);
     }
-    if attempt == 1
-        && let Some(unit_ordinal) = std::env::var_os("PSTFORGE_TEST_ABORT_ON_UNIT_ORDINAL")
-    {
-        command.env("PSTFORGE_INTERNAL_ABORT_ON_UNIT", unit_ordinal);
-    }
-    if attempt == 1
-        && let Some(unit_ordinal) = std::env::var_os("PSTFORGE_TEST_SEGV_ON_UNIT_ORDINAL")
-    {
-        command.env("PSTFORGE_INTERNAL_SEGV_ON_UNIT", unit_ordinal);
-    }
-    if attempt == 1
-        && let Some(candidate_count) =
+    if attempt == 1 {
+        if let Some(unit_ordinal) = std::env::var_os("PSTFORGE_TEST_ABORT_ON_UNIT_ORDINAL") {
+            command.env("PSTFORGE_INTERNAL_ABORT_ON_UNIT", unit_ordinal);
+        }
+        if let Some(unit_ordinal) = std::env::var_os("PSTFORGE_TEST_SEGV_ON_UNIT_ORDINAL") {
+            command.env("PSTFORGE_INTERNAL_SEGV_ON_UNIT", unit_ordinal);
+        }
+        if let Some(candidate_count) =
             std::env::var_os("PSTFORGE_TEST_ABORT_INSIDE_UNIT_AFTER_CANDIDATES")
-    {
-        command.env(
-            "PSTFORGE_INTERNAL_ABORT_INSIDE_AFTER_CANDIDATES",
-            candidate_count,
-        );
+        {
+            command.env(
+                "PSTFORGE_INTERNAL_ABORT_INSIDE_AFTER_CANDIDATES",
+                candidate_count,
+            );
+        }
     }
     if let Some(unit) = repeat_fault_unit {
         let variable =
@@ -947,14 +944,15 @@ fn spawn_worker(
             serde_json::to_string(&unit).map_err(WorkerProtocolError::Json)?,
         );
     }
-    if attempt == 1
-        && let Some(candidate_count) =
+    if attempt == 1 {
+        if let Some(candidate_count) =
             std::env::var_os("PSTFORGE_TEST_PARSER_ERROR_AFTER_CANDIDATES")
-    {
-        command.env(
-            "PSTFORGE_INTERNAL_PARSER_ERROR_AFTER_CANDIDATES",
-            candidate_count,
-        );
+        {
+            command.env(
+                "PSTFORGE_INTERNAL_PARSER_ERROR_AFTER_CANDIDATES",
+                candidate_count,
+            );
+        }
     }
     let mut child = command.spawn().map_err(RecoveryError::WorkerSpawn)?;
     let mut watchdog = match AttemptWatchdog::start(

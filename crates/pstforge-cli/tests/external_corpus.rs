@@ -748,19 +748,18 @@ impl CatalogSink for IndependentMessageSink {
                         .ok_or_else(|| "folder identity preceded its parent".to_owned())?,
                     None => Vec::new(),
                 };
-                if parent_id.is_some()
-                    && id != NID_IPM_SUBTREE
-                    && let Some(name) = name
-                {
-                    let ordinal = self
-                        .sibling_name_counts
-                        .entry((parent_id, name.clone()))
-                        .or_default();
-                    identity.push((name.clone(), *ordinal));
-                    *ordinal = ordinal
-                        .checked_add(1)
-                        .ok_or_else(|| "same-name sibling ordinal overflow".to_owned())?;
-                    path.push(name);
+                if parent_id.is_some() && id != NID_IPM_SUBTREE {
+                    if let Some(name) = name {
+                        let ordinal = self
+                            .sibling_name_counts
+                            .entry((parent_id, name.clone()))
+                            .or_default();
+                        identity.push((name.clone(), *ordinal));
+                        *ordinal = ordinal
+                            .checked_add(1)
+                            .ok_or_else(|| "same-name sibling ordinal overflow".to_owned())?;
+                        path.push(name);
+                    }
                 }
                 if self.folder_paths.insert(id, path).is_some() {
                     return Err("duplicate folder identifier".to_owned());
@@ -1630,13 +1629,14 @@ fn root_and_associated_data_roundtrip_through_the_supervised_split()
     let child_deadline = Instant::now() + Duration::from_secs(10);
     let worker_id = loop {
         let children_path = format!("/proc/{supervisor_id}/task/{supervisor_id}/children");
-        if let Ok(children) = fs::read_to_string(children_path)
-            && let Some(worker) = children
+        if let Ok(children) = fs::read_to_string(children_path) {
+            if let Some(worker) = children
                 .split_ascii_whitespace()
                 .next()
                 .and_then(|value| value.parse::<u32>().ok())
-        {
-            break worker;
+            {
+                break worker;
+            }
         }
         if Instant::now() >= child_deadline {
             let _ = killed_supervisor.kill();
@@ -4447,13 +4447,14 @@ fn milestone_0_4_1_interruption_and_sigkill_resume_without_orphan_worker()
         let deadline = Instant::now() + Duration::from_secs(10);
         let worker_id = loop {
             let children_path = format!("/proc/{supervisor_id}/task/{supervisor_id}/children");
-            if let Ok(children) = fs::read_to_string(children_path)
-                && let Some(worker) = children
+            if let Ok(children) = fs::read_to_string(children_path) {
+                if let Some(worker) = children
                     .split_ascii_whitespace()
                     .next()
                     .and_then(|value| value.parse::<u32>().ok())
-            {
-                break worker;
+                {
+                    break worker;
+                }
             }
             if Instant::now() >= deadline {
                 let _ = child.kill();

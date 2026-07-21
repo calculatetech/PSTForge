@@ -1,0 +1,70 @@
+name: Approved Release Build
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing approved v* tag to build
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ inputs.tag }}
+  cancel-in-progress: false
+
+jobs:
+  package:
+    name: Build approved Debian package
+    runs-on: ubuntu-24.04
+    container: debian:13-slim
+    environment: release
+    timeout-minutes: 60
+    steps:
+      - name: Install build tools
+        run: |
+          apt-get update
+          apt-get install --yes --no-install-recommends \
+            binutils build-essential ca-certificates curl dpkg-dev findutils git gzip jq \
+            libpff-dev lintian pkg-config pff-tools pst-utils
+      - name: Check out approved tag
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ inputs.tag }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Verify immutable release tag
+        env:
+          RELEASE_TAG: ${{ inputs.tag }}
+        run: |
+          case "$RELEASE_TAG" in
+            v*) ;;
+            *) echo "release tag must begin with v" >&2; exit 2 ;;
+          esac
+          test "$(git tag --points-at HEAD --list "$RELEASE_TAG")" = "$RELEASE_TAG"
+      - name: Install Rust 1.85
+        uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c
+        with:
+          toolchain: 1.85.0
+          components: rustfmt, clippy
+      - name: Match tag to package version
+        env:
+          RELEASE_TAG: ${{ inputs.tag }}
+        run: |
+          PACKAGE_VERSION=$(cargo metadata --locked --no-deps --format-version 1 \
+            | jq --raw-output '.packages[] | select(.name == "pstforge-cli") | .version')
+          test -n "$PACKAGE_VERSION"
+          test "$RELEASE_TAG" = "v$PACKAGE_VERSION"
+      - name: Run public CI gate
+        run: cargo xtask gate ci
+      - name: Build reproducible package
+        run: cargo xtask package deb
+      - name: Retain approved build artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: pstforge-${{ inputs.tag }}-amd64
+          path: target/debian/pstforge_*_amd64.deb
+          if-no-files-found: error
+          retention-days: 14

@@ -1,0 +1,28 @@
+name: Scheduled Fuzzing
+
+on:
+  schedule:
+    - cron: "43 6 * * 3"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  pst-reader:
+    name: PST reader fuzz target
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Check out source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - name: Install nightly Rust
+        uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c
+        with:
+          toolchain: nightly
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz --version 0.13.2 --locked
+      - name: Fuzz bounded native PST-reader input
+        run: cargo fuzz run pst_reader -- -max_total_time=300 -max_len=262144
