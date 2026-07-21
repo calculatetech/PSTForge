@@ -10,8 +10,9 @@ behavior is in `docs/PRODUCT_SPEC.md`, the version roadmap is in
 
 PSTForge 1.0 is a Linux-native command-line utility that reads a damaged PST
 without modifying it and creates smaller, independently valid Unicode PST
-files for import into Synology MailPlus Server. Outlook compatibility is a
-secondary interoperability check.
+files for import into Synology MailPlus Server. Outlook is the required human
+interoperability check after ScanPST; MailPlus remains the intended consumer
+without becoming an external acceptance dependency.
 
 Preserve every readable native PST item and useful property that Outlook,
 MailPlus, or another PST reader could consume. This includes non-mail item
@@ -216,8 +217,11 @@ tests proportional to its risk.
   Conformance tests must also use Ubuntu/Debian `pffinfo` and independent
   `readpst`.
 - PSTForge reading its own generated PST is not sufficient validation.
-- The release gate includes manual import into Synology MailPlus and secondary
-  Outlook compatibility checks.
+- The interoperability release gate requires clean ScanPST analysis followed
+  by successful Outlook opening and inspection. Synology MailPlus import is
+  not a PSTForge acceptance gate: when those two checks pass, MailPlus
+  compatibility is assumed. A subsequent MailPlus-only failure belongs in a
+  Synology support ticket and does not block PSTForge work or release.
 - Add failure tests for truncated input, invalid indexes, malformed properties,
   huge attachments, symlinks, permission denial, disk exhaustion, worker
   crashes, forced termination, corrupt durable state, resume mismatch, and an

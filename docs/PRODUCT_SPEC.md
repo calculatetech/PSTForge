@@ -9,9 +9,11 @@ for reachable and recoverable PST content, and produces smaller PST files that c
 imported independently into Synology MailPlus Server. Smaller parts provide
 restart and import checkpoints and limit the scope of a failed import.
 
-Synology MailPlus is the primary 1.0 consumer. Outlook is a secondary
-compatibility check. PSTForge is noninteractive and suitable for unattended
-runs, while retaining concise human progress and machine-readable reports.
+Synology MailPlus is the intended 1.0 consumer. Clean ScanPST analysis followed
+by successful Outlook inspection is the required human interoperability check;
+MailPlus compatibility is then assumed. PSTForge is noninteractive and
+suitable for unattended runs, while retaining concise human progress and
+machine-readable reports.
 
 ## Scope
 
@@ -106,9 +108,10 @@ Direct mode traverses readable source content once. It does not pre-hash the
 source, hash or reopen a completed part, or run PST readers in the production
 path. The writer emits documented PST structures and allocation metadata
 correctly as it constructs the destination-side temporary, syncs the completed
-file, and publishes it with an atomic rename. Independent readers, ScanPST,
-Outlook, and MailPlus are CI or release-acceptance evidence rather than runtime
-transformation stages.
+file, and publishes it with an atomic rename. Independent readers, ScanPST, and
+Outlook are CI or release-acceptance evidence rather than runtime
+transformation stages. MailPlus import is an intended use, not a PSTForge
+acceptance dependency.
 Direct traversal retains metadata for at most one top-level message graph.
 Bounded prefixes, control metadata, and collection overhead have a checked
 256 MiB aggregate supervisor budget and a 262,144-frame ceiling. Exceeding
@@ -563,9 +566,12 @@ status 130 promptly.
 Every output part must pass PSTForge structural checks, Ubuntu/Debian
 `pffinfo`, independent `readpst`, size and SHA-256 verification, and repeated
 determinism tests. Representative healthy, partial, orphan, attachment, and
-embedded-message cases must then import into a test Synology MailPlus mailbox
-with matching folder and message counts and sampled content. Outlook opening
-and inspection is a secondary release check.
+embedded-message cases must receive clean ScanPST analysis and then open and
+inspect successfully in Outlook. Together those checks satisfy PSTForge's
+interoperability acceptance boundary and MailPlus compatibility is assumed.
+MailPlus import is optional operator evidence, not a release gate or an
+external resource dependency. A failure confined to MailPlus after ScanPST and
+Outlook pass is a Synology support issue rather than PSTForge release work.
 
 Before the 0.4 correctness series closes, every corrupt external acceptance
 sample with an owner-supplied ScanPST-repaired reference must be classified by
