@@ -22,6 +22,18 @@ type MatchedSourceMessages = (Vec<Vec<String>>, usize);
 type FolderIdentity = Vec<(String, u32)>;
 type RepairedMessageCatalog = (Vec<MessageFingerprint>, BTreeSet<FolderIdentity>);
 
+fn linux_process_is_running(process_id: u32) -> bool {
+    let stat = match fs::read_to_string(format!("/proc/{process_id}/stat")) {
+        Ok(stat) => stat,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return false,
+        Err(_) => return true,
+    };
+    let Some((_, fields)) = stat.rsplit_once(") ") else {
+        return true;
+    };
+    !matches!(fields.as_bytes().first(), Some(b'Z' | b'X'))
+}
+
 #[derive(Default)]
 struct WriterOrderSink {
     message_stack: Vec<u32>,
@@ -1650,7 +1662,7 @@ fn root_and_associated_data_roundtrip_through_the_supervised_split()
         return Err("killed verification supervisor unexpectedly succeeded".into());
     }
     let worker_deadline = Instant::now() + Duration::from_secs(5);
-    while PathBuf::from(format!("/proc/{worker_id}")).exists() {
+    while linux_process_is_running(worker_id) {
         if Instant::now() >= worker_deadline {
             return Err("verification worker outlived its killed supervisor".into());
         }
@@ -4487,7 +4499,7 @@ fn milestone_0_4_1_interruption_and_sigkill_resume_without_orphan_worker()
             return Err("SIGKILL unexpectedly reported success".into());
         }
         let worker_deadline = Instant::now() + Duration::from_secs(5);
-        while PathBuf::from(format!("/proc/{worker_id}")).exists() {
+        while linux_process_is_running(worker_id) {
             if Instant::now() >= worker_deadline {
                 return Err("parser worker outlived its killed supervisor".into());
             }
@@ -4747,9 +4759,7 @@ exit 1
     let wrapper_id: u32 = fs::read_to_string(&wrapper_file)?.trim().parse()?;
     let child_id: u32 = fs::read_to_string(&child_file)?.trim().parse()?;
     let deadline = Instant::now() + Duration::from_secs(5);
-    while PathBuf::from(format!("/proc/{wrapper_id}")).exists()
-        || PathBuf::from(format!("/proc/{child_id}")).exists()
-    {
+    while linux_process_is_running(wrapper_id) || linux_process_is_running(child_id) {
         if Instant::now() >= deadline {
             return Err("validator process group outlived its supervisor".into());
         }
