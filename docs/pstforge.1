@@ -1,0 +1,153 @@
+.TH PSTFORGE 1 "July 2026" "PSTForge 0.5.0" "User Commands"
+.SH NAME
+pstforge \- recover and split damaged Outlook PST files without modifying them
+.SH SYNOPSIS
+.B pstforge info
+.I SOURCE
+.RI [ --json ]
+.br
+.B pstforge verify
+.I SOURCE
+.RI [ --mode " full|recovery" ]
+.RI [ --json ]
+.br
+.B pstforge recover
+.I SOURCE
+.B --output
+.I JOB-DIR
+.RI [ --recovery " balanced|aggressive" ]
+.RI [ --json ]
+.br
+.B pstforge split
+.I SOURCE
+.B --output
+.I JOB-DIR
+.RI [ OPTIONS ]
+.br
+.B pstforge report
+.I JOB-DIR
+.RI [ --json ]
+.SH DESCRIPTION
+PSTForge opens an ANSI or Unicode PST read-only and writes new Unicode PST
+files. The primary
+.B split
+command recovers readable native items and properties into independently
+importable parts. Its default direct mode streams source data into an active
+temporary PST and atomically publishes each validated part.
+.PP
+PSTForge never repairs or modifies the source. It refuses source symlinks,
+unsafe output placement, incompatible existing job state, and output-name
+conflicts.
+.SH COMMANDS
+.TP
+.B info
+Report source identity, PST format, encryption, corruption flag, and library
+versions without enumerating mail.
+.TP
+.B verify
+Stream and account for readable content without creating a recovery job.
+Recovery mode also examines deleted, recovered, and orphan collections.
+.TP
+.B recover
+Create durable canonical recovery state without writing importable PST parts.
+.TP
+.B split
+Recover content and write complete PST parts. The default maximum size is 4
+GiB. One indivisible item larger than the requested limit is emitted alone as
+a reported oversize part.
+.TP
+.B report
+Recreate a summary from a completed or retained PSTForge job without reopening
+the source.
+.SH SPLIT OPTIONS
+.TP
+.BI --max-pst-size " SIZE"
+Hard target for normal parts. Accepts IEC and SI byte suffixes. Default: 4GiB.
+.TP
+.BI --recovery " MODE"
+Use
+.B balanced
+(default) or
+.B aggressive
+recovery. Aggressive mode also asks libpff to ignore allocation data and scan
+fragments, so additional damaged candidates may have lower confidence.
+.TP
+.B --restartable
+Persist recovered payloads so an interrupted job can resume. This costs about
+one extra payload write and additional temporary disk space. Direct mode is
+the default.
+.TP
+.B --resume
+Resume a matching restartable job. Source digest, identity, configuration,
+schema, and writer format must match.
+.TP
+.B --keep-work
+Keep restartable payload storage after successful completion.
+.TP
+.B --json
+Write one versioned JSON result to standard output.
+.SH GLOBAL OPTIONS
+.TP
+.BI --color " auto|always|never"
+Control diagnostic color.
+.TP
+.BI --log-format " human|json"
+Select the standard-error diagnostic format.
+.TP
+.B --quiet
+Suppress progress diagnostics.
+.TP
+.B -v
+Increase diagnostic verbosity. Repeat for more detail.
+.SH EXIT STATUS
+.TP
+.B 0
+Complete success.
+.TP
+.B 1
+Partial success with usable output and explicitly accounted omissions or
+damage.
+.TP
+.B 3
+Source or parser failure.
+.TP
+.B 4
+Output or durable-state failure.
+.TP
+.B 5
+Generated PST conformance failure.
+.TP
+.B 6
+Internal or supervision failure.
+.TP
+.B 130
+Interrupted by SIGINT or SIGTERM after checkpointing applicable state.
+.SH FILES
+.TP
+.I JOB-DIR/parts/part-NNNN.pst
+Atomically published PST output parts.
+.TP
+.I JOB-DIR/recovery.log
+Bounded, aggregate human recovery record. Message subjects, addresses, bodies,
+and attachment contents are excluded.
+.TP
+.I JOB-DIR/.pstforge/
+Private ledger and temporary state. Payload spool data exists only for
+restartable execution.
+.TP
+.I /usr/share/pstforge/schemas/
+Installed public JSON result schemas.
+.SH LIMITATIONS
+PSTForge can preserve only content that libpff can expose and the output PST
+format can represent. Corrupt or unsupported values are counted by reason.
+Version 1.0 does not provide in-place PST repair, PST merging, OST conversion,
+password cracking, attachment export, EML, Maildir, PDF, a GUI, or date/folder
+partitioning. Direct jobs cannot resume; rerun them into a new empty output
+directory. Restartable split additionally requires
+.B pffinfo
+and
+.B readpst
+for independent validation.
+.SH SEE ALSO
+.BR pffinfo (1),
+.BR readpst (1)

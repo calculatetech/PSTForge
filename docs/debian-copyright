@@ -1,0 +1,32 @@
+Format: https://www.debian.org/doc/packaging-manuals/copyright-format/1.0/
+Upstream-Name: PSTForge
+Source: https://github.com/calculatetech/PSTForge
+
+Files: *
+Copyright: 2026 PSTForge contributors
+License: Apache-2.0 or MIT
+ The complete Apache-2.0 and MIT license texts are installed as
+ /usr/share/doc/pstforge/LICENSE-APACHE and
+ /usr/share/doc/pstforge/LICENSE-MIT.
+
+Files: Rust dependencies linked into /usr/bin/pstforge
+Copyright: See /usr/share/doc/pstforge/RUST-DEPENDENCY-LICENSES.txt
+License: multiple
+ Each dependency's identity, version, authors, Cargo license expression, and
+ complete shipped license/notice files are installed in
+ /usr/share/doc/pstforge/RUST-DEPENDENCY-LICENSES.txt.
+
+Files: crates/pstforge-pst/*
+Copyright: Microsoft Corporation
+License: MIT
+ The complete adapted-writer MIT license is installed as
+ /usr/share/doc/pstforge/WRITER-LICENSE-MIT.
+
+Files: crates/libpff-sys/*
+Copyright: 2026 PSTForge contributors
+License: Apache-2.0 or MIT
+Comment:
+ This wrapper dynamically links the separately distributed system libpff.
+ libpff is LGPL-3.0-or-later and is not copied into this package. See
+ /usr/share/doc/pstforge/THIRD_PARTY_LICENSES.md and
+ /usr/share/common-licenses/LGPL-3.

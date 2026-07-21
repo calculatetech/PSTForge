@@ -11,7 +11,9 @@ available from its upstream project and the operating-system package metadata.
 
 Rust dependency license expressions are checked by `cargo xtask gate full`.
 The committed `Cargo.lock` fixes the dependency set reviewed for each
-milestone.
+milestone. Debian packages additionally install
+`RUST-DEPENDENCY-LICENSES.txt`, generated from the locked executable dependency
+closure and the complete license/notice files shipped by each crate.
 
 The `crates/pstforge-pst` writer is adapted from Microsoft's `outlook-pst`
 1.2.0 source at commit `1397836e73b690dbb09663f66056012fced45ff9` and remains

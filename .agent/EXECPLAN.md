@@ -3406,7 +3406,7 @@ not modified.
     fixture were also narrowed to the exact modes and inventory scopes emitted
     by production. The resulting fast gate passes at
     `.agent/test-results/1784594021-fast`.
-  - [ ] Checkpoint 3: add reproducible Debian packaging. `cargo xtask package
+  - [x] Checkpoint 3: add reproducible Debian packaging. `cargo xtask package
     deb` builds the release binary with `--locked`, stages only declared files,
     installs the binary, manual, README/operator documents, application
     licenses, writer MIT notice, and libpff LGPL notice, then creates a
@@ -3415,6 +3415,39 @@ not modified.
     dependencies; development readers are not runtime dependencies. Inspect
     ownership, modes, paths, control metadata, dynamic linkage, reproducibility,
     installation, command execution, and removal without touching user jobs.
+    `cargo xtask package deb` now builds the locked release binary, derives its
+    glibc and libgcc ABI dependencies through `dpkg-shlibdeps`, retains the
+    documented `libpff1t64 (>= 20180714)` compatibility floor, strips only the
+    staged binary, and produces a root-owned `amd64` package. It installs the
+    CLI, manpage, README/product specification, public JSON schemas, application
+    licenses, adapted-writer MIT license, and dynamic-libpff LGPL notice. Two
+    isolated Cargo target directories use disabled incremental state, stable
+    source dates, and path remapping; their independently staged archives must
+    compare byte-for-byte before the package is published. Validation requires
+    the exact declared path set, modes,
+    metadata, version execution, dynamic `libpff.so.1` without RPATH/RUNPATH,
+    lintian with error failure, and isolated `dpkg` install/removal that leaves
+    an operator-job sentinel intact. On Ubuntu 26.04 the package SHA-256 is
+    `95a1608b2aee54988c261276cc9206ebbec6a7798406d0ebc5045e140b34f769` and
+    its generated dependencies are `libc6 (>= 2.39), libgcc-s1 (>= 4.2),
+    libpff1t64 (>= 20180714)`. The checkpoint passes the fast gate at
+    `.agent/test-results/1784594750-fast`. Adversarial review found that the
+    first implementation could follow a symlinked workspace `target`, only
+    restaged one compiled binary, and assigned the final package name before
+    validation. Cleanup now refuses a symlinked/non-directory `target` (with a
+    sentinel-preservation regression test), both binaries are compiled
+    independently, and validation precedes the final atomic rename. The
+    remediated checkpoint passes the fast gate at
+    `.agent/test-results/1784595017-fast`. Final review then identified missing
+    notices for Rust code linked into the executable. Packaging now walks only
+    the locked, Linux, normal-dependency closure, installs each crate's complete
+    shipped license/notice files with identity, version, authors, expression,
+    and source, and synthesizes an attributed MIT grant only when a crate ships
+    no text but its expression explicitly offers MIT. Unknown missing-license
+    cases fail closed; an xtask-only dependency exclusion test guards closure
+    accuracy. The final bundle covers 89 executable dependencies and lintian
+    remains clean. The licensing-remediated checkpoint passes the fast gate at
+    `.agent/test-results/1784595555-fast`.
   - [ ] Checkpoint 4: replace the stale README with current features,
     limitations, basic usage, source compilation, Ubuntu development packages,
     Debian installation/removal, exit statuses, privacy, recovery modes, and
