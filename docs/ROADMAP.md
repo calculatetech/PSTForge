@@ -4,8 +4,10 @@
 
 PSTForge 1.0 will run on Linux, read a damaged Microsoft Outlook PST without
 modifying it, recover as much mail as can be handled safely, and write smaller
-independently valid PST files for import into Synology MailPlus Server.
-Microsoft Outlook is a secondary interoperability target.
+independently valid PST files for import into Synology MailPlus Server. Clean
+ScanPST analysis followed by successful Microsoft Outlook inspection is the
+required interoperability acceptance boundary; MailPlus compatibility is then
+assumed.
 
 Each milestone has one observable result and one version. A new feature
 category increments the second version digit. A related feature increments the
@@ -214,16 +216,19 @@ thread resolution.
 ### 16. Version 0.6.0 - Interoperability Release Candidate
 
 Freeze the candidate CLI and schemas, run the complete external corpus,
-exercise fault injection and resource limits, import generated parts into a
-test Synology MailPlus mailbox, and perform secondary Outlook checks. Resolve
-all blocker and high-severity adversarial review findings.
+exercise fault injection and resource limits, require clean ScanPST analysis,
+and open and inspect generated parts in Outlook. Resolve all blocker and
+high-severity adversarial review findings. MailPlus compatibility is assumed
+after ScanPST and Outlook pass; MailPlus import is not a release gate.
 
 ### 17. Version 1.0.0 - MailPlus-Ready Release
 
-Repeat the 50 GB recovery and MailPlus import rehearsal from a clean install,
-reproduce the Debian package, verify licenses and notices, finalize operator
-documentation, and record the release evidence. Tag, publish, push, or merge
-only after explicit human approval.
+Repeat the 50 GB recovery from a clean install, require clean ScanPST and
+successful Outlook acceptance, reproduce the Debian package, verify licenses
+and notices, finalize operator documentation, and record the release evidence.
+A MailPlus-only failure after those checks is a Synology support issue and does
+not block the release. Tag, publish, push, or merge only after explicit human
+approval.
 
 ## Beyond 1.0
 
