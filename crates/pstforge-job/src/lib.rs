@@ -8339,7 +8339,7 @@ mod tests {
     #[test]
     fn foreign_owned_private_state_is_rejected_by_the_attribute_gate() {
         let effective = rustix::process::geteuid().as_raw();
-        let foreign = effective.checked_add(1).unwrap_or(effective - 1);
+        let foreign = effective ^ 1;
         assert!(!private_state_attributes_valid(true, foreign, 0o700, None));
         assert!(!private_state_attributes_valid(
             true,
