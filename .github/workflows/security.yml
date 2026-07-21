@@ -18,12 +18,14 @@ jobs:
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
           persist-credentials: false
+      - name: Install Rust 1.85
+        uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c
+        with:
+          toolchain: 1.85.0
+      - name: Install cargo-audit 0.22.1
+        run: cargo install cargo-audit --version 0.22.1 --locked
       - name: Check Rust advisories
-        uses: rustsec/audit-check@69366f33c96575abad1ee0dba8212993eecbe998
-        with:
-          token: ${{ secrets.GITHUB_TOKEN }}
+        run: cargo audit --deny warnings
       - name: Check fuzz dependency advisories
-        uses: rustsec/audit-check@69366f33c96575abad1ee0dba8212993eecbe998
-        with:
-          token: ${{ secrets.GITHUB_TOKEN }}
-          working-directory: fuzz
+        working-directory: fuzz
+        run: cargo audit --deny warnings

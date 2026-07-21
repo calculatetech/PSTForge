@@ -42,12 +42,15 @@ jobs:
         with:
           toolchain: 1.85.0
           components: rustfmt, clippy
+      - name: Install cargo-audit 0.22.1
+        run: cargo install cargo-audit --version 0.22.1 --locked
       - name: Check Rust advisories
-        uses: rustsec/audit-check@69366f33c96575abad1ee0dba8212993eecbe998
-        with:
-          token: ${{ secrets.GITHUB_TOKEN }}
+        run: cargo audit --deny warnings
       - name: Run public CI gate
         run: cargo xtask gate ci
+      - name: Show bounded public test failure
+        if: failure()
+        run: find .agent/test-results -name tests.log -exec tail --lines=250 {} \;
 
   debian:
     name: Debian 13 package
@@ -72,5 +75,8 @@ jobs:
           components: rustfmt, clippy
       - name: Run public CI gate
         run: cargo xtask gate ci
+      - name: Show bounded public test failure
+        if: failure()
+        run: find .agent/test-results -name tests.log -exec tail --lines=250 {} \;
       - name: Build and validate Debian package
         run: cargo xtask package deb

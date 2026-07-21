@@ -1,6 +1,6 @@
 #![deny(unsafe_code)]
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::io::Read as _;
@@ -108,6 +108,37 @@ struct CargoDependencyKind {
 struct Gate {
     root: PathBuf,
     evidence: PathBuf,
+}
+
+#[derive(Debug, Deserialize)]
+struct GithubWorkflow {
+    jobs: BTreeMap<String, GithubJob>,
+    defaults: Option<serde_yaml_ng::Value>,
+    env: Option<serde_yaml_ng::Value>,
+}
+
+#[derive(Debug, Deserialize)]
+struct GithubJob {
+    steps: Vec<GithubStep>,
+    defaults: Option<serde_yaml_ng::Value>,
+    #[serde(rename = "if")]
+    condition: Option<serde_yaml_ng::Value>,
+    #[serde(rename = "continue-on-error")]
+    continue_on_error: Option<serde_yaml_ng::Value>,
+    env: Option<serde_yaml_ng::Value>,
+}
+
+#[derive(Debug, Deserialize)]
+struct GithubStep {
+    run: Option<String>,
+    #[serde(rename = "working-directory")]
+    working_directory: Option<String>,
+    #[serde(rename = "if")]
+    condition: Option<serde_yaml_ng::Value>,
+    #[serde(rename = "continue-on-error")]
+    continue_on_error: Option<serde_yaml_ng::Value>,
+    env: Option<serde_yaml_ng::Value>,
+    shell: Option<serde_yaml_ng::Value>,
 }
 
 struct PreparedCorpus {
@@ -2802,6 +2833,7 @@ impl Gate {
             "actionlint_1.7.12_linux_amd64.tar.gz",
             "8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8",
             "./actionlint -color",
+            "find .agent/test-results -name tests.log -exec tail --lines=250",
         ] {
             if !ci.contains(required) {
                 return Err(format!(
@@ -2809,6 +2841,56 @@ impl Gate {
                 ));
             }
         }
+        let ci_workflow: GithubWorkflow = serde_yaml_ng::from_str(&ci)
+            .map_err(|error| format!("CI workflow cannot be inspected: {error}"))?;
+        let ubuntu_steps = ci_workflow
+            .jobs
+            .get("ubuntu")
+            .ok_or_else(|| "CI workflow is missing the Ubuntu job".to_owned())?;
+        require_unmodified_workflow_execution("CI Ubuntu job", &ci_workflow, ubuntu_steps)?;
+        require_workflow_command(
+            "CI Ubuntu job",
+            ubuntu_steps.steps.as_slice(),
+            "cargo install cargo-audit --version 0.22.1 --locked",
+            None,
+        )?;
+        require_workflow_command(
+            "CI Ubuntu job",
+            ubuntu_steps.steps.as_slice(),
+            "cargo audit --deny warnings",
+            None,
+        )?;
+        let security = fs::read_to_string(self.root.join(".github/workflows/security.yml"))
+            .map_err(|error| format!("cannot read security workflow: {error}"))?;
+        let security_workflow: GithubWorkflow = serde_yaml_ng::from_str(&security)
+            .map_err(|error| format!("security workflow cannot be inspected: {error}"))?;
+        let security_steps = security_workflow
+            .jobs
+            .get("rustsec")
+            .ok_or_else(|| "security workflow is missing the RustSec job".to_owned())?;
+        require_unmodified_workflow_execution(
+            "security RustSec job",
+            &security_workflow,
+            security_steps,
+        )?;
+        require_workflow_command(
+            "security RustSec job",
+            security_steps.steps.as_slice(),
+            "cargo install cargo-audit --version 0.22.1 --locked",
+            None,
+        )?;
+        require_workflow_command(
+            "security RustSec job",
+            security_steps.steps.as_slice(),
+            "cargo audit --deny warnings",
+            None,
+        )?;
+        require_workflow_command(
+            "security RustSec job",
+            security_steps.steps.as_slice(),
+            "cargo audit --deny warnings",
+            Some("fuzz"),
+        )?;
         let release = fs::read_to_string(self.root.join(".github/workflows/release-build.yml"))
             .map_err(|error| format!("cannot read release workflow: {error}"))?;
         for required in [
@@ -3267,6 +3349,55 @@ impl Gate {
     }
 }
 
+fn require_workflow_command(
+    context: &str,
+    steps: &[GithubStep],
+    command: &str,
+    working_directory: Option<&str>,
+) -> Result<(), String> {
+    let present = steps.iter().any(|step| {
+        step.run.as_deref().map(str::trim) == Some(command)
+            && step.working_directory.as_deref() == working_directory
+            && step.condition.is_none()
+            && step.env.is_none()
+            && step.shell.is_none()
+            && matches!(
+                step.continue_on_error,
+                None | Some(serde_yaml_ng::Value::Bool(false))
+            )
+    });
+    if present {
+        Ok(())
+    } else {
+        Err(format!(
+            "{context} must run {command:?} with working directory {working_directory:?}"
+        ))
+    }
+}
+
+fn require_unmodified_workflow_execution(
+    context: &str,
+    workflow: &GithubWorkflow,
+    job: &GithubJob,
+) -> Result<(), String> {
+    if workflow.defaults.is_some()
+        || workflow.env.is_some()
+        || job.defaults.is_some()
+        || job.condition.is_some()
+        || !matches!(
+            job.continue_on_error,
+            None | Some(serde_yaml_ng::Value::Bool(false))
+        )
+        || job.env.is_some()
+    {
+        Err(format!(
+            "{context} must not inherit execution overrides or ignore job failure"
+        ))
+    } else {
+        Ok(())
+    }
+}
+
 fn directory_contains_file_with(path: &Path, required: &[&[u8]]) -> Result<bool, String> {
     let mut pending = vec![path.to_path_buf()];
     while let Some(directory) = pending.pop() {
@@ -3359,8 +3490,70 @@ mod tests {
     use std::os::unix::fs::symlink;
 
     use super::{
-        document_checkpoint_payload, prepare_generated_directory, rust_dependency_licenses,
+        GithubWorkflow, document_checkpoint_payload, prepare_generated_directory,
+        require_workflow_command, rust_dependency_licenses,
     };
+
+    #[test]
+    fn workflow_command_validation_uses_executable_steps_and_scope()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let workflow: GithubWorkflow = serde_yaml_ng::from_str(
+            r#"
+jobs:
+  rustsec:
+    steps:
+      # run: cargo audit --deny warnings
+      - run: cargo audit --deny warnings
+        working-directory: fuzz
+"#,
+        )?;
+        let steps = workflow
+            .jobs
+            .get("rustsec")
+            .ok_or("missing job")?
+            .steps
+            .as_slice();
+        assert!(
+            require_workflow_command("test", steps, "cargo audit --deny warnings", Some("fuzz"))
+                .is_ok()
+        );
+        assert!(
+            require_workflow_command("test", steps, "cargo audit --deny warnings", None).is_err()
+        );
+
+        let inherited: GithubWorkflow = serde_yaml_ng::from_str(
+            r#"
+defaults:
+  run:
+    working-directory: fuzz
+jobs:
+  rustsec:
+    steps:
+      - run: cargo audit --deny warnings
+"#,
+        )?;
+        let inherited_job = inherited.jobs.get("rustsec").ok_or("missing job")?;
+        assert!(
+            super::require_unmodified_workflow_execution("test", &inherited, inherited_job)
+                .is_err()
+        );
+
+        let ignored_failure: GithubWorkflow = serde_yaml_ng::from_str(
+            r#"
+jobs:
+  rustsec:
+    continue-on-error: true
+    steps:
+      - run: cargo audit --deny warnings
+"#,
+        )?;
+        let ignored_job = ignored_failure.jobs.get("rustsec").ok_or("missing job")?;
+        assert!(
+            super::require_unmodified_workflow_execution("test", &ignored_failure, ignored_job)
+                .is_err()
+        );
+        Ok(())
+    }
 
     #[test]
     fn packaged_rust_licenses_cover_only_the_executable_closure()
