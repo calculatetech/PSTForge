@@ -3670,7 +3670,16 @@ not modified.
     it with behavior-equivalent nested conditionals in focused commit
     `8a431a6`; local fast gate `.agent/test-results/1784668203-fast` and the
     replacement Ubuntu, Debian 13 package, and CodeQL checks all pass. The PR
-    has no comments, reviews, or unresolved review threads.
+    then received one valid medium-priority review thread: one-shot input
+    preflight retained the obsolete single-page NAMEID aggregate check even
+    though final construction externalized large streams. Preflight now builds
+    the same bounded scalable context shape, 600 numeric identities and two
+    large string identities pass focused regressions, and the prior overflow
+    bounds remain enforced. The accepted writer representation is unchanged
+    and is already covered by the clean 562-identity 50 GB ScanPST result. The
+    remediation fast and canonical full gates pass at
+    `.agent/test-results/1784668914-fast` and
+    `.agent/test-results/1784668952-full`.
   - [ ] (2026-07-21) Run the bounded five-minute `pst_reader` fuzz target in
     hosted CI or a true nightly local toolchain. The pinned cargo-fuzz 0.13.2
     tool installed successfully, but this host supplies distro Rust 1.93.1
@@ -3761,6 +3770,14 @@ not modified.
   Evidence: pull request #2 Actions runs `29868529338` (failed) and
   `29868904959` (passed), plus focused local fast evidence
   `.agent/test-results/1784668203-fast`.
+
+- Observation: Scalable construction and preflight must share the same shape
+  rules. The NAMEID writer externalized streams larger than one heap allocation,
+  but per-message preflight still summed every stream into the removed single-
+  page limit. A store with 600 numeric named identities was therefore rejected
+  before the already-tested scalable builder could run.
+  Evidence: pull request #2 review thread `PRRT_kwDOTYqaMs6SuhIh`; the new
+  600-identity preflight and scalable NAMEID round-trip tests pass.
 
 - Observation: direct traversal order initially made bounded diagnostic
   saturation affect parent completeness. Once the 1,024 retained issue slots

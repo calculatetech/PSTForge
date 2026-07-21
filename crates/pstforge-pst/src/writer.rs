@@ -2781,7 +2781,8 @@ pub fn validate_mail_store_input(spec: &MailStoreSpec) -> Result<(), WriterError
         let folder_plans = plan_folders(fallback, &messages, Some(&spec.folders))?;
         validate_folder_hierarchy_shapes(&folder_plans)?;
         let named_identities = collect_named_identities_many_refs(&messages);
-        property_context_logical_size(&named_property_map(&named_identities)?)?;
+        let mut next_named_block_index = 0x10_0000_u64;
+        build_named_property_context(&named_identities, &mut next_named_block_index)?;
         for folder in &spec.folders {
             for message in &folder.messages {
                 validate_aggregate_properties(message)?;
@@ -5537,94 +5538,9 @@ fn validate_aggregate_properties_with_limit(
         .checked_mul(16)
         .ok_or(WriterError::ValueTooLarge("named-property GUID stream"))?;
     validate_payload_len("named-property GUID stream", custom_guid_bytes)?;
-    validate_named_property_map_shape(&identities, &custom_guids, string_bytes)
-}
-
-fn validate_named_property_map_shape(
-    identities: &BTreeSet<NamedIdentity>,
-    custom_guids: &BTreeSet<&[u8; 16]>,
-    string_bytes: usize,
-) -> Result<(), WriterError> {
-    let mut bucket_lengths = [0_usize; 251];
-    for (set, name) in identities {
-        let guid = match set {
-            NamedPropertySet::Mapi => 1_u16,
-            NamedPropertySet::PublicStrings => 2_u16,
-            NamedPropertySet::Guid(value) => custom_guids
-                .iter()
-                .position(|candidate| *candidate == value)
-                .and_then(|position| u16::try_from(position).ok())
-                .and_then(|position| position.checked_add(3))
-                .ok_or(WriterError::ValueTooLarge("named-property GUID count"))?,
-        };
-        let (hash_identifier, kind) = match name {
-            NamedPropertyName::Numeric(identifier) => (*identifier, 0_u16),
-            NamedPropertyName::String(name) => {
-                let encoded = unicode_bytes(name)?;
-                (crate::crc::compute_crc(0, &encoded), 1_u16)
-            }
-        };
-        let guid_and_kind = (guid << 1) | kind;
-        let bucket = usize::try_from((hash_identifier ^ u32::from(guid_and_kind)) % 251)
-            .map_err(|_| WriterError::ValueTooLarge("named-property bucket"))?;
-        bucket_lengths[bucket] = bucket_lengths[bucket]
-            .checked_add(8)
-            .ok_or(WriterError::ValueTooLarge("named-property bucket"))?;
-    }
-
-    let mut empty_properties = vec![
-        (0x0001, PropertyValue::Integer32(251)),
-        (0x0002, PropertyValue::Binary(Vec::new())),
-        (0x0003, PropertyValue::Binary(Vec::new())),
-        (0x0004, PropertyValue::Binary(Vec::new())),
-    ];
-    empty_properties.extend(
-        bucket_lengths
-            .iter()
-            .enumerate()
-            .filter(|(_, length)| **length != 0)
-            .map(|(bucket, _)| (0x1000 + bucket as u16, PropertyValue::Binary(Vec::new()))),
-    );
-    let base_size = property_context(&empty_properties)?.len();
-    let entry_bytes = identities
-        .len()
-        .checked_mul(8)
-        .ok_or(WriterError::ValueTooLarge("named-property entry stream"))?;
-    let guid_bytes = if custom_guids.is_empty() {
-        16
-    } else {
-        custom_guids
-            .len()
-            .checked_mul(16)
-            .ok_or(WriterError::ValueTooLarge("named-property GUID stream"))?
-    };
-    let mut allocation_lengths = vec![guid_bytes];
-    if entry_bytes != 0 {
-        allocation_lengths.push(entry_bytes);
-    }
-    if string_bytes != 0 {
-        allocation_lengths.push(string_bytes);
-    }
-    allocation_lengths.extend(bucket_lengths.into_iter().filter(|length| *length != 0));
-    let variable_bytes = allocation_lengths
-        .iter()
-        .try_fold(0_usize, |total, length| {
-            total
-                .checked_add(*length)
-                .ok_or(WriterError::ValueTooLarge("named-property map heap page"))
-        })?;
-    let total = base_size
-        .checked_add(variable_bytes)
-        .and_then(|size| {
-            allocation_lengths
-                .len()
-                .checked_mul(2)
-                .and_then(|map| size.checked_add(map))
-        })
-        .ok_or(WriterError::ValueTooLarge("named-property map heap page"))?;
-    if total > MAX_DATA_BLOCK_PAYLOAD {
-        return Err(WriterError::ValueTooLarge("named-property map heap page"));
-    }
+    let identities = identities.into_iter().collect::<Vec<_>>();
+    let mut next_block_index = 0x10_0000_u64;
+    build_named_property_context(&identities, &mut next_block_index)?;
     Ok(())
 }
 
@@ -14818,6 +14734,29 @@ mod tests {
         };
         assert!(validate_mail_store_input(&many_folders).is_ok());
 
+        let mut many_named_message = base.message.clone();
+        many_named_message.named_properties = (0..600_u32)
+            .map(|identifier| NamedProperty {
+                set: NamedPropertySet::Mapi,
+                name: NamedPropertyName::Numeric(0x9000 + identifier),
+                value: RawPropertyValue::Integer32(7),
+            })
+            .collect();
+        let many_named = MailStoreSpec {
+            store_name: "PSTForge NAMEID preflight".to_owned(),
+            record_key: base.record_key,
+            folders: vec![MailFolderSpec {
+                path: vec!["Inbox".to_owned()],
+                location: MailFolderLocation::IpmSubtree,
+                role: MailFolderRole::Ordinary,
+                container_class: "IPF.Note".to_owned(),
+                messages: vec![many_named_message],
+                associated_messages: Vec::new(),
+            }],
+        };
+        let named_validation = validate_mail_store_input(&many_named);
+        assert!(named_validation.is_ok(), "{named_validation:?}");
+
         let mut huge_message = base.message;
         huge_message.attachments = vec![AttachmentSpec {
             filename: "huge.bin".to_owned(),
@@ -16881,13 +16820,10 @@ mod tests {
             .message
             .named_properties
             .push(property(format!("B{}", "x".repeat(2047))));
-        assert!(matches!(
-            create_fidelity_store(
-                directory.path().join("nameid-overflow.pst"),
-                &names_at_limit
-            ),
-            Err(WriterError::ValueTooLarge("named-property map heap page"))
-        ));
+        create_fidelity_store(
+            directory.path().join("nameid-scalable-strings.pst"),
+            &names_at_limit,
+        )?;
 
         let mut scalable_raw = FidelityStore::default();
         scalable_raw.message.raw_properties = (0..5)
