@@ -3276,10 +3276,10 @@ fn find_item_path(message: &crate::CanonicalMail, target: &str, path: &mut Vec<S
         return true;
     }
     for attachment in &message.attachments {
-        if let Some(embedded) = &attachment.embedded
-            && find_item_path(embedded, target, path)
-        {
-            return true;
+        if let Some(embedded) = &attachment.embedded {
+            if find_item_path(embedded, target, path) {
+                return true;
+            }
         }
     }
     path.pop();

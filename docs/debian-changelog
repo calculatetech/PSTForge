@@ -1,3 +1,12 @@
+pstforge (0.5.1) unstable; urgency=medium
+
+  * Add public CI and scheduled security and fuzz checks.
+  * Require pull requests with hosted Ubuntu and Debian checks.
+  * Keep private-corpus and risk-based ScanPST acceptance local without a
+    self-hosted runner dependency.
+
+ -- PSTForge Maintainers <noreply@pstforge.invalid>  Tue, 21 Jul 2026 00:00:00 +0000
+
 pstforge (0.5.0) unstable; urgency=medium
 
   * Add operational reporting, stable JSON schemas, and Debian packaging.

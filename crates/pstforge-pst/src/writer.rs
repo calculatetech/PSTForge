@@ -5005,9 +5005,10 @@ fn run_validator(
         if signal_observed || Instant::now() >= deadline {
             if let Err(error) =
                 rustix::process::kill_process_group(pid, rustix::process::Signal::KILL)
-                && error != rustix::io::Errno::SRCH
             {
-                return Err(error.into());
+                if error != rustix::io::Errno::SRCH {
+                    return Err(error.into());
+                }
             }
             if status.is_none() {
                 status = Some(child.wait()?);
@@ -5238,15 +5239,14 @@ impl Drop for PublicationTemporary {
             &self.directory_name,
             rustix::fs::AtFlags::SYMLINK_NOFOLLOW,
         );
-        if let (Ok(held), Ok(named)) = (held, named)
-            && held.dev() == named.st_dev
-            && held.ino() == named.st_ino
-        {
-            let _ = rustix::fs::unlinkat(
-                &self.parent_directory,
-                &self.directory_name,
-                rustix::fs::AtFlags::REMOVEDIR,
-            );
+        if let (Ok(held), Ok(named)) = (held, named) {
+            if held.dev() == named.st_dev && held.ino() == named.st_ino {
+                let _ = rustix::fs::unlinkat(
+                    &self.parent_directory,
+                    &self.directory_name,
+                    rustix::fs::AtFlags::REMOVEDIR,
+                );
+            }
         }
     }
 }

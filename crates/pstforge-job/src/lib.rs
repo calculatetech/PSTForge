@@ -2748,10 +2748,10 @@ impl DurableCatalogSink {
                     })
             })
             .transpose()?;
-        if let Some(parent_id) = parent_message_id
-            && let Some(durable_parent_id) = self.replayed_source_ids.get(&parent_id)
-        {
-            metadata["parent_message_id"] = serde_json::json!(durable_parent_id);
+        if let Some(parent_id) = parent_message_id {
+            if let Some(durable_parent_id) = self.replayed_source_ids.get(&parent_id) {
+                metadata["parent_message_id"] = serde_json::json!(durable_parent_id);
+            }
         }
         if parent_item_key.is_some() != parent_attachment_index.is_some() {
             return Err(JobError::EventSequence(
@@ -8339,7 +8339,7 @@ mod tests {
     #[test]
     fn foreign_owned_private_state_is_rejected_by_the_attribute_gate() {
         let effective = rustix::process::geteuid().as_raw();
-        let foreign = effective.checked_add(1).unwrap_or(effective - 1);
+        let foreign = effective ^ 1;
         assert!(!private_state_attributes_valid(true, foreign, 0o700, None));
         assert!(!private_state_attributes_valid(
             true,

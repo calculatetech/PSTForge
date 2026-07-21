@@ -1,5 +1,8 @@
 # PSTForge
 
+[![CI](https://github.com/calculatetech/PSTForge/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/calculatetech/PSTForge/actions/workflows/ci.yml)
+[![Security Audit](https://github.com/calculatetech/PSTForge/actions/workflows/security.yml/badge.svg)](https://github.com/calculatetech/PSTForge/actions/workflows/security.yml)
+
 PSTForge is a Linux-native command-line utility for recovering large or damaged
 Outlook PST files without modifying the source. It writes new, independently
 importable Unicode PST files, normally capped at 4 GiB, for checkpointed import
@@ -65,13 +68,21 @@ before 1.0.
 
 ### Debian package
 
-Build the reproducible package, then install it with APT so runtime dependencies
-are resolved:
+Build one package with one release compilation, then install it with APT so
+runtime dependencies are resolved:
 
 ```bash
 cargo xtask package deb
-sudo apt install ./target/debian/pstforge_0.5.0_amd64.deb
+sudo apt install ./target/debian/pstforge_0.5.1_amd64.deb
 pstforge --version
+```
+
+The default command produces one `.deb` and does not perform a second build or
+simulate an installation. Maintainers can opt into reproducibility, package
+contents, linkage, lintian, and isolated install/removal checks:
+
+```bash
+cargo xtask package deb --validate
 ```
 
 The package targets `amd64` and dynamically links the replaceable system
@@ -216,6 +227,7 @@ Fast tests use generated fixtures and do not need private PST data:
 
 ```bash
 cargo xtask gate fast
+cargo xtask gate ci
 ```
 
 Real PST files must live outside the repository and are referenced only by an
@@ -233,6 +245,19 @@ Start a new external manifest from
 PSTForge never scans user directories to discover test PSTs. Detailed gate
 evidence is written beneath the ignored `.agent/test-results/` directory, and
 independent-reader output is redacted because it can contain mailbox data.
+
+GitHub runs the public CI gate on pull requests and pushes to `main` in Ubuntu
+24.04 and Debian 13. Protected `main` requires both jobs and resolved
+review threads before merge. Scheduled jobs run RustSec and a bounded parser
+fuzz target. Private-corpus `full` and `release` gates run only on the local
+machine holding the explicitly configured corpus; PST files, paths, reader
+output, and detailed evidence are never uploaded to GitHub. Changes that can
+affect output PST bytes or recovered content also require a focused
+ScanPST-first human gate. Documentation, automation, packaging, reporting, and
+proven byte-identical refactors do not. Release automation accepts only the
+existing tag matching the package version, requires approval through the
+`release` environment, and retains a Debian build artifact without creating a
+GitHub release.
 
 See [`docs/PRODUCT_SPEC.md`](docs/PRODUCT_SPEC.md) for the authoritative
 behavior contract, [`docs/ATTACHMENT_RECOVERY.md`](docs/ATTACHMENT_RECOVERY.md)

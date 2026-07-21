@@ -3484,12 +3484,125 @@ not modified.
     Debian 13 (trixie) `libc6`, `libgcc-s1`, `libpff1t64`, `libbfio1`, and zlib,
     reported version 0.5.0, and completed `info --json` against the external
     healthy Unicode PST. The temporary compatibility root disappeared on exit.
-- [ ] Milestone 0.5.1: GitHub CI and Private-Corpus Automation; the remote is
-  reachable, and work begins after the approved baseline is pushed.
+- [ ] Milestone 0.5.1: GitHub CI and Local Acceptance Policy.
+  - [x] Checkpoint 1: bump every package/operator version marker to 0.5.1 and
+    add a local `ci` gate that covers the public formatting, check, Clippy,
+    tests, documentation, licenses, workflow contracts, and independent writer
+    validation without requiring private PSTs. The first local CI gate passed
+    at `.agent/test-results/1784597651-ci`.
+  - [x] Checkpoint 2: add pull-request and `main`-push Ubuntu 24.04 and Debian
+    13 automation, scheduled RustSec and bounded parser fuzzing, and an
+    approved-tag Debian build that is gated by the `release` environment and
+    does not publish a GitHub release. Third-party actions are pinned to full
+    commits; the downloaded `actionlint` 1.7.12 archive is pinned by SHA-256.
+  - [ ] Checkpoint 3: pass clean-context adversarial review, commit and push the
+    branch, prove the hosted public lanes, configure the GitHub `release`
+    environment with owner approval, complete every risk-triggered local
+    acceptance gate, then merge the approved pull request.
+    The repository `release` environment now requires review by the
+    `calculatetech` owner and limits deployments to `v*`; self-approval remains
+    possible because this single-owner repository has no second release
+    operator. The exact canonical-manifest full gate passed at
+    `.agent/test-results/1784597956-full`, including RustSec, regenerated
+    focused writer fixtures, the external ANSI/Unicode corpus, `pffinfo`, and
+    `readpst`. A clean isolated Rust 1.85 toolchain exposed a newer-compiler
+    dependency selection and unstable syntax that the Rust 1.93 host had
+    hidden. The lock now selects the latest compatible ICU 2.1 family, and
+    equivalent nested control flow plus generic sink dispatch remove those
+    language-version dependencies. The final complete CI gate passed under the
+    real Rust 1.85 compiler at `.agent/test-results/1784598619-ci`, and the
+    exact canonical-manifest full gate passed after the final workflow
+    hardening at `.agent/test-results/1784599078-full`. The final fresh
+    clean-context adversarial review reported `CLEAN`. Hosted pull-request
+    execution remains open. Owner packaging feedback
+    exposed that the ordinary `cargo xtask package deb` path still performed
+    the maintainer reproducibility gate: it compiled the release binary twice
+    and forced a dependency-free synthetic install that printed expected dpkg
+    dependency warnings. The default path now performs one release compilation
+    and publishes one `.deb`; `--validate`, the release gate, and hosted package
+    lanes retain the second build, byte comparison, content/linkage inspection,
+    lintian, and isolated install/removal checks. Both package paths pass end to
+    end with identical final SHA-256
+    `d9fb6e133971dde79fdbb99bb3d927b7092f0c480880177279820f75b824ade1`;
+    the default transcript contains one release compilation and no synthetic
+    dependency warnings. The remediated fast gate passes at
+    `.agent/test-results/1784647914-fast`. Owner direction then removed the
+    proposed self-hosted private-corpus workflow and made `main` pull-request
+    protected. Public hosted CI uses only public/generated inputs. Private
+    corpus gates remain explicit local acceptance, and ScanPST-first human
+    acceptance is mandatory exactly when a change can affect recovered content
+    or generated PST bytes. The existing active GitHub ruleset requires the
+    Ubuntu and Debian jobs plus review-thread resolution with no bypass actor.
+    The complete local public CI gate passes at
+    `.agent/test-results/1784648673-ci`; qualified packaging passes with the
+    final digest above. This workflow/package/documentation-only diff cannot
+    affect recovered content or PST output, so the risk-based policy does not
+    require another private-corpus or ScanPST run.
 - [ ] Milestone 0.6.0: Interoperability Release Candidate.
 - [ ] Milestone 1.0.0: MailPlus-Ready Release.
 
 ## Surprises & Discoveries
+
+- Observation: The Debian builder's dependency errors came from its own
+  `dpkg --force-depends` install/removal test inside an empty synthetic package
+  database. They did not describe the host installation, but they appeared in
+  the ordinary build transcript and were indistinguishable from real install
+  trouble. The same ordinary path also selected separate Cargo target
+  directories and therefore deliberately compiled PSTForge twice.
+  Evidence: `validate_isolated_install_remove` supplies both
+  `--force-depends` and an empty status database; `package_deb` previously
+  invoked independent `build-one` and `build-two` targets unconditionally.
+
+- Observation: `rustsec/audit-check` installs the latest `cargo-audit` at run
+  time even when the action itself is commit-pinned. On 2026-07-20 that selected
+  cargo-audit 0.22.2, which requires Rust 1.88, and failed the hosted Rust 1.85
+  lane before auditing the lock. Hosted automation must therefore install the
+  exact reviewed cargo-audit 0.22.1 release, which supports Rust 1.85, rather
+  than delegate tool-version selection to the action.
+  Evidence: GitHub Actions run 29794637339, Ubuntu job 88523375395.
+
+- Observation: The initial workflow contract check proved only that audit
+  strings existed, so removal of either the workspace or fuzz audit could still
+  leave a passing local gate. The corrected contract requires the CI audit
+  command and separately scoped scheduled workspace and fuzz audit steps. The
+  typed contract also rejects inherited execution defaults, conditional audit
+  steps, and ignored audit failures. Clean-context reviews identified these
+  gaps before the hosted-fix checkpoint was committed.
+
+- Observation: Debian 13 containers can retain exited validator and parser
+  descendants as zombies because the container init process has not reaped
+  them. The original lifecycle tests equated any `/proc/<pid>` entry with a
+  running process and therefore reported false containment failures. Linux
+  lifecycle assertions now read `/proc/<pid>/stat` and treat `Z` and `X` states
+  as dead while retaining the timeout for executable descendants.
+  Evidence: GitHub Actions run 29795594931, Debian job 88526165736.
+
+- Observation: The Debian package lane runs tests as UID 0. The foreign-owner
+  fixture used an eagerly evaluated `unwrap_or(effective - 1)`, which underflowed
+  for root before testing the attribute gate. Flipping the low UID bit produces
+  a distinct in-range fixture identity for every possible unsigned UID without
+  arithmetic overflow.
+  Evidence: GitHub Actions run 29795887616, Debian job 88527021229.
+
+- Observation: Once Debian tests passed, Git rejected both the gate's final
+  `diff --check` and packaging's commit-timestamp lookup because the root-owned
+  container does not inherit checkout's temporary safe-directory setting. Both
+  Git calls now mark their exact known checkout with command-local
+  `safe.directory` values. The workflow also publishes a bounded
+  `diff-check.log` alongside the bounded public test diagnostic if the gate
+  integration fails again.
+  Evidence: GitHub Actions runs 29796156056 and 29796499128; Debian jobs
+  88527828807 and 88528806575.
+
+- Observation: A package-level `rust-version = "1.85"` declaration does not
+  stop a lock generated by a newer Cargo from selecting newer transitive
+  dependencies, and the development host compiler can hide newer syntax in
+  existing code. The initial 0.5.1 lock selected ICU 2.2 (`rust-version =
+  "1.86"`), while several let-chains and trait-object upcasts also failed on
+  Rust 1.85. An isolated, checksum-verified Rust 1.85 toolchain was necessary
+  to expose both classes of failure before the hosted lanes ran.
+  Evidence: failing isolated 1.85 checks followed by the passing complete CI
+  gate at `.agent/test-results/1784598619-ci`.
 
 - Observation: The first default-direct 19 GB qualification reached the full
   writer pass with no mailbox-sized payload spool, but all three attempts
@@ -4279,6 +4392,39 @@ not modified.
   `large-qualification-20260717T204931Z`.
 
 ## Decision Log
+
+- Decision: `cargo xtask package deb` performs exactly one PSTForge release
+  compilation and publishes exactly one final `.deb`. The optional
+  `--validate` flag adds a second isolated compilation, byte-for-byte
+  reproducibility comparison, package metadata/content/linkage checks,
+  lintian, and forced synthetic install/removal. CI package lanes and the
+  release gate always pass `--validate`.
+  Rationale: Operators need a direct build command whose transcript is not
+  polluted by expected missing-dependency warnings or doubled compilation.
+  Maintainer and release assurance remains mandatory where it belongs without
+  taxing or confusing every local package build.
+  Date/Author: 2026-07-21 / human owner direction and Codex.
+
+- Decision: Public CI runs on pull requests to `main` and again on `main` after
+  merge. The active GitHub ruleset requires pull requests, the Ubuntu and
+  Debian status checks, and resolution of review threads, with no bypass actor.
+  Private PSTs never enter GitHub automation: `full` and `release` corpus gates
+  run locally only when a change can affect recovered content or generated PST
+  output. Those output-affecting changes also require ScanPST-first human
+  acceptance. Documentation, workflows, packaging, reporting, diagnostics,
+  tests, and refactors proven byte-identical do not require ScanPST. Ambiguous
+  changes compare a focused qualification artifact and escalate every
+  unexplained byte or semantic difference to ScanPST. Release automation
+  accepts an existing matching tag, requires the protected `release`
+  environment, builds a retained package artifact, and cannot publish a
+  GitHub release.
+  Rationale: Hosted CI should remain reproducible and infrastructure-free,
+  while private mail stays on its controlled local host. Risk-based local
+  corpus and ScanPST acceptance preserve the interoperability evidence that
+  has found pivotal writer defects without imposing irrelevant manual gates on
+  changes incapable of altering PST output.
+  Date/Author: 2026-07-21 / project owner workflow policy and Codex; supersedes
+  the 2026-07-20 branch-push/self-hosted-runner policy.
 
 - Decision: The 0.4.6 historical-pair gate accepts documented partial-success
   output when item/content comparison against the repaired reference succeeds
@@ -5747,6 +5893,18 @@ scratch. The unresolved manifest and those three compact evidence sets remain.
 No writer behavior changed, so no further human ScanPST or Outlook validation
 is required for this milestone.
 
+Version 0.5.1 now separates ordinary Debian package construction from
+maintainer qualification. The default command performs one release compilation
+and leaves one final `.deb`, while explicit `--validate`, CI, and release gates
+retain independent rebuild/reproducibility, content, linkage, lintian, and
+synthetic install/removal checks. This removes misleading dependency warnings
+and doubled compilation from the operator path without weakening release
+assurance. GitHub-hosted pull-request CI now uses only public and generated
+inputs. Protected `main` requires the Ubuntu and Debian jobs plus resolved
+review threads, while private-corpus and ScanPST-first acceptance remain local,
+risk-triggered gates for changes capable of altering recovered content or PST
+output.
+
 ## Context and Orientation
 
 The repository initially contains only documentation. `AGENTS.md` governs all
@@ -6363,20 +6521,56 @@ Acceptance: installing the package on clean Debian 13 makes `pstforge info`,
 it leaves user jobs and source PSTs untouched; package contents, licenses, and
 dependency metadata pass inspection.
 
-### Milestone 15: Version 0.5.1 - GitHub CI and Private-Corpus Automation
+### Milestone 15: Version 0.5.1 - GitHub CI and Local Acceptance Policy
 
 Begin after the human-approved documentation baseline is pushed to the
-reachable `origin` remote and repository settings can be configured. This
-repository does not use pull requests. Add branch-push workflows for formatting,
-clippy, unit/integration tests, Debian and Ubuntu builds, docs, license policy,
-and advisories. Add scheduled fuzzing and a manual self-hosted runner labeled
-for the private PST corpus. The private runner emits only redacted
-JUnit/summary data and never uploads PSTs, spool data, mail metadata, or verbose
-logs.
+reachable `origin` remote and repository settings can be configured. Protect
+`main` with required pull requests, Ubuntu and Debian checks, and review-thread
+resolution. Add pull-request workflows for formatting, Clippy,
+unit/integration tests, Debian and Ubuntu builds, docs, license policy, and
+advisories. Add scheduled fuzzing without any self-hosted runner or private
+corpus dependency.
 
 Add a release workflow that builds but cannot publish without an approved tag
 and environment. Repository automation does not waive the rule that agents may
 not push, merge, tag, or publish without explicit human approval.
+
+Implement this milestone without changing recovery or writer behavior. Add a
+public `cargo xtask gate ci` tier that is independent of all private PSTs and
+runs formatting, locked workspace checks, warnings-as-errors Clippy, tests,
+private-item documentation, license policy, generated writer acceptance, and
+independent `libpff`, `pffinfo`, and `readpst` checks. Keep `full` as `ci` plus
+RustSec and the explicitly configured external corpus; keep `release` as
+`full` plus the locked release build and reproducible Debian package.
+
+On pull requests to `main`, run the public gate on Ubuntu 24.04 and
+build/validate the package in Debian 13; repeat both checks after merge on
+`main`. Validate all workflow YAML with a checksum-pinned `actionlint`, pin
+every referenced action to a complete commit, and grant only `contents: read`.
+Schedule separate RustSec audits for the main and fuzz dependency locks and a
+five-minute, 256 KiB-bounded native Rust PST-reader fuzz target. The fuzz input
+must be ephemeral generated bytes, never a private mail-derived corpus
+committed or uploaded by automation.
+
+Keep the canonical private corpus local. Run the exact `full` or `release` gate
+with `PSTFORGE_CORPUS_MANIFEST` only when a change can affect source recovery or
+generated PST output. Require ScanPST-first human acceptance for writer,
+translation, recovery selection/classification, placement, packing, replay,
+rollback, finalization, and non-byte-identical dependency/toolchain changes.
+Do not require ScanPST for documentation, workflow, packaging, reporting,
+diagnostic, test-only, or proven byte-identical work. Compare a focused
+qualification artifact when impact is ambiguous and escalate any unexplained
+byte or semantic difference.
+
+The release build is also manual. It checks out an existing operator-supplied
+`v*` tag, proves that exact tag points at `HEAD` and equals `v` plus the
+checked-out `pstforge-cli` package version, enters the protected `release`
+environment, reruns the public CI gate, builds the qualified Debian package,
+and retains that package as a short-lived workflow artifact. It cannot create
+a tag, GitHub release, package publication, push, or merge. Acceptance requires
+local workflow validation, a pull request with clean hosted Ubuntu and Debian
+checks and resolved review threads, confirmed release-environment enforcement,
+every risk-triggered local corpus or ScanPST gate, and clean adversarial review.
 
 ### Milestone 16: Version 0.6.0 - Interoperability Release Candidate
 
@@ -6565,13 +6759,14 @@ notices in binary/package documentation. If a proven corpus failure requires a
 baseline is pushed, prefer an upstreamable patch, publish corresponding source
 with any distributed binary, and preserve runtime library replacement.
 
-GitHub Actions, remote forks, release environments, badges, branch protection,
-and self-hosted runner configuration build on the approved remote baseline.
-Recheck authentication and repository settings before creating or configuring
-them. Local work must never depend on their existence.
+GitHub Actions, remote forks, release environments, badges, and branch
+protection build on the approved remote baseline. Recheck authentication and
+repository settings before creating or configuring them. Local work and
+private-corpus acceptance must never depend on their existence.
 
-Revision note (2026-07-20): Closed the 0.4.6 historical corruption archive
-after proving 16 repaired-reference cases, recording three current-libpff
-exceptions for post-1.0 work, completing the release-profile full gate, and
-removing private passing samples. The strict historical harness is now opt-in
-when its external manifest and scratch directory are explicitly supplied.
+Revision note (2026-07-21): Replaced the proposed self-hosted private-corpus
+runner with public pull-request CI plus risk-triggered local corpus and
+ScanPST-first acceptance. Protected `main` requires the hosted Ubuntu and Debian
+checks and resolved review threads. Debian package qualification is explicit:
+ordinary builds compile once, while `--validate`, CI, and release paths retain
+the independent qualification suite.

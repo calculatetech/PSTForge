@@ -1,6 +1,6 @@
 #![deny(unsafe_code)]
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::io::Read as _;
@@ -108,6 +108,37 @@ struct CargoDependencyKind {
 struct Gate {
     root: PathBuf,
     evidence: PathBuf,
+}
+
+#[derive(Debug, Deserialize)]
+struct GithubWorkflow {
+    jobs: BTreeMap<String, GithubJob>,
+    defaults: Option<serde_yaml_ng::Value>,
+    env: Option<serde_yaml_ng::Value>,
+}
+
+#[derive(Debug, Deserialize)]
+struct GithubJob {
+    steps: Vec<GithubStep>,
+    defaults: Option<serde_yaml_ng::Value>,
+    #[serde(rename = "if")]
+    condition: Option<serde_yaml_ng::Value>,
+    #[serde(rename = "continue-on-error")]
+    continue_on_error: Option<serde_yaml_ng::Value>,
+    env: Option<serde_yaml_ng::Value>,
+}
+
+#[derive(Debug, Deserialize)]
+struct GithubStep {
+    run: Option<String>,
+    #[serde(rename = "working-directory")]
+    working_directory: Option<String>,
+    #[serde(rename = "if")]
+    condition: Option<serde_yaml_ng::Value>,
+    #[serde(rename = "continue-on-error")]
+    continue_on_error: Option<serde_yaml_ng::Value>,
+    env: Option<serde_yaml_ng::Value>,
+    shell: Option<serde_yaml_ng::Value>,
 }
 
 struct PreparedCorpus {
@@ -279,10 +310,8 @@ fn run() -> Result<(), String> {
         let format = arguments
             .next()
             .ok_or_else(|| "missing package format: deb".to_owned())?;
-        if format != OsStr::new("deb") || arguments.next().is_some() {
-            return Err("usage: cargo xtask package deb".to_owned());
-        }
-        return package_deb(&root);
+        let validate = package_validation_option(format.as_os_str(), arguments)?;
+        return package_deb(&root, validate);
     }
     if command == std::ffi::OsStr::new("qualify") {
         let checkpoint = arguments
@@ -320,7 +349,7 @@ fn run() -> Result<(), String> {
     }
     let tier = arguments
         .next()
-        .ok_or_else(|| "missing gate tier: fast, full, or release".to_owned())?;
+        .ok_or_else(|| "missing gate tier: fast, ci, full, or release".to_owned())?;
     if arguments.next().is_some() {
         return Err("unexpected arguments after gate tier".to_owned());
     }
@@ -337,30 +366,48 @@ fn run() -> Result<(), String> {
 
     match tier.to_str() {
         Some("fast") => gate.fast(),
+        Some("ci") => gate.ci(),
         Some("full") => gate.full(),
         Some("release") => gate.release(),
-        _ => Err("unknown gate tier; expected fast, full, or release".to_owned()),
+        _ => Err("unknown gate tier; expected fast, ci, full, or release".to_owned()),
     }
 }
 
 fn usage() -> String {
-    "usage: cargo xtask gate <fast|full|release> | package deb | qualify <embedded-attachments|named-properties|empty-folders|contacts|appointments|meetings|pim-items|distribution-list|document-object|ole-attachments|reference-attachments|calendar-exceptions|associated-data> <output>"
+    "usage: cargo xtask gate <fast|ci|full|release> | package deb [--validate] | qualify <embedded-attachments|named-properties|empty-folders|contacts|appointments|meetings|pim-items|distribution-list|document-object|ole-attachments|reference-attachments|calendar-exceptions|associated-data> <output>"
         .to_owned()
 }
 
-fn package_deb(root: &Path) -> Result<(), String> {
+fn package_validation_option(
+    format: &OsStr,
+    mut arguments: impl Iterator<Item = OsString>,
+) -> Result<bool, String> {
+    let option = arguments.next();
+    let known_option = option
+        .as_deref()
+        .is_none_or(|value| value == OsStr::new("--validate"));
+    if format != OsStr::new("deb") || !known_option || arguments.next().is_some() {
+        return Err("usage: cargo xtask package deb [--validate]".to_owned());
+    }
+    Ok(option.is_some())
+}
+
+fn package_deb(root: &Path, validate: bool) -> Result<(), String> {
     for program in [
         "dpkg",
         "dpkg-deb",
         "dpkg-shlibdeps",
         "find",
         "gzip",
-        "lintian",
-        "readelf",
         "strip",
         "touch",
     ] {
         require_program(program)?;
+    }
+    if validate {
+        for program in ["lintian", "readelf"] {
+            require_program(program)?;
+        }
     }
     let architecture = command_stdout(root, "dpkg", &["--print-architecture"])?;
     if architecture.trim() != "amd64" {
@@ -375,52 +422,58 @@ fn package_deb(root: &Path) -> Result<(), String> {
     prepare_generated_directory(root, &package_root)?;
     fs::create_dir_all(&package_root)
         .map_err(|error| format!("cannot create {}: {error}", package_root.display()))?;
-    let first_target = package_root.join("build-one");
-    let second_target = package_root.join("build-two");
-    build_release_binary(root, &first_target, &epoch)?;
-    build_release_binary(root, &second_target, &epoch)?;
-    let first_binary = first_target.join("release/pstforge");
-    let second_binary = second_target.join("release/pstforge");
-    let dependencies = debian_runtime_dependencies(&package_root, &first_binary)?;
+    let build_target = package_root.join("build");
+    build_release_binary(root, &build_target, &epoch)?;
+    let binary = build_target.join("release/pstforge");
+    let dependencies = debian_runtime_dependencies(&package_root, &binary)?;
     let rust_licenses = rust_dependency_licenses(root)?;
-    let first = package_root.join(format!("pstforge_{version}_amd64.first.deb"));
-    let second = package_root.join(format!("pstforge_{version}_amd64.second.deb"));
+    let candidate = package_root.join(format!(".pstforge_{version}_amd64.candidate.deb"));
     build_deb_archive(
         root,
-        &first_binary,
+        &binary,
         &dependencies,
         &rust_licenses,
         &epoch,
-        "one",
-        &first,
+        "package",
+        &candidate,
     )?;
-    build_deb_archive(
-        root,
-        &second_binary,
-        &dependencies,
-        &rust_licenses,
-        &epoch,
-        "two",
-        &second,
-    )?;
-    let first_bytes =
-        fs::read(&first).map_err(|error| format!("cannot read {}: {error}", first.display()))?;
-    if first_bytes
-        != fs::read(&second)
-            .map_err(|error| format!("cannot read {}: {error}", second.display()))?
-    {
-        return Err("two Debian package builds were not byte-for-byte reproducible".to_owned());
+
+    if validate {
+        let validation_target = package_root.join("validation-build");
+        build_release_binary(root, &validation_target, &epoch)?;
+        let validation_binary = validation_target.join("release/pstforge");
+        let validation_package =
+            package_root.join(format!(".pstforge_{version}_amd64.validation.deb"));
+        build_deb_archive(
+            root,
+            &validation_binary,
+            &dependencies,
+            &rust_licenses,
+            &epoch,
+            "validation",
+            &validation_package,
+        )?;
+        if fs::read(&candidate)
+            .map_err(|error| format!("cannot read {}: {error}", candidate.display()))?
+            != fs::read(&validation_package)
+                .map_err(|error| format!("cannot read {}: {error}", validation_package.display()))?
+        {
+            return Err("two Debian package builds were not byte-for-byte reproducible".to_owned());
+        }
+        validate_deb_package(root, &package_root, &candidate, version, &dependencies)?;
+        fs::remove_file(&validation_package)
+            .map_err(|error| format!("cannot remove {}: {error}", validation_package.display()))?;
     }
-    validate_deb_package(root, &package_root, &first, version, &dependencies)?;
+
+    let package_bytes = fs::read(&candidate)
+        .map_err(|error| format!("cannot read {}: {error}", candidate.display()))?;
     let package = package_root.join(format!("pstforge_{version}_amd64.deb"));
-    fs::rename(&first, &package)
+    fs::rename(&candidate, &package)
         .map_err(|error| format!("cannot publish {}: {error}", package.display()))?;
-    fs::remove_file(&second)
-        .map_err(|error| format!("cannot remove {}: {error}", second.display()))?;
     println!(
         "Debian package: {}\nsha256: {:x}\ndepends: {}",
         package.display(),
-        Sha256::digest(&first_bytes),
+        Sha256::digest(&package_bytes),
         dependencies
     );
     Ok(())
@@ -469,9 +522,14 @@ fn source_date_epoch(root: &Path) -> Result<String, String> {
             .map_err(|_| "SOURCE_DATE_EPOCH must be an unsigned Unix timestamp".to_owned())?;
         return Ok(value);
     }
-    Ok(command_stdout(root, "git", &["log", "-1", "--format=%ct"])?
-        .trim()
-        .to_owned())
+    let safe_directory = format!("safe.directory={}", root.display());
+    Ok(command_stdout(
+        root,
+        "git",
+        &["-c", &safe_directory, "log", "-1", "--format=%ct"],
+    )?
+    .trim()
+    .to_owned())
 }
 
 fn debian_runtime_dependencies(package_root: &Path, binary: &Path) -> Result<String, String> {
@@ -2492,16 +2550,19 @@ impl Gate {
         )?;
         self.documentation()?;
         self.validate_documents_and_schemas()?;
-        self.command("diff-check", "git", &["diff", "--check"])?;
+        let safe_directory = format!("safe.directory={}", self.root.display());
+        self.command(
+            "diff-check",
+            "git",
+            &["-c", &safe_directory, "diff", "--check"],
+        )?;
         println!("fast gate passed; evidence: {}", self.evidence.display());
         Ok(())
     }
 
     fn full(&self) -> Result<(), String> {
-        self.fast()?;
-        self.validate_licenses()?;
+        self.ci()?;
         self.command("advisories", "cargo", &["audit", "--deny", "warnings"])?;
-        self.validate_generated_store()?;
         let manifest_path = std::env::var_os("PSTFORGE_CORPUS_MANIFEST").ok_or_else(|| {
             "PSTFORGE_CORPUS_MANIFEST must point to an external corpus manifest for the full gate"
                 .to_owned()
@@ -2531,6 +2592,14 @@ impl Gate {
         Ok(())
     }
 
+    fn ci(&self) -> Result<(), String> {
+        self.fast()?;
+        self.validate_licenses()?;
+        self.validate_generated_store()?;
+        println!("CI gate passed; evidence: {}", self.evidence.display());
+        Ok(())
+    }
+
     fn release(&self) -> Result<(), String> {
         self.full()?;
         self.command(
@@ -2538,6 +2607,7 @@ impl Gate {
             "cargo",
             &["build", "--workspace", "--release", "--locked"],
         )?;
+        package_deb(&self.root, true)?;
         println!(
             "release gate foundation passed; evidence: {}",
             self.evidence.display()
@@ -2656,6 +2726,13 @@ impl Gate {
             "docs/debian-changelog",
             "docs/debian-copyright",
             "docs/pstforge.1",
+            ".github/workflows/ci.yml",
+            ".github/workflows/fuzz.yml",
+            ".github/workflows/release-build.yml",
+            ".github/workflows/security.yml",
+            "fuzz/Cargo.lock",
+            "fuzz/Cargo.toml",
+            "fuzz/fuzz_targets/pst_reader.rs",
             "docs/schemas/common.schema.json",
             "docs/schemas/info.schema.json",
             "docs/schemas/verify.schema.json",
@@ -2699,6 +2776,7 @@ impl Gate {
                 .map_err(|error| format!("{relative} is not valid JSON: {error}"))?;
         }
         self.validate_public_json_schemas()?;
+        self.validate_github_workflows()?;
         let example = fs::read_to_string(self.root.join("tests/corpus-manifest.example.toml"))
             .map_err(|error| format!("cannot read example manifest: {error}"))?;
         let example: CorpusManifest = toml::from_str(&example)
@@ -2710,6 +2788,152 @@ impl Gate {
         )
         .map_err(|error| format!("cannot record artifact validation: {error}"))?;
         println!("artifacts ... ok");
+        Ok(())
+    }
+
+    fn validate_github_workflows(&self) -> Result<(), String> {
+        const WORKFLOWS: [&str; 4] = ["ci.yml", "fuzz.yml", "release-build.yml", "security.yml"];
+        for filename in WORKFLOWS {
+            let path = self.root.join(".github/workflows").join(filename);
+            let text = fs::read_to_string(&path)
+                .map_err(|error| format!("cannot read {}: {error}", path.display()))?;
+            serde_yaml_ng::from_str::<serde_yaml_ng::Value>(&text)
+                .map_err(|error| format!("{} is not valid YAML: {error}", path.display()))?;
+            if (filename != "ci.yml" && text.contains("pull_request:"))
+                || !text.contains("permissions:\n  contents: read")
+            {
+                return Err(format!(
+                    "{filename} has an unexpected trigger or lacks read-only contents permission"
+                ));
+            }
+            for line in text.lines().map(str::trim) {
+                let Some(action) = line.strip_prefix("uses:") else {
+                    continue;
+                };
+                let Some((_, revision)) = action.trim().rsplit_once('@') else {
+                    return Err(format!("{filename} has an unversioned action: {action}"));
+                };
+                if revision.len() != 40 || !revision.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+                    return Err(format!(
+                        "{filename} action is not pinned to a full commit: {action}"
+                    ));
+                }
+            }
+        }
+        let fuzz = fs::read_to_string(self.root.join(".github/workflows/fuzz.yml"))
+            .map_err(|error| format!("cannot read fuzz workflow: {error}"))?;
+        if !fuzz.contains("cargo install cargo-fuzz --version 0.13.2 --locked") {
+            return Err("fuzz workflow must install the reviewed cargo-fuzz version".to_owned());
+        }
+        let ci = fs::read_to_string(self.root.join(".github/workflows/ci.yml"))
+            .map_err(|error| format!("cannot read CI workflow: {error}"))?;
+        for required in [
+            "actionlint_1.7.12_linux_amd64.tar.gz",
+            "8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8",
+            "./actionlint -color",
+            "find .agent/test-results \\( -name tests.log -o -name diff-check.log \\) -exec tail --lines=250",
+            "pull_request:",
+            "      - main",
+        ] {
+            if !ci.contains(required) {
+                return Err(format!(
+                    "CI workflow is missing actionlint requirement {required}"
+                ));
+            }
+        }
+        let ci_workflow: GithubWorkflow = serde_yaml_ng::from_str(&ci)
+            .map_err(|error| format!("CI workflow cannot be inspected: {error}"))?;
+        let ubuntu_steps = ci_workflow
+            .jobs
+            .get("ubuntu")
+            .ok_or_else(|| "CI workflow is missing the Ubuntu job".to_owned())?;
+        require_unmodified_workflow_execution("CI Ubuntu job", &ci_workflow, ubuntu_steps)?;
+        require_workflow_command(
+            "CI Ubuntu job",
+            ubuntu_steps.steps.as_slice(),
+            "cargo install cargo-audit --version 0.22.1 --locked",
+            None,
+        )?;
+        require_workflow_command(
+            "CI Ubuntu job",
+            ubuntu_steps.steps.as_slice(),
+            "cargo audit --deny warnings",
+            None,
+        )?;
+        let debian_steps = ci_workflow
+            .jobs
+            .get("debian")
+            .ok_or_else(|| "CI workflow is missing the Debian package job".to_owned())?;
+        require_unmodified_workflow_execution("CI Debian job", &ci_workflow, debian_steps)?;
+        require_workflow_command(
+            "CI Debian job",
+            debian_steps.steps.as_slice(),
+            "cargo xtask package deb --validate",
+            None,
+        )?;
+        let security = fs::read_to_string(self.root.join(".github/workflows/security.yml"))
+            .map_err(|error| format!("cannot read security workflow: {error}"))?;
+        let security_workflow: GithubWorkflow = serde_yaml_ng::from_str(&security)
+            .map_err(|error| format!("security workflow cannot be inspected: {error}"))?;
+        let security_steps = security_workflow
+            .jobs
+            .get("rustsec")
+            .ok_or_else(|| "security workflow is missing the RustSec job".to_owned())?;
+        require_unmodified_workflow_execution(
+            "security RustSec job",
+            &security_workflow,
+            security_steps,
+        )?;
+        require_workflow_command(
+            "security RustSec job",
+            security_steps.steps.as_slice(),
+            "cargo install cargo-audit --version 0.22.1 --locked",
+            None,
+        )?;
+        require_workflow_command(
+            "security RustSec job",
+            security_steps.steps.as_slice(),
+            "cargo audit --deny warnings",
+            None,
+        )?;
+        require_workflow_command(
+            "security RustSec job",
+            security_steps.steps.as_slice(),
+            "cargo audit --deny warnings",
+            Some("fuzz"),
+        )?;
+        let release = fs::read_to_string(self.root.join(".github/workflows/release-build.yml"))
+            .map_err(|error| format!("cannot read release workflow: {error}"))?;
+        for required in [
+            "environment: release",
+            "git tag --points-at HEAD",
+            "v*)",
+            "cargo metadata --locked --no-deps --format-version 1",
+            "test \"$RELEASE_TAG\" = \"v$PACKAGE_VERSION\"",
+        ] {
+            if !release.contains(required) {
+                return Err(format!(
+                    "release workflow is missing approval/tag requirement {required}"
+                ));
+            }
+        }
+        let release_workflow: GithubWorkflow = serde_yaml_ng::from_str(&release)
+            .map_err(|error| format!("release workflow cannot be inspected: {error}"))?;
+        let package_steps = release_workflow
+            .jobs
+            .get("package")
+            .ok_or_else(|| "release workflow is missing the package job".to_owned())?;
+        require_unmodified_workflow_execution(
+            "release package job",
+            &release_workflow,
+            package_steps,
+        )?;
+        require_workflow_command(
+            "release package job",
+            package_steps.steps.as_slice(),
+            "cargo xtask package deb --validate",
+            None,
+        )?;
         Ok(())
     }
 
@@ -3153,6 +3377,55 @@ impl Gate {
     }
 }
 
+fn require_workflow_command(
+    context: &str,
+    steps: &[GithubStep],
+    command: &str,
+    working_directory: Option<&str>,
+) -> Result<(), String> {
+    let present = steps.iter().any(|step| {
+        step.run.as_deref().map(str::trim) == Some(command)
+            && step.working_directory.as_deref() == working_directory
+            && step.condition.is_none()
+            && step.env.is_none()
+            && step.shell.is_none()
+            && matches!(
+                step.continue_on_error,
+                None | Some(serde_yaml_ng::Value::Bool(false))
+            )
+    });
+    if present {
+        Ok(())
+    } else {
+        Err(format!(
+            "{context} must run {command:?} with working directory {working_directory:?}"
+        ))
+    }
+}
+
+fn require_unmodified_workflow_execution(
+    context: &str,
+    workflow: &GithubWorkflow,
+    job: &GithubJob,
+) -> Result<(), String> {
+    if workflow.defaults.is_some()
+        || workflow.env.is_some()
+        || job.defaults.is_some()
+        || job.condition.is_some()
+        || !matches!(
+            job.continue_on_error,
+            None | Some(serde_yaml_ng::Value::Bool(false))
+        )
+        || job.env.is_some()
+    {
+        Err(format!(
+            "{context} must not inherit execution overrides or ignore job failure"
+        ))
+    } else {
+        Ok(())
+    }
+}
+
 fn directory_contains_file_with(path: &Path, required: &[&[u8]]) -> Result<bool, String> {
     let mut pending = vec![path.to_path_buf()];
     while let Some(directory) = pending.pop() {
@@ -3245,8 +3518,102 @@ mod tests {
     use std::os::unix::fs::symlink;
 
     use super::{
-        document_checkpoint_payload, prepare_generated_directory, rust_dependency_licenses,
+        GithubWorkflow, document_checkpoint_payload, package_validation_option,
+        prepare_generated_directory, require_workflow_command, rust_dependency_licenses,
     };
+
+    #[test]
+    fn package_validation_is_explicit_and_rejects_unknown_arguments() {
+        assert!(
+            !package_validation_option(std::ffi::OsStr::new("deb"), std::iter::empty()).unwrap()
+        );
+        assert!(
+            package_validation_option(
+                std::ffi::OsStr::new("deb"),
+                [std::ffi::OsString::from("--validate")].into_iter()
+            )
+            .unwrap()
+        );
+        assert!(
+            package_validation_option(
+                std::ffi::OsStr::new("deb"),
+                [std::ffi::OsString::from("--unknown")].into_iter()
+            )
+            .is_err()
+        );
+        assert!(
+            package_validation_option(
+                std::ffi::OsStr::new("deb"),
+                [
+                    std::ffi::OsString::from("--validate"),
+                    std::ffi::OsString::from("extra")
+                ]
+                .into_iter()
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn workflow_command_validation_uses_executable_steps_and_scope()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let workflow: GithubWorkflow = serde_yaml_ng::from_str(
+            r#"
+jobs:
+  rustsec:
+    steps:
+      # run: cargo audit --deny warnings
+      - run: cargo audit --deny warnings
+        working-directory: fuzz
+"#,
+        )?;
+        let steps = workflow
+            .jobs
+            .get("rustsec")
+            .ok_or("missing job")?
+            .steps
+            .as_slice();
+        assert!(
+            require_workflow_command("test", steps, "cargo audit --deny warnings", Some("fuzz"))
+                .is_ok()
+        );
+        assert!(
+            require_workflow_command("test", steps, "cargo audit --deny warnings", None).is_err()
+        );
+
+        let inherited: GithubWorkflow = serde_yaml_ng::from_str(
+            r#"
+defaults:
+  run:
+    working-directory: fuzz
+jobs:
+  rustsec:
+    steps:
+      - run: cargo audit --deny warnings
+"#,
+        )?;
+        let inherited_job = inherited.jobs.get("rustsec").ok_or("missing job")?;
+        assert!(
+            super::require_unmodified_workflow_execution("test", &inherited, inherited_job)
+                .is_err()
+        );
+
+        let ignored_failure: GithubWorkflow = serde_yaml_ng::from_str(
+            r#"
+jobs:
+  rustsec:
+    continue-on-error: true
+    steps:
+      - run: cargo audit --deny warnings
+"#,
+        )?;
+        let ignored_job = ignored_failure.jobs.get("rustsec").ok_or("missing job")?;
+        assert!(
+            super::require_unmodified_workflow_execution("test", &ignored_failure, ignored_job)
+                .is_err()
+        );
+        Ok(())
+    }
 
     #[test]
     fn packaged_rust_licenses_cover_only_the_executable_closure()

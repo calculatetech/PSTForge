@@ -200,13 +200,16 @@ diagnostics, installation checks, and a reproducible Debian 13 x86_64 package.
 Verify operation with Debian's older supported `libpff` ABI as well as the
 newer Ubuntu development host package.
 
-### 15. Version 0.5.1 - GitHub CI and Private-Corpus Automation
+### 15. Version 0.5.1 - GitHub CI and Local Acceptance Policy
 
 The GitHub remote and approved documentation baseline are available. Add branch
-checks, scheduled security and fuzzing jobs, release automation, and an
-explicitly invoked private self-hosted corpus runner that never uploads PST
-content or sensitive logs. This repository does not use pull requests, so
-required checks apply to milestone branches and pre-merge local gates.
+and pull-request checks, scheduled security and fuzzing jobs, and release
+automation using only GitHub-hosted resources and public/generated inputs. Keep
+the private corpus as an explicitly invoked local gate. Require ScanPST-first
+human acceptance when a significant change can affect recovered content or
+generated PST output, but not for changes that cannot affect output. Protect
+`main` with required pull requests, hosted Ubuntu and Debian checks, and review
+thread resolution.
 
 ### 16. Version 0.6.0 - Interoperability Release Candidate
 

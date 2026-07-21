@@ -951,12 +951,12 @@ impl<'a> DirectProtocolSource<'a> {
                 "worker property names a non-active message",
             ));
         }
-        if let Some(index) = attachment_index
-            && self.attachments.last() != Some(&(message_id, index))
-        {
-            return Err(direct_protocol_error(
-                "worker property names a non-active attachment",
-            ));
+        if let Some(index) = attachment_index {
+            if self.attachments.last() != Some(&(message_id, index)) {
+                return Err(direct_protocol_error(
+                    "worker property names a non-active attachment",
+                ));
+            }
         }
         Ok(())
     }
@@ -2165,8 +2165,8 @@ fn send_buffered_metadata_to_sink(
     }
 }
 
-fn send_control_to_sink(
-    sink: &mut dyn CatalogSink,
+fn send_control_to_sink<S: CatalogSink + ?Sized>(
+    sink: &mut S,
     frame: ControlFrame,
 ) -> Result<(), WorkerProtocolError> {
     let event = match frame {
@@ -2290,8 +2290,8 @@ fn reported_error(kind: WorkerFailureKind, detail: String) -> WorkerProtocolErro
     }
 }
 
-fn send_to_sink(
-    sink: &mut dyn CatalogSink,
+fn send_to_sink<S: CatalogSink + ?Sized>(
+    sink: &mut S,
     event: CatalogEvent<'_>,
 ) -> Result<(), WorkerProtocolError> {
     sink.event(event).map_err(WorkerProtocolError::Sink)
