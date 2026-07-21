@@ -1,0 +1,78 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "split.schema.json",
+  "title": "PSTForge split result",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "command", "execution_mode", "maximum_pst_bytes", "resumed", "keep_work", "disk_preflight", "metrics", "recovery", "rejection_counts", "parts", "written_candidates", "partial", "terminal_failure"],
+  "properties": {
+    "schema_version": { "const": "0.5.0" },
+    "command": { "const": "split" },
+    "execution_mode": { "enum": ["direct", "restartable"] },
+    "maximum_pst_bytes": { "type": "integer", "minimum": 1 },
+    "resumed": { "type": "boolean" },
+    "keep_work": { "type": "boolean" },
+    "disk_preflight": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["required_bytes", "available_bytes", "existing_job_bytes"],
+      "properties": {
+        "required_bytes": { "type": "integer", "minimum": 0 },
+        "available_bytes": { "type": "integer", "minimum": 0 },
+        "existing_job_bytes": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "metrics": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["elapsed_millis", "source_bytes", "output_bytes", "average_source_bytes_per_second", "peak_process_rss_bytes", "payload_pack_bytes_written", "peak_payload_pack_bytes", "active_pst_bytes_written", "finalized_output_bytes", "validator_input_bytes", "peak_payload_and_active_pst_bytes", "supervisor_filesystem_read_bytes", "supervisor_filesystem_write_bytes"],
+      "properties": {
+        "elapsed_millis": { "type": "integer", "minimum": 0 },
+        "source_bytes": { "type": "integer", "minimum": 0 },
+        "output_bytes": { "type": "integer", "minimum": 0 },
+        "average_source_bytes_per_second": { "type": "integer", "minimum": 0 },
+        "peak_process_rss_bytes": { "type": "integer", "minimum": 0 },
+        "payload_pack_bytes_written": { "type": "integer", "minimum": 0 },
+        "peak_payload_pack_bytes": { "type": "integer", "minimum": 0 },
+        "active_pst_bytes_written": { "type": "integer", "minimum": 0 },
+        "finalized_output_bytes": { "type": "integer", "minimum": 0 },
+        "validator_input_bytes": { "type": "integer", "minimum": 0 },
+        "peak_payload_and_active_pst_bytes": { "type": "integer", "minimum": 0 },
+        "supervisor_filesystem_read_bytes": { "type": ["integer", "null"], "minimum": 0 },
+        "supervisor_filesystem_write_bytes": { "type": ["integer", "null"], "minimum": 0 }
+      }
+    },
+    "recovery": { "$ref": "recover.schema.json" },
+    "rejection_counts": {
+      "type": "object",
+      "additionalProperties": { "type": "integer", "minimum": 0 },
+      "propertyNames": {
+        "enum": ["source_item_unsupported", "malformed_candidate", "malformed_property", "writer_input_rejected", "item_graph_dependency_rejected", "unsupported_embedded_item", "stranded_embedded_item"]
+      }
+    },
+    "parts": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["index", "filename", "byte_len", "folder_count", "message_count", "oversize", "partial", "omitted_folders", "omitted_properties", "omitted_attachments"],
+        "properties": {
+          "index": { "type": "integer", "minimum": 1 },
+          "filename": { "type": "string", "pattern": "^part-[0-9]{4,}\\.pst$" },
+          "byte_len": { "type": "integer", "minimum": 0 },
+          "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+          "folder_count": { "type": "integer", "minimum": 0 },
+          "message_count": { "type": "integer", "minimum": 0 },
+          "oversize": { "type": "boolean" },
+          "partial": { "type": "boolean" },
+          "omitted_folders": { "type": "integer", "minimum": 0 },
+          "omitted_properties": { "type": "integer", "minimum": 0 },
+          "omitted_attachments": { "type": "integer", "minimum": 0 }
+        }
+      }
+    },
+    "written_candidates": { "type": "integer", "minimum": 0 },
+    "partial": { "type": "boolean" },
+    "terminal_failure": { "type": ["string", "null"], "enum": ["worker_crash", "worker_stall", "worker_protocol", null] }
+  }
+}

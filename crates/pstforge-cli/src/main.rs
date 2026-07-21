@@ -26,6 +26,9 @@ fn main() -> ExitCode {
         Err(run_error) => {
             error!(error = %run_error, "command failed");
             eprintln!("pstforge: {run_error}");
+            if let Some(hint) = run_error.installation_hint() {
+                eprintln!("pstforge: hint: {hint}");
+            }
             ExitCode::from(run_error.exit_code())
         }
     }

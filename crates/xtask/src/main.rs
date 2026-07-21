@@ -1760,8 +1760,19 @@ impl Gate {
             ".agent/PLANS.md",
             "docs/PRODUCT_SPEC.md",
             "docs/ROADMAP.md",
+            "docs/schemas/common.schema.json",
+            "docs/schemas/info.schema.json",
+            "docs/schemas/verify.schema.json",
+            "docs/schemas/recover.schema.json",
+            "docs/schemas/split.schema.json",
+            "docs/schemas/report.schema.json",
             "tests/corpus-schema.json",
             "tests/corpus-manifest.example.toml",
+            "tests/fixtures/json/info.json",
+            "tests/fixtures/json/verify.json",
+            "tests/fixtures/json/recover.json",
+            "tests/fixtures/json/split.json",
+            "tests/fixtures/json/report.json",
         ] {
             if !self.root.join(relative).is_file() {
                 return Err(format!(
@@ -1773,6 +1784,25 @@ impl Gate {
             .map_err(|error| format!("cannot read corpus schema: {error}"))?;
         serde_json::from_str::<serde_json::Value>(&schema)
             .map_err(|error| format!("corpus schema is not valid JSON: {error}"))?;
+        for relative in [
+            "docs/schemas/common.schema.json",
+            "docs/schemas/info.schema.json",
+            "docs/schemas/verify.schema.json",
+            "docs/schemas/recover.schema.json",
+            "docs/schemas/split.schema.json",
+            "docs/schemas/report.schema.json",
+            "tests/fixtures/json/info.json",
+            "tests/fixtures/json/verify.json",
+            "tests/fixtures/json/recover.json",
+            "tests/fixtures/json/split.json",
+            "tests/fixtures/json/report.json",
+        ] {
+            let document = fs::read_to_string(self.root.join(relative))
+                .map_err(|error| format!("cannot read {relative}: {error}"))?;
+            serde_json::from_str::<serde_json::Value>(&document)
+                .map_err(|error| format!("{relative} is not valid JSON: {error}"))?;
+        }
+        self.validate_public_json_schemas()?;
         let example = fs::read_to_string(self.root.join("tests/corpus-manifest.example.toml"))
             .map_err(|error| format!("cannot read example manifest: {error}"))?;
         let example: CorpusManifest = toml::from_str(&example)
@@ -1784,6 +1814,68 @@ impl Gate {
         )
         .map_err(|error| format!("cannot record artifact validation: {error}"))?;
         println!("artifacts ... ok");
+        Ok(())
+    }
+
+    fn validate_public_json_schemas(&self) -> Result<(), String> {
+        const SCHEMAS: &[&str] = &[
+            "common.schema.json",
+            "info.schema.json",
+            "verify.schema.json",
+            "recover.schema.json",
+            "split.schema.json",
+            "report.schema.json",
+        ];
+        const COMMANDS: &[(&str, &str)] = &[
+            ("info.schema.json", "info.json"),
+            ("verify.schema.json", "verify.json"),
+            ("recover.schema.json", "recover.json"),
+            ("split.schema.json", "split.json"),
+            ("report.schema.json", "report.json"),
+        ];
+
+        let mut schemas = Vec::with_capacity(SCHEMAS.len());
+        let mut registry = jsonschema::Registry::new();
+        for filename in SCHEMAS {
+            let path = self.root.join("docs/schemas").join(filename);
+            let value: serde_json::Value = serde_json::from_str(
+                &fs::read_to_string(&path)
+                    .map_err(|error| format!("cannot read {}: {error}", path.display()))?,
+            )
+            .map_err(|error| format!("{} is not valid JSON: {error}", path.display()))?;
+            let uri = format!("file:///pstforge-schemas/{filename}");
+            registry = registry
+                .add(uri, value.clone())
+                .map_err(|error| format!("cannot register {filename}: {error}"))?;
+            schemas.push((*filename, value));
+        }
+        let registry = registry
+            .prepare()
+            .map_err(|error| format!("cannot prepare public schema registry: {error}"))?;
+
+        for (schema_filename, fixture_filename) in COMMANDS {
+            let schema = schemas
+                .iter()
+                .find_map(|(filename, value)| (*filename == *schema_filename).then_some(value))
+                .ok_or_else(|| format!("public schema {schema_filename} was not loaded"))?;
+            let base_uri = format!("file:///pstforge-schemas/{schema_filename}");
+            let validator = jsonschema::options()
+                .with_registry(&registry)
+                .with_base_uri(&base_uri)
+                .build(schema)
+                .map_err(|error| format!("cannot compile {schema_filename}: {error}"))?;
+            let fixture_path = self.root.join("tests/fixtures/json").join(fixture_filename);
+            let fixture: serde_json::Value = serde_json::from_str(
+                &fs::read_to_string(&fixture_path)
+                    .map_err(|error| format!("cannot read {}: {error}", fixture_path.display()))?,
+            )
+            .map_err(|error| format!("{} is not valid JSON: {error}", fixture_path.display()))?;
+            if let Err(error) = validator.validate(&fixture) {
+                return Err(format!(
+                    "{fixture_filename} violates {schema_filename}: {error}"
+                ));
+            }
+        }
         Ok(())
     }
 

@@ -1,0 +1,53 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "verify.schema.json",
+  "title": "PSTForge verify result",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "command", "mode", "producer", "source", "pst", "inventory", "source_unchanged"],
+  "properties": {
+    "schema_version": { "const": "1.1.0" },
+    "command": { "const": "verify" },
+    "mode": { "enum": ["full", "recovery"] },
+    "producer": { "$ref": "common.schema.json#/$defs/producer" },
+    "source": { "$ref": "common.schema.json#/$defs/source" },
+    "pst": { "$ref": "common.schema.json#/$defs/pst" },
+    "inventory": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["scope", "folders", "normal_items", "recipients", "attachments", "embedded_messages", "unsupported_messages", "raw_properties", "property_bytes", "body_bytes", "attachment_bytes", "peak_stream_chunk_bytes", "recovered_items", "orphan_items", "issues", "issues_dropped"],
+      "properties": {
+        "scope": { "enum": ["reachable_mail_catalog", "reachable_and_recovery_catalog"] },
+        "folders": { "type": "integer", "minimum": 0 },
+        "normal_items": { "type": "integer", "minimum": 0 },
+        "recipients": { "type": "integer", "minimum": 0 },
+        "attachments": { "type": "integer", "minimum": 0 },
+        "embedded_messages": { "type": "integer", "minimum": 0 },
+        "unsupported_messages": { "type": "integer", "minimum": 0 },
+        "raw_properties": { "type": "integer", "minimum": 0 },
+        "property_bytes": { "type": "integer", "minimum": 0 },
+        "body_bytes": { "type": "integer", "minimum": 0 },
+        "attachment_bytes": { "type": "integer", "minimum": 0 },
+        "peak_stream_chunk_bytes": { "type": "integer", "minimum": 0 },
+        "recovered_items": { "type": ["integer", "null"], "minimum": 0 },
+        "orphan_items": { "type": ["integer", "null"], "minimum": 0 },
+        "issues": {
+          "type": "array",
+          "maxItems": 10000,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["node_id", "operation", "message"],
+            "properties": {
+              "node_id": { "type": ["integer", "null"], "minimum": 0 },
+              "operation": { "type": "string" },
+              "message": { "type": "string" }
+            }
+          }
+        },
+        "issues_dropped": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "source_unchanged": { "type": "boolean" }
+  }
+}

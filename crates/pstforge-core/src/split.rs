@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
+use std::ffi::OsStr;
 use std::fs::{self, File};
 use std::io::Read;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
@@ -67,6 +68,8 @@ pub enum SplitError {
     ZeroMaximumSize,
     #[error("--resume and --keep-work require --restartable")]
     RestartableOptionRequired,
+    #[error("restartable output requires {0}, but it was not found as an executable in PATH")]
+    MissingValidator(&'static str),
     #[error("packing assignment references an unknown canonical item")]
     UnknownAssignment,
     #[error("cannot access staged PST {path}: {source}")]
@@ -146,8 +149,21 @@ impl SplitError {
             )
             | Self::ZeroMaximumSize
             | Self::RestartableOptionRequired
+            | Self::MissingValidator(_)
             | Self::UnknownAssignment
             | Self::TooManyParts => SplitFailureKind::Internal,
+        }
+    }
+
+    pub fn installation_hint(&self) -> Option<&'static str> {
+        match self {
+            Self::MissingValidator("pffinfo") => {
+                Some("install the pff-tools package to use restartable output")
+            }
+            Self::MissingValidator("readpst") => {
+                Some("install the pst-utils package to use restartable output")
+            }
+            _ => None,
         }
     }
 }
@@ -257,6 +273,9 @@ pub fn split(
     }
     if !restartable && (resume || keep_work) {
         return Err(SplitError::RestartableOptionRequired);
+    }
+    if restartable {
+        require_restartable_validators(std::env::var_os("PATH").as_deref())?;
     }
     let interrupt = InterruptHandler::install()?;
     let interrupt_flag = interrupt.flag();
@@ -603,6 +622,22 @@ pub fn split(
     };
     publish_report_artifacts(&job, &report)?;
     Ok(report)
+}
+
+fn require_restartable_validators(path: Option<&OsStr>) -> Result<(), SplitError> {
+    for tool in ["pffinfo", "readpst"] {
+        let available = path.is_some_and(|path| {
+            std::env::split_paths(path).any(|directory| {
+                let candidate = directory.join(tool);
+                fs::metadata(&candidate).is_ok_and(|metadata| metadata.is_file())
+                    && rustix::fs::access(&candidate, rustix::fs::Access::EXEC_OK).is_ok()
+            })
+        });
+        if !available {
+            return Err(SplitError::MissingValidator(tool));
+        }
+    }
+    Ok(())
 }
 
 fn publish_report_artifacts(
@@ -3509,6 +3544,7 @@ fn staged_io(path: &Path, source: std::io::Error) -> SplitError {
 mod tests {
     use std::collections::VecDeque;
     use std::io;
+    use std::os::unix::fs::PermissionsExt;
     use std::path::PathBuf;
     use std::sync::atomic::AtomicBool;
 
@@ -3526,8 +3562,9 @@ mod tests {
         SplitFailureKind, SplitOptions, SplitReport, direct_exact_projection_required,
         direct_required_capacity, disk_preflight, extend_to_fitting_prefix, hash_file,
         open_restartable_resume, preflight_filesystem_path, projection_batch_byte_target,
-        published_folder_count, render_recovery_log, shrink_to_fitting_prefix,
-        source_folders_for_part, split, take_fitting_prefix, translation_rejections,
+        published_folder_count, render_recovery_log, require_restartable_validators,
+        shrink_to_fitting_prefix, source_folders_for_part, split, take_fitting_prefix,
+        translation_rejections,
     };
     use crate::{
         CanonicalAttachment, CanonicalFolder, CanonicalFolderRole, CanonicalMail,
@@ -3975,6 +4012,53 @@ mod tests {
         assert_eq!(invalid_output.failure_kind(), SplitFailureKind::Conformance);
         let interrupted = SplitError::Writer(WriterError::Interrupted);
         assert_eq!(interrupted.failure_kind(), SplitFailureKind::Interrupted);
+    }
+
+    #[test]
+    fn missing_restartable_validators_have_actionable_package_hints() {
+        for (tool, package) in [("pffinfo", "pff-tools"), ("readpst", "pst-utils")] {
+            let error = SplitError::MissingValidator(tool);
+            assert!(
+                error
+                    .installation_hint()
+                    .is_some_and(|hint| hint.contains(package))
+            );
+        }
+        assert_eq!(
+            SplitError::MissingValidator("other").installation_hint(),
+            None
+        );
+    }
+
+    #[test]
+    fn restartable_validator_preflight_requires_both_executables()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempdir()?;
+        for tool in ["pffinfo", "readpst"] {
+            let path = directory.path().join(tool);
+            std::fs::write(&path, b"#!/bin/sh\nexit 0\n")?;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700))?;
+        }
+        require_restartable_validators(Some(directory.path().as_os_str()))?;
+        std::fs::remove_file(directory.path().join("readpst"))?;
+        assert!(matches!(
+            require_restartable_validators(Some(directory.path().as_os_str())),
+            Err(SplitError::MissingValidator("readpst"))
+        ));
+        assert!(matches!(
+            require_restartable_validators(None),
+            Err(SplitError::MissingValidator("pffinfo"))
+        ));
+        std::fs::write(directory.path().join("pffinfo"), b"not executable\n")?;
+        std::fs::set_permissions(
+            directory.path().join("pffinfo"),
+            std::fs::Permissions::from_mode(0o600),
+        )?;
+        assert!(matches!(
+            require_restartable_validators(Some(directory.path().as_os_str())),
+            Err(SplitError::MissingValidator("pffinfo"))
+        ));
+        Ok(())
     }
 
     #[test]

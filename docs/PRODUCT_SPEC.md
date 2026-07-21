@@ -456,6 +456,12 @@ prefilter translation, and source-blob verification observe that flag as well.
 
 ## Reporting And Privacy
 
+The stable JSON contracts are tracked in `docs/schemas/` for `info`, `verify`,
+`recover`, `split`, and persisted-job `report` output. Synthetic bounded
+examples live in `tests/fixtures/json/` and must deserialize through the same
+Rust models used by the CLI. Diagnostics and progress remain on stderr; a
+successful `--json` result on stdout contains JSON only.
+
 Split reports include source identity, recovery mode, invocation elapsed time,
 logical source and finalized output bytes, average end-to-end source
 throughput, and peak sampled RSS across the supervisor and parser workers.
@@ -474,7 +480,13 @@ item/property totals, exact aggregate rejection categories, part sizes and
 hashes, retries, worker crashes, bounded error summaries, and whether the
 source identity remained unchanged. A writer implementation limit is reported
 as a product defect and does not establish that readable source data is
-unrecoverable.
+unrecoverable. Limits are reported by aggregate reason and count rather than by
+subject, address, body, attachment content, or source folder name.
+`recovery.log` contains bounded aggregate
+accounting, source size and optional hash, generated part names, and part
+metrics; it does not contain the source path or mailbox values. The explicit
+command result does include the canonical source and selected job paths so an
+operator can identify which requested file was processed.
 
 Candidate rejection records use only these bounded structural reasons: source
 reader reported unsupported, malformed candidate, malformed property, writer

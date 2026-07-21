@@ -47,3 +47,29 @@ pub use catalog::{
 };
 pub use libpff_sys::PffError;
 pub use libpff_sys::RecoveryMode;
+
+#[cfg(test)]
+mod public_json_fixture_tests {
+    use super::{InfoReport, JobReport, RecoveryReport, SplitReport, VerifyReport};
+
+    #[test]
+    fn tracked_public_command_fixtures_match_the_rust_contracts() -> Result<(), serde_json::Error> {
+        let info: InfoReport =
+            serde_json::from_str(include_str!("../../../tests/fixtures/json/info.json"))?;
+        let verify: VerifyReport =
+            serde_json::from_str(include_str!("../../../tests/fixtures/json/verify.json"))?;
+        let recovery: RecoveryReport =
+            serde_json::from_str(include_str!("../../../tests/fixtures/json/recover.json"))?;
+        let split: SplitReport =
+            serde_json::from_str(include_str!("../../../tests/fixtures/json/split.json"))?;
+        let report: JobReport =
+            serde_json::from_str(include_str!("../../../tests/fixtures/json/report.json"))?;
+
+        assert_eq!(info.command, "info");
+        assert_eq!(verify.command, "verify");
+        assert_eq!(recovery.command, "recover");
+        assert_eq!(split.command, "split");
+        assert_eq!(report.command, "report");
+        Ok(())
+    }
+}

@@ -238,6 +238,13 @@ impl CliError {
             | Self::VerifyWorkerProtocol(_) => 6,
         }
     }
+
+    pub fn installation_hint(&self) -> Option<&'static str> {
+        match self {
+            Self::Split(error) => error.installation_hint(),
+            _ => None,
+        }
+    }
 }
 
 pub fn execute(cli: &Cli, output: &mut dyn Write) -> Result<CommandStatus, CliError> {

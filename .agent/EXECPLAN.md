@@ -3363,13 +3363,49 @@ not modified.
     staged replacement test proves publication refuses changed identity. The
     third-remediated checkpoint passes the fast gate at
     `.agent/test-results/1784592542-fast`.
-  - [ ] Checkpoint 2: finalize operational reporting and privacy. Persist the
+  - [x] Checkpoint 2: finalize operational reporting and privacy. Persist the
     snapshot before atomically publishing `recovery.log`; validate it against
     ledger-owned parts when regenerating human or JSON output. Add tracked JSON
     schemas and bounded fixtures for every public command. Audit diagnostics,
     progress, logs, permissions, successful spool removal, stale-partial
     cleanup, and interrupted-state reporting. Add actionable installation
     diagnostics without adding a new pre-1.0 product command.
+    Six draft-2020-12 schema documents cover the shared definitions and every
+    public JSON command result; five bounded synthetic fixtures deserialize
+    through the production Rust report types, and the fast gate requires and
+    parses every tracked artifact. The privacy contract now distinguishes
+    explicitly requested source/job paths in command output from aggregate,
+    path-free `recovery.log` content. Existing tests already prove private
+    permissions, bounded log detail, mailbox-value exclusion, spool removal,
+    secure ledger compaction, stale-partial cleanup, and interrupted-state
+    durability, so the audited implementation was preserved. Missing
+    restartable validators now provide actionable `pff-tools` or `pst-utils`
+    package hints only for `ENOENT`; direct mode retains no dependency on
+    either tool. The checkpoint passes the fast gate at
+    `.agent/test-results/1784593183-fast`. Clean-context review found the
+    initial verify schema capped issue detail at 1,000 while the parser retains
+    10,000, and found that syntax-only schema checks neither resolved `$ref`
+    targets nor validated fixtures. The bound now matches the implemented
+    10,000-entry limit. Portable relative schema identifiers resolve against
+    adjacent installed files, while xtask builds an offline local registry,
+    compiles every command schema under draft 2020-12, resolves all references,
+    and semantically validates the matching fixture. The remediated checkpoint
+    passes the fast gate at `.agent/test-results/1784593513-fast`. The next
+    review trace showed that missing validator executables were hidden behind
+    the supervised child exit and could not reach the initial hint mapping.
+    Restartable split now preflights executable `pffinfo` and `readpst` entries
+    in `PATH` before source or output work, returns a typed missing-validator
+    error, and prints the corresponding Ubuntu/Debian package hint. Direct mode
+    does not run the preflight. Focused tests cover both available tools, each
+    missing-tool mapping, and absent `PATH`. The final remediated checkpoint
+    passes the fast gate at `.agent/test-results/1784593850-fast`. The bounded
+    final review correctly noted that mode bits alone do not establish whether
+    the current process can execute a validator. The preflight now combines a
+    regular-file check with the OS effective-access `X_OK` decision, and its
+    test rejects a non-executable candidate. Public schema enums and the verify
+    fixture were also narrowed to the exact modes and inventory scopes emitted
+    by production. The resulting fast gate passes at
+    `.agent/test-results/1784594021-fast`.
   - [ ] Checkpoint 3: add reproducible Debian packaging. `cargo xtask package
     deb` builds the release binary with `--locked`, stages only declared files,
     installs the binary, manual, README/operator documents, application
