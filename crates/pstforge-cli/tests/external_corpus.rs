@@ -872,6 +872,7 @@ impl CatalogSink for IndependentMessageSink {
                 attachment_type,
                 data_size,
                 filename,
+                detected_mime: _,
             } if self.active.contains_key(&message_id) => {
                 if self
                     .attachments
@@ -1805,6 +1806,137 @@ fn root_and_associated_data_roundtrip_through_the_supervised_split()
     if rejected_replacement.status.code() != Some(4) || !rejected_replacement.stdout.is_empty() {
         return Err("report accepted a same-length replacement for a direct part".into());
     }
+    Ok(())
+}
+
+#[test]
+fn direct_and_restartable_derive_the_same_container_mime() -> Result<(), Box<dyn std::error::Error>>
+{
+    use std::io::{Cursor, Write as _};
+
+    use pstforge_pst::writer::{
+        AttachmentContent, AttachmentSpec, FidelityStore, FileBlobSpec, MailFolderLocation,
+        MailFolderRole, MailFolderSpec, MailStoreSpec,
+    };
+
+    let cursor = Cursor::new(Vec::new());
+    let mut archive = zip::ZipWriter::new(cursor);
+    let deflated = zip::write::SimpleFileOptions::default()
+        .compression_method(zip::CompressionMethod::Deflated);
+    archive.start_file("[Content_Types].xml", deflated)?;
+    archive.write_all(
+        br#"<?xml version="1.0" encoding="UTF-8"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/></Types>"#,
+    )?;
+    archive.start_file("word/document.xml", deflated)?;
+    archive.write_all(br#"<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body/></w:document>"#)?;
+    let stored =
+        zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
+    archive.start_file("padding.bin", stored)?;
+    archive.write_all(&vec![0xA5; 32 * 1024])?;
+    let payload = archive.finish()?.into_inner();
+    if payload.len() <= 16 * 1024 {
+        return Err("container MIME fixture did not exceed the direct prefix".into());
+    }
+
+    let directory = tempfile::tempdir()?;
+    let source = directory.path().join("container-source.pst");
+    let payload_path = directory.path().join("container-payload.bin");
+    fs::write(&payload_path, &payload)?;
+    let payload_sha256: [u8; 32] = Sha256::digest(&payload).into();
+    let payload_len = u64::try_from(payload.len())?;
+    let mut message = FidelityStore::default().message;
+    message.attachments = vec![AttachmentSpec {
+        filename: "payload.bin".to_owned(),
+        mime_type: None,
+        content_id: None,
+        content_location: None,
+        rendering_position: Some(-1),
+        flags: 0,
+        raw_properties: Vec::new(),
+        spooled_properties: Vec::new(),
+        direct_properties: Vec::new(),
+        content: AttachmentContent::Spooled(FileBlobSpec {
+            path: payload_path,
+            offset: 0,
+            byte_len: payload_len,
+            sha256: payload_sha256,
+        }),
+    }];
+    let fixture = MailStoreSpec {
+        store_name: "PSTForge mode consistency".to_owned(),
+        record_key: *b"PSTForgeMime0001",
+        folders: vec![MailFolderSpec {
+            path: vec!["Inbox".to_owned()],
+            location: MailFolderLocation::IpmSubtree,
+            role: MailFolderRole::Ordinary,
+            container_class: "IPF.Note".to_owned(),
+            messages: vec![message],
+            associated_messages: Vec::new(),
+        }],
+    };
+    pstforge_pst::writer::create_mail_store(&source, &fixture)?;
+
+    let run = |output: &std::path::Path, restartable: bool| {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_pstforge"));
+        command
+            .arg("split")
+            .arg(&source)
+            .arg("--output")
+            .arg(output)
+            .arg("--max-pst-size")
+            .arg("4GiB")
+            .arg("--json")
+            .arg("--color")
+            .arg("never");
+        if restartable {
+            command.arg("--restartable");
+        }
+        command.output()
+    };
+    let direct_job = directory.path().join("direct");
+    let restartable_job = directory.path().join("restartable");
+    for (output, restartable) in [(&direct_job, false), (&restartable_job, true)] {
+        let result = run(output, restartable)?;
+        if !matches!(result.status.code(), Some(0 | 1)) {
+            return Err(format!(
+                "{} mode split failed: status={} stdout={} stderr={}",
+                if restartable { "restartable" } else { "direct" },
+                result.status,
+                String::from_utf8_lossy(&result.stdout),
+                String::from_utf8_lossy(&result.stderr)
+            )
+            .into());
+        }
+        let report: serde_json::Value = serde_json::from_slice(&result.stdout)?;
+        if report["written_candidates"].as_u64() != Some(1)
+            || report["terminal_failure"].is_string()
+        {
+            return Err("mode consistency split did not publish its candidate".into());
+        }
+    }
+
+    let mime_property =
+        |job: &std::path::Path| -> Result<PropertyFingerprint, Box<dyn std::error::Error>> {
+            let messages = independent_generated_messages(&job.join("parts/part-0001.pst"))?;
+            let attachment = messages
+                .first()
+                .and_then(|message| message.content.attachments.first())
+                .ok_or("mode consistency output omitted its attachment")?;
+            attachment
+                .rendering_properties
+                .iter()
+                .find(|property| property.id == 0x370E)
+                .cloned()
+                .ok_or_else(|| "mode consistency output omitted derived MIME".into())
+        };
+    let direct_mime = mime_property(&direct_job)?;
+    let restartable_mime = mime_property(&restartable_job)?;
+    assert_eq!(direct_mime, restartable_mime);
+    let expected = "application/vnd.openxmlformats-officedocument.wordprocessingml.document";
+    assert_eq!(
+        direct_mime.byte_len,
+        u64::try_from(expected.encode_utf16().count() * 2)?
+    );
     Ok(())
 }
 

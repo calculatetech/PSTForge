@@ -1402,7 +1402,7 @@ fn split_direct_recovered_job(
                 worker_attempts,
             )?;
             let mut active: Option<DirectPartTransaction> = None;
-            {
+            let protocol_result: Result<bool, SplitError> = (|| {
                 let progress = worker.progress_token();
                 let mut protocol = DirectProtocolSource::new(
                     worker.output(),
@@ -1671,6 +1671,17 @@ fn split_direct_recovered_job(
                     )
                 })?;
                 completed_catalog = Some(catalog);
+                Ok(false)
+            })();
+            match protocol_result {
+                Ok(true) => return Ok(true),
+                Ok(false) => {}
+                Err(protocol_error) => {
+                    return Err(direct_protocol_attempt_error(
+                        protocol_error,
+                        worker.finish_after_protocol_failure(),
+                    ));
+                }
             }
             worker.progress();
             worker.finish()?;
@@ -1856,6 +1867,18 @@ fn direct_failure_category(error: &SplitError) -> Option<DirectFailureCategory> 
             Some(DirectFailureCategory::Protocol)
         }
         _ => None,
+    }
+}
+
+fn direct_protocol_attempt_error(
+    protocol_error: SplitError,
+    worker_result: Result<(), RecoveryError>,
+) -> SplitError {
+    match worker_result {
+        Err(worker_error @ RecoveryError::WorkerExit { .. })
+        | Err(worker_error @ RecoveryError::WorkerStalled)
+        | Err(worker_error @ RecoveryError::Interrupted) => worker_error.into(),
+        Err(_) | Ok(()) => protocol_error,
     }
 }
 
@@ -3545,6 +3568,7 @@ mod tests {
     use std::collections::VecDeque;
     use std::io;
     use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::process::ExitStatusExt;
     use std::path::PathBuf;
     use std::sync::atomic::AtomicBool;
 
@@ -3560,11 +3584,11 @@ mod tests {
         AdaptiveSizeModel, DirectFailureCategory, DiskPreflight, ExecutionMetrics, LayoutEstimator,
         MAX_RECOVERY_LOG_DETAIL_LINES, PartReport, SPLIT_SCHEMA_VERSION, SplitError,
         SplitFailureKind, SplitOptions, SplitReport, direct_exact_projection_required,
-        direct_required_capacity, disk_preflight, extend_to_fitting_prefix, hash_file,
-        open_restartable_resume, preflight_filesystem_path, projection_batch_byte_target,
-        published_folder_count, render_recovery_log, require_restartable_validators,
-        shrink_to_fitting_prefix, source_folders_for_part, split, take_fitting_prefix,
-        translation_rejections,
+        direct_protocol_attempt_error, direct_required_capacity, disk_preflight,
+        extend_to_fitting_prefix, hash_file, open_restartable_resume, preflight_filesystem_path,
+        projection_batch_byte_target, published_folder_count, render_recovery_log,
+        require_restartable_validators, shrink_to_fitting_prefix, source_folders_for_part, split,
+        take_fitting_prefix, translation_rejections,
     };
     use crate::{
         CanonicalAttachment, CanonicalFolder, CanonicalFolderRole, CanonicalMail,
@@ -3585,6 +3609,23 @@ mod tests {
             folder_path: vec!["Inbox".to_owned()],
             payload_bytes,
         }
+    }
+
+    #[test]
+    fn premature_protocol_eof_reports_the_worker_exit() {
+        let protocol_error = SplitError::Writer(WriterError::InvalidStructure(
+            "direct worker protocol failed: unexpected EOF".to_owned(),
+        ));
+        let status = std::process::ExitStatus::from_raw(6 << 8);
+        let error = direct_protocol_attempt_error(
+            protocol_error,
+            Err(RecoveryError::WorkerExit { status }),
+        );
+        assert_eq!(
+            super::direct_failure_category(&error),
+            Some(DirectFailureCategory::Crash)
+        );
+        assert!(error.to_string().contains("exit status: 6"));
     }
 
     #[test]
@@ -3632,6 +3673,7 @@ mod tests {
             index,
             attachment_type: Some(i32::from(b'i')),
             filename: None,
+            detected_mime: None,
             declared_size: None,
             data: None,
             direct_id: None,
@@ -3689,7 +3731,7 @@ mod tests {
     fn direct_default_validates_source_before_creating_output() {
         let directory = tempfile::tempdir().expect("temporary directory");
         let source = directory.path().join("missing-source.pst");
-        let output = directory.path().join("job");
+        let output = directory.path().join("new/parent/job");
         let worker = directory.path().join("missing-worker");
 
         assert!(matches!(
@@ -3708,6 +3750,7 @@ mod tests {
             Err(SplitError::Recovery(RecoveryError::Source(_)))
         ));
         assert!(!output.exists());
+        assert!(!directory.path().join("new").exists());
     }
 
     #[test]

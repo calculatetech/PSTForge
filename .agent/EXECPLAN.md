@@ -3484,7 +3484,7 @@ not modified.
     Debian 13 (trixie) `libc6`, `libgcc-s1`, `libpff1t64`, `libbfio1`, and zlib,
     reported version 0.5.0, and completed `info --json` against the external
     healthy Unicode PST. The temporary compatibility root disappeared on exit.
-- [ ] Milestone 0.5.1: GitHub CI and Local Acceptance Policy.
+- [x] Milestone 0.5.1: GitHub CI and Local Acceptance Policy.
   - [x] Checkpoint 1: bump every package/operator version marker to 0.5.1 and
     add a local `ci` gate that covers the public formatting, check, Clippy,
     tests, documentation, licenses, workflow contracts, and independent writer
@@ -3495,7 +3495,7 @@ not modified.
     approved-tag Debian build that is gated by the `release` environment and
     does not publish a GitHub release. Third-party actions are pinned to full
     commits; the downloaded `actionlint` 1.7.12 archive is pinned by SHA-256.
-  - [ ] Checkpoint 3: pass clean-context adversarial review, commit and push the
+  - [x] Checkpoint 3: pass clean-context adversarial review, commit and push the
     branch, prove the hosted public lanes, configure the GitHub `release`
     environment with owner approval, complete every risk-triggered local
     acceptance gate, then merge the approved pull request.
@@ -3538,10 +3538,296 @@ not modified.
     final digest above. This workflow/package/documentation-only diff cannot
     affect recovered content or PST output, so the risk-based policy does not
     require another private-corpus or ScanPST run.
+    Pull request #1 had no comments or review threads; Ubuntu, Debian package,
+    and CodeQL checks passed on commit `1016fb8`. The protected merge produced
+    approved `main` commit `d8c5236`, whose post-merge Ubuntu and Debian jobs
+    also passed in Actions run `29846219576`. The integrated worktree and local
+    and remote milestone branches were removed.
 - [ ] Milestone 0.6.0: Interoperability Release Candidate.
+  - [x] (2026-07-21) Started
+    `milestone/v0.6.0-interoperability-release-candidate` in sibling worktree
+    `../pstforge-worktrees/v0.6.0-interoperability-release-candidate` from
+    approved, protected, and hosted-CI-green `main` commit `d8c5236`. Advanced
+    workspace, CLI/manual, report producer, and Debian package version markers
+    to 0.6.0 without changing the frozen CLI or schema contracts. The initial
+    version-transition fast gate passes at
+    `.agent/test-results/1784649882-fast`.
+  - [x] (2026-07-21) Made fresh `recover` and `split` jobs create every missing
+    output parent before creating the job directory. Creation walks through
+    held no-follow directory descriptors, assigns `0700` to each new directory,
+    syncs each parent, and refuses symlinked or non-directory components. The
+    focused regression and the existing source-before-output safety tests pass;
+    the complete fast gate passes at
+    `.agent/test-results/1784650652-fast` after the final all-component
+    no-follow traversal review.
+  - [x] (2026-07-21) Resolved the first real 50 GB direct rehearsal failure.
+    The source remained unchanged, but the single writer-order worker ended
+    early after 231 seconds with no published part. The retained direct ledger
+    is 5.3 GiB: 37,151 candidates, 6,246,894 candidate-event rows, and
+    1,422,311 inline prefix blobs representing 2,284,937,787 bytes. The old
+    supervisor discarded the child's exit status and stderr when the protocol
+    pipe ended mid-frame, misreporting the event as `worker_protocol`. The
+    correction inherits privacy-safe worker diagnostics and distinguishes an
+    already-exited worker from a live worker blocked on its stdout pipe. The
+    latter is terminated before reaping, avoiding a supervisor/worker wait
+    cycle; focused exit-status and live-pipe regressions pass with all 100 core
+    tests. The bounded rerun then exposed the real error: direct mode discarded
+    the exact attachment handle that produced a 16 KiB prefix and reacquired
+    attachment index 6 from a damaged table before streaming the remaining
+    1,160,521 bytes. The worker consequently advanced to the next message and
+    the supervisor reported the requested stream absent. Deferred attachment
+    state now owns and continues the original libpff handle. A fresh rerun has
+    crossed the former 225-second failure point and completed in 1,368,579 ms,
+    publishing 83,491 candidates in four independently validated parts totaling
+    37,917,388,800 bytes. Peak RSS was 1,739,882,496 bytes and the source was
+    unchanged. The final direct and restartable ledgers contain the same 83,500
+    item keys, provenance/ownership identities, metadata, 17,427,150 event
+    rows, terminal states, completeness classes, and 83,491 published item
+    mappings, with zero differences in either SQL `EXCEPT` direction. The
+    direct ledger still amplified to 13.7 GB plus a 12+ GB cleanup WAL before
+    compacting to about 5 GB; retain that as follow-up performance evidence.
+  - [x] (2026-07-21) Complete the retained restartable 50 GB recovery and
+    writer qualification. Balanced recovery durably captured 83,500 candidates
+    and 24,301,678,312 payload bytes before containing libpff's corrupt-offset
+    boundary as one parser issue. The first writer pass then exposed two
+    independent artificial single-page limits before any message append: the
+    198-folder hierarchy table and the 562-identity NAMEID property context.
+    Hierarchy tables now use the documented external TC representation, while
+    large NAMEID streams use the existing documented PC subnode/data-tree
+    representation. Focused independent-reader regressions cover 220 folders
+    and 600 named identities; all 107 ordinary writer tests pass with the one
+    intentional multi-gigabyte case ignored. Resume completed 83,491 written
+    candidates and nine writer-input rejections in four atomically finalized
+    parts totaling 37,915,103,232 bytes. Every part passed internal validation,
+    `pffinfo`, and `readpst`; the final source identity and SHA-256 remained
+    unchanged. The owner subsequently reported that ScanPST analysis of the
+    final direct output was clean. The restartable parts remain independently
+    valid through the automated readers; their mode-specific packing did not
+    require another large qualification run.
+  - [x] (2026-07-21) Proved the repaired 50 GB direct and restartable modes have
+    exact source-level semantic accounting. Both contain 32,131 complete and
+    51,369 partial candidates, including the same nine reason-coded unsupported
+    candidates, and publish the same 83,491 item keys. Part boundaries and
+    derived convenience metadata remain mode-specific: direct one-pass packing
+    produced 37,917,388,800 bytes while restartable packing produced
+    37,915,103,232 bytes. This is not source-item loss; every durable native
+    candidate identity, metadata record, event count, terminal state, and
+    published mapping compares equal.
+  - [x] (2026-07-21) Measured the scale bottleneck. Parser-only recovery verify
+    reached the known corrupt terminal boundary in 5:03.30 including source
+    hashing, used 282.60 CPU-seconds, and peaked at 412,856 KiB RSS. The final
+    direct split took 22:48.58 and peaked at 1.74 GB RSS; its parser was
+    repeatedly blocked on the protocol pipe, and final ledger cleanup continued
+    for minutes after the parser exited. libpff limits the isolated traversal
+    phase, but PST serialization and SQLite/event lifecycle dominate the
+    end-to-end direct pipeline. The run remains within the one-minute-per-GiB,
+    2 GiB RSS, and 24-hour release limits.
+  - [x] (2026-07-21) Compared the corrupt source with the owner's ScanPST-
+    repaired reference without modifying either file. ScanPST grew the
+    50,995,610,624-byte source by only 33,521,664 bytes. A final direct split
+    of that repaired reference produced the same 83,500 candidates, 32,131
+    complete/51,369 partial classification, nine unsupported candidates,
+    event/blob aggregates, omissions, per-part message/folder counts, and
+    exact four part byte lengths as the direct split of the corrupt original.
+    The only report differences are the expected source path, inode, size, and
+    modification time. This is strong bounded evidence that the apparent
+    12.2 GB source-to-output difference is PST container free/slack/index
+    allocation and repacking, not readable mailbox data discarded by
+    PSTForge. No further 50 GB generation is required for this question.
+  - [x] (2026-07-21) Passed the post-fix fast gate at
+    `.agent/test-results/1784667532-fast` and the exact canonical combined-
+    manifest full gate at `.agent/test-results/1784667570-full`. The latter
+    includes warnings-as-errors Clippy, all workspace tests, license/advisory
+    policy, generated-writer `pffinfo`/`readpst`, all focused 0.4.2
+    qualification cases, and the configured external corpus. Because writer
+    bytes changed, ScanPST-first human acceptance remains mandatory before a
+    milestone commit or pull request.
+  - [x] (2026-07-21) Passed the complete release foundation at
+    `.agent/test-results/1784667723-release`. The release tier reran the public
+    and canonical combined-manifest gates, advisories, independent readers,
+    locked release build, and explicit two-build Debian reproducibility and
+    isolated install/remove checks. Lintian first caught that the new 0.6.0
+    changelog timestamp equaled 0.5.1; assigning the actual later UTC timestamp
+    resolved the policy error. Adversarial review then found that missing-parent
+    creation could briefly inherit wider umask permissions before chmod; the
+    final implementation requests `0700` in the `mkdir` operation itself and
+    the entire release tier passes again. The final package SHA-256 is
+    `b422cdcebd79676f5496da9cbf2d923a54efcd4b5d41310b1bd7f6f6832826c1`.
+    Dependency warnings remain confined to the deliberate empty synthetic
+    package database in `--validate`/release; the ordinary package command is
+    still one compile and one deliverable.
+  - [x] (2026-07-21) Complete ScanPST-first human acceptance of the final
+    direct 50 GB rehearsal. The owner reported that ScanPST analysis of all
+    four direct parts was clean. The four accepted candidates have SHA-256 values
+    `ab61388eca65a3ff6fc62eba38d037bcd162ba99b656669a46192a6df61884bb`,
+    `295c9f8f9446cf0dadc54c6fa15bc02bf1b2dddb0bafae29ff0bd380614f5a36`,
+    `8856cb625e765b071ba65e416dd9c6d5dd1e12015b241954122f0720bb714814`,
+    and `b7d35c9cf0c1bc247fe075db08f51386fdad93ddad79e38c37fb8ddc91f5446c`.
+    The detailed logs remain external to the repository.
+  - [x] (2026-07-21) Submitted protected pull request #2. Its first hosted run
+    exposed one Rust 1.85 incompatibility: the local Rust 1.93 compiler had
+    accepted a let-chain that remains unstable at the declared MSRV. Replaced
+    it with behavior-equivalent nested conditionals in focused commit
+    `8a431a6`; local fast gate `.agent/test-results/1784668203-fast` and the
+    replacement Ubuntu, Debian 13 package, and CodeQL checks all pass. The PR
+    then received one valid medium-priority review thread: one-shot input
+    preflight retained the obsolete single-page NAMEID aggregate check even
+    though final construction externalized large streams. Preflight now builds
+    the same bounded scalable context shape, 600 numeric identities and two
+    large string identities pass focused regressions, and the prior overflow
+    bounds remain enforced. The accepted writer representation is unchanged
+    and is already covered by the clean 562-identity 50 GB ScanPST result. The
+    remediation fast and canonical full gates pass at
+    `.agent/test-results/1784668914-fast` and
+    `.agent/test-results/1784668952-full`.
+  - [ ] (2026-07-21) Run the bounded five-minute `pst_reader` fuzz target in
+    hosted CI or a true nightly local toolchain. The pinned cargo-fuzz 0.13.2
+    tool installed successfully, but this host supplies distro Rust 1.93.1
+    without rustup/nightly and rejects the required `-Zsanitizer=address` even
+    with `RUSTC_BOOTSTRAP`. The scheduled workflow already provisions pinned
+    nightly Rust and uses only ephemeral generated bytes.
+  - [ ] Run the complete local and GitHub acceptance matrix, bounded fuzzing,
+    disk/process fault injection, and security/license/privacy/data-loss review.
+  - [ ] Generate representative parts and complete ScanPST-first, MailPlus,
+    and secondary Outlook acceptance with bounded hashes and conclusions.
+  - [ ] Resolve all blocker/high findings and every unaccepted medium finding,
+    then submit the protected 0.6.0 pull request.
 - [ ] Milestone 1.0.0: MailPlus-Ready Release.
 
 ## Surprises & Discoveries
+
+- Observation: A premature EOF from the direct worker hid the event that
+  caused it. The protocol reader returned first, unwinding through
+  `DirectWorkerProcess::drop`; `drop` killed/reaped the child without returning
+  its status, while worker stderr had been explicitly connected to
+  `/dev/null`. Consequently a native crash or unsuccessful worker exit was
+  durably labeled `worker_protocol` and the operator saw only `failed to fill
+  whole buffer`.
+  Evidence: The first 50 GB rehearsal retained only the generic category even
+  though no process or coredump remained. Code inspection found the early
+  unwind and discarded stderr. The first correction also revealed that waiting
+  before killing a still-live child deadlocks when that child is blocked writing
+  the pipe. The final containment path uses `try_wait`, preserves an available
+  exit status, and otherwise stops and kills the live child before reaping it.
+  Focused regressions prove both exit classification and bounded live-pipe
+  termination.
+
+- Observation: Direct and restartable modes diverged because deferred direct
+  attachment streaming reacquired a damaged attachment table entry by index.
+  The 16 KiB prefix had already been read successfully from the original
+  libpff handle, but reacquiring index 6 failed to produce its remaining
+  1,160,521 bytes and traversal advanced to the next top-level message.
+  Restartable mode streams the same attachment from its original handle and
+  therefore retained the item.
+  Evidence: the bounded diagnostic now reports the exact owner, declared
+  1,176,905-byte length, 16,384-byte prefix, and `message_start` boundary. A
+  direct rerun that owns and continues the original handle crossed that point
+  and published its first independently validated parts.
+
+- Observation: libpff is not the bottleneck during the measured direct writer
+  phase. The parser is frequently blocked in `anon_pipe_write` while the
+  supervisor constructs PST and records durable metadata. A 30-second `pidstat`
+  sample averaged 76.73% supervisor CPU, 94,420 KiB/s supervisor writes, and
+  41,374 KiB/s supervisor reads versus 37.83% worker CPU and 64,971 KiB/s
+  worker reads. The supervisor reached about 1.5 GiB RSS while the worker stayed
+  near 366 MiB. SQLite/event amplification and PST serialization are the
+  current direct-mode constraints. Parser-only recovery verify reached the
+  known source boundary in 5:03.30 including hashing (282.60 CPU-seconds,
+  412,856 KiB peak RSS), while the full direct split required 22:48.58 and
+  1,739,882,496 peak bytes. Cleanup continued after parser exit and generated a
+  12+ GB WAL before checkpoint/compaction.
+
+- Observation: ScanPST repair did not expose a hidden source-sized body of
+  readable mail. The repaired reference is only 33,521,664 bytes larger than
+  the corrupt original, both libpff traversals reach the same damaged terminal
+  boundary in about five minutes, and their direct split reports match in
+  every content/accounting aggregate and exact part length after excluding
+  source identity. A PST's physical size includes allocation maps, indexes,
+  free space, slack, and obsolete structures; a newly packed output is not a
+  byte-conservation transform of that container.
+  Evidence: the original and repaired sources are 50,995,610,624 and
+  51,029,132,288 bytes. Both direct jobs publish the same 83,491 messages into
+  parts of 10,732,282,880, 10,733,552,640, 10,737,361,920, and 5,714,191,360
+  bytes, with identical candidate and omission summaries.
+
+- Observation: Direct-mode private-ledger cleanup is the dominant avoidable
+  SSD-write cost at this scale. The repaired-reference run wrote all four PST
+  parts before spending minutes clearing blob references and compacting the
+  ledger. Its WAL grew to about 13 GB, and process accounting reported
+  173,217,439,744 filesystem write bytes for 37,917,388,800 finalized PST
+  bytes. This is distinct from parser throughput and does not justify another
+  large diagnostic run; future optimization should avoid persisting or
+  rewriting already-consumed direct-mode blob state.
+  Evidence: final elapsed time was 1,565,341 ms, while all four final part files
+  were present earlier; the parser-only original and repaired traversals took
+  5:07.74 and 5:03.51 respectively.
+
+- Observation: A local compiler newer than the declared MSRV can hide use of
+  syntax that hosted Rust 1.85 rejects. The initial pull-request lanes both
+  failed with E0658 at the new worker-exit conditional while all local gates on
+  Rust 1.93 passed. Rewriting the let-chain as nested conditionals preserves
+  behavior and made both hosted lanes green.
+  Evidence: pull request #2 Actions runs `29868529338` (failed) and
+  `29868904959` (passed), plus focused local fast evidence
+  `.agent/test-results/1784668203-fast`.
+
+- Observation: Scalable construction and preflight must share the same shape
+  rules. The NAMEID writer externalized streams larger than one heap allocation,
+  but per-message preflight still summed every stream into the removed single-
+  page limit. A store with 600 numeric named identities was therefore rejected
+  before the already-tested scalable builder could run.
+  Evidence: pull request #2 review thread `PRRT_kwDOTYqaMs6SuhIh`; the new
+  600-identity preflight and scalable NAMEID round-trip tests pass.
+
+- Observation: direct traversal order initially made bounded diagnostic
+  saturation affect parent completeness. Once the 1,024 retained issue slots
+  filled, an embedded child's dropped issue incremented the global dropped
+  counter before its direct-mode parent ended; restartable mode ended the
+  parent before visiting the child. A depth-bounded active-message issue stack
+  now attributes even dropped diagnostics to the correct message.
+  Evidence: before correction, the modes had identical 83,500 keys but 655
+  completeness differences. The saturated-child regression passes, and the
+  final 50 GB ledgers have zero state differences in either direction.
+
+- Observation: Bounded per-value prefix capture is not bounded job state at
+  mailbox scale. The failed direct rehearsal stored 1.42 million inline blobs
+  and 6.25 million event rows in a 5.3 GiB SQLite ledger before publishing a
+  part, causing approximately 22.2 GB of supervisor filesystem writes. This
+  contradicts the compact-ledger and low-write intent even though each
+  individual property and attachment prefix obeyed its 64 KiB/16 KiB limit.
+  Evidence: Read-only aggregate queries of the retained terminal job reported
+  37,151 candidates, 37,046 top-level candidates, a zero-byte payload pack,
+  2,284,937,787 inline-blob bytes, no part, and an unchanged source.
+
+- Observation: The complete restartable traversal proves the failed direct
+  inventory was incomplete. Restartable mode advanced past the direct job's
+  37,151 retained candidates and 5.3 GiB state, durably recovered 83,500
+  candidates and 24.3 GB of payload, then contained libpff's invalid recovered
+  index offset as one terminal parser issue. Its worker peaked near 408 MiB RSS
+  while the supervisor remained near 11 MiB during payload capture.
+  Evidence: The retained job records one started parser attempt, one contained
+  parser failure, an unchanged source hash/identity, 17,427,141 candidate-event
+  rows, and 3,261,481 payload blobs. No part had been published when writer
+  preflight began.
+
+- Observation: Real mailbox cardinality exceeded two writer structures that
+  already had normative scalable representations elsewhere. A hierarchy TC
+  with 198 folders and a NAMEID PC with 562 identities each failed as a bare
+  single `heap page`; the latter also contains streams larger than one HN
+  allocation. The correct forms are respectively the external TC row
+  matrix/subnode tree and a scalable PC whose large binary streams are PC
+  subnodes.
+  Evidence: Resume reused the completed recovery ledger without libpff and
+  reproduced each failure before the first message append. Focused 220-folder
+  and 600-identity stores now reopen through the independent reader with exact
+  hierarchy rows and NAMEID mappings.
+
+- Observation: Fresh jobs already created the final output directory, but
+  `DurableCatalogSink::create_with_capture` required its immediate parent to
+  exist. Consequently a single missing leaf worked while a path with one or
+  more missing parents failed before job creation.
+  Evidence: the prior implementation called `open_directory(job_parent(...))`
+  before its existing `create_dir` branch for the final job directory.
 
 - Observation: The Debian builder's dependency errors came from its own
   `dpkg --force-depends` install/removal test inside an empty synthetic package
@@ -4393,6 +4679,16 @@ not modified.
 
 ## Decision Log
 
+- Decision: Fresh job creation recursively creates missing output parents with
+  mode `0700`, one component at a time relative to a held directory descriptor.
+  It opens every created component with no-follow semantics before descending,
+  syncs its parent, and refuses symlinks and non-directories. Resume and report
+  remain open-only operations and never manufacture missing state.
+  Rationale: `--output` names the desired job path and should not require the
+  operator to prepare its directory chain, while descriptor-relative creation
+  preserves the source/output and path-traversal safety contract.
+  Date/Author: 2026-07-21 / human owner direction and Codex.
+
 - Decision: `cargo xtask package deb` performs exactly one PSTForge release
   compilation and publishes exactly one final `.deb`. The optional
   `--validate` flag adds a second isolated compilation, byte-for-byte
@@ -4513,6 +4809,20 @@ not modified.
   Retained RAII ownership is bounded to one top-level graph, preserves the
   one-read direct contract, and matches the native API's proven semantics.
   Date/Author: 2026-07-20 / qualification evidence and Codex.
+
+- Decision: Content-derived attachment MIME probing uses the exact retained
+  attachment handle, begins only after all native attachment properties have
+  been enumerated, rewinds its bounded reader before signature detection, and
+  records the result as a distinct catalog event before payload streaming.
+  Both direct and restartable canonical reconstruction consume that same
+  event. Probing before property enumeration is prohibited.
+  Rationale: Reacquiring a damaged attachment entry caused the original direct
+  failure. A preliminary implementation that probed before properties also
+  changed 791 damaged candidates from complete to partial by disturbing
+  libpff's record-set state. Post-property probing retains fidelity and makes
+  derived MIME output mode-invariant; the focused DOCX-container regression
+  proves both modes publish the same MIME property.
+  Date/Author: 2026-07-21 / 50 GB failure diagnosis and Codex.
 
 - Decision: Close 0.4.2 at the owner-approved focused data-correctness
   boundary and move the failed final 19 GB scale reconciliation to an immediate
@@ -5903,7 +6213,15 @@ assurance. GitHub-hosted pull-request CI now uses only public and generated
 inputs. Protected `main` requires the Ubuntu and Debian jobs plus resolved
 review threads, while private-corpus and ScanPST-first acceptance remain local,
 risk-triggered gates for changes capable of altering recovered content or PST
-output.
+output. Pull request #1 passed Ubuntu, Debian, and CodeQL with no review
+comments or threads, merged through the no-bypass ruleset as `d8c5236`, and
+passed both required jobs again on the resulting `main` push.
+
+Version 0.6.0 has begun from the protected green baseline. Its initial operator
+fix makes a fresh output path self-creating without weakening path safety:
+missing parents are private, descriptor-walked, synced directories, while
+symlinked components, non-directories, absent resume state, and absent report
+state remain refusals.
 
 ## Context and Orientation
 
@@ -6764,9 +7082,12 @@ protection build on the approved remote baseline. Recheck authentication and
 repository settings before creating or configuring them. Local work and
 private-corpus acceptance must never depend on their existence.
 
-Revision note (2026-07-21): Replaced the proposed self-hosted private-corpus
-runner with public pull-request CI plus risk-triggered local corpus and
-ScanPST-first acceptance. Protected `main` requires the hosted Ubuntu and Debian
-checks and resolved review threads. Debian package qualification is explicit:
-ordinary builds compile once, while `--validate`, CI, and release paths retain
-the independent qualification suite.
+Revision note (2026-07-21): Started 0.6.0 from protected green merge commit
+`d8c5236`, made fresh output paths recursively self-creating through held,
+no-follow directory descriptors, contained the damaged-source direct worker
+failure, and proved direct/restartable semantic consistency. The owner's clean
+ScanPST result and the repaired-reference comparison close the 50 GB content-
+loss question without another large generation run; the measured direct-ledger
+write amplification remains explicit performance follow-up evidence. Protected
+pull request #2 is locally and hosted-CI green after one Rust 1.85 syntax-only
+remediation.

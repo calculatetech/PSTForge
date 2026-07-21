@@ -129,8 +129,11 @@ recovered store produces one `part-0001.pst`, using the same direct path rather
 than a separate single-file implementation.
 
 `--resume` and `--keep-work` require `--restartable`; incompatible combinations
-are refused before creating the output directory. Without `--resume`, an
-existing nonempty job directory is an error. With `--resume`, the restartable
+are refused before creating the output directory. For a fresh run, PSTForge
+creates the selected job directory and any missing parent directories with
+private permissions after source and option validation. Symlinked or
+non-directory path components are refused. Without `--resume`, an existing
+nonempty job directory is an error. With `--resume`, the restartable
 job's source
 SHA-256, source identity, job schema, recovery mode, part-size policy, writer
 format, and compatible tool major version must match. A mismatch is refused

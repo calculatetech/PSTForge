@@ -690,6 +690,35 @@ impl DirectWorkerProcess {
         }
         Ok(())
     }
+
+    pub(crate) fn finish_after_protocol_failure(mut self) -> Result<(), RecoveryError> {
+        let status = match self.worker.child.try_wait() {
+            Ok(Some(status)) => {
+                self.worker.reaped = true;
+                Some(status)
+            }
+            Ok(None) => None,
+            Err(error) => {
+                self.worker.stop();
+                return Err(RecoveryError::WorkerSpawn(error));
+            }
+        };
+        let watchdog_outcome = self.worker.watchdog.stop();
+        if status.is_none() {
+            self.worker.stop();
+        }
+        match watchdog_outcome {
+            WatchdogOutcome::Stalled => return Err(RecoveryError::WorkerStalled),
+            WatchdogOutcome::Interrupted => return Err(RecoveryError::Interrupted),
+            WatchdogOutcome::Stopped => {}
+        }
+        if let Some(status) = status {
+            if !status.success() {
+                return Err(RecoveryError::WorkerExit { status });
+            }
+        }
+        Ok(())
+    }
 }
 
 pub(crate) fn spawn_direct_worker(
@@ -870,7 +899,7 @@ fn spawn_worker(
         .arg(recovery_mode_name(controls.mode))
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null());
+        .stderr(Stdio::inherit());
     if controls.metadata_only {
         command.arg("--metadata-only");
     }
@@ -1218,9 +1247,17 @@ fn recovery_mode_name(mode: RecoveryMode) -> &'static str {
 
 #[cfg(test)]
 mod tests {
+    use std::process::{Command, Stdio};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, AtomicU64};
+    use std::time::{Duration, Instant};
+
     use pstforge_job::JobSummary;
 
-    use super::{RecoveryError, validate_catalog, worker_failure_category};
+    use super::{
+        AttemptWatchdog, DirectWorkerProcess, RecoveryError, WorkerProcess, validate_catalog,
+        worker_failure_category,
+    };
     use crate::worker::WorkerCatalog;
 
     #[test]
@@ -1276,5 +1313,35 @@ mod tests {
             worker_failure_category(&RecoveryError::WorkerStalled),
             "stall"
         );
+    }
+
+    #[test]
+    fn protocol_failure_terminates_a_live_worker_without_waiting_for_stdout() {
+        let mut child = Command::new("sh")
+            .args(["-c", "while :; do printf 'worker-output\\n'; done"])
+            .stdout(Stdio::piped())
+            .spawn()
+            .expect("live worker substitute");
+        let output = child.stdout.take().expect("worker stdout");
+        let watchdog = AttemptWatchdog::start(
+            child.id(),
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicU64::new(0)),
+        )
+        .expect("watchdog");
+        let worker = DirectWorkerProcess {
+            worker: WorkerProcess {
+                child,
+                output,
+                reaped: false,
+                watchdog,
+            },
+        };
+
+        let started = Instant::now();
+        worker
+            .finish_after_protocol_failure()
+            .expect("live worker is contained");
+        assert!(started.elapsed() < Duration::from_secs(2));
     }
 }

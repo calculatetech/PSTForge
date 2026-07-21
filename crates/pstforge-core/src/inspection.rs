@@ -406,6 +406,7 @@ mod tests {
                 attachment_bytes: 17,
                 issues: Vec::new(),
                 issues_dropped: 0,
+                active_message_issues: Vec::new(),
             })
         }
 

@@ -95,6 +95,7 @@ pub(crate) fn detect<R: Read + Seek>(
     byte_len: u64,
     filename: Option<&str>,
 ) -> io::Result<Option<&'static str>> {
+    reader.rewind()?;
     let mut signature = [0_u8; 11];
     let signature_len = u64::try_from(signature.len())
         .map_err(|_| io::Error::other("attachment signature length does not fit u64"))?;

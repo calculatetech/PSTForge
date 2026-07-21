@@ -6,8 +6,8 @@ use std::fmt::Write as _;
 use std::fs::{self, File, OpenOptions};
 use std::io::{ErrorKind, Read, Seek as _, Write as _};
 use std::os::fd::{AsRawFd, RawFd};
-use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
-use std::path::{Path, PathBuf};
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
+use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::Duration;
@@ -510,7 +510,7 @@ impl DurableCatalogSink {
         capture_mode: CatalogCaptureMode,
     ) -> Result<Self, JobError> {
         let parent_path = job_parent(job_directory);
-        let parent_directory = open_directory(parent_path)?;
+        let parent_directory = open_or_create_directory(parent_path)?;
         let job_name = job_directory
             .file_name()
             .ok_or_else(|| JobError::UnsafePath(job_directory.to_path_buf()))?;
@@ -3661,6 +3661,7 @@ impl DurableCatalogSink {
                 attachment_type,
                 data_size,
                 filename,
+                detected_mime,
             } => {
                 require_message(self.active.as_ref(), message_id)?;
                 if self.attachment.is_some() {
@@ -3675,6 +3676,7 @@ impl DurableCatalogSink {
                         "attachment_type": attachment_type,
                         "data_size": data_size,
                         "filename": filename,
+                        "detected_mime": detected_mime,
                     }),
                     None,
                 )?;
@@ -3685,6 +3687,26 @@ impl DurableCatalogSink {
                     expected: data_size,
                     blob: None,
                 });
+            }
+            CatalogEvent::AttachmentMimeProbe {
+                message_id,
+                index,
+                mime_type,
+            } => {
+                require_message(self.active.as_ref(), message_id)?;
+                let attachment = self.attachment.as_ref().ok_or_else(|| {
+                    JobError::EventSequence("attachment MIME probe without metadata".to_owned())
+                })?;
+                if attachment.message_id != message_id || attachment.index != index {
+                    return Err(JobError::EventSequence(
+                        "attachment MIME probe does not match active attachment".to_owned(),
+                    ));
+                }
+                self.record_event(
+                    "attachment_mime_probe",
+                    json!({ "index": index, "mime_type": mime_type }),
+                    None,
+                )?;
             }
             CatalogEvent::AttachmentData {
                 message_id,
@@ -5044,6 +5066,51 @@ fn open_directory(path: &Path) -> Result<File, JobError> {
         .map_err(|source| io_error(path, source))?;
     if initial.dev() != opened.dev() || initial.ino() != opened.ino() || !opened.is_dir() {
         return Err(JobError::UnsafePath(path.to_path_buf()));
+    }
+    Ok(directory)
+}
+
+fn open_or_create_directory(path: &Path) -> Result<File, JobError> {
+    let mut directory = open_directory(if path.is_absolute() {
+        Path::new("/")
+    } else {
+        Path::new(".")
+    })?;
+    for component in path.components() {
+        match component {
+            Component::RootDir | Component::CurDir => {}
+            Component::ParentDir => {
+                directory = open_directory(&fd_path(directory.as_raw_fd()).join(".."))?;
+            }
+            Component::Normal(name) => {
+                let child = fd_path(directory.as_raw_fd()).join(name);
+                let created = match child.symlink_metadata() {
+                    Ok(metadata) => {
+                        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+                            return Err(JobError::UnsafePath(child));
+                        }
+                        false
+                    }
+                    Err(source) if source.kind() == ErrorKind::NotFound => {
+                        fs::DirBuilder::new()
+                            .mode(0o700)
+                            .create(&child)
+                            .map_err(|source| io_error(&child, source))?;
+                        true
+                    }
+                    Err(source) => return Err(io_error(&child, source)),
+                };
+                let child_directory = open_directory(&child)?;
+                if created {
+                    set_mode(&fd_path(child_directory.as_raw_fd()), 0o700)?;
+                    sync_file(&directory, &child)?;
+                }
+                directory = child_directory;
+            }
+            Component::Prefix(_) => {
+                return Err(JobError::UnsafePath(path.to_path_buf()));
+            }
+        }
     }
     Ok(directory)
 }
@@ -6552,6 +6619,7 @@ mod tests {
             attachment_type: Some(i32::from(b'f')),
             data_size: Some(8),
             filename: Some("payload.bin".to_owned()),
+            detected_mime: None,
         })?;
         assert_eq!(
             sink.attachment_payload(10, 0, Some(8)),
@@ -6962,6 +7030,7 @@ mod tests {
             attachment_type: Some(i32::from(b'd')),
             data_size: Some(6),
             filename: Some("private.bin".to_owned()),
+            detected_mime: None,
         })?;
         sink.event(CatalogEvent::AttachmentData {
             message_id: 10,
@@ -7603,6 +7672,7 @@ mod tests {
             attachment_type: Some(i32::from(b'd')),
             data_size: Some(6),
             filename: None,
+            detected_mime: None,
         })?;
         sink.event(CatalogEvent::AttachmentData {
             message_id: 10,
@@ -7687,6 +7757,7 @@ mod tests {
             attachment_type: Some(i32::from(b'd')),
             data_size: Some(3),
             filename: None,
+            detected_mime: None,
         })?;
         sink.event(CatalogEvent::AttachmentData {
             message_id: 10,
@@ -7736,6 +7807,7 @@ mod tests {
             attachment_type: Some(i32::from(b'd')),
             data_size: Some(4),
             filename: Some("damaged.bin".to_owned()),
+            detected_mime: None,
         })?;
         sink.event(CatalogEvent::AttachmentData {
             message_id: 10,
@@ -7752,6 +7824,7 @@ mod tests {
             attachment_type: Some(i32::from(b'd')),
             data_size: Some(3),
             filename: Some("valid.bin".to_owned()),
+            detected_mime: None,
         })?;
         sink.event(CatalogEvent::AttachmentData {
             message_id: 10,
@@ -7799,6 +7872,7 @@ mod tests {
                 attachment_type: Some(i32::from(b'd')),
                 data_size: None,
                 filename: None,
+                detected_mime: None,
             })?;
             let rejected = if end_with_message {
                 sink.event(CatalogEvent::MessageEnd {
@@ -7812,6 +7886,7 @@ mod tests {
                     attachment_type: Some(i32::from(b'd')),
                     data_size: Some(0),
                     filename: None,
+                    detected_mime: None,
                 })
             };
             assert!(rejected.is_err());
@@ -7834,6 +7909,7 @@ mod tests {
                     attachment_type: Some(i32::from(b'd')),
                     data_size: expected,
                     filename: None,
+                    detected_mime: None,
                 })?;
                 if explicitly_ended {
                     let ended = sink.event(CatalogEvent::AttachmentEnd {
@@ -7896,6 +7972,35 @@ mod tests {
             Err(JobError::UnsafePath(_))
         ));
         assert_eq!(std::fs::read(external.join(".tmp-private"))?, b"keep");
+        Ok(())
+    }
+
+    #[test]
+    fn create_builds_missing_parent_chain_without_following_symlinks()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempdir()?;
+        let job = directory.path().join("new/parent/job");
+        let sink = DurableCatalogSink::create(&job)?;
+        drop(sink);
+        assert!(job.join(".pstforge/job.sqlite3").is_file());
+        for parent in [
+            directory.path().join("new"),
+            directory.path().join("new/parent"),
+        ] {
+            assert!(parent.is_dir());
+            assert_eq!(parent.metadata()?.permissions().mode() & 0o777, 0o700);
+        }
+
+        let external = directory.path().join("external");
+        std::fs::create_dir(&external)?;
+        let linked_parent = directory.path().join("linked-parent");
+        symlink(&external, &linked_parent)?;
+        let linked_job = linked_parent.join("nested/job");
+        assert!(matches!(
+            DurableCatalogSink::create(&linked_job),
+            Err(JobError::UnsafePath(_))
+        ));
+        assert!(!external.join("nested").exists());
         Ok(())
     }
 
