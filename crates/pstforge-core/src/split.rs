@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
 use std::fs::{self, File};
 use std::io::Read;
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
@@ -17,7 +17,7 @@ use pstforge_pst::writer::{
     TransactionAppend, TransactionalMailStoreWriter, WriterError, create_mail_store_interruptible,
     create_mail_store_supervised, validate_mail_store_input, validate_mail_store_layout,
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
@@ -38,7 +38,7 @@ use crate::{
     load_canonical_mail_interruptible,
 };
 
-pub const SPLIT_SCHEMA_VERSION: &str = "0.4.6";
+pub const SPLIT_SCHEMA_VERSION: &str = "0.5.0";
 const TOOL_COMPATIBILITY_MAJOR: u64 = 0;
 const PART_SIZE_POLICY: &str = "hard-maximum-v1";
 const WRITER_FORMAT: &str = "unicode-pst-v23";
@@ -152,14 +152,14 @@ impl SplitError {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DiskPreflight {
     pub required_bytes: u64,
     pub available_bytes: u64,
     pub existing_job_bytes: u64,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExecutionMetrics {
     pub elapsed_millis: u64,
     pub source_bytes: u64,
@@ -182,7 +182,7 @@ struct ProcessIoSnapshot {
     write_bytes: u64,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PartReport {
     pub index: u32,
     pub filename: String,
@@ -196,11 +196,11 @@ pub struct PartReport {
     pub omitted_folders: u64,
     pub omitted_properties: u64,
     pub omitted_attachments: u64,
-    #[serde(skip_serializing)]
+    #[serde(skip, default)]
     pub reconstructions: ReconstructionCounts,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SplitReport {
     pub schema_version: String,
     pub command: String,
@@ -218,7 +218,7 @@ pub struct SplitReport {
     pub terminal_failure: Option<DirectFailureCategory>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DirectFailureCategory {
     #[serde(rename = "worker_crash")]
@@ -413,7 +413,7 @@ pub fn split(
             partial: true,
             terminal_failure: None,
         };
-        job.publish_recovery_log(&render_recovery_log(&report))?;
+        publish_report_artifacts(&job, &report)?;
         return Ok(report);
     }
     if source.identity() != &recovery.source {
@@ -495,7 +495,7 @@ pub fn split(
             partial,
             terminal_failure: outcome.terminal_failure,
         };
-        job.publish_recovery_log(&render_recovery_log(&report))?;
+        publish_report_artifacts(&job, &report)?;
         return Ok(report);
     }
     let source_key = recovery.source.stable_key();
@@ -537,7 +537,7 @@ pub fn split(
             partial: true,
             terminal_failure: None,
         };
-        job.publish_recovery_log(&render_recovery_log(&report))?;
+        publish_report_artifacts(&job, &report)?;
         return Ok(report);
     }
     recovery.unsupported_candidates = job.summary()?.unsupported_candidates;
@@ -601,8 +601,17 @@ pub fn split(
         partial,
         terminal_failure: None,
     };
-    job.publish_recovery_log(&render_recovery_log(&report))?;
+    publish_report_artifacts(&job, &report)?;
     Ok(report)
+}
+
+fn publish_report_artifacts(
+    job: &DurableCatalogSink,
+    report: &SplitReport,
+) -> Result<(), SplitError> {
+    job.publish_report_snapshot(report)?;
+    job.publish_recovery_log(&render_recovery_log(report))?;
+    Ok(())
 }
 
 fn open_restartable_resume(
@@ -621,7 +630,7 @@ fn open_restartable_resume(
         Err(JobError::ResumeMismatch("split report schema version")) => {}
         Err(error) => return Err(error),
     }
-    for legacy_schema in ["0.4.5", "0.4.4", "0.4.2"] {
+    for legacy_schema in ["0.4.6", "0.4.5", "0.4.4", "0.4.2"] {
         let mut legacy_configuration = configuration.clone();
         legacy_configuration.split_schema_version = legacy_schema.to_owned();
         match DurableCatalogSink::open_resume_interruptible(
@@ -1047,10 +1056,10 @@ fn finalize_direct_part(
     } = transaction;
     let top_level_count = writer.message_count();
     writer.finalize_constructed(interrupted)?;
-    let byte_len = staged_path
+    let staged_metadata = staged_path
         .metadata()
-        .map_err(|source| staged_io(&staged_path, source))?
-        .len();
+        .map_err(|source| staged_io(&staged_path, source))?;
+    let byte_len = staged_metadata.len();
     let oversize = byte_len > maximum_pst_bytes;
     if oversize && top_level_count != 1 {
         return Err(SplitError::PartExceedsMaximum {
@@ -1082,12 +1091,14 @@ fn finalize_direct_part(
         oversize,
     };
     let sidecar = PartSidecar {
-        schema_version: "1.1.0".to_owned(),
+        schema_version: "1.2.0".to_owned(),
         producer_version: crate::VERSION.to_owned(),
         index: part_index,
         filename: filename.clone(),
         byte_len,
         sha256: None,
+        published_device: Some(staged_metadata.dev()),
+        published_inode: Some(staged_metadata.ino()),
         store_record_key: hex(&store_record_key),
         folder_count,
         message_count: stats.message_count,
@@ -1624,6 +1635,11 @@ fn split_direct_recovered_job(
                         "direct worker completion omitted catalog counters".to_owned(),
                     )
                 })?;
+                completed_catalog = Some(catalog);
+            }
+            worker.progress();
+            worker.finish()?;
+            if let Some(catalog) = &completed_catalog {
                 job.record_recovery_completion(&RecoveryCompletion {
                     normal_items: catalog
                         .messages
@@ -1638,10 +1654,7 @@ fn split_direct_recovered_job(
                     peak_worker_rss_bytes: 0,
                 })?;
                 job.checkpoint()?;
-                completed_catalog = Some(catalog);
             }
-            worker.progress();
-            worker.finish()?;
             if let Some(transaction) = active.as_mut() {
                 source_folders = load_canonical_folders_interruptible(job, interrupted)?;
                 for source_folder in &source_folders.folders {
@@ -1771,7 +1784,7 @@ fn split_direct_recovered_job(
 }
 
 impl DirectFailureCategory {
-    fn metadata_name(self) -> &'static str {
+    pub(crate) fn metadata_name(self) -> &'static str {
         match self {
             Self::Crash => "worker_crash",
             Self::Stall => "worker_stall",
@@ -2284,6 +2297,9 @@ fn split_recovered_job_with_interrupt(
             remove_staged_if_present(&staged_path)?;
             return finish_incremental_interruption(job, reports, written_candidates);
         };
+        let staged_metadata = staged_path
+            .metadata()
+            .map_err(|source| staged_io(&staged_path, source))?;
         if !stats.unsupported_item_keys.is_empty() {
             job.mark_candidates_unsupported(
                 &stats.unsupported_item_keys,
@@ -2308,12 +2324,14 @@ fn split_recovered_job_with_interrupt(
             oversize,
         };
         let sidecar = PartSidecar {
-            schema_version: "1.1.0".to_owned(),
+            schema_version: "1.2.0".to_owned(),
             producer_version: crate::VERSION.to_owned(),
             index: part_index,
             filename: filename.clone(),
             byte_len,
             sha256: Some(sha256.clone()),
+            published_device: Some(staged_metadata.dev()),
+            published_inode: Some(staged_metadata.ino()),
             store_record_key: hex(&store_record_key),
             folder_count,
             message_count: stats.message_count,
@@ -2821,6 +2839,9 @@ fn split_recovered_job_with_interrupt_legacy(
             job.checkpoint()?;
             return Ok((reports, written_candidates, true, true));
         };
+        let staged_metadata = staged_path
+            .metadata()
+            .map_err(|source| staged_io(&staged_path, source))?;
         if interrupted.load(Ordering::Relaxed) {
             fs::remove_file(&staged_path).map_err(|source| staged_io(&staged_path, source))?;
             job.record_interrupted()?;
@@ -2856,12 +2877,14 @@ fn split_recovered_job_with_interrupt_legacy(
             || omitted_properties != 0
             || input.omitted_attachments != 0;
         let sidecar = PartSidecar {
-            schema_version: "1.1.0".to_owned(),
+            schema_version: "1.2.0".to_owned(),
             producer_version: crate::VERSION.to_owned(),
             index: part_index,
             filename: filename.clone(),
             byte_len,
             sha256: Some(sha256.clone()),
+            published_device: Some(staged_metadata.dev()),
+            published_inode: Some(staged_metadata.ino()),
             store_record_key: hex(&input.store.record_key),
             folder_count,
             message_count,
@@ -3676,7 +3699,7 @@ mod tests {
     }
 
     #[test]
-    fn restartable_resume_accepts_explicit_0_4_5_and_0_4_4_jobs() {
+    fn restartable_resume_accepts_explicit_0_4_6_through_0_4_4_jobs() {
         let directory = tempfile::tempdir().expect("temporary directory");
         let source = JobSourceIdentity {
             canonical_path: "/external/mail.pst".to_owned(),
@@ -3686,7 +3709,7 @@ mod tests {
             modified_at: "2026-07-19T00:00:00Z".to_owned(),
             sha256: Some("a".repeat(64)),
         };
-        for legacy_schema in ["0.4.5", "0.4.4"] {
+        for legacy_schema in ["0.4.6", "0.4.5", "0.4.4"] {
             let output = directory.path().join(legacy_schema);
             let legacy = JobConfiguration {
                 tool_compatibility_major: 0,
@@ -3771,7 +3794,7 @@ mod tests {
 
     fn split_report() -> SplitReport {
         SplitReport {
-            schema_version: "0.4.6".to_owned(),
+            schema_version: "0.5.0".to_owned(),
             command: "split".to_owned(),
             execution_mode: "restartable".to_owned(),
             maximum_pst_bytes: 4_294_967_296,
@@ -3798,7 +3821,7 @@ mod tests {
                 supervisor_filesystem_write_bytes: Some(0),
             },
             recovery: RecoveryReport {
-                schema_version: "0.4.6".to_owned(),
+                schema_version: "0.5.0".to_owned(),
                 command: "recover".to_owned(),
                 mode: "balanced".to_owned(),
                 source: SourceIdentity {

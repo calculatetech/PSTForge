@@ -3304,6 +3304,89 @@ not modified.
     Merge and push 0.4.6, remove its worktree, and begin 0.5.0 only after this
     permanently closes the 0.4 series.
 - [ ] Milestone 0.5.0: Operational UX and Debian Packaging.
+  - [x] Started `milestone/v0.5.0-operational-ux-packaging` in sibling worktree
+    `../pstforge-worktrees/v0.5.0-operational-ux-packaging` from approved,
+    merged, and pushed `main` commit `ceb9478`.
+  - [x] Checkpoint 1: finalize the public CLI and report contracts. Bump every
+    producer/package version to 0.5.0. Implement balanced recovery verification
+    without writing a job. Add `report` as a read-only consumer of a versioned
+    report snapshot stored in the private SQLite ledger. Opening a report must
+    not create, reconcile, compact, or otherwise mutate job state. Validate the
+    ledger, manifests, published part type/identity/size, and every SHA-256 that
+    the producing mode recorded. Direct mode remains deliberately hash-free and
+    reports `not calculated`; do not reintroduce a post-write read. A 0.4 job
+    without a report snapshot receives a clear compatibility error rather than
+    fabricated zero metrics. Preserve exit statuses 0, 1, 2, 3, 4, 5, 6, and
+    130 and keep final JSON isolated on stdout.
+    The implementation stores a bounded digest-protected split snapshot,
+    validates it against ledger-owned manifests, and opens completed SQLite
+    state with immutable URI semantics after refusing active WAL state. Focused
+    tests prove the read creates no files or database changes, rejects snapshot
+    and finalized-part damage, regenerates equal restartable and hash-free
+    direct results, explains pre-0.5 jobs, and reports balanced recovery counts.
+    The checkpoint passes the fast gate at
+    `.agent/test-results/1784590928-fast`. Initial adversarial review found
+    that recovery verification still ran native recovery in the CLI process,
+    hash-free direct parts lacked production-time filesystem identity, and the
+    snapshot did not cover aggregate ledger drift or invalidate at resume
+    start. Recovery verification now runs in a bounded supervised child while
+    the parent holds and rechecks the protected source; an injected child abort
+    returns contained source status 3 with no partial JSON. Sidecar schema 1.2.0
+    records the staged file's device and inode, which survive atomic rename and
+    reject a same-length replacement without hashing direct content. Snapshot
+    publication also records a digest of source/configuration, recovery,
+    candidate, rejection, supervision, interruption, and terminal-failure
+    aggregates; resume removes every prior snapshot key before changing state.
+    Focused replacement, ledger-drift, resume-invalidation, normal worker, and
+    aborting-worker tests pass. The remediated checkpoint passes the fast gate
+    at `.agent/test-results/1784591583-fast`. A second clean-context review
+    found that abnormal recovery-verification worker exits could bypass the
+    parent's final protected-source identity check, and that a report snapshot
+    digest proved ledger stability without proving the snapshot's typed totals
+    matched that ledger. The parent now performs its final source recheck on
+    every worker result path. Report regeneration compares source,
+    configuration, candidate and blob totals, recovery completion, rejection,
+    supervision, interruption, terminal failure, and published-part fields to
+    independently decoded ledger evidence. Direct recovery records completion
+    only after the worker exits successfully. A regression test proves that a
+    digest-valid but ledger-inconsistent snapshot is rejected. The twice-
+    remediated checkpoint passes the fast gate at
+    `.agent/test-results/1784592122-fast`. A third clean-context review found
+    that a recovery-verification child lacked the parser worker's parent-death
+    contract and that direct publication deferred hash-free filesystem identity
+    validation until a later `report`. Verification workers now arm Linux
+    `PDEATHSIG` with an expected-supervisor PID race check before native work;
+    a forced-supervisor-death test proves the child cannot survive it. Both
+    staged and atomically finalized direct artifacts now receive the same
+    type, mode, size, device, and inode checks as restartable artifacts while
+    still skipping content hashing when no SHA-256 was recorded. A same-length
+    staged replacement test proves publication refuses changed identity. The
+    third-remediated checkpoint passes the fast gate at
+    `.agent/test-results/1784592542-fast`.
+  - [ ] Checkpoint 2: finalize operational reporting and privacy. Persist the
+    snapshot before atomically publishing `recovery.log`; validate it against
+    ledger-owned parts when regenerating human or JSON output. Add tracked JSON
+    schemas and bounded fixtures for every public command. Audit diagnostics,
+    progress, logs, permissions, successful spool removal, stale-partial
+    cleanup, and interrupted-state reporting. Add actionable installation
+    diagnostics without adding a new pre-1.0 product command.
+  - [ ] Checkpoint 3: add reproducible Debian packaging. `cargo xtask package
+    deb` builds the release binary with `--locked`, stages only declared files,
+    installs the binary, manual, README/operator documents, application
+    licenses, writer MIT notice, and libpff LGPL notice, then creates a
+    root-owned reproducible `amd64` package. Runtime dependencies include the
+    Debian-compatible `libpff1t64 (>= 20180714)` floor and only binary ABI
+    dependencies; development readers are not runtime dependencies. Inspect
+    ownership, modes, paths, control metadata, dynamic linkage, reproducibility,
+    installation, command execution, and removal without touching user jobs.
+  - [ ] Checkpoint 4: replace the stale README with current features,
+    limitations, basic usage, source compilation, Ubuntu development packages,
+    Debian installation/removal, exit statuses, privacy, recovery modes, and
+    restartability tradeoffs. Run the fast/full/release gates on Ubuntu 26.04
+    and execute the package against Debian 13 libraries or a clean Debian 13
+    environment. Record any host package prerequisite by its verified Ubuntu
+    package name. No MailPlus or Outlook check is required unless this milestone
+    changes PST writer behavior.
 - [ ] Milestone 0.5.1: GitHub CI and Private-Corpus Automation; the remote is
   reachable, and work begins after the approved baseline is pushed.
 - [ ] Milestone 0.6.0: Interoperability Release Candidate.
@@ -6150,6 +6233,33 @@ report regeneration, install diagnostics, spool cleanup, and operator docs.
 Create a reproducible Debian 13 x86_64 `.deb` that dynamically depends on
 `libpff1t64` at the Debian-compatible floor. Run build and integration tests in
 a clean Debian 13 environment and on Ubuntu 26.04.
+
+Implement the milestone through four independently recoverable checkpoints.
+First finalize the command surface: balanced `verify --mode recovery`, stable
+exit mapping, and a `report` command backed by a versioned snapshot in the
+private ledger. Report opening is strictly read-only. It validates durable
+state and every owned output's identity and length; it checks a part digest
+only when the producing mode recorded one. This preserves the approved direct
+mode contract, which deliberately avoids hashing or rereading completed PSTs.
+Jobs created before 0.5.0 that lack a snapshot fail with an explicit
+compatibility diagnostic rather than invented metrics.
+
+Next finalize bounded human/JSON output, schemas, privacy, spool/partial
+cleanup, and operator diagnostics. Then add an `xtask` Debian builder whose
+staging tree contains only the release binary, manual, operator documents, and
+required license/notices. Normalize timestamps from `SOURCE_DATE_EPOCH`, use
+root ownership in the archive, declare the Debian-compatible dynamic
+`libpff1t64 (>= 20180714)` dependency, and build twice to prove byte-for-byte
+reproducibility. Package tests inspect paths, permissions, ELF dependencies,
+control metadata, install/remove behavior, and preservation of a pre-existing
+user job directory.
+
+Finally replace the stale README with current features, limitations, usage,
+compilation, Ubuntu dependency installation, Debian package installation and
+removal, exit statuses, privacy boundaries, and direct-versus-restartable
+tradeoffs. Validate locally on Ubuntu 26.04 and against Debian 13 runtime
+libraries or a clean Debian 13 environment. No writer behavior changes in this
+milestone, so human ScanPST, Outlook, and MailPlus testing is not a gate.
 
 Acceptance: installing the package on clean Debian 13 makes `pstforge info`,
 `verify`, `split`, and `report` work with only declared dependencies; removing

@@ -1,10 +1,11 @@
+use std::cell::RefCell;
 use std::os::fd::AsFd;
 use std::path::Path;
 
 use libpff_sys::{
     CatalogEvent, CatalogSink, PffError, PffFile, PropertyOwner, RawCatalog, RawPffMetadata,
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tracing::info;
 
@@ -24,7 +25,7 @@ pub enum InspectionError {
     UnsupportedContentType { raw: Option<u8> },
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum FileFormat {
     Ansi32,
@@ -33,7 +34,7 @@ pub enum FileFormat {
     Unknown,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum EncryptionMode {
     None,
@@ -42,13 +43,13 @@ pub enum EncryptionMode {
     Unknown,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Producer {
     pub pstforge_version: String,
     pub libpff_version: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PstMetadata {
     pub content_type: String,
     pub format: FileFormat,
@@ -57,7 +58,7 @@ pub struct PstMetadata {
     pub corruption_observed: bool,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InfoReport {
     pub schema_version: String,
     pub command: String,
@@ -67,14 +68,14 @@ pub struct InfoReport {
     pub source_unchanged: bool,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InventoryIssueReport {
     pub node_id: Option<u32>,
     pub operation: String,
     pub message: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InventoryReport {
     pub scope: String,
     pub folders: u64,
@@ -94,7 +95,7 @@ pub struct InventoryReport {
     pub issues_dropped: u64,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VerifyReport {
     pub schema_version: String,
     pub command: String,
@@ -110,16 +111,20 @@ pub trait InspectionBackend {
     fn library_version(&self) -> String;
     fn metadata(&self) -> Result<RawPffMetadata, PffError>;
     fn catalog(&self, sink: &mut dyn CatalogSink) -> Result<RawCatalog, PffError>;
+
+    fn recovery_catalog(&self, sink: &mut dyn CatalogSink) -> Result<RawCatalog, PffError> {
+        self.catalog(sink)
+    }
 }
 
 pub struct LibpffBackend {
-    file: PffFile,
+    file: RefCell<PffFile>,
 }
 
 impl LibpffBackend {
     pub fn open(source: &SourceFile) -> Result<Self, PffError> {
         Ok(Self {
-            file: PffFile::open_fd(source.file().as_fd())?,
+            file: RefCell::new(PffFile::open_fd(source.file().as_fd())?),
         })
     }
 }
@@ -130,11 +135,15 @@ impl InspectionBackend for LibpffBackend {
     }
 
     fn metadata(&self) -> Result<RawPffMetadata, PffError> {
-        self.file.metadata()
+        self.file.borrow().metadata()
     }
 
     fn catalog(&self, sink: &mut dyn CatalogSink) -> Result<RawCatalog, PffError> {
-        self.file.catalog(sink)
+        self.file.borrow().catalog(sink)
+    }
+
+    fn recovery_catalog(&self, sink: &mut dyn CatalogSink) -> Result<RawCatalog, PffError> {
+        self.file.borrow_mut().recovery_catalog(sink)
     }
 }
 
@@ -148,6 +157,16 @@ pub fn verify(path: &Path) -> Result<VerifyReport, InspectionError> {
     let source = SourceFile::open(path)?;
     let backend = LibpffBackend::open(&source)?;
     verify_with_backend(&source, &backend)
+}
+
+pub fn verify_recovery(path: &Path) -> Result<VerifyReport, InspectionError> {
+    let source = SourceFile::open(path)?;
+    verify_recovery_source(&source)
+}
+
+pub fn verify_recovery_source(source: &SourceFile) -> Result<VerifyReport, InspectionError> {
+    let backend = LibpffBackend::open(source)?;
+    verify_recovery_with_backend(source, &backend)
 }
 
 pub fn info_with_backend(
@@ -176,10 +195,29 @@ pub fn verify_with_backend(
     source: &SourceFile,
     backend: &dyn InspectionBackend,
 ) -> Result<VerifyReport, InspectionError> {
+    verify_with_scope(source, backend, false)
+}
+
+pub fn verify_recovery_with_backend(
+    source: &SourceFile,
+    backend: &dyn InspectionBackend,
+) -> Result<VerifyReport, InspectionError> {
+    verify_with_scope(source, backend, true)
+}
+
+fn verify_with_scope(
+    source: &SourceFile,
+    backend: &dyn InspectionBackend,
+    recovery: bool,
+) -> Result<VerifyReport, InspectionError> {
     let raw = backend.metadata()?;
     validate_metadata(source, raw)?;
     let mut sink = InventorySink::default();
-    let raw_inventory = backend.catalog(&mut sink)?;
+    let raw_inventory = if recovery {
+        backend.recovery_catalog(&mut sink)?
+    } else {
+        backend.catalog(&mut sink)?
+    };
     source.verify_unchanged()?;
     let issues = raw_inventory
         .issues
@@ -194,17 +232,23 @@ pub fn verify_with_backend(
         operation = "verify",
         folders = raw_inventory.folders,
         normal_items = raw_inventory.messages,
-        "reachable inventory complete"
+        recovery,
+        "inventory complete"
     );
     Ok(VerifyReport {
         schema_version: INSPECTION_SCHEMA_VERSION.to_owned(),
         command: "verify".to_owned(),
-        mode: "full".to_owned(),
+        mode: if recovery { "recovery" } else { "full" }.to_owned(),
         producer: producer(backend),
         source: source.identity().clone(),
         pst: map_metadata(raw),
         inventory: InventoryReport {
-            scope: "reachable_mail_catalog".to_owned(),
+            scope: if recovery {
+                "reachable_and_recovery_catalog"
+            } else {
+                "reachable_mail_catalog"
+            }
+            .to_owned(),
             folders: raw_inventory.folders,
             normal_items: raw_inventory.messages,
             recipients: raw_inventory.recipients,
@@ -216,8 +260,8 @@ pub fn verify_with_backend(
             body_bytes: sink.body_bytes,
             attachment_bytes: raw_inventory.attachment_bytes,
             peak_stream_chunk_bytes: sink.peak_chunk_bytes,
-            recovered_items: None,
-            orphan_items: None,
+            recovered_items: recovery.then_some(raw_inventory.recovered_messages),
+            orphan_items: recovery.then_some(raw_inventory.orphan_messages),
             issues,
             issues_dropped: raw_inventory.issues_dropped,
         },
@@ -364,6 +408,13 @@ mod tests {
                 issues_dropped: 0,
             })
         }
+
+        fn recovery_catalog(&self, sink: &mut dyn CatalogSink) -> Result<RawCatalog, PffError> {
+            let mut catalog = self.catalog(sink)?;
+            catalog.recovered_messages = 3;
+            catalog.orphan_messages = 2;
+            Ok(catalog)
+        }
     }
 
     #[test]
@@ -383,6 +434,27 @@ mod tests {
         assert_eq!(report.inventory.normal_items, 12);
         assert_eq!(report.inventory.recipients, 24);
         assert_eq!(report.inventory.peak_stream_chunk_bytes, 17);
+        assert!(report.source_unchanged);
+        Ok(())
+    }
+
+    #[test]
+    fn recovery_verification_reports_explicit_recovery_scope()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempdir()?;
+        let path = directory.path().join("fake.pst");
+        fs::write(&path, b"fake pst")?;
+        let source = SourceFile::open(&path)?;
+        let report = super::verify_recovery_with_backend(
+            &source,
+            &FakeBackend {
+                size: source.identity().size_bytes,
+            },
+        )?;
+        assert_eq!(report.mode, "recovery");
+        assert_eq!(report.inventory.scope, "reachable_and_recovery_catalog");
+        assert_eq!(report.inventory.recovered_items, Some(3));
+        assert_eq!(report.inventory.orphan_items, Some(2));
         assert!(report.source_unchanged);
         Ok(())
     }

@@ -1551,7 +1551,7 @@ fn publish_qualification(
         .filter(|path| path.is_dir())
         .ok_or_else(|| "qualification output parent must already exist".to_owned())?;
     let temporary = tempfile::Builder::new()
-        .prefix(".pstforge-0.4.6-")
+        .prefix(".pstforge-0.5.0-")
         .tempdir_in(parent)
         .map_err(|error| format!("cannot create qualification staging directory: {error}"))?;
     let parts = temporary.path().join("parts");

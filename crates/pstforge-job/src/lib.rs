@@ -30,6 +30,7 @@ const PAYLOAD_PACK_FILENAME: &str = "payload.pack";
 pub const CANDIDATE_CHECKPOINT_BATCH: u32 = 128;
 const DIRECT_SQLITE_CACHE_KIB: u64 = 512 * 1024;
 const MAX_RECOVERY_LOG_BYTES: usize = 4 * 1024 * 1024;
+const MAX_REPORT_SNAPSHOT_BYTES: usize = 4 * 1024 * 1024;
 
 #[derive(Debug, Error)]
 pub enum JobError {
@@ -41,6 +42,8 @@ pub enum JobError {
     Integrity(String),
     #[error("resume configuration does not match the existing job: {0}")]
     ResumeMismatch(&'static str),
+    #[error("job report is unavailable: {0}")]
+    ReportUnavailable(&'static str),
     #[error("output part name conflicts with existing data: {0}")]
     OutputNameConflict(PathBuf),
     #[error("job validation was interrupted")]
@@ -61,7 +64,7 @@ pub enum JobError {
     Json(#[from] serde_json::Error),
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub struct JobSummary {
     pub committed_candidates: u64,
     pub recovered_candidates: u64,
@@ -277,6 +280,10 @@ pub struct PartSidecar {
     pub byte_len: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub sha256: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub published_device: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub published_inode: Option<u64>,
     pub store_record_key: String,
     pub folder_count: u64,
     pub message_count: u64,
@@ -341,6 +348,13 @@ pub struct PublishedPartRecord {
     pub part: PublishedPart,
     pub sidecar: PartSidecar,
     pub item_count: u64,
+}
+
+#[derive(Debug)]
+pub struct ValidatedReportSnapshot {
+    pub json: String,
+    pub parts: Vec<PublishedPartRecord>,
+    pub evidence: ReportLedgerEvidence,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -743,6 +757,7 @@ impl DurableCatalogSink {
         read_candidate_rejection_counts(&connection)?;
         if expected.is_some() {
             connection.execute_batch("PRAGMA query_only = OFF;")?;
+            invalidate_report_snapshot(&connection)?;
         }
         configure(&connection)?;
         run_sql_interruptible(&mut connection, interrupted, |connection| {
@@ -1382,39 +1397,38 @@ impl DurableCatalogSink {
     }
 
     pub fn published_parts(&self) -> Result<Vec<PublishedPartRecord>, JobError> {
-        let mut statement = self.connection.prepare(
-            "SELECT p.part_index, p.filename, p.byte_len, p.sha256, p.oversize, \
-                    p.sidecar_json, COUNT(i.item_key) \
-             FROM parts p JOIN part_items i ON i.part_index = p.part_index \
-             GROUP BY p.part_index, p.filename, p.byte_len, p.sha256, p.oversize, p.sidecar_json \
-             ORDER BY p.part_index",
+        read_published_parts(&self.connection)
+    }
+
+    pub fn publish_report_snapshot<T: Serialize>(&self, report: &T) -> Result<(), JobError> {
+        if self.active.is_some() || self.property.is_some() || self.attachment.is_some() {
+            return Err(JobError::EventSequence(
+                "cannot publish a report during an active candidate".to_owned(),
+            ));
+        }
+        let json = serde_json::to_string(report)?;
+        if json.len() > MAX_REPORT_SNAPSHOT_BYTES {
+            return Err(JobError::Integrity(
+                "report snapshot exceeds the supported size".to_owned(),
+            ));
+        }
+        let sha256 = digest_hex(Sha256::digest(json.as_bytes()).as_slice());
+        let state_sha256 = report_ledger_digest(&self.connection)?;
+        let transaction = self.connection.unchecked_transaction()?;
+        transaction.execute(
+            "INSERT OR REPLACE INTO job_metadata(key, value) VALUES ('split_report_snapshot', ?1)",
+            [&json],
         )?;
-        let rows = statement
-            .query_map([], |row| {
-                Ok((
-                    PublishedPart {
-                        index: row.get(0)?,
-                        filename: row.get(1)?,
-                        byte_len: row.get(2)?,
-                        sha256: row.get(3)?,
-                        oversize: row.get(4)?,
-                    },
-                    row.get::<_, String>(5)?,
-                    row.get::<_, u64>(6)?,
-                ))
-            })?
-            .collect::<Result<Vec<_>, _>>()?;
-        rows.into_iter()
-            .map(|(part, sidecar, item_count)| {
-                let sidecar = serde_json::from_str(&sidecar)?;
-                validate_sidecar(&part, &sidecar)?;
-                Ok(PublishedPartRecord {
-                    part,
-                    sidecar,
-                    item_count,
-                })
-            })
-            .collect()
+        transaction.execute(
+            "INSERT OR REPLACE INTO job_metadata(key, value) VALUES ('split_report_snapshot_sha256', ?1)",
+            [&sha256],
+        )?;
+        transaction.execute(
+            "INSERT OR REPLACE INTO job_metadata(key, value) VALUES ('split_report_state_sha256', ?1)",
+            [&state_sha256],
+        )?;
+        transaction.commit()?;
+        Ok(())
     }
 
     pub fn candidate_is_terminal(&self, item_key: &str) -> Result<bool, JobError> {
@@ -2482,7 +2496,6 @@ impl DurableCatalogSink {
             sidecar,
             item_keys,
             Some(interrupted),
-            false,
         )
     }
 
@@ -2494,14 +2507,7 @@ impl DurableCatalogSink {
         item_keys: &[String],
         interrupted: Option<&AtomicBool>,
     ) -> Result<(), JobError> {
-        self.publish_part_with_interrupt(
-            staged_filename,
-            part,
-            sidecar,
-            item_keys,
-            interrupted,
-            true,
-        )
+        self.publish_part_with_interrupt(staged_filename, part, sidecar, item_keys, interrupted)
     }
 
     fn publish_part_with_interrupt(
@@ -2511,15 +2517,12 @@ impl DurableCatalogSink {
         sidecar: &PartSidecar,
         item_keys: &[String],
         interrupted: Option<&AtomicBool>,
-        verify_content: bool,
     ) -> Result<(), JobError> {
         self.commit_candidate_batch()?;
         validate_part_record(part)?;
         validate_sidecar(part, sidecar)?;
         let staged = self.staged_part_path(staged_filename)?;
-        if verify_content {
-            verify_part_artifact(&staged, part, interrupted)?;
-        }
+        verify_part_artifact(&staged, part, sidecar, interrupted)?;
         check_interrupted(interrupted)?;
         let final_path = self.parts.join(&part.filename);
         let sidecar_filename = part.filename.trim_end_matches(".pst").to_owned() + ".json";
@@ -2543,9 +2546,7 @@ impl DurableCatalogSink {
         )?;
         sync_file(&self._parts_directory, &self.parts)?;
         check_interrupted(interrupted)?;
-        if verify_content {
-            verify_part_artifact(&final_path, part, interrupted)?;
-        }
+        verify_part_artifact(&final_path, part, sidecar, interrupted)?;
         check_interrupted(interrupted)?;
         rename_noclobber(
             &self._partial_directory,
@@ -2611,7 +2612,7 @@ impl DurableCatalogSink {
         self.commit_candidate_batch()?;
         validate_part_record(part)?;
         validate_sidecar(part, sidecar)?;
-        verify_part_artifact(&self.parts.join(&part.filename), part, None)?;
+        verify_part_artifact(&self.parts.join(&part.filename), part, sidecar, None)?;
         commit_published_part_transaction(&mut self.connection, part, sidecar, item_keys, false)
     }
 
@@ -3127,6 +3128,316 @@ impl DurableCatalogSink {
             .ok_or_else(|| JobError::Integrity("direct blob identifier overflow".to_owned()))?;
         Ok(id)
     }
+}
+
+pub fn read_validated_report_snapshot(
+    job_directory: &Path,
+) -> Result<ValidatedReportSnapshot, JobError> {
+    let parent_path = job_parent(job_directory);
+    let parent_directory = open_directory(parent_path)?;
+    let job_name = job_directory
+        .file_name()
+        .ok_or_else(|| JobError::UnsafePath(job_directory.to_path_buf()))?;
+    let held_job_path = fd_path(parent_directory.as_raw_fd()).join(job_name);
+    let job_directory_handle = open_directory(&held_job_path)?;
+    let held_job_path = fd_path(job_directory_handle.as_raw_fd());
+    validate_private_directory(&job_directory_handle, &held_job_path)?;
+
+    let private_directory = open_directory(&held_job_path.join(".pstforge"))?;
+    let private_root = fd_path(private_directory.as_raw_fd());
+    validate_private_directory(&private_directory, &private_root)?;
+    validate_private_root_entries(&private_root)?;
+
+    let parts_directory = open_directory(&held_job_path.join("parts"))?;
+    let parts = fd_path(parts_directory.as_raw_fd());
+    validate_private_directory(&parts_directory, &parts)?;
+    let manifests_directory = open_directory(&private_root.join("manifests"))?;
+    let manifests = fd_path(manifests_directory.as_raw_fd());
+    validate_private_directory(&manifests_directory, &manifests)?;
+    let spool_directory = open_directory(&private_root.join("spool"))?;
+    validate_private_directory(&spool_directory, &private_root.join("spool"))?;
+    let partial_directory = open_directory(&private_root.join("partial"))?;
+    validate_private_directory(&partial_directory, &private_root.join("partial"))?;
+
+    let database = private_root.join("job.sqlite3");
+    validate_private_file(&database, true)?;
+    let wal = private_root.join("job.sqlite3-wal");
+    let shared_memory = private_root.join("job.sqlite3-shm");
+    validate_private_file(&wal, false)?;
+    validate_private_file(&shared_memory, false)?;
+    if path_exists(&wal)? || path_exists(&shared_memory)? {
+        return Err(JobError::ReportUnavailable(
+            "the job ledger is active or has not completed its final checkpoint",
+        ));
+    }
+    let database_uri = format!("file:{}?immutable=1", database.display());
+    let connection = Connection::open_with_flags(
+        database_uri,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI,
+    )?;
+    connection.execute_batch("PRAGMA trusted_schema = OFF; PRAGMA query_only = ON;")?;
+    if read_schema_version(&connection)? != JOB_SCHEMA_VERSION {
+        return Err(JobError::ReportUnavailable(
+            "the job schema is not supported by this PSTForge version",
+        ));
+    }
+    let integrity = connection.query_row("PRAGMA integrity_check(1)", [], |row| {
+        row.get::<_, String>(0)
+    })?;
+    if integrity != "ok" {
+        return Err(JobError::Integrity(integrity));
+    }
+    validate_foreign_keys(&connection)?;
+    read_candidate_rejection_counts(&connection)?;
+    validate_part_store(&connection, &parts, &manifests, None)?;
+
+    let snapshot_length = connection
+        .query_row(
+            "SELECT length(value) FROM job_metadata WHERE key = 'split_report_snapshot'",
+            [],
+            |row| row.get::<_, u64>(0),
+        )
+        .optional()?
+        .ok_or(JobError::ReportUnavailable(
+            "this job predates the 0.5.0 report snapshot",
+        ))?;
+    if snapshot_length
+        > u64::try_from(MAX_REPORT_SNAPSHOT_BYTES)
+            .map_err(|_| JobError::Integrity("report size limit overflow".to_owned()))?
+    {
+        return Err(JobError::Integrity(
+            "report snapshot exceeds the supported size".to_owned(),
+        ));
+    }
+    let json = connection.query_row(
+        "SELECT value FROM job_metadata WHERE key = 'split_report_snapshot'",
+        [],
+        |row| row.get::<_, String>(0),
+    )?;
+    let expected_sha256 = connection
+        .query_row(
+            "SELECT value FROM job_metadata WHERE key = 'split_report_snapshot_sha256'",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?
+        .ok_or_else(|| JobError::Integrity("report snapshot has no integrity digest".to_owned()))?;
+    let actual_sha256 = digest_hex(Sha256::digest(json.as_bytes()).as_slice());
+    if actual_sha256 != expected_sha256 {
+        return Err(JobError::Integrity(
+            "report snapshot failed SHA-256 validation".to_owned(),
+        ));
+    }
+    let expected_state_sha256 = connection
+        .query_row(
+            "SELECT value FROM job_metadata WHERE key = 'split_report_state_sha256'",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?
+        .ok_or_else(|| JobError::Integrity("report snapshot has no ledger digest".to_owned()))?;
+    let evidence = report_ledger_evidence(&connection)?;
+    if digest_report_ledger_evidence(&evidence)? != expected_state_sha256 {
+        return Err(JobError::Integrity(
+            "report snapshot disagrees with current durable job state".to_owned(),
+        ));
+    }
+    let parts = read_published_parts(&connection)?;
+    Ok(ValidatedReportSnapshot {
+        json,
+        parts,
+        evidence,
+    })
+}
+
+fn read_published_parts(connection: &Connection) -> Result<Vec<PublishedPartRecord>, JobError> {
+    let mut statement = connection.prepare(
+        "SELECT p.part_index, p.filename, p.byte_len, p.sha256, p.oversize, \
+                p.sidecar_json, COUNT(i.item_key) \
+         FROM parts p JOIN part_items i ON i.part_index = p.part_index \
+         GROUP BY p.part_index, p.filename, p.byte_len, p.sha256, p.oversize, p.sidecar_json \
+         ORDER BY p.part_index",
+    )?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok((
+                PublishedPart {
+                    index: row.get(0)?,
+                    filename: row.get(1)?,
+                    byte_len: row.get(2)?,
+                    sha256: row.get(3)?,
+                    oversize: row.get(4)?,
+                },
+                row.get::<_, String>(5)?,
+                row.get::<_, u64>(6)?,
+            ))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    rows.into_iter()
+        .map(|(part, sidecar, item_count)| {
+            let sidecar = serde_json::from_str(&sidecar)?;
+            validate_sidecar(&part, &sidecar)?;
+            Ok(PublishedPartRecord {
+                part,
+                sidecar,
+                item_count,
+            })
+        })
+        .collect()
+}
+
+#[derive(Debug, Serialize)]
+pub struct ReportLedgerEvidence {
+    pub source: JobSourceIdentity,
+    pub configuration: JobConfiguration,
+    pub recovery_completion: Option<RecoveryCompletion>,
+    pub summary: JobSummary,
+    pub rejection_counts: CandidateRejectionCounts,
+    pub worker_attempts: u32,
+    pub worker_failures: u32,
+    pub worker_retries_exhausted: bool,
+    pub isolated_units: u64,
+    pub interrupted: bool,
+    pub direct_terminal_failure: Option<String>,
+}
+
+fn report_ledger_digest(connection: &Connection) -> Result<String, JobError> {
+    digest_report_ledger_evidence(&report_ledger_evidence(connection)?)
+}
+
+fn report_ledger_evidence(connection: &Connection) -> Result<ReportLedgerEvidence, JobError> {
+    let source = read_metadata_json(connection, "source_identity")?;
+    let configuration = read_metadata_json(connection, "job_configuration")?;
+    let recovery_completion = connection
+        .query_row(
+            "SELECT value FROM job_metadata WHERE key = 'recovery_completion'",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?
+        .map(|value| serde_json::from_str(&value))
+        .transpose()?;
+    let (committed, recovered, orphan, fragment, complete, partial, unsupported) = connection
+        .query_row(
+            "SELECT COUNT(*),\
+                COALESCE(SUM(provenance = 'recovered'), 0),\
+                COALESCE(SUM(provenance = 'orphan'), 0),\
+                COALESCE(SUM(provenance = 'fragment'), 0),\
+                COALESCE(SUM(completeness = 'complete'), 0),\
+                COALESCE(SUM(completeness = 'partial'), 0),\
+                COALESCE(SUM(status = 'unsupported'), 0)\
+         FROM candidates WHERE status IN ('spooled', 'written', 'unsupported')",
+            [],
+            |row| {
+                Ok((
+                    row.get::<_, u64>(0)?,
+                    row.get::<_, u64>(1)?,
+                    row.get::<_, u64>(2)?,
+                    row.get::<_, u64>(3)?,
+                    row.get::<_, u64>(4)?,
+                    row.get::<_, u64>(5)?,
+                    row.get::<_, u64>(6)?,
+                ))
+            },
+        )?;
+    let (live_blob_count, live_blob_bytes) = connection.query_row(
+        "SELECT COUNT(*), COALESCE(SUM(byte_len), 0) FROM blobs",
+        [],
+        |row| Ok((row.get::<_, u64>(0)?, row.get::<_, u64>(1)?)),
+    )?;
+    let final_blob_count = read_optional_metadata_u64(connection, "final_blob_count")?;
+    let final_blob_bytes = read_optional_metadata_u64(connection, "final_blob_bytes")?;
+    let (blob_count, blob_bytes) = match (final_blob_count, final_blob_bytes) {
+        (Some(count), Some(bytes)) if live_blob_count == 0 && live_blob_bytes == 0 => {
+            (count, bytes)
+        }
+        (None, None) => (live_blob_count, live_blob_bytes),
+        _ => {
+            return Err(JobError::Integrity(
+                "final spool metrics disagree with retained work".to_owned(),
+            ));
+        }
+    };
+    let interrupted = read_strict_boolean_metadata(connection, "interrupted")?;
+    let worker_retries_exhausted =
+        read_strict_boolean_metadata(connection, "worker_retries_exhausted")?;
+    let direct_terminal_failure = connection
+        .query_row(
+            "SELECT value FROM job_metadata WHERE key = 'direct_terminal_failure'",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?;
+    if direct_terminal_failure
+        .as_deref()
+        .is_some_and(|value| !matches!(value, "worker_crash" | "worker_stall" | "worker_protocol"))
+    {
+        return Err(JobError::Integrity(
+            "direct terminal failure metadata is invalid".to_owned(),
+        ));
+    }
+    let evidence = ReportLedgerEvidence {
+        source,
+        configuration,
+        recovery_completion,
+        summary: JobSummary {
+            committed_candidates: committed,
+            recovered_candidates: recovered,
+            orphan_candidates: orphan,
+            fragment_candidates: fragment,
+            complete_candidates: complete,
+            partial_candidates: partial,
+            unsupported_candidates: unsupported,
+            blob_count,
+            blob_bytes,
+        },
+        rejection_counts: read_candidate_rejection_counts(connection)?,
+        worker_attempts: read_optional_metadata_u32(connection, "worker_attempts")?,
+        worker_failures: read_optional_metadata_u32(connection, "worker_failures")?,
+        worker_retries_exhausted,
+        isolated_units: connection.query_row("SELECT COUNT(*) FROM isolated_units", [], |row| {
+            row.get::<_, u64>(0)
+        })?,
+        interrupted,
+        direct_terminal_failure,
+    };
+    Ok(evidence)
+}
+
+fn digest_report_ledger_evidence(evidence: &ReportLedgerEvidence) -> Result<String, JobError> {
+    Ok(digest_hex(
+        Sha256::digest(serde_json::to_vec(evidence)?).as_slice(),
+    ))
+}
+
+fn read_strict_boolean_metadata(
+    connection: &Connection,
+    key: &'static str,
+) -> Result<bool, JobError> {
+    let value = connection
+        .query_row(
+            "SELECT value FROM job_metadata WHERE key = ?1",
+            [key],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?;
+    match value.as_deref() {
+        None | Some("false") => Ok(false),
+        Some("true") => Ok(true),
+        Some(_) => Err(JobError::Integrity(format!("invalid {key}"))),
+    }
+}
+
+fn invalidate_report_snapshot(connection: &Connection) -> Result<(), JobError> {
+    connection.execute(
+        "DELETE FROM job_metadata WHERE key IN (\
+            'split_report_snapshot',\
+            'split_report_snapshot_sha256',\
+            'split_report_state_sha256'\
+         )",
+        [],
+    )?;
+    Ok(())
 }
 
 impl CatalogSink for DurableCatalogSink {
@@ -4362,7 +4673,7 @@ fn reconcile_publications(
             )?;
             continue;
         }
-        verify_part_artifact(&final_path, &part, interrupted)?;
+        verify_part_artifact(&final_path, &part, &sidecar, interrupted)?;
         if sidecar_exists {
             verify_sidecar_artifact(&sidecar_path, &sidecar)?;
         } else {
@@ -4413,7 +4724,12 @@ fn validate_part_record(part: &PublishedPart) -> Result<(), JobError> {
 }
 
 fn validate_sidecar(part: &PublishedPart, sidecar: &PartSidecar) -> Result<(), JobError> {
-    if sidecar.schema_version != "1.1.0"
+    let identity_valid = match sidecar.schema_version.as_str() {
+        "1.1.0" => sidecar.published_device.is_none() && sidecar.published_inode.is_none(),
+        "1.2.0" => sidecar.published_device.is_some() && sidecar.published_inode.is_some(),
+        _ => false,
+    };
+    if !identity_valid
         || sidecar.producer_version.is_empty()
         || sidecar.index != part.index
         || sidecar.filename != part.filename
@@ -4978,10 +5294,15 @@ fn validate_part_store(
     let mut accounted_sidecars = HashSet::new();
     for (part, sidecar_json) in rows {
         validate_part_record(&part)?;
-        verify_part_artifact(&parts.join(&part.filename), &part, interrupted)?;
         let sidecar_filename = part.filename.trim_end_matches(".pst").to_owned() + ".json";
         let expected_sidecar: PartSidecar = serde_json::from_str(&sidecar_json)?;
         validate_sidecar(&part, &expected_sidecar)?;
+        verify_part_artifact(
+            &parts.join(&part.filename),
+            &part,
+            &expected_sidecar,
+            interrupted,
+        )?;
         verify_sidecar_artifact(&manifests.join(&sidecar_filename), &expected_sidecar)?;
         accounted_sidecars.insert(sidecar_filename);
     }
@@ -5005,6 +5326,7 @@ fn validate_part_store(
 fn verify_part_artifact(
     path: &Path,
     part: &PublishedPart,
+    sidecar: &PartSidecar,
     interrupted: Option<&AtomicBool>,
 ) -> Result<(), JobError> {
     let metadata = path
@@ -5039,6 +5361,12 @@ fn verify_part_artifact(
             Some(opened.nlink()),
         )
         || opened.len() != part.byte_len
+        || sidecar
+            .published_device
+            .is_some_and(|expected| expected != opened.dev())
+        || sidecar
+            .published_inode
+            .is_some_and(|expected| expected != opened.ino())
     {
         return Err(JobError::Integrity(format!(
             "published part {} changed while opening",
@@ -5476,11 +5804,141 @@ mod tests {
         DirectEmbeddedCandidate, DurableCatalogSink, INLINE_BLOB_MAX_BYTES, INLINE_CACHE_DIRECTORY,
         JobConfiguration, JobError, JobSourceIdentity, PAYLOAD_PACK_FILENAME, PartSidecar,
         PayloadPackMetrics, PublishedPart, WorkerEvent, digest_hex, private_state_attributes_valid,
-        run_sql_interruptible, validate_blob_store, write_hashed, write_sidecar_partial,
+        read_validated_report_snapshot, run_sql_interruptible, validate_blob_store, write_hashed,
+        write_sidecar_partial,
     };
 
     struct PrefixThenError {
         remaining: usize,
+    }
+
+    #[test]
+    fn report_snapshot_read_is_validated_and_does_not_mutate_the_job()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempdir()?;
+        let job = directory.path().join("job");
+        let sink = DurableCatalogSink::create(&job)?;
+        sink.bind_source(&JobSourceIdentity {
+            canonical_path: "/external/mail.pst".to_owned(),
+            device: 1,
+            inode: 2,
+            size_bytes: 3,
+            modified_at: "2026-07-20T00:00:00Z".to_owned(),
+            sha256: Some("a".repeat(64)),
+        })?;
+        sink.bind_configuration(&JobConfiguration {
+            tool_compatibility_major: 0,
+            split_schema_version: "0.5.0".to_owned(),
+            execution_mode: "direct".to_owned(),
+            recovery_mode: "balanced".to_owned(),
+            maximum_pst_bytes: 4_294_967_296,
+            part_size_policy: "hard-maximum-v1".to_owned(),
+            writer_format: "unicode-pst-v23".to_owned(),
+        })?;
+        let snapshot = json!({"schema_version": "0.5.0", "parts": []});
+        sink.publish_report_snapshot(&snapshot)?;
+        sink.checkpoint()?;
+        drop(sink);
+
+        let database = job.join(".pstforge/job.sqlite3");
+        let before = fs::read(&database)?;
+        let private_entries = |path: &Path| -> Result<Vec<String>, std::io::Error> {
+            let mut entries = fs::read_dir(path)?
+                .map(|entry| Ok(entry?.file_name().to_string_lossy().into_owned()))
+                .collect::<Result<Vec<_>, std::io::Error>>()?;
+            entries.sort();
+            Ok(entries)
+        };
+        let private_entries_before = private_entries(&job.join(".pstforge"))?;
+        let validated = read_validated_report_snapshot(&job)?;
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&validated.json)?,
+            snapshot
+        );
+        assert!(validated.parts.is_empty());
+        assert_eq!(fs::read(&database)?, before);
+        assert_eq!(
+            private_entries(&job.join(".pstforge"))?,
+            private_entries_before
+        );
+
+        let connection = Connection::open(&database)?;
+        connection.execute(
+            "INSERT INTO job_metadata(key, value) VALUES ('worker_attempts', '1')",
+            [],
+        )?;
+        drop(connection);
+        assert!(matches!(
+            read_validated_report_snapshot(&job),
+            Err(JobError::Integrity(_))
+        ));
+        let connection = Connection::open(&database)?;
+        connection.execute("DELETE FROM job_metadata WHERE key = 'worker_attempts'", [])?;
+        connection.execute(
+            "UPDATE job_metadata SET value = value || ' ' WHERE key = 'split_report_snapshot'",
+            [],
+        )?;
+        drop(connection);
+        assert!(matches!(
+            read_validated_report_snapshot(&job),
+            Err(JobError::Integrity(_))
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn resume_invalidates_a_completed_report_before_changing_job_state()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempdir()?;
+        let job = directory.path().join("job");
+        let sink = DurableCatalogSink::create(&job)?;
+        let source = JobSourceIdentity {
+            canonical_path: "/external/mail.pst".to_owned(),
+            device: 1,
+            inode: 2,
+            size_bytes: 3,
+            modified_at: "2026-07-20T00:00:00Z".to_owned(),
+            sha256: Some("a".repeat(64)),
+        };
+        let configuration = JobConfiguration {
+            tool_compatibility_major: 0,
+            split_schema_version: "0.5.0".to_owned(),
+            execution_mode: "restartable".to_owned(),
+            recovery_mode: "balanced".to_owned(),
+            maximum_pst_bytes: 4_294_967_296,
+            part_size_policy: "hard-maximum-v1".to_owned(),
+            writer_format: "unicode-pst-v23".to_owned(),
+        };
+        sink.bind_source(&source)?;
+        sink.bind_recovery_mode("balanced")?;
+        sink.bind_configuration(&configuration)?;
+        sink.publish_report_snapshot(&json!({"schema_version": "0.5.0"}))?;
+        sink.checkpoint()?;
+        drop(sink);
+        assert!(read_validated_report_snapshot(&job).is_ok());
+
+        let resumed = DurableCatalogSink::open_resume(&job, &source, &configuration)?;
+        drop(resumed);
+        assert!(matches!(
+            read_validated_report_snapshot(&job),
+            Err(JobError::ReportUnavailable(_))
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn report_explains_jobs_that_predate_snapshot_storage() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let directory = tempdir()?;
+        let job = directory.path().join("job");
+        let sink = DurableCatalogSink::create(&job)?;
+        sink.checkpoint()?;
+        drop(sink);
+        assert!(matches!(
+            read_validated_report_snapshot(&job),
+            Err(JobError::ReportUnavailable(_))
+        ));
+        Ok(())
     }
 
     #[test]
@@ -6634,11 +7092,6 @@ mod tests {
             sha256: Some(digest_hex(Sha256::digest(&part_bytes).as_slice())),
             oversize: false,
         };
-        let interrupted = AtomicBool::new(true);
-        assert!(matches!(
-            super::verify_part_artifact(&part_path, &part, Some(&interrupted)),
-            Err(JobError::Interrupted)
-        ));
         let sidecar = PartSidecar {
             schema_version: "1.1.0".to_owned(),
             producer_version: "0.4.0".to_owned(),
@@ -6646,6 +7099,8 @@ mod tests {
             filename: part.filename.clone(),
             byte_len: part.byte_len,
             sha256: part.sha256.clone(),
+            published_device: None,
+            published_inode: None,
             store_record_key: "0".repeat(32),
             folder_count: 1,
             message_count: 1,
@@ -6656,6 +7111,11 @@ mod tests {
             omitted_attachments: 0,
             reconstructions: Default::default(),
         };
+        let interrupted = AtomicBool::new(true);
+        assert!(matches!(
+            super::verify_part_artifact(&part_path, &part, &sidecar, Some(&interrupted)),
+            Err(JobError::Interrupted)
+        ));
         let item_key = candidates[0].item_key.clone();
         let oversize = PublishedPart {
             oversize: true,
@@ -6943,6 +7403,8 @@ mod tests {
                 filename: part.filename.clone(),
                 byte_len: part.byte_len,
                 sha256: part.sha256.clone(),
+                published_device: None,
+                published_inode: None,
                 store_record_key: "0".repeat(32),
                 folder_count: 1,
                 message_count: 1,
@@ -6991,6 +7453,69 @@ mod tests {
                 assert!(job.join(".pstforge/manifests/part-0001.json").is_file());
             }
         }
+        Ok(())
+    }
+
+    #[test]
+    fn constructed_publication_rejects_a_same_length_staged_replacement()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempdir()?;
+        let job = directory.path().join("job");
+        let mut sink = DurableCatalogSink::create(&job)?;
+        message_start(&mut sink, 10)?;
+        sink.event(CatalogEvent::MessageEnd {
+            id: 10,
+            complete: true,
+        })?;
+        sink.checkpoint()?;
+        let item_key = sink.spooled_candidates()?[0].item_key.clone();
+        let staged_filename = "part-0001.pst.partial";
+        let staged = job.join(".pstforge/partial").join(staged_filename);
+        fs::write(&staged, b"direct part checkpoint")?;
+        fs::set_permissions(&staged, fs::Permissions::from_mode(0o600))?;
+        let original = staged.metadata()?;
+        let part = PublishedPart {
+            index: 1,
+            filename: "part-0001.pst".to_owned(),
+            byte_len: original.len(),
+            sha256: None,
+            oversize: false,
+        };
+        let sidecar = PartSidecar {
+            schema_version: "1.2.0".to_owned(),
+            producer_version: "0.5.0".to_owned(),
+            index: part.index,
+            filename: part.filename.clone(),
+            byte_len: part.byte_len,
+            sha256: None,
+            published_device: Some(original.dev()),
+            published_inode: Some(original.ino()),
+            store_record_key: "0".repeat(32),
+            folder_count: 1,
+            message_count: 1,
+            oversize: false,
+            partial: false,
+            omitted_folders: 0,
+            omitted_properties: 0,
+            omitted_attachments: 0,
+            reconstructions: Default::default(),
+        };
+        let replacement = job.join(".pstforge/partial/replacement.pst");
+        fs::write(&replacement, b"replaced part content!")?;
+        fs::set_permissions(&replacement, fs::Permissions::from_mode(0o600))?;
+        fs::rename(&replacement, &staged)?;
+
+        assert!(matches!(
+            sink.publish_constructed_part_interruptible(
+                staged_filename,
+                &part,
+                &sidecar,
+                &[item_key],
+                &AtomicBool::new(false),
+            ),
+            Err(JobError::Integrity(_))
+        ));
+        assert!(!job.join("parts/part-0001.pst").exists());
         Ok(())
     }
 

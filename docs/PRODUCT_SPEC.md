@@ -186,7 +186,15 @@ partial-success status rather than discarding content.
 
 `report` reads only durable job state and finalized part manifests. It does not
 reopen the source PST. It recreates the bounded human or JSON summary and
-fails if the job state or a finalized part hash is inconsistent.
+fails if the job state, finalized part identity/size, or a recorded finalized
+part hash is inconsistent. Direct jobs deliberately have no finalized-part
+hash and are validated without rereading their contents; restartable jobs
+verify the hashes recorded during their existing durable workflow. Version
+0.5.0 jobs store a digest-protected report snapshot in the private ledger.
+Earlier pre-release jobs without that snapshot receive an explicit
+compatibility error rather than fabricated timing or I/O metrics. Report
+schema `1.0.0` wraps the original split result and identifies the command as
+`report`.
 
 ## Source Safety
 
@@ -400,9 +408,10 @@ a separate nonempty display name. If an associated item has neither a display
 name nor subject, `(no subject)` is generated only for that structural display
 name. These omissions and generated structural values are counted without
 logging message values or item identifiers.
-Part manifests contain size, SHA-256, store identity, counts, oversize status,
-and bounded error totals under private job state rather than beside the PST
-files. CLI `--json` output remains the machine-readable summary. The JSON
+Part manifests contain size, SHA-256 when the producing mode calculated one,
+store identity, counts, oversize status, and bounded error totals under private
+job state rather than beside the PST files. CLI `--json` output remains the
+machine-readable summary. The JSON
 manifests, SQLite ledger, and spool are private implementation data and are not
 an interchange format.
 

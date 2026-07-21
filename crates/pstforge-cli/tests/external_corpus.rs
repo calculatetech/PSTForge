@@ -1575,6 +1575,88 @@ fn root_and_associated_data_roundtrip_through_the_supervised_split()
         return Err("source placement fixture does not meet its contract".into());
     }
 
+    let recovery_verify = Command::new(env!("CARGO_BIN_EXE_pstforge"))
+        .arg("verify")
+        .arg(&source)
+        .arg("--mode")
+        .arg("recovery")
+        .arg("--json")
+        .arg("--color")
+        .arg("never")
+        .output()?;
+    if !recovery_verify.status.success() {
+        return Err(format!(
+            "supervised recovery verification failed: {}",
+            String::from_utf8_lossy(&recovery_verify.stderr)
+        )
+        .into());
+    }
+    let recovery_verify: serde_json::Value = serde_json::from_slice(&recovery_verify.stdout)?;
+    if recovery_verify["mode"] != "recovery"
+        || recovery_verify["inventory"]["recovered_items"].as_u64() != Some(0)
+        || recovery_verify["inventory"]["orphan_items"].as_u64() != Some(0)
+        || recovery_verify["source_unchanged"].as_bool() != Some(true)
+    {
+        return Err("supervised recovery verification returned the wrong scope".into());
+    }
+
+    let contained_crash = Command::new(env!("CARGO_BIN_EXE_pstforge"))
+        .arg("verify")
+        .arg(&source)
+        .arg("--mode")
+        .arg("recovery")
+        .arg("--json")
+        .arg("--color")
+        .arg("never")
+        .env("PSTFORGE_TEST_VERIFY_WORKER_ABORT", "1")
+        .output()?;
+    if contained_crash.status.code() != Some(3) || !contained_crash.stdout.is_empty() {
+        return Err("recovery verification did not contain its native worker abort".into());
+    }
+
+    let mut killed_supervisor = Command::new(env!("CARGO_BIN_EXE_pstforge"))
+        .arg("verify")
+        .arg(&source)
+        .arg("--mode")
+        .arg("recovery")
+        .arg("--json")
+        .arg("--color")
+        .arg("never")
+        .env("PSTFORGE_TEST_VERIFY_WORKER_STALL", "1")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()?;
+    let supervisor_id = killed_supervisor.id();
+    let child_deadline = Instant::now() + Duration::from_secs(10);
+    let worker_id = loop {
+        let children_path = format!("/proc/{supervisor_id}/task/{supervisor_id}/children");
+        if let Ok(children) = fs::read_to_string(children_path)
+            && let Some(worker) = children
+                .split_ascii_whitespace()
+                .next()
+                .and_then(|value| value.parse::<u32>().ok())
+        {
+            break worker;
+        }
+        if Instant::now() >= child_deadline {
+            let _ = killed_supervisor.kill();
+            return Err("verification worker did not start before signal deadline".into());
+        }
+        thread::sleep(Duration::from_millis(25));
+    };
+    killed_supervisor.kill()?;
+    let status = killed_supervisor.wait()?;
+    if status.success() {
+        return Err("killed verification supervisor unexpectedly succeeded".into());
+    }
+    let worker_deadline = Instant::now() + Duration::from_secs(5);
+    while PathBuf::from(format!("/proc/{worker_id}")).exists() {
+        if Instant::now() >= worker_deadline {
+            return Err("verification worker outlived its killed supervisor".into());
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
+
     let output = directory.path().join("split");
     let result = Command::new(env!("CARGO_BIN_EXE_pstforge"))
         .arg("split")
@@ -1601,6 +1683,27 @@ fn root_and_associated_data_roundtrip_through_the_supervised_split()
     {
         return Err("placement split was not a complete one-part result".into());
     }
+    let regenerated = Command::new(env!("CARGO_BIN_EXE_pstforge"))
+        .arg("report")
+        .arg(&output)
+        .arg("--json")
+        .arg("--color")
+        .arg("never")
+        .output()?;
+    if !regenerated.status.success() {
+        return Err(format!(
+            "report regeneration failed: {}",
+            String::from_utf8_lossy(&regenerated.stderr)
+        )
+        .into());
+    }
+    let regenerated: serde_json::Value = serde_json::from_slice(&regenerated.stdout)?;
+    if regenerated["schema_version"] != "1.0.0"
+        || regenerated["command"] != "report"
+        || regenerated["split"] != report
+    {
+        return Err("regenerated JSON does not match the finalized split report".into());
+    }
     let generated = output.join("parts/part-0001.pst");
     let actual = independent_placement(&generated)?;
     if actual != expected {
@@ -1618,6 +1721,77 @@ fn root_and_associated_data_roundtrip_through_the_supervised_split()
         .map_err(|_| "placement source changed during split")?;
     if pstforge_core::SourceFile::open(&source)?.identity() != &source_identity {
         return Err("placement source identity changed during split".into());
+    }
+    let mut damaged_output = fs::read(&generated)?;
+    let changed = damaged_output
+        .get_mut(1024)
+        .ok_or("generated placement PST is unexpectedly short")?;
+    *changed ^= 1;
+    fs::write(&generated, damaged_output)?;
+    let rejected = Command::new(env!("CARGO_BIN_EXE_pstforge"))
+        .arg("report")
+        .arg(&output)
+        .arg("--json")
+        .arg("--color")
+        .arg("never")
+        .output()?;
+    if rejected.status.code() != Some(4) || !rejected.stdout.is_empty() {
+        return Err("report did not reject changed finalized output with status 4".into());
+    }
+    let direct_output = directory.path().join("direct-split");
+    let direct = Command::new(env!("CARGO_BIN_EXE_pstforge"))
+        .arg("split")
+        .arg(&source)
+        .arg("--output")
+        .arg(&direct_output)
+        .arg("--max-pst-size")
+        .arg("4GiB")
+        .arg("--json")
+        .arg("--color")
+        .arg("never")
+        .output()?;
+    if !direct.status.success() {
+        return Err(format!(
+            "direct placement split failed: {}",
+            String::from_utf8_lossy(&direct.stderr)
+        )
+        .into());
+    }
+    let direct: serde_json::Value = serde_json::from_slice(&direct.stdout)?;
+    if !direct["parts"][0]["sha256"].is_null() {
+        return Err("direct split unexpectedly calculated a finalized-part hash".into());
+    }
+    let direct_report = Command::new(env!("CARGO_BIN_EXE_pstforge"))
+        .arg("report")
+        .arg(&direct_output)
+        .arg("--json")
+        .arg("--color")
+        .arg("never")
+        .output()?;
+    if !direct_report.status.success()
+        || serde_json::from_slice::<serde_json::Value>(&direct_report.stdout)?["split"] != direct
+    {
+        return Err("direct report did not preserve the hash-free split result".into());
+    }
+    let direct_part = direct_output.join("parts/part-0001.pst");
+    let mut replaced = fs::read(&direct_part)?;
+    let changed = replaced
+        .get_mut(1024)
+        .ok_or("direct placement PST is unexpectedly short")?;
+    *changed ^= 1;
+    let replacement = direct_output.join("parts/replacement.pst");
+    fs::write(&replacement, replaced)?;
+    fs::set_permissions(&replacement, fs::metadata(&direct_part)?.permissions())?;
+    fs::rename(&replacement, &direct_part)?;
+    let rejected_replacement = Command::new(env!("CARGO_BIN_EXE_pstforge"))
+        .arg("report")
+        .arg(&direct_output)
+        .arg("--json")
+        .arg("--color")
+        .arg("never")
+        .output()?;
+    if rejected_replacement.status.code() != Some(4) || !rejected_replacement.stdout.is_empty() {
+        return Err("report accepted a same-length replacement for a direct part".into());
     }
     Ok(())
 }
@@ -3802,7 +3976,8 @@ fn milestone_0_4_real_pst_splits_deterministically_without_mutation()
                     )
                     .into());
                 }
-                if sidecar.schema_version != "1.1.0"
+                let published_metadata = fs::metadata(&path)?;
+                if sidecar.schema_version != "1.2.0"
                     || sidecar.producer_version != env!("CARGO_PKG_VERSION")
                     || u64::from(sidecar.index) != part["index"].as_u64().unwrap_or_default()
                     || sidecar.filename != filename
@@ -3816,6 +3991,8 @@ fn milestone_0_4_real_pst_splits_deterministically_without_mutation()
                     || Some(sidecar.omitted_properties) != part["omitted_properties"].as_u64()
                     || Some(sidecar.omitted_attachments) != part["omitted_attachments"].as_u64()
                     || sidecar.store_record_key != record_key
+                    || sidecar.published_device != Some(published_metadata.dev())
+                    || sidecar.published_inode != Some(published_metadata.ino())
                 {
                     return Err(format!("{} part sidecar mismatch", case.name).into());
                 }
