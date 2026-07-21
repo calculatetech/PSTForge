@@ -501,9 +501,14 @@ fn source_date_epoch(root: &Path) -> Result<String, String> {
             .map_err(|_| "SOURCE_DATE_EPOCH must be an unsigned Unix timestamp".to_owned())?;
         return Ok(value);
     }
-    Ok(command_stdout(root, "git", &["log", "-1", "--format=%ct"])?
-        .trim()
-        .to_owned())
+    let safe_directory = format!("safe.directory={}", root.display());
+    Ok(command_stdout(
+        root,
+        "git",
+        &["-c", &safe_directory, "log", "-1", "--format=%ct"],
+    )?
+    .trim()
+    .to_owned())
 }
 
 fn debian_runtime_dependencies(package_root: &Path, binary: &Path) -> Result<String, String> {
