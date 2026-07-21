@@ -6,13 +6,16 @@
 PSTForge is a Linux-native command-line utility for recovering large or damaged
 Outlook PST files without modifying the source. It writes new, independently
 importable Unicode PST files, normally capped at 4 GiB, for checkpointed import
-into Synology MailPlus Server. Microsoft Outlook is the secondary compatibility
-target.
+into Synology MailPlus Server. Clean ScanPST analysis followed by successful
+Microsoft Outlook inspection is the required interoperability acceptance
+boundary; MailPlus compatibility is then assumed.
 
 PSTForge is pre-1.0 software. The output writer and recovery pipeline have been
 validated with real damaged PSTs, ScanPST, Outlook, MailPlus, `libpff`,
 `pffinfo`, and `readpst`, but the command and report contracts may still change
-before 1.0.
+before 1.0. MailPlus import is optional operator evidence rather than a release
+gate; a MailPlus-only failure after ScanPST and Outlook pass belongs in a
+Synology support ticket.
 
 ## Features
 
@@ -255,11 +258,12 @@ fuzz target. Private-corpus `full` and `release` gates run only on the local
 machine holding the explicitly configured corpus; PST files, paths, reader
 output, and detailed evidence are never uploaded to GitHub. Changes that can
 affect output PST bytes or recovered content also require a focused
-ScanPST-first human gate. Documentation, automation, packaging, reporting, and
-proven byte-identical refactors do not. Release automation accepts only the
-existing tag matching the package version, requires approval through the
-`release` environment, and retains a Debian build artifact without creating a
-GitHub release.
+ScanPST-first human gate followed by Outlook inspection. MailPlus import is not
+an external acceptance dependency. Documentation, automation, packaging,
+reporting, and proven byte-identical refactors do not require the human gate.
+Release automation accepts only the existing tag matching the package version,
+requires approval through the `release` environment, and retains a Debian
+build artifact without creating a GitHub release.
 
 See [`docs/PRODUCT_SPEC.md`](docs/PRODUCT_SPEC.md) for the authoritative
 behavior contract, [`docs/ATTACHMENT_RECOVERY.md`](docs/ATTACHMENT_RECOVERY.md)
