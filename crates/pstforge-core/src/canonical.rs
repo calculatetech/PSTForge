@@ -41,6 +41,7 @@ pub struct CanonicalAttachment {
     pub index: u32,
     pub attachment_type: Option<i32>,
     pub filename: Option<String>,
+    pub detected_mime: Option<String>,
     pub declared_size: Option<u64>,
     pub data: Option<SpooledBlob>,
     pub direct_id: Option<u64>,
@@ -647,6 +648,7 @@ fn build_mail_inner(
                             index,
                             attachment_type: optional_i32(candidate, event, "attachment_type")?,
                             filename: optional_string(candidate, event, "filename")?,
+                            detected_mime: optional_string(candidate, event, "detected_mime")?,
                             declared_size: optional_u64(candidate, event, "data_size")?,
                             data: None,
                             direct_id: None,
@@ -659,6 +661,18 @@ fn build_mail_inner(
                     .is_some()
                 {
                     return invalid(candidate, "duplicate attachment index");
+                }
+            }
+            "attachment_mime_probe" => {
+                let index = required_u32(candidate, event, "index")?;
+                let mime_type = optional_string(candidate, event, "mime_type")?
+                    .filter(|value| !value.is_empty())
+                    .ok_or_else(|| invalid_error(candidate, "attachment MIME probe is empty"))?;
+                let attachment = attachments.get_mut(&index).ok_or_else(|| {
+                    invalid_error(candidate, "attachment MIME probe precedes metadata")
+                })?;
+                if attachment.detected_mime.replace(mime_type).is_some() {
+                    return invalid(candidate, "duplicate attachment MIME probe");
                 }
             }
             "attachment_data" | "attachment_partial" | "attachment_direct" => {
@@ -1470,6 +1484,7 @@ mod tests {
             attachment_type: Some(i32::from(b'i')),
             data_size: None,
             filename: Some("embedded.msg".to_owned()),
+            detected_mime: None,
         })?;
         sink.event(CatalogEvent::AttachmentEnd {
             message_id: 0,
@@ -1481,6 +1496,7 @@ mod tests {
             attachment_type: Some(i32::from(b'i')),
             data_size: None,
             filename: Some("second.msg".to_owned()),
+            detected_mime: None,
         })?;
         sink.event(CatalogEvent::AttachmentEnd {
             message_id: 0,
@@ -1510,6 +1526,7 @@ mod tests {
             attachment_type: Some(i32::from(b'i')),
             data_size: None,
             filename: Some("nested.msg".to_owned()),
+            detected_mime: None,
         })?;
         sink.event(CatalogEvent::AttachmentEnd {
             message_id: 0,
@@ -2033,6 +2050,7 @@ mod tests {
             attachment_type: Some(i32::from(b'i')),
             data_size: None,
             filename: Some("unsupported-contact.msg".to_owned()),
+            detected_mime: None,
         })?;
         sink.event(CatalogEvent::AttachmentEnd {
             message_id: 30,
@@ -2108,6 +2126,7 @@ mod tests {
             attachment_type: Some(i32::from(b'i')),
             data_size: None,
             filename: Some("embedded-40.msg".to_owned()),
+            detected_mime: None,
         })?;
         sink.event(CatalogEvent::AttachmentEnd {
             message_id: 40,
@@ -2129,6 +2148,7 @@ mod tests {
             attachment_type: Some(i32::from(b'i')),
             data_size: None,
             filename: Some("embedded-50.msg".to_owned()),
+            detected_mime: None,
         })?;
         sink.event(CatalogEvent::AttachmentEnd {
             message_id: 50,
@@ -2198,6 +2218,7 @@ mod tests {
             attachment_type: Some(i32::from(b'd')),
             data_size: Some(0),
             filename: Some("empty.bin".to_owned()),
+            detected_mime: None,
         })?;
         sink.event(CatalogEvent::AttachmentEnd {
             message_id: 80,
@@ -2292,6 +2313,7 @@ mod tests {
             attachment_type: Some(i32::from(b'i')),
             data_size: None,
             filename: Some("embedded.msg".to_owned()),
+            detected_mime: None,
         })?;
         sink.event(CatalogEvent::AttachmentEnd {
             message_id: 80,

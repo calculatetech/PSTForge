@@ -73,7 +73,7 @@ runtime dependencies are resolved:
 
 ```bash
 cargo xtask package deb
-sudo apt install ./target/debian/pstforge_0.5.1_amd64.deb
+sudo apt install ./target/debian/pstforge_0.6.0_amd64.deb
 pstforge --version
 ```
 
@@ -199,7 +199,9 @@ job-001/
 Parts are created beside their destination under temporary names, flushed, and
 atomically renamed only after writer validation. `.pstforge` is private durable
 state. Restartable payload data exists there only when `--restartable` is used.
-Do not place the source PST inside the job directory.
+For a new job, PSTForge creates a missing output directory and its missing
+parent directories with private permissions; symlinked path components are
+refused. Do not place the source PST inside the job directory.
 
 Public JSON schemas are in [`docs/schemas`](docs/schemas) and install to
 `/usr/share/pstforge/schemas`. `recovery.log` is intentionally aggregate and

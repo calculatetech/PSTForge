@@ -1597,7 +1597,9 @@ fn translate_attachment(
         && attachment.embedded.is_none()
         && (source_mime.is_none() || source_filename.is_none())
     {
-        if let Some(data) = &attachment.data {
+        if let Some(detected) = attachment.detected_mime.as_deref() {
+            Some(detected)
+        } else if let Some(data) = &attachment.data {
             infer_attachment_mime(job, mail, data, attachment.filename.as_deref())?
         } else {
             None
@@ -2858,6 +2860,7 @@ mod tests {
             attachment_type: Some(i32::from(b'f')),
             data_size: Some(20),
             filename: Some("payload.bin".to_owned()),
+            detected_mime: None,
         })?;
         job.event(CatalogEvent::AttachmentData {
             message_id: 10,
@@ -3024,6 +3027,7 @@ mod tests {
                 index,
                 attachment_type: Some(i32::from(b'd')),
                 filename: Some(format!("document-{index}.bin")),
+                detected_mime: None,
                 declared_size: Some(0),
                 data: data_complete.then(|| SpooledBlob {
                     sha256: "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
@@ -3499,6 +3503,7 @@ mod tests {
                     attachment_type: Some(i32::from(if index == 2 { b'd' } else { b'r' })),
                     data_size: None,
                     filename: Some(filename.to_owned()),
+                    detected_mime: None,
                 },
             )?;
             property(&mut job, 11, index, 0, 0x3705, 0x0003, &2_i32.to_le_bytes())?;
@@ -3645,6 +3650,7 @@ mod tests {
                     attachment_type: Some(i32::from(b'd')),
                     data_size: Some(u64::try_from(payload.len())?),
                     filename: Some(format!("ole-{index}.bin")),
+                    detected_mime: None,
                 },
             )?;
             property(&mut job, 12, index, 0, 0x3705, 0x0003, &6_i32.to_le_bytes())?;
@@ -3758,6 +3764,7 @@ mod tests {
             index: 0,
             attachment_type: Some(i32::from(b'i')),
             filename: Some("embedded.msg".to_owned()),
+            detected_mime: None,
             declared_size: None,
             data: None,
             direct_id: None,
@@ -3869,6 +3876,7 @@ mod tests {
                 attachment_type: Some(i32::from(b'd')),
                 data_size: Some(u64::try_from(payload.len())?),
                 filename: Some("checkpoint.pdf".to_owned()),
+                detected_mime: None,
             },
         )?;
         let mime_descriptor = PropertyDescriptor {
@@ -3914,6 +3922,7 @@ mod tests {
                 attachment_type: Some(i32::from(b'd')),
                 data_size: Some(u64::try_from(truncated_jpeg.len())?),
                 filename: Some("truncated.jpg".to_owned()),
+                detected_mime: None,
             },
         )?;
         send(
@@ -3939,6 +3948,7 @@ mod tests {
                 attachment_type: Some(i32::from(b'd')),
                 data_size: Some(u64::try_from(truncated_jpeg.len())?),
                 filename: None,
+                detected_mime: None,
             },
         )?;
         let docx_mime_descriptor = PropertyDescriptor {
@@ -4038,6 +4048,7 @@ mod tests {
                     index: 0,
                     attachment_type: Some(i32::from(b'd')),
                     filename: None,
+                    detected_mime: None,
                     declared_size: Some(u64::try_from(payload.len())?),
                     data: Some(blob),
                     direct_id: None,
@@ -4050,6 +4061,10 @@ mod tests {
                     index: 1,
                     attachment_type: Some(i32::from(b'd')),
                     filename: None,
+                    detected_mime: Some(
+                        "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+                            .to_owned(),
+                    ),
                     declared_size: Some(u64::try_from(truncated_jpeg.len())?),
                     data: Some(truncated_blob),
                     direct_id: None,
@@ -4062,6 +4077,7 @@ mod tests {
                     index: 2,
                     attachment_type: Some(i32::from(b'd')),
                     filename: None,
+                    detected_mime: None,
                     declared_size: Some(u64::try_from(truncated_jpeg.len())?),
                     data: Some(docx_payload_blob),
                     direct_id: None,
@@ -4102,11 +4118,14 @@ mod tests {
         assert_eq!(attachment.flags, 0);
         assert_eq!(
             input.store.folders[0].messages[0].attachments[1].mime_type,
-            None
+            Some(
+                "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+                    .to_owned()
+            )
         );
         assert_eq!(
             input.store.folders[0].messages[0].attachments[1].filename,
-            "Recovered attachment 1.bin"
+            "Recovered attachment 1.docx"
         );
         assert_eq!(
             input.store.folders[0].messages[0].attachments[2]
@@ -4123,7 +4142,7 @@ mod tests {
                 .reconstructions
                 .derived
                 .get(&ReconstructedField::AttachmentMimeType),
-            Some(&1)
+            Some(&2)
         );
         assert_eq!(
             input
@@ -4177,11 +4196,12 @@ mod tests {
         let attachment = &source_input.store.folders[0].messages[0].attachments[0];
         assert_eq!(attachment.mime_type.as_deref(), Some("application/x-owner"));
         assert_eq!(attachment.filename, "Recovered attachment 0.pdf");
-        assert!(
-            !source_input
+        assert_eq!(
+            source_input
                 .reconstructions
                 .derived
-                .contains_key(&ReconstructedField::AttachmentMimeType)
+                .get(&ReconstructedField::AttachmentMimeType),
+            Some(&1)
         );
         Ok(())
     }
@@ -4789,6 +4809,7 @@ mod tests {
                 index: 0,
                 attachment_type: Some(1),
                 filename: Some("huge.bin".to_owned()),
+                detected_mime: None,
                 declared_size: Some(2_147_483_648),
                 data: Some(SpooledBlob {
                     sha256: "0".repeat(64),
@@ -5153,6 +5174,7 @@ mod tests {
             index: 0,
             attachment_type: Some(5),
             filename: Some("original.msg".to_owned()),
+            detected_mime: None,
             declared_size: None,
             data: None,
             direct_id: None,
@@ -5302,6 +5324,7 @@ mod tests {
             index: 1,
             attachment_type: Some(i32::from(b'i')),
             filename: Some("nested.msg".to_owned()),
+            detected_mime: None,
             declared_size: None,
             data: None,
             direct_id: None,
@@ -5370,6 +5393,7 @@ mod tests {
                         index: 0,
                         attachment_type: Some(i32::from(b'i')),
                         filename: Some("nested.msg".to_owned()),
+                        detected_mime: None,
                         declared_size: None,
                         data: None,
                         direct_id: None,

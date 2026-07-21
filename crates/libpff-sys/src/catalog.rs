@@ -1,4 +1,5 @@
 use std::collections::HashSet;
+use std::io::{self, Read, Seek, SeekFrom};
 use std::ptr;
 use std::rc::Rc;
 
@@ -213,6 +214,12 @@ pub enum CatalogEvent<'a> {
         attachment_type: Option<i32>,
         data_size: Option<u64>,
         filename: Option<String>,
+        detected_mime: Option<String>,
+    },
+    AttachmentMimeProbe {
+        message_id: u32,
+        index: u32,
+        mime_type: String,
     },
     AttachmentData {
         message_id: u32,
@@ -273,12 +280,27 @@ pub trait CatalogSink {
         PayloadRequest::Full
     }
 
+    fn probe_attachment(
+        &mut self,
+        _message_id: u32,
+        _index: u32,
+        _byte_len: u64,
+        _filename: Option<&str>,
+        _reader: &mut dyn AttachmentDataReader,
+    ) -> Result<Option<String>, String> {
+        Ok(None)
+    }
+
     fn traversal_order(&self) -> TraversalOrder {
         TraversalOrder::Source
     }
 
     fn event(&mut self, event: CatalogEvent<'_>) -> Result<(), String>;
 }
+
+pub trait AttachmentDataReader: Read + Seek {}
+
+impl<T: Read + Seek> AttachmentDataReader for T {}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PayloadRequest {
@@ -318,10 +340,19 @@ pub struct RawCatalog {
     pub attachment_bytes: u64,
     pub issues: Vec<CatalogIssue>,
     pub issues_dropped: u64,
+    #[doc(hidden)]
+    pub active_message_issues: Vec<(u32, u64)>,
 }
 
 impl RawCatalog {
     fn record_issue(&mut self, issue: CatalogIssue) {
+        if let Some(node_id) = issue.node_id {
+            for (active_node_id, issue_count) in &mut self.active_message_issues {
+                if *active_node_id == node_id {
+                    *issue_count = issue_count.saturating_add(1);
+                }
+            }
+        }
         if self.issues.len() < MAX_CATALOG_ISSUES {
             self.issues.push(issue);
         } else {
@@ -333,31 +364,19 @@ impl RawCatalog {
 #[derive(Debug, Clone, Copy)]
 struct MessageIssueState {
     node_id: u32,
-    retained: usize,
-    dropped: u64,
 }
 
 impl MessageIssueState {
-    fn capture(catalog: &RawCatalog, node_id: u32) -> Self {
-        Self {
-            node_id,
-            retained: catalog
-                .issues
-                .iter()
-                .filter(|issue| issue.node_id == Some(node_id))
-                .count(),
-            dropped: catalog.issues_dropped,
-        }
+    fn capture(catalog: &mut RawCatalog, node_id: u32) -> Self {
+        catalog.active_message_issues.push((node_id, 0));
+        Self { node_id }
     }
 
-    fn unchanged(self, catalog: &RawCatalog) -> bool {
-        self.dropped == catalog.issues_dropped
-            && self.retained
-                == catalog
-                    .issues
-                    .iter()
-                    .filter(|issue| issue.node_id == Some(self.node_id))
-                    .count()
+    fn unchanged(self, catalog: &mut RawCatalog) -> bool {
+        matches!(
+            catalog.active_message_issues.pop(),
+            Some((node_id, 0)) if node_id == self.node_id
+        )
     }
 }
 
@@ -891,12 +910,13 @@ enum DeferredPayload {
         index: u32,
         expected: u64,
         prefix_bytes: u64,
+        attachment: PffItem,
     },
 }
 
 struct RetainedMessage {
     embedded_path: Vec<u32>,
-    item: PffItem,
+    _item: PffItem,
     _container: Option<PffItem>,
 }
 
@@ -952,7 +972,6 @@ fn process_message_inner(
         work.item.identifier(),
     )?;
     let identifier_complete = (catalog.issues.len(), catalog.issues_dropped) == issue_state;
-    let message_issue_state = MessageIssueState::capture(catalog, message_id);
     if stable_top_level_identifier_seen(visited, message_id, &work.embedded_path) {
         catalog.record_issue(CatalogIssue {
             node_id: Some(message_id),
@@ -961,6 +980,7 @@ fn process_message_inner(
         });
         return Ok(());
     }
+    let message_issue_state = MessageIssueState::capture(catalog, message_id);
     let messages = checked_increment(catalog.messages, "message count", MAX_MESSAGES)?;
     let recovered_messages = match work.provenance {
         CatalogProvenance::Recovered => checked_increment(
@@ -1148,7 +1168,7 @@ fn process_message_inner(
     )?;
     retained.push(RetainedMessage {
         embedded_path: work.embedded_path,
-        item: work.item,
+        _item: work.item,
         _container: work._container,
     });
     Ok(())
@@ -1263,6 +1283,7 @@ fn stream_attachments(
                         attachment_type: None,
                         data_size: None,
                         filename: None,
+                        detected_mime: None,
                     },
                 )?;
                 catalog.attachments =
@@ -1335,7 +1356,8 @@ fn stream_attachments(
                 index: index_u32,
                 attachment_type,
                 data_size,
-                filename,
+                filename: filename.clone(),
+                detected_mime: None,
             },
         )?;
         catalog.attachments =
@@ -1370,6 +1392,30 @@ fn stream_attachments(
                 operation: "get attachment size",
                 detail: "attachment data size is unavailable".to_owned(),
             })?;
+            let mut reader = PffAttachmentReader::new(&attachment, expected);
+            if let Some(mime_type) = sink
+                .probe_attachment(
+                    message_id,
+                    index_u32,
+                    expected,
+                    filename.as_deref(),
+                    &mut reader,
+                )
+                .map_err(|detail| PffError::Sink {
+                    operation: "probe attachment metadata",
+                    detail,
+                })?
+            {
+                emit(
+                    sink,
+                    "attachment MIME probe",
+                    CatalogEvent::AttachmentMimeProbe {
+                        message_id,
+                        index: index_u32,
+                        mime_type,
+                    },
+                )?;
+            }
             let request = sink.attachment_payload(message_id, index_u32, Some(expected));
             let result = data_size
                 .ok_or(PffError::Native {
@@ -1426,6 +1472,7 @@ fn stream_attachments(
                     index: index_u32,
                     expected,
                     prefix_bytes: actual,
+                    attachment,
                 });
                 emit(
                     sink,
@@ -1774,9 +1821,9 @@ fn stream_deferred_payloads(
                 index,
                 expected,
                 prefix_bytes,
+                attachment,
             } => {
-                let message = retained_message(retained, &embedded_path)?;
-                let attachment = message.item.attachment(u64::from(index))?;
+                let _message = retained_message(retained, &embedded_path)?;
                 let remaining = attachment.stream_attachment_deferred(
                     &embedded_path,
                     index,
@@ -2246,6 +2293,113 @@ impl Drop for PffRecordEntry {
     }
 }
 
+struct PffAttachmentReader<'a> {
+    item: &'a PffItem,
+    byte_len: u64,
+    position: u64,
+}
+
+impl<'a> PffAttachmentReader<'a> {
+    fn new(item: &'a PffItem, byte_len: u64) -> Self {
+        Self {
+            item,
+            byte_len,
+            position: 0,
+        }
+    }
+}
+
+impl Read for PffAttachmentReader<'_> {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        let remaining = self.byte_len.saturating_sub(self.position);
+        let requested =
+            usize::try_from(remaining.min(u64::try_from(buffer.len()).unwrap_or(u64::MAX)))
+                .map_err(|_| io::Error::other("attachment probe read length overflow"))?;
+        if requested == 0 {
+            return Ok(0);
+        }
+        let mut error = ptr::null_mut();
+        // SAFETY: the attachment handle is live for this bounded adapter and the output slice is
+        // writable for `requested` bytes.
+        let read = unsafe {
+            bindings::libpff_attachment_data_read_buffer(
+                self.item.raw,
+                buffer.as_mut_ptr(),
+                requested,
+                &mut error,
+            )
+        };
+        if read < 0 {
+            return Err(io::Error::other(native_error(
+                error,
+                "read attachment metadata probe",
+            )));
+        }
+        free_error(error);
+        let read = usize::try_from(read)
+            .map_err(|_| io::Error::other("attachment probe read size overflow"))?;
+        if read > requested {
+            return Err(io::Error::other(
+                "attachment probe returned more bytes than requested",
+            ));
+        }
+        self.position = self
+            .position
+            .checked_add(
+                u64::try_from(read)
+                    .map_err(|_| io::Error::other("attachment probe position overflow"))?,
+            )
+            .ok_or_else(|| io::Error::other("attachment probe position overflow"))?;
+        Ok(read)
+    }
+}
+
+impl Seek for PffAttachmentReader<'_> {
+    fn seek(&mut self, position: SeekFrom) -> io::Result<u64> {
+        let next = match position {
+            SeekFrom::Start(value) => i128::from(value),
+            SeekFrom::Current(value) => i128::from(self.position) + i128::from(value),
+            SeekFrom::End(value) => i128::from(self.byte_len) + i128::from(value),
+        };
+        if next < 0 || next > i128::from(self.byte_len) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "seek outside attachment metadata probe",
+            ));
+        }
+        let next =
+            u64::try_from(next).map_err(|_| io::Error::other("attachment probe seek overflow"))?;
+        let native_offset = i64::try_from(next)
+            .map_err(|_| io::Error::other("attachment probe seek exceeds libpff range"))?;
+        let mut error = ptr::null_mut();
+        // SAFETY: the live attachment stream accepts a bounded absolute seek from its start.
+        let observed = unsafe {
+            bindings::libpff_attachment_data_seek_offset(
+                self.item.raw,
+                native_offset,
+                0,
+                &mut error,
+            )
+        };
+        if observed < 0 {
+            return Err(io::Error::other(native_error(
+                error,
+                "seek attachment metadata probe",
+            )));
+        }
+        free_error(error);
+        let observed = u64::try_from(observed)
+            .map_err(|_| io::Error::other("attachment probe seek result overflow"))?;
+        if observed != next {
+            return Err(io::Error::other(
+                "libpff attachment probe seek returned an unexpected offset",
+            ));
+        }
+        self.position = observed;
+        Ok(observed)
+    }
+}
+
 impl PffItem {
     fn from_raw(raw: *mut libpff_item_t, operation: &'static str) -> Result<Self, PffError> {
         if raw.is_null() {
@@ -2628,26 +2782,9 @@ impl PffItem {
         let expected_remaining = expected - prefix_bytes;
         let mut total = 0_u64;
         let mut buffer = vec![0_u8; STREAM_CHUNK_BYTES];
-        let prefix_offset = i64::try_from(prefix_bytes).map_err(|_| PffError::InvalidValue {
-            field: "attachment prefix size",
-            value: i64::MAX,
-        })?;
-        let mut error = ptr::null_mut();
-        // SAFETY: self.raw is valid; SEEK_SET positions the reacquired stream at the prefix boundary.
-        let offset = unsafe {
-            bindings::libpff_attachment_data_seek_offset(self.raw, prefix_offset, 0, &mut error)
-        };
-        if offset < 0 {
-            return Err(native_error(error, "seek deferred attachment data"));
-        }
-        free_error(error);
-        if offset != prefix_offset {
-            return Err(PffError::StreamSizeMismatch {
-                field: "deferred attachment offset",
-                expected: prefix_bytes,
-                actual: u64::try_from(offset).unwrap_or(u64::MAX),
-            });
-        }
+        // The deferred payload owns the exact attachment handle used for the prefix read.
+        // Continue that stream in place: reacquiring the attachment by index is not stable for
+        // damaged tables and can resolve a different or unreadable record.
         while total < expected_remaining {
             let requested = usize::try_from(
                 expected_remaining
@@ -2658,7 +2795,7 @@ impl PffItem {
                 field: "attachment read size",
                 value: i64::MAX,
             })?;
-            error = ptr::null_mut();
+            let mut error = ptr::null_mut();
             // SAFETY: self.raw is valid and buffer is writable for its declared size.
             let read = unsafe {
                 bindings::libpff_attachment_data_read_buffer(
@@ -3251,19 +3388,41 @@ mod tests {
     #[test]
     fn message_issue_state_ignores_retained_child_issues() {
         let mut catalog = RawCatalog::default();
-        let parent = MessageIssueState::capture(&catalog, 7);
+        let parent = MessageIssueState::capture(&mut catalog, 7);
+        let child = MessageIssueState::capture(&mut catalog, 8);
         catalog.record_issue(CatalogIssue {
             node_id: Some(8),
             operation: "embedded child",
             message: "child issue".to_owned(),
         });
-        assert!(parent.unchanged(&catalog));
+        assert!(!child.unchanged(&mut catalog));
 
         catalog.record_issue(CatalogIssue {
             node_id: Some(7),
             operation: "parent",
             message: "parent issue".to_owned(),
         });
-        assert!(!parent.unchanged(&catalog));
+        assert!(!parent.unchanged(&mut catalog));
+    }
+
+    #[test]
+    fn message_issue_state_ignores_dropped_child_issues() {
+        let mut catalog = RawCatalog::default();
+        for _ in 0..MAX_CATALOG_ISSUES {
+            catalog.record_issue(CatalogIssue {
+                node_id: None,
+                operation: "fill diagnostics",
+                message: "test".to_owned(),
+            });
+        }
+        let parent = MessageIssueState::capture(&mut catalog, 7);
+        let child = MessageIssueState::capture(&mut catalog, 8);
+        catalog.record_issue(CatalogIssue {
+            node_id: Some(8),
+            operation: "embedded child",
+            message: "dropped child issue".to_owned(),
+        });
+        assert!(!child.unchanged(&mut catalog));
+        assert!(parent.unchanged(&mut catalog));
     }
 }

@@ -1,3 +1,9 @@
+pstforge (0.6.0) unstable; urgency=medium
+
+  * Begin the interoperability release-candidate acceptance milestone.
+
+ -- PSTForge Maintainers <noreply@pstforge.invalid>  Tue, 21 Jul 2026 18:53:56 +0000
+
 pstforge (0.5.1) unstable; urgency=medium
 
   * Add public CI and scheduled security and fuzz checks.

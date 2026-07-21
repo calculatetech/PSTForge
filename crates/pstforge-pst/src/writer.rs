@@ -1018,8 +1018,20 @@ struct ExternalTableBuild {
     blocks: Vec<BlockSpec>,
 }
 
+struct TableBuild {
+    data_block: UnicodeBlockId,
+    subnode_block: Option<UnicodeBlockId>,
+    blocks: Vec<BlockSpec>,
+}
+
 struct ExternalPropertyBuild {
     data_block: UnicodeBlockId,
+    blocks: Vec<BlockSpec>,
+}
+
+struct NamedPropertyMapBuild {
+    data_block: UnicodeBlockId,
+    subnode_block: Option<UnicodeBlockId>,
     blocks: Vec<BlockSpec>,
 }
 
@@ -2769,7 +2781,7 @@ pub fn validate_mail_store_input(spec: &MailStoreSpec) -> Result<(), WriterError
         let folder_plans = plan_folders(fallback, &messages, Some(&spec.folders))?;
         validate_folder_hierarchy_shapes(&folder_plans)?;
         let named_identities = collect_named_identities_many_refs(&messages);
-        property_context(&named_property_map(&named_identities)?)?;
+        property_context_logical_size(&named_property_map(&named_identities)?)?;
         for folder in &spec.folders {
             for message in &folder.messages {
                 validate_aggregate_properties(message)?;
@@ -2789,6 +2801,7 @@ pub fn validate_mail_store_input(spec: &MailStoreSpec) -> Result<(), WriterError
 
 fn validate_folder_hierarchy_shapes(folders: &[FolderPlan<'_>]) -> Result<(), WriterError> {
     let columns = hierarchy_columns()?;
+    let mut next_block_index = 0x10_0000_u64;
     for folder in folders {
         let rows = folder
             .children
@@ -2808,7 +2821,7 @@ fn validate_folder_hierarchy_shapes(folders: &[FolderPlan<'_>]) -> Result<(), Wr
                 ))
             })
             .collect::<Result<Vec<_>, WriterError>>()?;
-        table_context(&columns, &rows)?;
+        build_table_context(&columns, &rows, &mut next_block_index, None)?;
     }
     let deleted = node(NodeIdType::NormalFolder, DELETED_FOLDER_INDEX)?;
     let deleted_plan = folders.iter().find(|folder| folder.node == deleted);
@@ -2844,7 +2857,7 @@ fn validate_folder_hierarchy_shapes(folders: &[FolderPlan<'_>]) -> Result<(), Wr
             &folder.container_class,
         ));
     }
-    table_context(&columns, &rows)?;
+    build_table_context(&columns, &rows, &mut next_block_index, None)?;
     Ok(())
 }
 
@@ -3283,10 +3296,9 @@ fn build_finalization_plan(
             });
         }
 
-        let hierarchy_block = if folder.children.is_empty() {
-            leaf_bid(9)?
+        let (hierarchy_block, hierarchy_subnode) = if folder.children.is_empty() {
+            (leaf_bid(9)?, None)
         } else {
-            let block = take_block_id(&mut next_block_index, false)?;
             let rows = folder
                 .children
                 .iter()
@@ -3305,12 +3317,12 @@ fn build_finalization_plan(
                     ))
                 })
                 .collect::<Result<Vec<_>, WriterError>>()?;
-            folder_blocks.push(BlockSpec {
-                id: block,
-                payload: BlockPayload::Data(table_context(hierarchy_columns, &rows)?),
-                ref_count: 2,
-            });
-            block
+            let hierarchy =
+                build_table_context(hierarchy_columns, &rows, &mut next_block_index, None)?;
+            let data = hierarchy.data_block;
+            let subnode = hierarchy.subnode_block;
+            folder_blocks.extend(hierarchy.blocks);
+            (data, subnode)
         };
 
         let rows = contents_rows.remove(&folder.node).unwrap_or_default();
@@ -3402,6 +3414,7 @@ fn build_finalization_plan(
             parent,
             property_block,
             hierarchy_block,
+            hierarchy_subnode,
             contents_block,
             contents_subnode,
             associated_block,
@@ -3488,6 +3501,26 @@ fn build_finalization_plan(
         u16::try_from(base.saturating_add(extra))
             .map_err(|_| WriterError::ValueTooLarge("shared block reference count"))
     };
+    let root_hierarchy = build_table_context(
+        hierarchy_columns,
+        &root_rows,
+        &mut next_block_index,
+        Some(leaf_bid(4)?),
+    )?;
+    let root_hierarchy_node = (root_hierarchy.data_block, root_hierarchy.subnode_block);
+    let ipm_hierarchy = build_table_context(
+        hierarchy_columns,
+        &ipm_rows,
+        &mut next_block_index,
+        Some(leaf_bid(7)?),
+    )?;
+    let ipm_hierarchy_node = (ipm_hierarchy.data_block, ipm_hierarchy.subnode_block);
+    let named_property_context =
+        build_named_property_context(named_identities, &mut next_block_index)?;
+    let named_property_node = (
+        named_property_context.data_block,
+        named_property_context.subnode_block,
+    );
     let mut blocks = vec![
         BlockSpec {
             id: leaf_bid(1)?,
@@ -3500,18 +3533,8 @@ fn build_finalization_plan(
             ref_count: 2,
         },
         BlockSpec {
-            id: leaf_bid(2)?,
-            payload: BlockPayload::Data(property_context(&named_property_map(named_identities)?)?),
-            ref_count: 2,
-        },
-        BlockSpec {
             id: leaf_bid(3)?,
             payload: BlockPayload::Data(property_context(&folder_properties("", 0, true))?),
-            ref_count: 2,
-        },
-        BlockSpec {
-            id: leaf_bid(4)?,
-            payload: BlockPayload::Data(table_context(hierarchy_columns, &root_rows)?),
             ref_count: 2,
         },
         BlockSpec {
@@ -3529,11 +3552,6 @@ fn build_finalization_plan(
                 0,
                 true,
             ))?),
-            ref_count: 2,
-        },
-        BlockSpec {
-            id: leaf_bid(7)?,
-            payload: BlockPayload::Data(table_context(hierarchy_columns, &ipm_rows)?),
             ref_count: 2,
         },
         BlockSpec {
@@ -3656,6 +3674,9 @@ fn build_finalization_plan(
             ref_count: 2,
         },
     ];
+    blocks.extend(named_property_context.blocks);
+    blocks.extend(root_hierarchy.blocks);
+    blocks.extend(ipm_hierarchy.blocks);
     blocks.extend(folder_blocks);
     if let Some(message) = single_message {
         blocks.extend(built_message_block_specs(message, &mut next_block_index)?);
@@ -3664,6 +3685,9 @@ fn build_finalization_plan(
     let nodes = node_entries(
         root_folder,
         ipm_folder,
+        named_property_node,
+        root_hierarchy_node,
+        ipm_hierarchy_node,
         search_root,
         deleted_folder,
         spam_search,
@@ -9362,6 +9386,40 @@ fn build_property_context(
     }
 }
 
+fn build_named_property_context(
+    named_identities: &[NamedIdentity],
+    next_block_index: &mut u64,
+) -> Result<NamedPropertyMapBuild, WriterError> {
+    let mut properties = named_property_map(named_identities)?;
+    let mut blocks = Vec::new();
+    let mut subnodes = Vec::new();
+    let mut next_value_node = 0x5_0000_u32;
+    externalize_large_properties(
+        &mut properties,
+        next_block_index,
+        &mut next_value_node,
+        &mut blocks,
+        &mut subnodes,
+    )?;
+    let context = build_property_context(&properties, leaf_bid(2)?, next_block_index)?;
+    let data_block = context.data_block;
+    blocks.extend(context.blocks);
+    let subnode_block = if subnodes.is_empty() {
+        None
+    } else {
+        Some(append_subnode_tree(
+            subnodes,
+            next_block_index,
+            &mut blocks,
+        )?)
+    };
+    Ok(NamedPropertyMapBuild {
+        data_block,
+        subnode_block,
+        blocks,
+    })
+}
+
 fn property_context_external(
     properties: &[(u16, PropertyValue)],
 ) -> Result<Vec<Vec<u8>>, WriterError> {
@@ -10571,6 +10629,40 @@ fn table_context_external(
     })
 }
 
+fn build_table_context(
+    columns: &[TableColumnDescriptor],
+    rows: &[TableRowSpec],
+    next_block_index: &mut u64,
+    compact_block: Option<UnicodeBlockId>,
+) -> Result<TableBuild, WriterError> {
+    match table_context(columns, rows) {
+        Ok(table) => {
+            let data_block = match compact_block {
+                Some(block) => block,
+                None => take_block_id(next_block_index, false)?,
+            };
+            Ok(TableBuild {
+                data_block,
+                subnode_block: None,
+                blocks: vec![BlockSpec {
+                    id: data_block,
+                    payload: BlockPayload::Data(table),
+                    ref_count: 2,
+                }],
+            })
+        }
+        Err(WriterError::ValueTooLarge("heap page")) => {
+            let external = table_context_external(columns, rows, next_block_index)?;
+            Ok(TableBuild {
+                data_block: external.data_block,
+                subnode_block: Some(external.subnode_block),
+                blocks: external.blocks,
+            })
+        }
+        Err(error) => Err(error),
+    }
+}
+
 fn fill_heap_page(page: &mut Vec<u8>) -> Result<(), WriterError> {
     if page.len() >= MAX_DATA_BLOCK_PAYLOAD {
         if page.len() == MAX_DATA_BLOCK_PAYLOAD {
@@ -11340,15 +11432,20 @@ struct TopFolderNode {
     parent: NodeId,
     property_block: UnicodeBlockId,
     hierarchy_block: UnicodeBlockId,
+    hierarchy_subnode: Option<UnicodeBlockId>,
     contents_block: UnicodeBlockId,
     contents_subnode: Option<UnicodeBlockId>,
     associated_block: UnicodeBlockId,
     associated_subnode: Option<UnicodeBlockId>,
 }
 
+#[allow(clippy::too_many_arguments)]
 fn node_entries(
     root: NodeId,
     ipm: NodeId,
+    named_property: (UnicodeBlockId, Option<UnicodeBlockId>),
+    root_hierarchy: (UnicodeBlockId, Option<UnicodeBlockId>),
+    ipm_hierarchy: (UnicodeBlockId, Option<UnicodeBlockId>),
     search_root: NodeId,
     deleted: NodeId,
     spam_search: NodeId,
@@ -11358,6 +11455,7 @@ fn node_entries(
     let deleted_override = folders.iter().find(|folder| folder.node == deleted);
     let deleted_property = deleted_override.map_or(leaf_bid(8)?, |folder| folder.property_block);
     let deleted_hierarchy = deleted_override.map_or(leaf_bid(9)?, |folder| folder.hierarchy_block);
+    let deleted_hierarchy_subnode = deleted_override.and_then(|folder| folder.hierarchy_subnode);
     let deleted_contents = deleted_override.map_or(leaf_bid(5)?, |folder| folder.contents_block);
     let deleted_contents_subnode = deleted_override.and_then(|folder| folder.contents_subnode);
     let deleted_associated =
@@ -11365,7 +11463,7 @@ fn node_entries(
     let deleted_associated_subnode = deleted_override.and_then(|folder| folder.associated_subnode);
     let mut entries = vec![
         UnicodeNodeBTreeEntry::new(NID_MESSAGE_STORE, leaf_bid(1)?, None, None),
-        UnicodeNodeBTreeEntry::new(NID_NAME_TO_ID_MAP, leaf_bid(2)?, None, None),
+        UnicodeNodeBTreeEntry::new(NID_NAME_TO_ID_MAP, named_property.0, named_property.1, None),
         UnicodeNodeBTreeEntry::new(
             NID_SEARCH_MANAGEMENT_QUEUE,
             UnicodeBlockId::default(),
@@ -11447,11 +11545,21 @@ fn node_entries(
             None,
         ),
         UnicodeNodeBTreeEntry::new(root, leaf_bid(3)?, None, Some(root)),
-        table_node(root, NodeIdType::HierarchyTable, leaf_bid(4)?)?,
+        table_node_with_subnode(
+            root,
+            NodeIdType::HierarchyTable,
+            root_hierarchy.0,
+            root_hierarchy.1,
+        )?,
         table_node(root, NodeIdType::ContentsTable, leaf_bid(5)?)?,
         table_node(root, NodeIdType::AssociatedContentsTable, leaf_bid(13)?)?,
         UnicodeNodeBTreeEntry::new(ipm, leaf_bid(6)?, None, Some(root)),
-        table_node(ipm, NodeIdType::HierarchyTable, leaf_bid(7)?)?,
+        table_node_with_subnode(
+            ipm,
+            NodeIdType::HierarchyTable,
+            ipm_hierarchy.0,
+            ipm_hierarchy.1,
+        )?,
         table_node(ipm, NodeIdType::ContentsTable, leaf_bid(5)?)?,
         table_node(ipm, NodeIdType::AssociatedContentsTable, leaf_bid(13)?)?,
         UnicodeNodeBTreeEntry::new(search_root, leaf_bid(14)?, None, Some(root)),
@@ -11463,7 +11571,12 @@ fn node_entries(
             leaf_bid(13)?,
         )?,
         UnicodeNodeBTreeEntry::new(deleted, deleted_property, None, Some(ipm)),
-        table_node(deleted, NodeIdType::HierarchyTable, deleted_hierarchy)?,
+        table_node_with_subnode(
+            deleted,
+            NodeIdType::HierarchyTable,
+            deleted_hierarchy,
+            deleted_hierarchy_subnode,
+        )?,
         table_node_with_subnode(
             deleted,
             NodeIdType::ContentsTable,
@@ -11508,7 +11621,7 @@ fn node_entries(
                 folder.node,
                 NodeIdType::HierarchyTable,
                 folder.hierarchy_block,
-                None,
+                folder.hierarchy_subnode,
             )?,
             table_node_with_subnode(
                 folder.node,
@@ -14687,7 +14800,7 @@ mod tests {
     }
 
     #[test]
-    fn mail_store_preflight_contains_hierarchy_and_huge_attachment_shapes() {
+    fn mail_store_preflight_accepts_scalable_hierarchy_and_contains_huge_attachment_shapes() {
         let base = FidelityStore::default();
         let many_folders = MailStoreSpec {
             store_name: "PSTForge hierarchy limit".to_owned(),
@@ -14703,10 +14816,7 @@ mod tests {
                 })
                 .collect(),
         };
-        assert!(matches!(
-            validate_mail_store_input(&many_folders),
-            Err(WriterError::InputRejected(_))
-        ));
+        assert!(validate_mail_store_input(&many_folders).is_ok());
 
         let mut huge_message = base.message;
         huge_message.attachments = vec![AttachmentSpec {
@@ -15393,6 +15503,50 @@ mod tests {
     }
 
     #[test]
+    fn scalable_hierarchy_table_round_trips() -> Result<(), Box<dyn std::error::Error>> {
+        const FOLDER_COUNT: usize = 220;
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("scalable-hierarchy.pst");
+        let base = FidelityStore::default();
+        let folders = (0..FOLDER_COUNT)
+            .map(|index| MailFolderSpec {
+                path: vec![format!("Folder {index:04}")],
+                location: MailFolderLocation::IpmSubtree,
+                role: MailFolderRole::Ordinary,
+                container_class: "IPF.Note".to_owned(),
+                messages: (index == 0)
+                    .then(|| base.message.clone())
+                    .into_iter()
+                    .collect(),
+                associated_messages: Vec::new(),
+            })
+            .collect();
+        let spec = MailStoreSpec {
+            store_name: "PSTForge scalable hierarchy".to_owned(),
+            record_key: base.record_key,
+            folders,
+        };
+
+        create_mail_store(&path, &spec)?;
+
+        let store = open_store(&path)?;
+        let ipm = store.open_folder(
+            &store
+                .properties()
+                .make_entry_id(node(NodeIdType::NormalFolder, IPM_FOLDER_INDEX)?)?,
+        )?;
+        let hierarchy = ipm.hierarchy_table().ok_or("missing IPM hierarchy")?;
+        assert_eq!(hierarchy.rows_matrix().count(), FOLDER_COUNT + 1);
+        for index in [0_u32, 109, 219] {
+            let folder = node(NodeIdType::NormalFolder, MAIL_FOLDER_INDEX + index)?;
+            hierarchy.find_row(crate::ltp::table_context::TableRowId::new(u32::from(
+                folder,
+            )))?;
+        }
+        Ok(())
+    }
+
+    #[test]
     fn mail_store_reproduces_required_nested_folder_paths() -> Result<(), Box<dyn std::error::Error>>
     {
         let directory = tempfile::tempdir()?;
@@ -16051,6 +16205,59 @@ mod tests {
             .ok_or("missing named-property string stream")?;
         assert!(matches!(&strings.1, PropertyValue::Binary(bytes) if !bytes.is_empty()));
         assert_eq!(map.iter().filter(|(id, _)| *id >= 0x1000).count(), 2);
+        Ok(())
+    }
+
+    #[test]
+    fn scalable_named_property_map_round_trips() -> Result<(), Box<dyn std::error::Error>> {
+        use crate::messaging::store::Store as _;
+
+        const IDENTITY_COUNT: u32 = 600;
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("scalable-nameid.pst");
+        let fixture = FidelityStore::default();
+        let layout = MailStoreSpec {
+            store_name: fixture.store_name,
+            record_key: fixture.record_key,
+            folders: vec![MailFolderSpec {
+                path: vec!["Inbox".to_owned()],
+                location: MailFolderLocation::IpmSubtree,
+                role: MailFolderRole::Ordinary,
+                container_class: "IPF.Note".to_owned(),
+                messages: Vec::new(),
+                associated_messages: Vec::new(),
+            }],
+        };
+        let mut catalog = NamedPropertyCatalog::default();
+        for identifier in 0..IDENTITY_COUNT {
+            catalog.observe(
+                NamedPropertySet::Mapi,
+                NamedPropertyName::Numeric(0x9000_u32 + identifier),
+            );
+        }
+        let mut message = fixture.message;
+        message.attachments.clear();
+        catalog.observe_message(&message);
+        let expected = catalog.identities.iter().cloned().collect::<Vec<_>>();
+        assert!(matches!(
+            property_context(&named_property_map(&expected)?),
+            Err(WriterError::ValueTooLarge("heap page"))
+        ));
+
+        let mut writer = TransactionalMailStoreWriter::begin(&path, layout, &catalog, true, None)?;
+        writer.append_message_deferred(
+            MailFolderLocation::IpmSubtree,
+            &["Inbox".to_owned()],
+            false,
+            message,
+            &NEVER_INTERRUPTED,
+        )?;
+        writer.finalize_constructed(&NEVER_INTERRUPTED)?;
+
+        let pst = std::rc::Rc::new(UnicodePstFile::open(&path)?);
+        let store = crate::messaging::store::UnicodeStore::read(pst)?;
+        let actual = store.named_property_map()?;
+        validate_named_map(actual.as_ref(), &expected)?;
         Ok(())
     }
 

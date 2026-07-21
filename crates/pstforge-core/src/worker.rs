@@ -99,6 +99,12 @@ enum ControlFrame {
         attachment_type: Option<i32>,
         data_size: Option<u64>,
         filename: Option<String>,
+        detected_mime: Option<String>,
+    },
+    AttachmentMimeProbe {
+        message_id: u32,
+        index: u32,
+        mime_type: String,
     },
     AttachmentData {
         message_id: u32,
@@ -842,6 +848,15 @@ impl<'a> DirectProtocolSource<'a> {
                     ));
                 }
             }
+            ControlFrame::AttachmentMimeProbe {
+                message_id, index, ..
+            } => {
+                if self.attachments.last() != Some(&(message_id, index)) {
+                    return Err(direct_protocol_error(
+                        "worker attachment MIME probe has inconsistent ownership",
+                    ));
+                }
+            }
             ControlFrame::PropertyStart { descriptor } => {
                 self.validate_property_owner(descriptor)?;
                 if self.property.replace(descriptor).is_some() {
@@ -1509,6 +1524,24 @@ impl CatalogSink for ProtocolSink<'_> {
         }
     }
 
+    fn probe_attachment(
+        &mut self,
+        _message_id: u32,
+        _index: u32,
+        byte_len: u64,
+        filename: Option<&str>,
+        reader: &mut dyn libpff_sys::AttachmentDataReader,
+    ) -> Result<Option<String>, String> {
+        let mut reader = AttachmentProbeReader(reader);
+        match crate::attachment_mime::detect(&mut reader, byte_len, filename) {
+            Ok(value) => Ok(value.map(str::to_owned)),
+            Err(error) => {
+                tracing::debug!(error = %error, "attachment MIME probe was inconclusive");
+                Ok(None)
+            }
+        }
+    }
+
     fn traversal_order(&self) -> TraversalOrder {
         if self.writer_order {
             TraversalOrder::Direct
@@ -1627,12 +1660,23 @@ impl CatalogSink for ProtocolSink<'_> {
                 attachment_type,
                 data_size,
                 filename,
+                detected_mime,
             } => self.send(&ControlFrame::AttachmentStart {
                 message_id,
                 index,
                 attachment_type,
                 data_size,
                 filename,
+                detected_mime,
+            }),
+            CatalogEvent::AttachmentMimeProbe {
+                message_id,
+                index,
+                mime_type,
+            } => self.send(&ControlFrame::AttachmentMimeProbe {
+                message_id,
+                index,
+                mime_type,
             }),
             CatalogEvent::AttachmentData {
                 message_id,
@@ -1745,6 +1789,20 @@ impl CatalogSink for ProtocolSink<'_> {
             CatalogEvent::TopLevelMetadataEnd => self.send(&ControlFrame::TopLevelMetadataEnd),
             CatalogEvent::TopLevelPayloadEnd => self.send(&ControlFrame::TopLevelPayloadEnd),
         }
+    }
+}
+
+struct AttachmentProbeReader<'a>(&'a mut dyn libpff_sys::AttachmentDataReader);
+
+impl Read for AttachmentProbeReader<'_> {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        self.0.read(buffer)
+    }
+}
+
+impl std::io::Seek for AttachmentProbeReader<'_> {
+    fn seek(&mut self, position: std::io::SeekFrom) -> std::io::Result<u64> {
+        self.0.seek(position)
     }
 }
 
@@ -2239,12 +2297,23 @@ fn send_control_to_sink<S: CatalogSink + ?Sized>(
             attachment_type,
             data_size,
             filename,
+            detected_mime,
         } => CatalogEvent::AttachmentStart {
             message_id,
             index,
             attachment_type,
             data_size,
             filename,
+            detected_mime,
+        },
+        ControlFrame::AttachmentMimeProbe {
+            message_id,
+            index,
+            mime_type,
+        } => CatalogEvent::AttachmentMimeProbe {
+            message_id,
+            index,
+            mime_type,
         },
         ControlFrame::AttachmentEnd { message_id, index } => {
             CatalogEvent::AttachmentEnd { message_id, index }
@@ -2671,6 +2740,7 @@ mod tests {
                 attachment_type: Some(i32::from(b'f')),
                 data_size: Some(3),
                 filename: None,
+                detected_mime: None,
             },
         )?;
         write_control(
@@ -2887,6 +2957,7 @@ mod tests {
                     attachment_type: Some(5),
                     data_size: None,
                     filename: None,
+                    detected_mime: None,
                 },
             )?;
             write_control(
@@ -2918,6 +2989,7 @@ mod tests {
                     attachment_type: Some(i32::from(b'f')),
                     data_size: Some(3),
                     filename: None,
+                    detected_mime: None,
                 },
             )?;
             write_control(
@@ -3334,6 +3406,7 @@ mod tests {
             attachment_type: Some(i32::from(b'i')),
             data_size: None,
             filename: None,
+            detected_mime: None,
         })?;
         sink.event(CatalogEvent::AttachmentEnd {
             message_id: 99,
@@ -3375,6 +3448,7 @@ mod tests {
             attachment_type: Some(i32::from(b'i')),
             data_size: None,
             filename: None,
+            detected_mime: None,
         })?;
         output.event(CatalogEvent::AttachmentEnd {
             message_id: 20,
