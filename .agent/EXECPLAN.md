@@ -3892,6 +3892,13 @@ not modified.
     `.agent/test-results/1784753630-release`; the final reproducible package
     SHA-256 after review remediation is
     `6ce43322a3665ca78578d8c70e987d60b823c5a95010d0a935ce77d24232eace`.
+    PR #4 merged through the protected gate as `f8b167e`, and the approved
+    annotated `v1.0.0` tag points to that merge. The first protected release
+    build reached its immutable-tag check but Debian's containerized Git
+    rejected the checkout as dubious ownership before evaluating the tag.
+    Release automation now explicitly trusts only `GITHUB_WORKSPACE` before
+    invoking Git; this workflow-only correction does not change tagged source
+    or package contents.
 
 ## Surprises & Discoveries
 
