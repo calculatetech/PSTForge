@@ -35,6 +35,8 @@ jobs:
           ref: ${{ inputs.tag }}
           fetch-depth: 0
           persist-credentials: false
+      - name: Trust container checkout
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
       - name: Verify immutable release tag
         env:
           RELEASE_TAG: ${{ inputs.tag }}
