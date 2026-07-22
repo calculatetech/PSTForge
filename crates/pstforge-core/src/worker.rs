@@ -305,6 +305,7 @@ pub(crate) struct DirectProtocolSource<'a> {
     completed_catalog: Option<WorkerCatalog>,
     pending: Option<ControlFrame>,
     complete: bool,
+    empty_top_level_boundaries: u64,
     progress: Option<Box<dyn FnMut() + 'a>>,
 }
 
@@ -328,6 +329,7 @@ impl<'a> DirectProtocolSource<'a> {
             completed_catalog: None,
             pending: None,
             complete: false,
+            empty_top_level_boundaries: 0,
             progress: None,
         }
     }
@@ -355,14 +357,18 @@ impl<'a> DirectProtocolSource<'a> {
                             "top-level metadata ended inside an active message",
                         ));
                     }
-                    root.take()
-                        .ok_or_else(|| {
-                            direct_protocol_error(
-                                "top-level metadata ended without a message graph",
-                            )
-                        })?
-                        .emit(job)
-                        .map_err(worker_writer_error)?;
+                    let Some(root) = root.take() else {
+                        if self.empty_top_level_boundaries == 0 {
+                            tracing::warn!(
+                                "direct traversal skipped empty top-level metadata boundaries; further occurrences are suppressed"
+                            );
+                        }
+                        self.empty_top_level_boundaries =
+                            self.empty_top_level_boundaries.saturating_add(1);
+                        self.finish_top_level_message()?;
+                        continue;
+                    };
+                    root.emit(job).map_err(worker_writer_error)?;
                     let candidate = job
                         .next_direct_top_level_candidate(after_rowid)
                         .map_err(|error| direct_protocol_error(error.to_string()))?
@@ -371,6 +377,15 @@ impl<'a> DirectProtocolSource<'a> {
                                 "worker completed candidate metadata without a durable candidate",
                             )
                         })?;
+                    if job
+                        .candidate_is_terminal(&candidate.item_key)
+                        .map_err(|error| direct_protocol_error(error.to_string()))?
+                    {
+                        self.path_keys.clear();
+                        self.prefixes.clear();
+                        self.unbound_prefixes.clear();
+                        return Ok(Some(candidate));
+                    }
                     let tree = job
                         .spooled_candidate_tree_interruptible(&candidate.item_key, interrupted)
                         .map_err(|error| direct_protocol_error(error.to_string()))?;
@@ -401,6 +416,12 @@ impl<'a> DirectProtocolSource<'a> {
                     return Ok(Some(candidate));
                 }
                 ControlFrame::Complete { catalog } => {
+                    if self.empty_top_level_boundaries != 0 {
+                        tracing::warn!(
+                            skipped_boundaries = self.empty_top_level_boundaries,
+                            "direct traversal completed after skipping empty top-level metadata boundaries"
+                        );
+                    }
                     self.completed_catalog = Some(catalog);
                     self.complete = true;
                     return Ok(None);
@@ -2428,6 +2449,7 @@ mod tests {
     use std::collections::HashMap;
     use std::io::{BufWriter, Cursor, Write};
     use std::rc::Rc;
+    use std::sync::atomic::AtomicBool;
 
     use libpff_sys::{
         CatalogEvent, CatalogIssue, CatalogProvenance, CatalogSink, NamedPropertyIdentity,
@@ -3505,6 +3527,155 @@ mod tests {
         assert_eq!(mail.len(), 1);
         assert_eq!(mail[0].attachments.len(), 1);
         assert!(mail[0].attachments[0].embedded.is_some());
+        Ok(())
+    }
+
+    #[test]
+    fn direct_one_pass_skips_an_unsupported_top_level_candidate()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let mut job = pstforge_job::DurableCatalogSink::create(&directory.path().join("job"))?;
+        let unit = libpff_sys::RecoveryUnit::Recovered { index: 0 };
+        let mut bytes = Vec::new();
+        write_control(&mut bytes, &ControlFrame::UnitStart { unit })?;
+        write_control(
+            &mut bytes,
+            &ControlFrame::MessageStart {
+                id: 33,
+                provenance: CatalogProvenance::Recovered,
+                recovery_index: Some(0),
+                folder_id: None,
+                parent_message_id: None,
+                parent_attachment_index: None,
+                embedded_path: Vec::new(),
+                associated: false,
+                item_type: Some(14),
+                message_class: None,
+                subject: None,
+                sender_name: None,
+                sender_email: None,
+                submit_filetime: None,
+                delivery_filetime: None,
+                supported: false,
+            },
+        )?;
+        write_control(
+            &mut bytes,
+            &ControlFrame::MessageEnd {
+                id: 33,
+                complete: false,
+            },
+        )?;
+        write_control(&mut bytes, &ControlFrame::TopLevelMetadataEnd)?;
+        write_control(&mut bytes, &ControlFrame::TopLevelPayloadEnd)?;
+        write_control(&mut bytes, &ControlFrame::UnitEnd { unit })?;
+        write_control(
+            &mut bytes,
+            &ControlFrame::Complete {
+                catalog: WorkerCatalog {
+                    messages: 1,
+                    recovered_messages: 1,
+                    unsupported_messages: 1,
+                    ..WorkerCatalog::default()
+                },
+            },
+        )?;
+
+        let mut input = Cursor::new(bytes);
+        let mut source =
+            DirectProtocolSource::new(&mut input, HashMap::new(), DirectCandidateBindings::new());
+        let interrupted = AtomicBool::new(false);
+        let candidate = source
+            .next_one_pass_candidate(&mut job, 0, &interrupted)?
+            .ok_or("unsupported candidate was not returned")?;
+        assert_eq!(candidate.item_key, "recovered:33:0:0");
+        assert!(job.candidate_is_terminal(&candidate.item_key)?);
+        source.finish_top_level_message()?;
+        assert!(
+            source
+                .next_one_pass_candidate(&mut job, candidate.rowid, &interrupted)?
+                .is_none()
+        );
+        assert!(source.is_complete());
+        source.require_end_of_stream()?;
+        Ok(())
+    }
+
+    #[test]
+    fn direct_one_pass_skips_an_empty_duplicate_boundary() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let directory = tempfile::tempdir()?;
+        let mut job = pstforge_job::DurableCatalogSink::create(&directory.path().join("job"))?;
+        let mut bytes = Vec::new();
+        let empty_unit = libpff_sys::RecoveryUnit::Recovered { index: 0 };
+        write_control(&mut bytes, &ControlFrame::UnitStart { unit: empty_unit })?;
+        write_control(&mut bytes, &ControlFrame::TopLevelMetadataEnd)?;
+        write_control(&mut bytes, &ControlFrame::TopLevelPayloadEnd)?;
+        write_control(&mut bytes, &ControlFrame::UnitEnd { unit: empty_unit })?;
+        let message_unit = libpff_sys::RecoveryUnit::Recovered { index: 1 };
+        write_control(&mut bytes, &ControlFrame::UnitStart { unit: message_unit })?;
+        write_control(
+            &mut bytes,
+            &ControlFrame::MessageStart {
+                id: 44,
+                provenance: CatalogProvenance::Recovered,
+                recovery_index: Some(1),
+                folder_id: None,
+                parent_message_id: None,
+                parent_attachment_index: None,
+                embedded_path: Vec::new(),
+                associated: false,
+                item_type: Some(14),
+                message_class: Some("IPM.Note".to_owned()),
+                subject: None,
+                sender_name: None,
+                sender_email: None,
+                submit_filetime: None,
+                delivery_filetime: None,
+                supported: true,
+            },
+        )?;
+        write_control(
+            &mut bytes,
+            &ControlFrame::MessageEnd {
+                id: 44,
+                complete: true,
+            },
+        )?;
+        write_control(&mut bytes, &ControlFrame::TopLevelMetadataEnd)?;
+        write_control(&mut bytes, &ControlFrame::TopLevelPayloadEnd)?;
+        write_control(&mut bytes, &ControlFrame::UnitEnd { unit: message_unit })?;
+        write_control(
+            &mut bytes,
+            &ControlFrame::Complete {
+                catalog: WorkerCatalog {
+                    messages: 1,
+                    recovered_messages: 1,
+                    issues: 1,
+                    ..WorkerCatalog::default()
+                },
+            },
+        )?;
+
+        let mut input = Cursor::new(bytes);
+        let mut source =
+            DirectProtocolSource::new(&mut input, HashMap::new(), DirectCandidateBindings::new());
+        let interrupted = AtomicBool::new(false);
+        let candidate = source
+            .next_one_pass_candidate(&mut job, 0, &interrupted)?
+            .ok_or("valid candidate after empty boundary was omitted")?;
+        assert_eq!(candidate.item_key, "recovered:44:1:0");
+        source.finish_top_level_message()?;
+        job.checkpoint()?;
+        assert!(
+            source
+                .next_one_pass_candidate(&mut job, candidate.rowid, &interrupted)?
+                .is_none()
+        );
+        assert!(source.is_complete());
+        assert_eq!(source.empty_top_level_boundaries, 1);
+        source.require_end_of_stream()?;
+        assert_eq!(job.spooled_candidates()?.len(), 1);
         Ok(())
     }
 }

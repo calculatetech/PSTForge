@@ -784,6 +784,22 @@ impl AttemptWatchdog {
         interrupted: Arc<AtomicBool>,
         peak_worker_rss_bytes: Arc<AtomicU64>,
     ) -> Result<Self, RecoveryError> {
+        Self::start_with_limits(
+            process_id,
+            interrupted,
+            peak_worker_rss_bytes,
+            worker_stall_timeout(),
+            Duration::from_secs(1),
+        )
+    }
+
+    fn start_with_limits(
+        process_id: u32,
+        interrupted: Arc<AtomicBool>,
+        peak_worker_rss_bytes: Arc<AtomicU64>,
+        idle_timeout: Duration,
+        resource_sample_interval: Duration,
+    ) -> Result<Self, RecoveryError> {
         let pid = i32::try_from(process_id)
             .ok()
             .and_then(rustix::process::Pid::from_raw)
@@ -792,23 +808,33 @@ impl AttemptWatchdog {
                     "worker process ID is out of range",
                 ))
             })?;
-        let timeout = worker_stall_timeout();
-        let poll_interval = Duration::from_millis(100);
+        let poll_interval = Duration::from_millis(100).min(resource_sample_interval);
         let (sender, receiver) = sync_channel(1);
         let thread = thread::Builder::new()
             .name("pstforge-worker-watchdog".to_owned())
             .spawn(move || {
-                let mut last_progress = Instant::now();
-                let mut last_resource_sample = Instant::now() - Duration::from_secs(1);
+                let mut last_observed_progress = Instant::now();
+                let mut last_activity = process_activity(process_id);
+                let mut last_resource_sample = Instant::now() - resource_sample_interval;
                 loop {
-                    if last_resource_sample.elapsed() >= Duration::from_secs(1) {
+                    if last_resource_sample.elapsed() >= resource_sample_interval {
                         if let Some(rss_bytes) = process_rss_bytes(process_id) {
                             peak_worker_rss_bytes.fetch_max(rss_bytes, Ordering::Relaxed);
                         }
+                        let current_activity = process_activity(process_id);
+                        if current_activity
+                            .zip(last_activity)
+                            .is_some_and(|(current, previous)| current.advanced_since(previous))
+                        {
+                            last_observed_progress = Instant::now();
+                        }
+                        last_activity = current_activity;
                         last_resource_sample = Instant::now();
                     }
                     match receiver.recv_timeout(poll_interval) {
-                        Ok(WatchdogSignal::Progress) => last_progress = Instant::now(),
+                        Ok(WatchdogSignal::Progress) => {
+                            last_observed_progress = Instant::now();
+                        }
                         Ok(WatchdogSignal::Stop)
                         | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
                             return WatchdogOutcome::Stopped;
@@ -821,7 +847,7 @@ impl AttemptWatchdog {
                                 );
                                 return WatchdogOutcome::Interrupted;
                             }
-                            if last_progress.elapsed() >= timeout {
+                            if last_observed_progress.elapsed() >= idle_timeout {
                                 let _ = rustix::process::kill_process(
                                     pid,
                                     rustix::process::Signal::KILL,
@@ -861,6 +887,43 @@ fn worker_stall_timeout() -> Duration {
         .and_then(|value| value.parse::<u64>().ok())
         .map(Duration::from_millis)
         .unwrap_or(Duration::from_secs(15 * 60))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ProcessActivity {
+    user_ticks: u64,
+    system_ticks: u64,
+    read_bytes: u64,
+    write_bytes: u64,
+}
+
+impl ProcessActivity {
+    fn advanced_since(self, previous: Self) -> bool {
+        self.user_ticks > previous.user_ticks
+            || self.system_ticks > previous.system_ticks
+            || self.read_bytes > previous.read_bytes
+            || self.write_bytes > previous.write_bytes
+    }
+}
+
+fn process_activity(process_id: u32) -> Option<ProcessActivity> {
+    let stat = std::fs::read_to_string(format!("/proc/{process_id}/stat")).ok()?;
+    let (_, fields) = stat.rsplit_once(") ")?;
+    let mut fields = fields.split_ascii_whitespace();
+    let user_ticks = fields.nth(11)?.parse::<u64>().ok()?;
+    let system_ticks = fields.next()?.parse::<u64>().ok()?;
+
+    let io = std::fs::read_to_string(format!("/proc/{process_id}/io")).ok()?;
+    let counter = |name: &str| {
+        io.lines()
+            .find_map(|line| line.strip_prefix(name)?.trim().parse::<u64>().ok())
+    };
+    Some(ProcessActivity {
+        user_ticks,
+        system_ticks,
+        read_bytes: counter("read_bytes:")?,
+        write_bytes: counter("write_bytes:")?,
+    })
 }
 
 fn process_rss_bytes(process_id: u32) -> Option<u64> {
@@ -1255,8 +1318,8 @@ mod tests {
     use pstforge_job::JobSummary;
 
     use super::{
-        AttemptWatchdog, DirectWorkerProcess, RecoveryError, WorkerProcess, validate_catalog,
-        worker_failure_category,
+        AttemptWatchdog, DirectWorkerProcess, RecoveryError, WatchdogOutcome, WorkerProcess,
+        validate_catalog, worker_failure_category,
     };
     use crate::worker::WorkerCatalog;
 
@@ -1343,5 +1406,46 @@ mod tests {
             .finish_after_protocol_failure()
             .expect("live worker is contained");
         assert!(started.elapsed() < Duration::from_secs(2));
+    }
+
+    #[test]
+    fn watchdog_treats_measurable_cpu_activity_as_progress() {
+        let mut child = Command::new("sh")
+            .args(["-c", "while :; do :; done"])
+            .spawn()
+            .expect("busy worker substitute");
+        let mut watchdog = AttemptWatchdog::start_with_limits(
+            child.id(),
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicU64::new(0)),
+            Duration::from_millis(100),
+            Duration::from_millis(10),
+        )
+        .expect("watchdog");
+
+        std::thread::sleep(Duration::from_millis(500));
+        assert_eq!(watchdog.stop(), WatchdogOutcome::Stopped);
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
+    #[test]
+    fn watchdog_still_terminates_an_idle_worker() {
+        let mut child = Command::new("sh")
+            .args(["-c", "sleep 10"])
+            .spawn()
+            .expect("idle worker substitute");
+        let mut watchdog = AttemptWatchdog::start_with_limits(
+            child.id(),
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicU64::new(0)),
+            Duration::from_millis(200),
+            Duration::from_millis(10),
+        )
+        .expect("watchdog");
+
+        std::thread::sleep(Duration::from_millis(400));
+        assert_eq!(watchdog.stop(), WatchdogOutcome::Stalled);
+        let _ = child.wait();
     }
 }
