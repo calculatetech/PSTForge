@@ -3696,6 +3696,25 @@ not modified.
     review finding, merged protected pull request #2 as `c0c5ce5`, and observed
     green required post-merge CI.
 - [ ] Milestone 1.0.0: MailPlus-Ready Release.
+  - [x] (2026-07-22) Started
+    `milestone/v1.0.0-mailplus-ready-release` in sibling worktree
+    `../pstforge-worktrees/v1.0.0-mailplus-ready-release` from approved,
+    protected, and post-merge-CI-green `main` commit `83c29bf`. Advanced the
+    workspace, CLI/manual, report producer, Debian package, and operator
+    installation version markers to 1.0.0 without changing the frozen CLI,
+    schemas, recovery behavior, or PST writer.
+  - [ ] Build and reproduce the 1.0.0 Debian package, install it with resolved
+    dependencies in a clean Debian 13 environment, and retain bounded package,
+    linkage, license, and execution evidence.
+  - [ ] From that clean package install, recover the immutable real 50 GB
+    corrupt source into a fresh output job and prove complete accounting,
+    source immutability, performance and memory bounds, and independent-reader
+    validity for every part.
+  - [ ] Run ScanPST first on every release part, then open and inspect the same
+    unrepaired parts in Outlook. MailPlus is not an acceptance dependency.
+  - [ ] Complete the canonical release gate, final license/operator-document
+    audit, and clean-context adversarial review; remediate all blocking
+    findings and integrate through the protected pull-request gate.
 
 ## Surprises & Discoveries
 
@@ -7100,8 +7119,7 @@ protection build on the approved remote baseline. Recheck authentication and
 repository settings before creating or configuring them. Local work and
 private-corpus acceptance must never depend on their existence.
 
-Revision note (2026-07-21): Closed 0.6.0 after protected merge `c0c5ce5`, green
-post-merge CI and bounded hosted fuzzing, clean ScanPST results, and successful
-Outlook acceptance. The human owner set ScanPST plus Outlook as PSTForge's
-interoperability boundary; MailPlus compatibility is assumed after those pass
-and no self-hosted MailPlus resource or import gate remains.
+Revision note (2026-07-22): Started 1.0.0 from protected green merge `83c29bf`.
+The release milestone repeats the real 50 GB recovery from a clean Debian 13
+package install, validates every part, and requires ScanPST followed by Outlook
+acceptance without introducing a MailPlus resource dependency.

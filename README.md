@@ -10,12 +10,11 @@ into Synology MailPlus Server. Clean ScanPST analysis followed by successful
 Microsoft Outlook inspection is the required interoperability acceptance
 boundary; MailPlus compatibility is then assumed.
 
-PSTForge is pre-1.0 software. The output writer and recovery pipeline have been
-validated with real damaged PSTs, ScanPST, Outlook, MailPlus, `libpff`,
-`pffinfo`, and `readpst`, but the command and report contracts may still change
-before 1.0. MailPlus import is optional operator evidence rather than a release
-gate; a MailPlus-only failure after ScanPST and Outlook pass belongs in a
-Synology support ticket.
+PSTForge 1.0 uses a stable command and report contract. The output writer and
+recovery pipeline have been validated with real damaged PSTs, ScanPST, Outlook,
+MailPlus, `libpff`, `pffinfo`, and `readpst`. MailPlus import is optional
+operator evidence rather than a release gate; a MailPlus-only failure after
+ScanPST and Outlook pass belongs in a Synology support ticket.
 
 ## Features
 
@@ -76,7 +75,7 @@ runtime dependencies are resolved:
 
 ```bash
 cargo xtask package deb
-sudo apt install ./target/debian/pstforge_0.6.0_amd64.deb
+sudo apt install ./target/debian/pstforge_1.0.0_amd64.deb
 pstforge --version
 ```
 
