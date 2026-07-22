@@ -3882,6 +3882,16 @@ not modified.
     the release gate passed at `.agent/test-results/1784752865-release`. The
     final reproducible package SHA-256 is
     `98ba84828ba7ba59f9f143cf6e15fe7642232d724a1d3a45b0ccda6eb930f911`.
+    Protected-PR review then found that contents-table type validation still
+    rejected non-Integer32 source RowID/RowVer properties before the table-row
+    projection guard. That validation now exempts only those two structural
+    IDs, while the message PC preserves their actual readable types and the
+    table continues to use writer-owned values. The focused regression uses
+    Unicode and binary collisions. The canonical full gate passed at
+    `.agent/test-results/1784753578-full` and the release gate passed at
+    `.agent/test-results/1784753630-release`; the final reproducible package
+    SHA-256 after review remediation is
+    `6ce43322a3665ca78578d8c70e987d60b823c5a95010d0a935ce77d24232eace`.
 
 ## Surprises & Discoveries
 

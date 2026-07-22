@@ -6350,6 +6350,9 @@ fn validate_message(message: &MessageSpec, depth: usize) -> Result<(), WriterErr
 fn validate_contents_raw_property_types(message: &MessageSpec) -> Result<(), WriterError> {
     let columns = contents_columns()?;
     for raw in &message.raw_properties {
+        if matches!(raw.id, LTP_ROW_ID_PROP_ID | LTP_ROW_VERSION_PROP_ID) {
+            continue;
+        }
         let Some(column) = columns.iter().find(|column| column.prop_id() == raw.id) else {
             continue;
         };
@@ -15358,11 +15361,11 @@ mod tests {
         normal.raw_properties.extend([
             RawProperty {
                 id: LTP_ROW_ID_PROP_ID,
-                value: RawPropertyValue::Integer32(0x0010_2f28),
+                value: RawPropertyValue::Unicode("source row identity".to_owned()),
             },
             RawProperty {
                 id: LTP_ROW_VERSION_PROP_ID,
-                value: RawPropertyValue::Integer32(77),
+                value: RawPropertyValue::Binary(vec![7, 7]),
             },
         ]);
         let mut associated = normal.clone();
@@ -15430,13 +15433,14 @@ mod tests {
             )?;
             assert!(matches!(
                 message.properties().get(LTP_ROW_ID_PROP_ID),
-                Some(crate::ltp::prop_context::PropertyValue::Integer32(
-                    0x0010_2f28
-                ))
+                Some(crate::ltp::prop_context::PropertyValue::Unicode(value))
+                    if value.buffer()
+                        == "source row identity".encode_utf16().collect::<Vec<_>>()
             ));
             assert!(matches!(
                 message.properties().get(LTP_ROW_VERSION_PROP_ID),
-                Some(crate::ltp::prop_context::PropertyValue::Integer32(77))
+                Some(crate::ltp::prop_context::PropertyValue::Binary(value))
+                    if value.buffer() == [7, 7]
             ));
         }
         Ok(())
