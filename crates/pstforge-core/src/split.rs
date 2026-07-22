@@ -1493,7 +1493,12 @@ fn split_direct_recovered_job(
                     {
                         let transaction = active.as_mut().ok_or(SplitError::TooManyParts)?;
                         for folder in input.store.folders.iter().cloned() {
-                            transaction.writer.observe_folder(folder)?;
+                            if !transaction
+                                .writer
+                                .contains_folder(folder.location, &folder.path)
+                            {
+                                transaction.writer.observe_folder(folder)?;
+                            }
                         }
                     }
                     let message_count = count_messages(&message);
@@ -1564,6 +1569,18 @@ fn split_direct_recovered_job(
                                 part_index,
                                 worker_executable,
                             )?);
+                            {
+                                let transaction =
+                                    active.as_mut().ok_or(SplitError::TooManyParts)?;
+                                for folder in input.store.folders.iter().cloned() {
+                                    if !transaction
+                                        .writer
+                                        .contains_folder(folder.location, &folder.path)
+                                    {
+                                        transaction.writer.observe_folder(folder)?;
+                                    }
+                                }
+                            }
                             private_file_eof = active
                                 .as_mut()
                                 .ok_or(SplitError::TooManyParts)?
@@ -1721,7 +1738,12 @@ fn split_direct_recovered_job(
                                     .stats
                                     .folder_keys
                                     .insert((folder.location, folder.path.clone()));
-                                transaction.writer.observe_folder(folder)?;
+                                if !transaction
+                                    .writer
+                                    .contains_folder(folder.location, &folder.path)
+                                {
+                                    transaction.writer.observe_folder(folder)?;
+                                }
                             }
                         }
                         Err(WriterError::InputRejected(_)) => {

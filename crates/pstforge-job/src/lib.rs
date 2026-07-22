@@ -911,12 +911,21 @@ impl DurableCatalogSink {
             self.batch_pack_start.set(self.payload_pack_position.get());
         }
         self.connection
-            .execute_batch("SAVEPOINT active_candidate")?;
+            .execute_batch("SAVEPOINT active_candidate")
+            .map_err(|error| {
+                JobError::EventSequence(format!("cannot begin active candidate savepoint: {error}"))
+            })?;
         Ok(())
     }
 
     fn finish_candidate(&self) -> Result<(), JobError> {
-        self.connection.execute_batch("RELEASE active_candidate")?;
+        self.connection
+            .execute_batch("RELEASE active_candidate")
+            .map_err(|error| {
+                JobError::EventSequence(format!(
+                    "cannot finish active candidate savepoint: {error}"
+                ))
+            })?;
         let candidates = self.batch_candidates.get().saturating_add(1);
         self.batch_candidates.set(candidates);
         if matches!(self.capture_mode, CatalogCaptureMode::Full)
@@ -929,7 +938,10 @@ impl DurableCatalogSink {
 
     fn abort_candidate(&self) -> Result<(), JobError> {
         self.connection
-            .execute_batch("ROLLBACK TO active_candidate; RELEASE active_candidate;")?;
+            .execute_batch("ROLLBACK TO active_candidate; RELEASE active_candidate;")
+            .map_err(|error| {
+                JobError::EventSequence(format!("cannot abort active candidate savepoint: {error}"))
+            })?;
         Ok(())
     }
 
@@ -1206,12 +1218,19 @@ impl DurableCatalogSink {
         self.recent_candidates.clear();
         if let Some(active) = self.active.take() {
             self.truncate_payload_pack(active.pack_start)?;
-            if let Err(error) = self.abort_candidate() {
-                let _ = self.connection.execute_batch("ROLLBACK");
-                let _ = self.truncate_payload_pack(self.batch_pack_start.get());
+            if self.abort_candidate().is_err() {
+                match self.connection.execute_batch("ROLLBACK") {
+                    Ok(()) => {}
+                    Err(rollback_error)
+                        if rollback_error
+                            .to_string()
+                            .contains("no transaction is active") => {}
+                    Err(rollback_error) => return Err(rollback_error.into()),
+                }
+                self.truncate_payload_pack(self.batch_pack_start.get())?;
                 self.batch_open.set(false);
                 self.batch_candidates.set(0);
-                return Err(error);
+                return Ok(());
             }
         }
         self.commit_candidate_batch()
@@ -3471,7 +3490,15 @@ impl CatalogSink for DurableCatalogSink {
     }
 
     fn event(&mut self, event: CatalogEvent<'_>) -> Result<(), String> {
-        self.handle_event(event).map_err(|error| error.to_string())
+        self.handle_event(event).map_err(|error| match error {
+            JobError::Sql(rusqlite::Error::SqliteFailure(code, detail)) => format!(
+                "SQLite {:?} (extended code {}): {}",
+                code.code,
+                code.extended_code,
+                detail.unwrap_or_else(|| "no additional detail".to_owned())
+            ),
+            other => other.to_string(),
+        })
     }
 }
 
@@ -8678,6 +8705,23 @@ mod tests {
                 .committed_candidates,
             u64::from(CANDIDATE_CHECKPOINT_BATCH + 1)
         );
+        Ok(())
+    }
+
+    #[test]
+    fn worker_cleanup_tolerates_an_already_rolled_back_candidate_savepoint()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempdir()?;
+        let mut sink =
+            DurableCatalogSink::create_direct_metadata(&directory.path().join("job"), 4, 3)?;
+        message_start(&mut sink, 1)?;
+        sink.connection.execute_batch("ROLLBACK")?;
+
+        sink.abort_worker_attempt()?;
+
+        assert!(sink.active.is_none());
+        assert!(!sink.batch_open.get());
+        assert_eq!(sink.payload_pack_position.get(), 0);
         Ok(())
     }
 

@@ -250,10 +250,7 @@ fn build_part_writer_input_expected(
                 entry.insert((mail.folder_role, container_class, normal, associated));
             }
             std::collections::btree_map::Entry::Occupied(mut entry) => {
-                let (role, _, messages, associated_messages) = entry.get_mut();
-                if mail.folder_role == CanonicalFolderRole::DeletedItems {
-                    *role = CanonicalFolderRole::DeletedItems;
-                }
+                let (_, _, messages, associated_messages) = entry.get_mut();
                 match mail.placement {
                     CanonicalMessagePlacement::Normal => messages.push(translated.message),
                     CanonicalMessagePlacement::Associated => {
@@ -4274,6 +4271,76 @@ mod tests {
         assert_eq!(layout.store_name, input.store.store_name);
         assert_eq!(layout.record_key, input.store.record_key);
         assert_eq!(layout.folders[0].path, input.store.folders[0].path);
+        assert_eq!(layout.folders[0].role, input.store.folders[0].role);
+        assert_eq!(
+            layout.folders[0].container_class,
+            input.store.folders[0].container_class
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn retained_ordinary_folder_role_survives_deleted_message_collision()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempdir()?;
+        let job = DurableCatalogSink::create(&directory.path().join("job"))?;
+        let mail = CanonicalMail {
+            durable_item_key: "recovered:1:0:0".to_owned(),
+            key: ItemKey {
+                provenance: RecoveryProvenance::Recovered,
+                source_node_id: Some(1),
+                recovery_index: Some(0),
+                occurrence: 0,
+            },
+            folder_path: vec!["Collision".to_owned()],
+            folder_location: CanonicalFolderLocation::IpmSubtree,
+            folder_role: CanonicalFolderRole::DeletedItems,
+            placement: CanonicalMessagePlacement::Normal,
+            message_class: Some("IPM.Note".to_owned()),
+            subject: Some("recovered collision".to_owned()),
+            sender_name: None,
+            sender_email: None,
+            submit_filetime: None,
+            delivery_filetime: None,
+            recipients: Vec::new(),
+            attachments: Vec::new(),
+            properties: Vec::new(),
+            completeness: ContentCompleteness::Complete,
+            spooled_bytes: 0,
+        };
+        let retained = [CanonicalFolder {
+            path: vec!["Collision".to_owned()],
+            location: CanonicalFolderLocation::IpmSubtree,
+            role: CanonicalFolderRole::Ordinary,
+            container_class: Some("IPF.Note".to_owned()),
+        }];
+        let input = build_part_writer_input_with_folders_interruptible(
+            &job,
+            &[&mail],
+            &retained,
+            PartBuildOptions {
+                source_sha256: &"0".repeat(64),
+                recovery_mode: "balanced",
+                maximum_pst_bytes: 4_294_967_296,
+                part_index: 2,
+                omitted_folders: 0,
+            },
+            &AtomicBool::new(false),
+        )?;
+
+        assert_eq!(input.store.folders.len(), 1);
+        assert_eq!(input.store.folders[0].role, MailFolderRole::Ordinary);
+        assert_eq!(input.store.folders[0].messages.len(), 1);
+        let layout = build_part_writer_layout(
+            &retained,
+            PartBuildOptions {
+                source_sha256: &"0".repeat(64),
+                recovery_mode: "balanced",
+                maximum_pst_bytes: 4_294_967_296,
+                part_index: 2,
+                omitted_folders: 0,
+            },
+        )?;
         assert_eq!(layout.folders[0].role, input.store.folders[0].role);
         assert_eq!(
             layout.folders[0].container_class,

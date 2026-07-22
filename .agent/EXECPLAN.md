@@ -3630,10 +3630,16 @@ not modified.
     event/blob aggregates, omissions, per-part message/folder counts, and
     exact four part byte lengths as the direct split of the corrupt original.
     The only report differences are the expected source path, inode, size, and
-    modification time. This is strong bounded evidence that the apparent
-    12.2 GB source-to-output difference is PST container free/slack/index
-    allocation and repacking, not readable mailbox data discarded by
-    PSTForge. No further 50 GB generation is required for this question.
+    modification time. This proves parity only for the 83,500 normally
+    reachable candidates exposed by libpff 20231205. The later Debian 20180714
+    run recovered 37,291 additional readable messages, many of which populate
+    the clean-scanning fifth output part. Therefore the apparent 12.2 GB
+    source-to-output difference cannot be classified wholly as empty/slack;
+    the newer reader omitted recoverable mailbox data that the older reader
+    exposed. The later same-reader comparison found 460 fewer recoverable
+    messages in the ScanPST-repaired reference, confirming that at least part
+    of the difference represents recoverable mailbox data rather than merely
+    container free space and repacking.
   - [x] (2026-07-21) Passed the post-fix fast gate at
     `.agent/test-results/1784667532-fast` and the exact canonical combined-
     manifest full gate at `.agent/test-results/1784667570-full`. The latter
@@ -3696,8 +3702,363 @@ not modified.
     review finding, merged protected pull request #2 as `c0c5ce5`, and observed
     green required post-merge CI.
 - [ ] Milestone 1.0.0: MailPlus-Ready Release.
+  - [x] (2026-07-22) Started
+    `milestone/v1.0.0-mailplus-ready-release` in sibling worktree
+    `../pstforge-worktrees/v1.0.0-mailplus-ready-release` from approved,
+    protected, and post-merge-CI-green `main` commit `83c29bf`. Advanced the
+    workspace, CLI/manual, report producer, Debian package, and operator
+    installation version markers to 1.0.0 without changing the frozen CLI,
+    schemas, recovery behavior, or PST writer.
+  - [x] Build and reproduce the 1.0.0 Debian package, install it with resolved
+    dependencies in a clean Debian 13 environment, and retain bounded package,
+    linkage, license, and execution evidence.
+    Explicit maintainer validation reproduced package SHA-256
+    `5466077c7089adb950948a33eadf3786747136866c87df95959554b7ee9aa15f`;
+    the same package ran with Debian 13's configured `libc6`, `libgcc-s1`, and
+    `libpff1t64` dependencies. Ordinary package construction remains the
+    one-build, one-deliverable operator path; the independent second build is
+    confined to explicit `--validate` and release automation. Read-only
+    package inspection confirms dynamic `libpff.so.1`, `libgcc_s.so.1`, and
+    `libc.so.6` dependencies and installed Apache/MIT project licenses, the
+    retained writer MIT license, third-party notice, Debian copyright data,
+    and the complete locked executable-dependency license bundle. The clean
+    root contains configured `pstforge` 1.0.0, `libc6` 2.41-12+deb13u3,
+    `libgcc-s1` 14.2.0-19, and `libpff1t64` 20180714-3.1+b2.
+  - [x] From that clean package install, recover the immutable real 50 GB
+    corrupt source into a fresh output job and prove complete accounting,
+    source immutability, measured performance and memory behavior, and
+    independent-reader validity for every part.
+    The first clean Debian 13 attempt used the reproducible package with SHA-256
+    `4113d2cb1bc28d765af5b7de931ad16aef798b506e909b8b2372b2f4184e5922` and
+    Debian libpff 20180714. It atomically finalized three valid-size parts and
+    wrote 75,664 candidates before the worker spent 15 minutes CPU-scanning the
+    known corrupt tail without a protocol frame. The watchdog misclassified
+    that measurable native activity as a stall at 32:37.75. The source remained
+    unchanged and the unpublished fourth part was correctly withheld. Treat
+    this as a qualification failure and rerun from a new output after the
+    activity-aware watchdog correction; do not promote the three partial-job
+    artifacts.
+    The second fresh run used corrected package SHA-256
+    `4ca511c4e9a841c2ca8c3bd7453664dbc065176b15af810fb2f12b1c02f17407`.
+    It passed the former 32:37 failure point and kept the measurably active
+    Debian libpff worker alive for 1:22:35, proving the watchdog correction on
+    the real source. It then exposed a separate terminal-candidate ordering
+    defect when the first recovered unsupported item was durably classified
+    before the direct loader requested its spooled tree. The source remained
+    unchanged and the same three parts remained safely finalized. A focused
+    regression now proves that an unsupported top-level candidate bypasses
+    writable-tree loading, discards its deferred payload, and lets the direct
+    protocol continue. Continue qualification with the corrected package.
+    Direct jobs intentionally cannot resume, so the retained second job could
+    not be continued. The third fresh run proved both unsupported recovered
+    candidates were handled, then exposed libpff's documented duplicate-node
+    behavior as an empty top-level direct boundary. PSTForge safely failed at
+    1:21:42 with source unchanged and three parts retained. The loader now
+    consumes an empty metadata/payload boundary without inventing a candidate,
+    then continues; a focused regression covers that exact sequence.
+    The fourth fresh run crossed the duplicate tail, wrote 97,621 candidates,
+    classified 261 unsupported candidates, and finalized a fourth 10.736 GB
+    part before failing with two candidates left spooled. A candidate that
+    forced rollover into part 5 used a recovered folder observed on part 4;
+    the new part was projected before that candidate folder was re-observed,
+    so the writer correctly refused an absent layout folder. Rollover now
+    re-observes the current candidate's folders before projection. The same run
+    also showed 4,218 legitimate empty duplicate boundaries, so diagnostics
+    now emit one initial notice and one completion count instead of one warning
+    per boundary.
+    The fifth fresh run proved all three corrections and again finalized four
+    parts, then exposed an order-dependent folder-role conflict at the same
+    rollover boundary. A retained ordinary folder discovered during streaming
+    could be promoted to Deleted Items by a damaged candidate in the bounded
+    one-message input, even though the new part had already established the
+    retained folder metadata. Retained layout metadata now remains
+    authoritative for an existing location/path; a focused inverse-collision
+    regression and the 106-test core suite pass. Continue qualification from a
+    sixth fresh output because direct jobs intentionally cannot resume.
+    Qualification attempts r6-r9 were harness diagnostics, not product
+    recovery evidence: the reconstructed read-only Debian bubblewrap omitted a
+    writable tmpfs at `/tmp`, so bundled SQLite reported extended code 6410
+    (`SQLITE_IOERR_GETTEMPPATH`) during its first bounded spill. Extended SQLite
+    diagnostics and idempotent cleanup now preserve that original failure
+    instead of masking it with a missing-savepoint error. With `/tmp` restored,
+    r10 ran for 1:23:22, reproduced the first four accepted part sizes exactly,
+    and reached recovered candidate 17,399. It proved the earlier role-only
+    normalization was insufficient: the candidate's synthetic `Recovered Mail`
+    destination collides with the damaged source's retained Deleted Items
+    folder carrying that display name. The replacement part already owns the
+    retained folder metadata, so rollover now observes only candidate folders
+    absent from that retained location/path layout. Focused collision tests and
+    the fast gate pass; continue from a fresh package and output.
+    The exact reproducible package r11 repeated r10 through four parts and the
+    same candidate in 1:22:43, proving the retained-layout filter was placed
+    too late: every candidate is observed before size projection, so the
+    collision stops before the rollover branch. The transactional writer now
+    exposes a typed location/path membership query. All direct observation
+    sites preserve metadata for folders already owned by the active layout and
+    add only genuinely missing folders. Writer, core, job, and fast-gate
+    regressions pass; continue from another fresh output.
+    Fresh qualification r12 completed in 1:34:41 with no worker failure or
+    terminal failure. It finalized five parts totaling 48,712,397,824 bytes,
+    assigned 120,367 candidates exactly once, classified the remaining 425 as
+    explicitly unsupported, left zero unfinished candidates, and retained no
+    payload pack. The ledger accounts for 83,500 normal, 37,291 recovered, and
+    one orphan candidate. All 83,500 normal candidate keys exactly match the
+    accepted Ubuntu direct/restartable key set; Debian's older libpff made
+    three keys writable that Ubuntu classified unsupported and exposed the
+    additional recovered/orphan set. This is reader-version recovery breadth,
+    not execution-mode loss. Debian `pffinfo` accepted every part and complete
+    recursive `readpst` extraction passed one part at a time with each decoded
+    scratch tree removed immediately. The source device, inode, size, times,
+    and SHA-256
+    `4c4e88812de1ae5d84c86c39e024f9c4efe4c8af9ca11c62d8ead3f8600fc941`
+    remained unchanged. Measured PSTForge supervisor peak RSS was
+    1,742,073,856 bytes and GNU time observed a 3,428,720,640-byte peak across
+    the worker-bearing command; these are capacity observations, not gates.
+    Debian libpff traversal remained on the critical path: it completed after
+    about 87 minutes, followed by roughly eight minutes of final packing and
+    publication. SQLite/WAL lifecycle still caused substantial write
+    amplification (261,938,294,784 supervisor filesystem-write bytes), but
+    direct mode wrote a zero-byte payload pack.
+    Human ScanPST acceptance rejected unrepaired part 4 (SHA-256
+    `c8b5b9cd680910839024d979b1de94c9eb3f0419c4fb86b010f1b40d8409d60c`).
+    The owner confirms parts 1, 2, 3, and 5 scanned clean; part 4 was the only
+    failed part. Part 5's clean result is human-reported and has no copied log
+    in the local evidence directory.
+    Its `Recovered Mail` contents table reports 12,927 rows, but ten source
+    properties with IDs colliding with the TC RowID/RowVer columns replaced
+    destination row metadata. The BTH therefore cannot resolve the first row;
+    ScanPST discards the table and rediscovers all 12,927 intact top-level
+    message nodes. The repaired reference SHA-256 is
+    `bcd899d23169b52fa2970bce0c0d5a53fd3fae198b757055feab41e073e52256`.
+    Treat r12 as failed qualification even though the payload nodes survive.
+    The writer now excludes structural RowID/RowVer from copied TC values while
+    retaining them in the message PC, and rereads every completed hierarchy,
+    contents, and associated table before publication to prove matrix/BTH
+    agreement. Focused regressions pass. The owner reports clean ScanPST
+    analysis of the deliberate normal/associated RowID-collision candidate
+    `/storage/recovery/pstforge-rowid-guard-1.0.0.pst` (SHA-256
+    `f2550b635c8bcda768ee496dfe7e14286ba708cd21b4776d1c4df4b86aed5f0f`).
+    The owner accepted the focused collision candidate's clean ScanPST result
+    as the regression proof for this fix and explicitly waived another 50 GB
+    generation/import cycle before publishing 1.0.0. The earlier unrepaired
+    r12 parts remain failed qualification evidence and are not release output.
+  - [x] Run ScanPST first on every release part, then open and inspect the same
+    unrepaired parts in Outlook. MailPlus is not an acceptance dependency.
+    The r12 exercise established the ScanPST-first procedure and the owner
+    reported Outlook acceptance, but its part 4 ScanPST failure invalidated
+    that generated set. The focused RowID/RowVer collision candidate then
+    passed ScanPST after the fix. By explicit owner direction, that focused
+    independent-reader result plus the automated completed-table invariant is
+    the accepted 1.0.0 regression evidence; a second large run is deferred.
+  - [x] Complete the canonical release gate, final license/operator-document
+    audit, and clean-context adversarial review; remediate all blocking
+    findings and integrate through the protected pull-request gate.
+    The canonical full gate passed at `.agent/test-results/1784727989-full`.
+    The release foundation passed at
+    `.agent/test-results/1784728034-release`, including licenses, advisories,
+    combined corpus, independent readers, and another byte-identical Debian
+    package reproduction. Release-corpus interruption tests prove SIGINT,
+    SIGTERM, and SIGKILL leave resumable durable state and no orphan worker.
+    The adversarial review identified and resolved one traceability omission:
+    NDB-08 now records the normative folder relationship, retained-metadata
+    precedence, implementation sites, focused regressions, and r12 evidence.
+    After the RowID fix and focused clean ScanPST result, the canonical full
+    gate passed again at `.agent/test-results/1784752118-full` and the release
+    foundation at `.agent/test-results/1784752169-release`; the reproducible
+    package SHA-256 is
+    `110d8cac08367d31b79e990844238086ee5c11462422b6778d5b0985ca4de875`.
+    Final adversarial review also established a material runtime-library
+    boundary: `libpff1t64 (>= 20180714)` can select Ubuntu 20231205 even though
+    controlled evidence proves that version omits 37,291 messages recovered by
+    20180714 from this damaged source. The owner explicitly chose to publish
+    1.0.0 with its existing replaceable dynamic system-library contract and to
+    handle source assessment, any maintained fork, ABI identity, packaging,
+    and LGPL distribution in a new version branch. Recovery breadth therefore
+    remains dependent on the installed libpff implementation in 1.0.0. This is
+    an approved version boundary, not an unresolved release blocker.
+    After recording those owner decisions and the product-contract limitation,
+    the final fast gate passed at `.agent/test-results/1784752816-fast`, the
+    canonical full gate passed at `.agent/test-results/1784752836-full`, and
+    the release gate passed at `.agent/test-results/1784752865-release`. The
+    final reproducible package SHA-256 is
+    `98ba84828ba7ba59f9f143cf6e15fe7642232d724a1d3a45b0ccda6eb930f911`.
+    Protected-PR review then found that contents-table type validation still
+    rejected non-Integer32 source RowID/RowVer properties before the table-row
+    projection guard. That validation now exempts only those two structural
+    IDs, while the message PC preserves their actual readable types and the
+    table continues to use writer-owned values. The focused regression uses
+    Unicode and binary collisions. The canonical full gate passed at
+    `.agent/test-results/1784753578-full` and the release gate passed at
+    `.agent/test-results/1784753630-release`; the final reproducible package
+    SHA-256 after review remediation is
+    `6ce43322a3665ca78578d8c70e987d60b823c5a95010d0a935ce77d24232eace`.
 
 ## Surprises & Discoveries
+
+- Observation: Debian 13 libpff 20180714 can spend more than 15 minutes inside
+  one damaged-source recovery scan without emitting a worker-protocol frame,
+  even while its CPU time and filesystem reads advance continuously. The
+  protocol-only watchdog therefore killed useful work as `worker_stall` after
+  75,664 written candidates and three finalized parts. Ubuntu libpff 20231205
+  crossed the same tail inside the old deadline.
+  Evidence: The first clean-package 1.0 rehearsal ran 32:37.75, reached
+  41.3 GB of worker filesystem reads, peaked at 2,592,056 KiB for the worker,
+  and exited with the source identity unchanged. Focused tests now prove that
+  CPU activity survives the idle deadline and a truly idle child is killed.
+  There is no fixed busy-worker deadline: an active scan scales with source
+  size and damage until it completes or the operator interrupts it.
+
+- Observation: R12 part 4's recovered payload nodes are intact, but ten
+  untrusted source properties used the reserved TC RowID/RowVer property IDs.
+  The contents-row builder copied those values after writing its generated
+  destination identifiers, so the row matrix and BTH disagreed and ScanPST
+  discarded the entire 12,927-row table. `pffinfo`, `readpst`, and the prior
+  constructed-output path did not detect the cross-index mismatch.
+  Evidence: ScanPST reports `row (0) missing BTH entry`, computed contents zero
+  versus actual 12,927, and adds all 12,927 message nodes back. Independent
+  PSTForge table inspection finds 12,927 matrix rows but only 12,917 resolvable
+  RowIDs; the ten failures contain the colliding source values. The repaired
+  PST exposes all 21,957 part messages without traversal issues.
+
+- Observation: On the completed 50 GB Debian rehearsal, libpff 20180714
+  traversal—not the zero-byte direct payload pack—remained the elapsed-time
+  critical path. The worker completed traversal after about 87 minutes and the
+  supervisor finished the fifth part and durable publication about eight
+  minutes later. The private SQLite ledger and WAL nevertheless amplified
+  writes to 261,938,294,784 measured supervisor filesystem bytes, so future
+  performance work has two distinct targets: native traversal latency on the
+  supported older reader and catalog transaction/write amplification.
+  Evidence: r12 terminal metrics, sampled worker/supervisor CPU and I/O, the
+  five finalized part manifests, and zero-byte `payload.pack`.
+
+- Observation: Debian libpff 20180714 and Ubuntu libpff 20231205 expose
+  different recovery breadth and completeness labels for the same damaged
+  source even though execution-mode identity is stable. R12 contains exactly
+  the same 83,500 normal candidate keys as the accepted Ubuntu direct and
+  restartable jobs, writes three keys Ubuntu classified unsupported, and adds
+  37,291 recovered plus one orphan candidate. Compare modes under the same
+  reader version by semantic keys; do not mistake cross-version recovery
+  breadth for direct/restartable data loss.
+  Evidence: immutable read-only ledger set comparison retained under the
+  ignored r12 test-results directory.
+
+- Observation: `--aggressive` does not restore Debian 20180714 recovery breadth
+  when PSTForge runs against Ubuntu's libpff 20231205. It only adds libpff's
+  `IGNORE_ALLOCATION_DATA` and `SCAN_FOR_FRAGMENTS` flags to the same normal,
+  recovered, and orphan collection traversal used by balanced mode. On the
+  immutable 50 GB source, Ubuntu aggressive found 83,501 messages (83,500
+  normal plus one orphan), zero recovered items, and 53,350 traversal issues;
+  it did not expose Debian's 37,291 recovered items.
+  Evidence: the read-only prefix-zero inventory under ignored
+  `.agent/test-results/1.0.0-ubuntu-aggressive-comparison/`; source identity was
+  unchanged. Official upstream history narrows the behavior change to the
+  March 2023 recovery/index refactor (`33258b9` and `474370b`), where the old
+  recovered index-tree scan was replaced by the index-values implementation
+  and offsets-index analysis remains compiled out behind `#ifdef TODO`.
+  Debian's `20180714-3.1` patch series changes spelling, manuals, and a RISC-V
+  memory test only; it does not alter recovery code. The `+b2` suffix is a
+  binary rebuild, so an Ubuntu process loading the official 20180714 library
+  is a valid recovery-behavior comparison with the Debian package.
+  That controlled Ubuntu run completed in 1:05:38 with an exact r12 inventory
+  match: 83,500 normal messages, 37,291 recovered messages, one orphan,
+  120,792 total messages, 255 unsupported messages, and 6,411 retained issues.
+  The source identity remained unchanged. Peak RSS was 3,336,220 KiB. This
+  proves the operating system is not the differentiator: Ubuntu obtains the
+  Debian result when the same official 20180714 recovery implementation is
+  loaded.
+  The same Ubuntu/20180714 read-only inventory of the owner's ScanPST-repaired
+  reference completed in 59:01.97 and retained the identical 83,500 normal
+  messages and one orphan, but exposed only 36,831 recovered messages:
+  460 fewer than the damaged original. Unsupported messages rose from 255 to
+  384 and retained issues from 6,411 to 8,623. The repaired source identity
+  remained unchanged and the process wrote zero filesystem blocks. This
+  disproves the hypothesis that the source/output byte difference is wholly
+  empty space and establishes the unrepaired original as the higher-yield
+  canonical recovery input.
+
+- Observation: Direct one-pass traversal can legitimately commit a candidate
+  directly to terminal `unsupported` state at its metadata boundary. The
+  loader previously selected that candidate because terminal rows are part of
+  the direct cursor, then incorrectly required a `spooled` tree before the
+  caller's terminal-state branch could discard its deferred payload.
+  Evidence: The second clean-package 50 GB run reached recovered candidate
+  `recovered:33:0:0`, whose durable metadata records unsupported source item
+  type 14 and a `source_item_unsupported` rejection, then failed with
+  `requested top-level spooled candidate does not exist`. The corrected loader
+  checks terminal state before writable-tree loading; its focused synthetic
+  direct-protocol regression and the 104-test core suite pass.
+
+- Observation: Debian libpff's recovered traversal can report a duplicate
+  stable node identifier by returning successfully without emitting a message
+  graph; direct traversal still emits the corresponding empty metadata and
+  payload boundaries. This is not a malformed worker frame and creates no
+  recoverable candidate.
+  Evidence: The third clean-package run durably committed recovered items 0
+  and 1 as unsupported, then failed on `top-level metadata ended without a
+  message graph`. `process_message_inner` records the duplicate and returns
+  before `MessageStart`, while `process_message` emits both direct boundaries.
+  The corrected loader consumes the empty pair, records no candidate, and
+  continues; a focused synthetic regression passes.
+
+- Observation: Direct part rollover must carry both the accumulated source
+  folder catalog and the current candidate's just-discovered synthetic folder
+  into the new transaction before projecting that candidate. Observing only
+  the old transaction leaves a valid recovered item without a destination
+  folder when the item itself triggers rollover.
+  Evidence: The fourth clean-package run finalized part 4, then failed on
+  recovered candidate 17,399 with `transactional message folder is absent from
+  the layout`; 97,621 candidates were already written and only two remained
+  spooled. The rollover path now re-observes the current bounded input folders
+  immediately after beginning the replacement part.
+
+- Observation: Bounded direct candidate translation must not change the role
+  or container class of a same-location, same-path folder already retained in
+  the streaming source layout. Allowing a recovered candidate to promote an
+  ordinary retained folder to Deleted Items makes part metadata depend on
+  discovery order and conflicts when rollover begins from the refreshed
+  source layout.
+  Evidence: The fifth clean-package run passed the watchdog, terminal-candidate,
+  duplicate-boundary, and missing-rollover-folder failures, then stopped at the
+  same part-5 boundary with `streaming folder metadata changed after
+  observation`. Code inspection isolated the only occupied-folder mutation to
+  the candidate-side Deleted Items promotion. Retained metadata now wins in
+  both role-collision directions, covered by focused regressions and the
+  106-test core suite.
+
+- Observation: A fresh direct part's retained source layout is authoritative
+  for every existing folder location/path. Re-observing candidate-derived role
+  or class metadata for the same key is redundant and can conflict on damaged
+  stores where a synthetic recovery destination shares a display path with a
+  well-known source folder. Candidate folders absent from the retained layout
+  must still be observed before projection.
+  Evidence: r10 reproduced all four r5 part sizes, then stopped at recovered
+  candidate 17,399. Read-only ledger inspection showed that candidate uses the
+  synthetic `Recovered Mail` path while the source folder catalog contains the
+  well-known Deleted Items node at that same display path. The rollover filter
+  now checks typed location plus full path, skips already-retained keys, and
+  continues to observe missing synthetic folders; focused tests and the fast
+  gate pass.
+
+- Observation: SQLite extended error 6410 is `SQLITE_IOERR_GETTEMPPATH`, not a
+  physical-device I/O failure. A read-only container root must provide a
+  writable ephemeral temp directory because bounded direct metadata queries
+  may spill even though durable data remains confined to the job directory.
+  Evidence: r6-r9 failed in about 12 seconds with no candidates or parts; btrfs
+  device statistics reported zero read, write, flush, corruption, and
+  generation errors, and the ledgers passed integrity checks. Restoring
+  bubblewrap `--tmpfs /tmp` allowed r10 to run through 1:23:22 and four parts.
+
+- Observation: Direct folder deduplication belongs at the shared active-writer
+  observation boundary, before size projection, not only in the rollover
+  branch. The active writer itself is the authority for whether a typed
+  location/path has already been established, including folders discovered
+  dynamically after part construction.
+  Evidence: r11 used reproducible package SHA-256
+  `efed0e36f5eb637d304caad342926c35177f82c5023ab541b0c85dab42206459`,
+  reproduced four exact part sizes, and failed before entering the filtered
+  rollover observation. `TransactionalMailStoreWriter::contains_folder` now
+  gates the pre-projection, rollover, and end-of-stream observation sites;
+  focused writer/core/job tests and the fast gate pass.
 
 - Observation: A premature EOF from the direct worker hid the event that
   caused it. The protocol reader returned first, unwinding through
@@ -4681,6 +5042,59 @@ not modified.
   `large-qualification-20260717T204931Z`.
 
 ## Decision Log
+
+- Decision: Do not modify, replace, bundle, or pin Ubuntu's system libpff in
+  the current PSTForge worktree. Treat recovery parity as a separate upstream
+  source assessment: evaluate current libpff, identify the recovery regression,
+  and likely create a separately maintained custom fork before changing
+  PSTForge's runtime or Debian packaging policy. Publish 1.0.0 with the
+  existing replaceable dynamic dependency and begin that work only from a new
+  version branch.
+  Rationale: Ubuntu can reproduce Debian's recovery breadth with the 20180714
+  implementation, but selecting the long-term library source, patch boundary,
+  ABI identity, LGPL distribution model, and upstream relationship requires a
+  focused assessment rather than an opportunistic package substitution.
+  Date/Author: 2026-07-22 / human owner direction after cross-version parity.
+
+- Decision: Accept the clean ScanPST result for the focused RowID/RowVer
+  collision candidate, the completed-table invariant, and the automated gates
+  as the 1.0.0 regression proof; do not require another 50 GB generation and
+  manual import cycle before publication.
+  Rationale: The failed r12 artifact localized the defect to structural table
+  identity, the fix rejects that collision at both serialization paths, the
+  publication check independently rereads every completed dynamic table, and
+  the deliberately colliding normal/associated candidate now passes ScanPST.
+  The owner explicitly directed publication before the separate libpff work.
+  Date/Author: 2026-07-22 / human owner release direction.
+
+- Decision: Do not impose an absolute wall-clock deadline on a parser worker
+  whose protocol, CPU, or filesystem-I/O activity continues to advance. Kill a
+  worker after 15 minutes without any of those progress signals, and always
+  honor operator interruption.
+  Rationale: The completed 50 GB Debian traversal required about 87 minutes,
+  and an 83 GB damaged candidate can legitimately exceed two hours. Source
+  size and corruption complexity, rather than an arbitrary clock, determine a
+  useful native recovery scan's duration.
+  Date/Author: 2026-07-22 / human owner direction after 50 GB qualification.
+
+- Decision: Treat TC RowID and RowVer as writer-owned structural fields. Do
+  not project same-ID source properties into any table row, while retaining
+  those source properties in the message property context when representable.
+  Reread every completed dynamic table and require one-to-one matrix/BTH RowID
+  resolution before atomic publication, including direct constructed output.
+  Rationale: R12 part 4 proved that otherwise valid untrusted properties can
+  overwrite destination row identity, orphan an entire folder in ScanPST, and
+  evade readers that do not cross-check the table index.
+  Date/Author: 2026-07-22 / ScanPST failure diagnosis and MS-PST LTP contract.
+
+- Decision: Remove the arbitrary 2 GiB per-process RSS ceiling from the 1.0
+  release gate. Continue measuring and reporting supervisor and parser-worker
+  peaks so operators can plan capacity, but judge the real 50 GB rehearsal on
+  completion, correctness, source safety, validation, and the retained 24-hour
+  elapsed-time ceiling.
+  Rationale: The 2 GiB value was an agent-selected optimization target rather
+  than an owner requirement. The owner does not want it to block 1.0.
+  Date/Author: 2026-07-22 / human owner direction.
 
 - Decision: Clean ScanPST analysis followed by successful Outlook opening and
   inspection is PSTForge's interoperability acceptance boundary. MailPlus is
@@ -6511,8 +6925,9 @@ complete within the owner's 20-minute operational target, with no loss of
 finalized parts and final accounting for every discovered mail candidate. The
 owner accepted the measured 5,317,328,896-byte peak RSS as a known 0.4.1
 limitation; the 2 GiB objective remains for later optimization and release-scale
-qualification. The 1.0 release still requires the same acceptance behavior on
-the 50 GB source.
+measurement, but is not a 1.0 acceptance threshold. The 1.0 release still
+requires the same correctness, interoperability, source-safety, and 24-hour
+acceptance behavior on the 50 GB source.
 
 The human qualification uses the external source in place; it never copies the
 source into the repository or job. Set `SOURCE` to the 19 GB manifest entry and
@@ -7028,8 +7443,8 @@ MailPlus after both Microsoft checks pass is referred to Synology support.
 Release acceptance is exactly the behavior in `docs/PRODUCT_SPEC.md`: all
 selected mail is accounted for; partial/unsupported/failed content is explicit;
 valid parts are independently importable; resume is durable; the 50 GB balanced
-run finishes within 24 hours and below 2 GiB process RSS on the current host;
-and the source remains unchanged.
+run finishes within 24 hours with measured peak RSS recorded for capacity
+planning; and the source remains unchanged.
 
 ## Idempotence and Recovery
 
@@ -7100,8 +7515,7 @@ protection build on the approved remote baseline. Recheck authentication and
 repository settings before creating or configuring them. Local work and
 private-corpus acceptance must never depend on their existence.
 
-Revision note (2026-07-21): Closed 0.6.0 after protected merge `c0c5ce5`, green
-post-merge CI and bounded hosted fuzzing, clean ScanPST results, and successful
-Outlook acceptance. The human owner set ScanPST plus Outlook as PSTForge's
-interoperability boundary; MailPlus compatibility is assumed after those pass
-and no self-hosted MailPlus resource or import gate remains.
+Revision note (2026-07-22): Started 1.0.0 from protected green merge `83c29bf`.
+The release milestone repeats the real 50 GB recovery from a clean Debian 13
+package install, validates every part, and requires ScanPST followed by Outlook
+acceptance without introducing a MailPlus resource dependency.

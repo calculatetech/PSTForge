@@ -3827,6 +3827,14 @@ impl TransactionalMailStoreWriter {
         Ok(())
     }
 
+    /// Report whether the streaming layout already owns a folder location and path.
+    pub fn contains_folder(&self, location: MailFolderLocation, path: &[String]) -> bool {
+        self.spec
+            .folders
+            .iter()
+            .any(|folder| folder.location == location && folder.path == path)
+    }
+
     /// Add source folder metadata discovered after streaming construction began.
     pub fn observe_folder(&mut self, folder: MailFolderSpec) -> Result<(), WriterError> {
         if !folder.messages.is_empty() || !folder.associated_messages.is_empty() {
@@ -4583,6 +4591,14 @@ impl TransactionalMailStoreWriter {
         )?;
         temporary.file.sync_all()?;
         check_interrupted(interrupted)?;
+        let validated_path = PathBuf::from(format!(
+            "/proc/{}/fd/{}",
+            std::process::id(),
+            temporary.file.as_raw_fd()
+        ));
+        validate_completed_table_indexes(&validated_path, &folder_plans)
+            .map_err(completed_validation_error)?;
+        check_interrupted(interrupted)?;
         if !validate_output {
             publish_noclobber(
                 temporary.source_name(),
@@ -4594,11 +4610,6 @@ impl TransactionalMailStoreWriter {
             verify_published_destination(&destination, &temporary.file)?;
             return Ok(report);
         }
-        let validated_path = PathBuf::from(format!(
-            "/proc/{}/fd/{}",
-            std::process::id(),
-            temporary.file.as_raw_fd()
-        ));
         if !input.associated {
             let first_message_node = first_message_node.ok_or_else(|| {
                 WriterError::InvalidStructure(
@@ -6339,6 +6350,9 @@ fn validate_message(message: &MessageSpec, depth: usize) -> Result<(), WriterErr
 fn validate_contents_raw_property_types(message: &MessageSpec) -> Result<(), WriterError> {
     let columns = contents_columns()?;
     for raw in &message.raw_properties {
+        if matches!(raw.id, LTP_ROW_ID_PROP_ID | LTP_ROW_VERSION_PROP_ID) {
+            continue;
+        }
         let Some(column) = columns.iter().find(|column| column.prop_id() == raw.id) else {
             continue;
         };
@@ -7117,6 +7131,69 @@ fn validate_completed_recipients(
         {
             return Err(invalid("completed store recipient value mismatch"));
         }
+    }
+    Ok(())
+}
+
+fn validate_completed_table_indexes(
+    path: &Path,
+    folders: &[FolderPlan<'_>],
+) -> Result<(), WriterError> {
+    fn validate(table: &dyn crate::ltp::table_context::TableContext) -> Result<(), WriterError> {
+        let mut row_ids = BTreeSet::new();
+        for row in table.rows_matrix() {
+            if !row_ids.insert(u32::from(row.id())) {
+                return Err(WriterError::InvalidStructure(
+                    "completed table row matrix contains a duplicate RowID".to_owned(),
+                ));
+            }
+            let indexed = table.find_row(row.id()).map_err(|_| {
+                WriterError::InvalidStructure(
+                    "completed table row matrix disagrees with its BTH index".to_owned(),
+                )
+            })?;
+            if indexed.id() != row.id() {
+                return Err(WriterError::InvalidStructure(
+                    "completed table BTH resolves to a different RowID".to_owned(),
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    let invalid = |message: &str| WriterError::InvalidStructure(message.to_owned());
+    let store = crate::open_store(path)?;
+    validate(store.root_hierarchy_table()?.as_ref())?;
+    let ipm = store.open_folder(
+        &store
+            .properties()
+            .make_entry_id(node(NodeIdType::NormalFolder, IPM_FOLDER_INDEX)?)?,
+    )?;
+    validate(
+        ipm.hierarchy_table()
+            .ok_or_else(|| invalid("completed IPM hierarchy table is missing"))?
+            .as_ref(),
+    )?;
+    for folder_plan in folders {
+        let folder = store.open_folder(&store.properties().make_entry_id(folder_plan.node)?)?;
+        validate(
+            folder
+                .hierarchy_table()
+                .ok_or_else(|| invalid("completed folder hierarchy table is missing"))?
+                .as_ref(),
+        )?;
+        validate(
+            folder
+                .contents_table()
+                .ok_or_else(|| invalid("completed folder contents table is missing"))?
+                .as_ref(),
+        )?;
+        validate(
+            folder
+                .associated_table()
+                .ok_or_else(|| invalid("completed folder associated table is missing"))?
+                .as_ref(),
+        )?;
     }
     Ok(())
 }
@@ -10158,6 +10235,9 @@ fn message_table_row(
             .filter(|(id, _)| matches!(*id, 0x0E03 | 0x0E04)),
     );
     for raw in &message.raw_properties {
+        if matches!(raw.id, LTP_ROW_ID_PROP_ID | LTP_ROW_VERSION_PROP_ID) {
+            continue;
+        }
         if values.iter().any(|(id, _)| *id == raw.id) {
             continue;
         }
@@ -10197,6 +10277,9 @@ fn associated_message_table_row(
         ),
     ];
     for raw in &message.raw_properties {
+        if matches!(raw.id, LTP_ROW_ID_PROP_ID | LTP_ROW_VERSION_PROP_ID) {
+            continue;
+        }
         if values.iter().any(|(property_id, _)| *property_id == raw.id) {
             continue;
         }
@@ -10762,6 +10845,11 @@ fn write_external_table_value(
     blocks: &mut Vec<BlockSpec>,
     subnodes: &mut Vec<UnicodeLeafSubNodeTreeEntry>,
 ) -> Result<(), WriterError> {
+    if matches!(property_id, LTP_ROW_ID_PROP_ID | LTP_ROW_VERSION_PROP_ID) {
+        return Err(WriterError::InvalidStructure(
+            "table RowID and RowVer are writer-owned structural fields".to_owned(),
+        ));
+    }
     let column = columns
         .iter()
         .find(|column| column.prop_id() == property_id)
@@ -10826,6 +10914,11 @@ fn write_table_value(
     value: &PropertyValue,
     variables: &mut Vec<Vec<u8>>,
 ) -> Result<(), WriterError> {
+    if matches!(property_id, LTP_ROW_ID_PROP_ID | LTP_ROW_VERSION_PROP_ID) {
+        return Err(WriterError::InvalidStructure(
+            "table RowID and RowVer are writer-owned structural fields".to_owned(),
+        ));
+    }
     let column = columns
         .iter()
         .find(|column| column.prop_id() == property_id)
@@ -15258,6 +15351,148 @@ mod tests {
     }
 
     #[test]
+    fn source_properties_cannot_replace_table_row_identity()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("reserved-row-properties.pst");
+        let fixture = FidelityStore::default();
+        let mut normal = fixture.message.clone();
+        normal.attachments.clear();
+        normal.raw_properties.extend([
+            RawProperty {
+                id: LTP_ROW_ID_PROP_ID,
+                value: RawPropertyValue::Unicode("source row identity".to_owned()),
+            },
+            RawProperty {
+                id: LTP_ROW_VERSION_PROP_ID,
+                value: RawPropertyValue::Binary(vec![7, 7]),
+            },
+        ]);
+        let mut associated = normal.clone();
+        associated.subject = "associated structural collision".to_owned();
+        associated.raw_properties.push(RawProperty {
+            id: 0x3001,
+            value: RawPropertyValue::Unicode("associated structural collision".to_owned()),
+        });
+        let spec = MailStoreSpec {
+            store_name: "Reserved row properties".to_owned(),
+            record_key: *b"PSTForgeRowGuard",
+            folders: vec![MailFolderSpec {
+                path: vec!["Recovered Mail".to_owned()],
+                location: MailFolderLocation::IpmSubtree,
+                role: MailFolderRole::Ordinary,
+                container_class: "IPF.Note".to_owned(),
+                messages: vec![normal],
+                associated_messages: vec![associated],
+            }],
+        };
+        create_mail_store(&path, &spec)?;
+
+        let store = open_store(&path)?;
+        let folder = store.open_folder(
+            &store
+                .properties()
+                .make_entry_id(node(NodeIdType::NormalFolder, MAIL_FOLDER_INDEX)?)?,
+        )?;
+        let normal_id = node(NodeIdType::NormalMessage, MESSAGE_INDEX)?;
+        let associated_id = node(NodeIdType::AssociatedMessage, MESSAGE_INDEX + 1)?;
+        let contents = folder.contents_table().ok_or("missing contents")?;
+        assert_eq!(
+            contents.rows_matrix().next().ok_or("missing row")?.id(),
+            crate::ltp::table_context::TableRowId::new(u32::from(normal_id))
+        );
+        assert_eq!(
+            contents
+                .find_row(crate::ltp::table_context::TableRowId::new(u32::from(
+                    normal_id
+                )))?
+                .id(),
+            crate::ltp::table_context::TableRowId::new(u32::from(normal_id))
+        );
+        let associated = folder.associated_table().ok_or("missing associated")?;
+        assert_eq!(
+            associated
+                .rows_matrix()
+                .next()
+                .ok_or("missing associated row")?
+                .id(),
+            crate::ltp::table_context::TableRowId::new(u32::from(associated_id))
+        );
+        assert_eq!(
+            associated
+                .find_row(crate::ltp::table_context::TableRowId::new(u32::from(
+                    associated_id
+                )))?
+                .id(),
+            crate::ltp::table_context::TableRowId::new(u32::from(associated_id))
+        );
+        for message_id in [normal_id, associated_id] {
+            let message = store.open_message(
+                &store.properties().make_entry_id(message_id)?,
+                Some(&[LTP_ROW_ID_PROP_ID, LTP_ROW_VERSION_PROP_ID]),
+            )?;
+            assert!(matches!(
+                message.properties().get(LTP_ROW_ID_PROP_ID),
+                Some(crate::ltp::prop_context::PropertyValue::Unicode(value))
+                    if value.buffer()
+                        == "source row identity".encode_utf16().collect::<Vec<_>>()
+            ));
+            assert!(matches!(
+                message.properties().get(LTP_ROW_VERSION_PROP_ID),
+                Some(crate::ltp::prop_context::PropertyValue::Binary(value))
+                    if value.buffer() == [7, 7]
+            ));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn table_serializers_reject_structural_row_properties() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let columns = contents_columns()?;
+        let mut row = vec![0_u8; 64];
+        let original = row.clone();
+        let mut variables = Vec::new();
+        for property_id in [LTP_ROW_ID_PROP_ID, LTP_ROW_VERSION_PROP_ID] {
+            assert!(
+                write_table_value(
+                    &mut row,
+                    &columns,
+                    property_id,
+                    &PropertyValue::Integer32(1),
+                    &mut variables,
+                )
+                .is_err()
+            );
+            assert_eq!(row, original);
+        }
+
+        let mut heap_allocations = Vec::new();
+        let mut next_value_node = 0x5_0000;
+        let mut next_block_index = 1;
+        let mut blocks = Vec::new();
+        let mut subnodes = Vec::new();
+        for property_id in [LTP_ROW_ID_PROP_ID, LTP_ROW_VERSION_PROP_ID] {
+            assert!(
+                write_external_table_value(
+                    &mut row,
+                    &columns,
+                    property_id,
+                    &PropertyValue::Integer32(1),
+                    &mut heap_allocations,
+                    &mut next_value_node,
+                    &mut next_block_index,
+                    &mut blocks,
+                    &mut subnodes,
+                )
+                .is_err()
+            );
+            assert_eq!(row, original);
+        }
+        Ok(())
+    }
+
+    #[test]
     fn external_table_fills_every_non_final_heap_page() -> Result<(), Box<dyn std::error::Error>> {
         let columns = contents_columns()?;
         let rows = (0..8000)
@@ -16233,6 +16468,8 @@ mod tests {
             }],
         };
         let mut writer = TransactionalMailStoreWriter::begin_streaming(&path, layout, true, None)?;
+        assert!(writer.contains_folder(MailFolderLocation::IpmSubtree, &["Inbox".to_owned()]));
+        assert!(!writer.contains_folder(MailFolderLocation::IpmSubtree, &["Archive".to_owned()]));
         writer.append_message_deferred(
             MailFolderLocation::IpmSubtree,
             &["Inbox".to_owned()],
@@ -16302,6 +16539,7 @@ mod tests {
             messages: Vec::new(),
             associated_messages: Vec::new(),
         })?;
+        assert!(writer.contains_folder(MailFolderLocation::IpmSubtree, &["Archive".to_owned()]));
         let mut second = fixture.message;
         second.attachments.clear();
         second.subject = "Archive item".to_owned();

@@ -80,10 +80,11 @@ movement, then run the real 50 GB corrupt PST end to end. Show that forced
 termination cannot damage the source or already finalized parts. The 19 GB
 qualification must finish within the owner's 20-minute operational target on
 the current host. Version 0.4.1 records measured peak RSS; the owner accepted
-the 5,317,328,896-byte result as a known limitation, while the 2 GiB objective
-remains for later optimization and release-scale qualification. Content
-fidelity findings discovered during qualification are planned separately as
-version 0.4.2 and are not folded into the accepted splitting branch.
+the 5,317,328,896-byte result as a known limitation. The former 2 GiB objective
+remains historical optimization evidence and is not a 1.0 release blocker.
+Content fidelity findings discovered during qualification are planned
+separately as version 0.4.2 and are not folded into the accepted splitting
+branch.
 
 ### 9. Version 0.4.2 - Incremental Data Correctness
 

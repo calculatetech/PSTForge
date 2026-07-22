@@ -27,6 +27,15 @@ deleted or disconnected items exposed by `libpff`, orphan items, and fragment
 candidates in explicit aggressive mode when the input library can prove
 fragment origin.
 
+PSTForge 1.0 dynamically links the platform `libpff.so.1`; recovery breadth is
+therefore limited to the candidates exposed by that installed implementation.
+The Debian package accepts `libpff1t64 (>= 20180714)`. Controlled qualification
+found that Debian's 20180714 implementation exposed substantially more deleted
+records from one damaged source than Ubuntu's 20231205 implementation, even
+though both satisfy that ABI dependency. `--aggressive` changes recovery flags;
+it does not reproduce an older library's recovery behavior. A maintained libpff
+fork and any corresponding package policy are explicitly post-1.0 work.
+
 PSTForge 1.0 always writes new 64-bit Unicode PST version 23 files with
 512-byte pages. Output uses the format's compressible permutation encoding for
 broad compatibility; this encoding is obfuscation, not password protection.
@@ -157,6 +166,12 @@ The direct parser receives one supervised attempt. A worker crash, stall, or
 protocol failure aborts the active ledger transaction, removes the unpublished
 active part, preserves atomically finalized parts, and produces a typed
 `failed-partial` result with the same non-resumable retained-state contract.
+The watchdog treats protocol frames and measurable child CPU or filesystem I/O
+activity as progress. Fifteen minutes with none of those signals is a stall;
+there is no fixed deadline while the child continues to make measurable
+progress. This permits recovery scans to scale with source size and damage.
+An operator interrupt still terminates the supervised child, checkpoints
+durable restartable state, and returns the documented interrupted status.
 PSTForge never reports an unfinished candidate as written. Operators who need
 durable retry select `--restartable`.
 If libpff reports a parser boundary after the last complete top-level graph,
@@ -362,8 +377,11 @@ Internet codepage and its byte-exact HTML; HTML declared as 65001, or lacking a
 source codepage and therefore defaulted to 65001, must pass bounded streaming
 UTF-8 validation or be omitted with partial accounting. The writer does not
 synthesize the redundant `PidTagMessageCodepage` fallback. A raw property that
-duplicates a writer-managed property is rejected at the writer boundary rather
-than silently replacing the conforming value. Every intentionally omitted
+duplicates a writer-managed message property is rejected at the writer
+boundary rather than silently replacing the conforming value. Source
+properties whose IDs equal the table-context RowID or RowVer fields are
+retained in the message property context but cannot replace those writer-owned
+structural values in a table row. Every intentionally omitted
 property is returned in a structured write report with an empty top-level path
 or the deterministic attachment-index path of its embedded message. The 0.2.1
 canonical fixture boundary externalizes property values through 16 KiB and
@@ -372,11 +390,12 @@ requirement.
 
 Output creation is append/build-only in a `.partial` file. In direct mode the
 writer emits all blocks, allocation maps, B-trees, tables, and headers by
-construction, syncs and closes the file, writes its sidecar manifest, syncs
-the directory, and atomically renames it to the final `.pst` name without
-rereading or hashing the content. Restartable mode performs its documented
-digest and validation work before publication. PSTForge never modifies a
-published part in place.
+construction, syncs the file, rereads every dynamic hierarchy, contents, and
+associated table to prove that each matrix RowID resolves through its BTH to
+the same row, writes its sidecar manifest, syncs the directory, and atomically
+renames it to the final `.pst` name without hashing the content. Restartable
+mode performs its additional documented digest and validation work before
+publication. PSTForge never modifies a published part in place.
 
 Every writer invariant is traceable through `docs/WRITER_CONFORMANCE.md` to an
 authoritative Microsoft Open Specification or Microsoft MAPI requirement, the
@@ -543,9 +562,10 @@ No command returns success merely because it reached the end of traversal.
 
 Release acceptance requires all local gates, the real external corpus, and the
 50 GB corrupt PST. On the current x86_64 host, balanced recovery must finish
-within 24 hours, keep peak PSTForge process RSS below 2 GiB, leave the source
-unchanged, survive forced termination without losing finalized parts, and
-account for every discovered mail item.
+within 24 hours, leave the source unchanged, survive forced termination without
+losing finalized parts, and account for every discovered mail item. Record
+measured peak supervisor and parser-worker RSS for operator capacity planning;
+1.0 does not impose an arbitrary fixed RSS ceiling on the 50 GB rehearsal.
 
 For the 19 GB qualification source, the readable inventory and the union of
 unique item keys written across all finalized parts must match one-for-one.
