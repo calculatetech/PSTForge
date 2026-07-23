@@ -5,12 +5,18 @@ use std::process::ExitCode;
 
 use clap::Parser;
 use pstforge_cli::{Cli, ColorChoice, CommandStatus, LogFormat};
-use tracing::error;
+use tracing::{error, info};
 use tracing_subscriber::EnvFilter;
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
     init_logging(&cli);
+    info!(
+        pstforge_version = pstforge_core::VERSION,
+        libpff_version = %pstforge_core::libpff_version(),
+        libpff_revision = pstforge_core::libpff_revision(),
+        "runtime initialized"
+    );
     let stdout = io::stdout();
     let mut output = io::BufWriter::with_capacity(1024 * 1024, stdout.lock());
     let result = pstforge_cli::execute(&cli, &mut output);

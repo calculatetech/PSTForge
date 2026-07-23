@@ -5,7 +5,7 @@ use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::io::Read as _;
 use std::os::fd::AsFd;
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{PermissionsExt, symlink};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode, Output};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -425,15 +425,15 @@ fn package_deb(root: &Path, validate: bool) -> Result<(), String> {
     let build_target = package_root.join("build");
     build_release_binary(root, &build_target, &epoch)?;
     let binary = build_target.join("release/pstforge");
-    let dependencies = debian_runtime_dependencies(&package_root, &binary)?;
+    let (libpff_revision, libpff_runtime) = packaged_libpff_runtime(root)?;
+    let dependencies = debian_runtime_dependencies(&package_root, &binary, &libpff_runtime)?;
     let rust_licenses = rust_dependency_licenses(root)?;
     let candidate = package_root.join(format!(".pstforge_{version}_amd64.candidate.deb"));
     build_deb_archive(
         root,
         &binary,
-        &dependencies,
-        &rust_licenses,
-        &epoch,
+        (&libpff_runtime, &libpff_revision),
+        (&dependencies, &rust_licenses, &epoch),
         "package",
         &candidate,
     )?;
@@ -447,9 +447,8 @@ fn package_deb(root: &Path, validate: bool) -> Result<(), String> {
         build_deb_archive(
             root,
             &validation_binary,
-            &dependencies,
-            &rust_licenses,
-            &epoch,
+            (&libpff_runtime, &libpff_revision),
+            (&dependencies, &rust_licenses, &epoch),
             "validation",
             &validation_package,
         )?;
@@ -480,12 +479,13 @@ fn package_deb(root: &Path, validate: bool) -> Result<(), String> {
 }
 
 fn build_release_binary(root: &Path, target: &Path, epoch: &str) -> Result<(), String> {
-    let remap = format!("--remap-path-prefix={}=/usr/src/pstforge", root.display());
+    let rustflags = format!("--remap-path-prefix={}=/usr/src/pstforge", root.display());
     let status = Command::new("cargo")
         .args(["build", "--locked", "--release", "-p", "pstforge-cli"])
         .env("CARGO_INCREMENTAL", "0")
         .env("CARGO_TARGET_DIR", target)
-        .env("RUSTFLAGS", remap)
+        .env("PSTFORGE_LIBPFF_RPATH", "$ORIGIN/../lib/pstforge")
+        .env("RUSTFLAGS", rustflags)
         .env("SOURCE_DATE_EPOCH", epoch)
         .current_dir(root)
         .status()
@@ -532,7 +532,11 @@ fn source_date_epoch(root: &Path) -> Result<String, String> {
     .to_owned())
 }
 
-fn debian_runtime_dependencies(package_root: &Path, binary: &Path) -> Result<String, String> {
+fn debian_runtime_dependencies(
+    package_root: &Path,
+    binary: &Path,
+    libpff_runtime: &Path,
+) -> Result<String, String> {
     let work = package_root.join("shlibdeps");
     fs::create_dir_all(work.join("debian"))
         .map_err(|error| format!("cannot create dependency workspace: {error}"))?;
@@ -541,12 +545,25 @@ fn debian_runtime_dependencies(package_root: &Path, binary: &Path) -> Result<Str
         "Source: pstforge\nSection: utils\nPriority: optional\nMaintainer: PSTForge Maintainers <noreply@pstforge.invalid>\nStandards-Version: 4.7.0\n\nPackage: pstforge\nArchitecture: any\nDepends: ${shlibs:Depends}\nDescription: PST recovery utility\n",
     )
     .map_err(|error| format!("cannot create dependency control file: {error}"))?;
+    fs::write(
+        work.join("debian/shlibs.local"),
+        "libpff 1 pstforge-private-libpff\n",
+    )
+    .map_err(|error| format!("cannot create private libpff dependency metadata: {error}"))?;
     let output = command_stdout_os(
         &work,
         OsStr::new("dpkg-shlibdeps"),
         &[
             OsString::from("-O"),
             OsString::from(format!("-e{}", binary.display())),
+            OsString::from(format!("-e{}", libpff_runtime.display())),
+            OsString::from(format!(
+                "-l{}",
+                libpff_runtime
+                    .parent()
+                    .ok_or_else(|| "libpff runtime has no parent directory".to_owned())?
+                    .display()
+            )),
         ],
     )?;
     let generated = output
@@ -556,12 +573,40 @@ fn debian_runtime_dependencies(package_root: &Path, binary: &Path) -> Result<Str
     let mut dependencies = generated
         .split(',')
         .map(str::trim)
-        .filter(|dependency| !dependency.starts_with("libpff1t64 "))
+        .filter(|dependency| *dependency != "pstforge-private-libpff")
         .map(str::to_owned)
         .collect::<Vec<_>>();
-    dependencies.push("libpff1t64 (>= 20180714)".to_owned());
     dependencies.sort();
     Ok(dependencies.join(", "))
+}
+
+fn packaged_libpff_runtime(root: &Path) -> Result<(String, PathBuf), String> {
+    let source = root.join("third_party/libpff");
+    let revision = command_stdout_os(
+        root,
+        OsStr::new("git"),
+        &[
+            OsString::from("-C"),
+            source.as_os_str().to_owned(),
+            OsString::from("rev-parse"),
+            OsString::from("HEAD"),
+        ],
+    )?;
+    let revision = revision.trim().to_owned();
+    if revision.len() != 40 || !revision.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(format!("unexpected libpff revision: {revision:?}"));
+    }
+    let runtime = root
+        .join("target/native/libpff")
+        .join(&revision)
+        .join("install/lib/libpff.so.1.0.0");
+    if !runtime.is_file() {
+        return Err(format!(
+            "the Cargo build did not produce {}",
+            runtime.display()
+        ));
+    }
+    Ok((revision, runtime))
 }
 
 fn rust_dependency_licenses(root: &Path) -> Result<String, String> {
@@ -703,17 +748,26 @@ fn rust_dependency_licenses(root: &Path) -> Result<String, String> {
 fn build_deb_archive(
     root: &Path,
     binary: &Path,
-    dependencies: &str,
-    rust_licenses: &str,
-    epoch: &str,
+    libpff: (&Path, &str),
+    metadata: (&str, &str, &str),
     suffix: &str,
     output: &Path,
 ) -> Result<(), String> {
+    let (libpff_runtime, libpff_revision) = libpff;
+    let (dependencies, rust_licenses, epoch) = metadata;
     let package_root = output
         .parent()
         .ok_or_else(|| "Debian output path has no parent".to_owned())?;
     let stage = package_root.join(format!("stage-{suffix}"));
-    stage_deb_tree(root, &stage, binary, dependencies, rust_licenses)?;
+    stage_deb_tree(
+        root,
+        &stage,
+        binary,
+        libpff_runtime,
+        libpff_revision,
+        dependencies,
+        rust_licenses,
+    )?;
     normalize_tree_timestamps(&stage, epoch)?;
     let status = Command::new("dpkg-deb")
         .args(["--root-owner-group", "-Zxz", "-z9", "--build"])
@@ -734,6 +788,8 @@ fn stage_deb_tree(
     root: &Path,
     stage: &Path,
     binary: &Path,
+    libpff_runtime: &Path,
+    libpff_revision: &str,
     dependencies: &str,
     rust_licenses: &str,
 ) -> Result<(), String> {
@@ -741,6 +797,8 @@ fn stage_deb_tree(
         "DEBIAN",
         "usr",
         "usr/bin",
+        "usr/lib",
+        "usr/lib/pstforge",
         "usr/share",
         "usr/share/doc",
         "usr/share/doc/pstforge",
@@ -765,6 +823,21 @@ fn stage_deb_tree(
             packaged_binary.as_os_str().to_owned(),
         ],
     )?;
+    let packaged_libpff = stage.join("usr/lib/pstforge/libpff.so.1.0.0");
+    copy_with_mode(libpff_runtime, &packaged_libpff, 0o644)?;
+    run_checked_os(
+        root,
+        OsStr::new("strip"),
+        &[
+            OsString::from("--strip-unneeded"),
+            packaged_libpff.as_os_str().to_owned(),
+        ],
+    )?;
+    symlink(
+        OsStr::new("libpff.so.1.0.0"),
+        stage.join("usr/lib/pstforge/libpff.so.1"),
+    )
+    .map_err(|error| format!("cannot create packaged libpff SONAME link: {error}"))?;
     for (source, destination) in [
         ("README.md", "usr/share/doc/pstforge/README.md"),
         (
@@ -782,6 +855,18 @@ fn stage_deb_tree(
             "usr/share/doc/pstforge/WRITER-LICENSE-MIT",
         ),
         ("docs/debian-copyright", "usr/share/doc/pstforge/copyright"),
+        (
+            "third_party/libpff/COPYING",
+            "usr/share/doc/pstforge/LIBPFF-COPYING",
+        ),
+        (
+            "third_party/libpff/COPYING.LESSER",
+            "usr/share/doc/pstforge/LIBPFF-COPYING.LESSER",
+        ),
+        (
+            "third_party/libpff/PSTFORGE_FORK.md",
+            "usr/share/doc/pstforge/LIBPFF-FORK.md",
+        ),
     ] {
         copy_with_mode(&root.join(source), &stage.join(destination), 0o644)?;
     }
@@ -790,6 +875,45 @@ fn stage_deb_tree(
         .map_err(|error| format!("cannot write Rust dependency licenses: {error}"))?;
     fs::set_permissions(&rust_license_path, fs::Permissions::from_mode(0o644))
         .map_err(|error| format!("cannot set Rust dependency license permissions: {error}"))?;
+    let source_offer = stage.join("usr/share/doc/pstforge/LIBPFF-SOURCE.txt");
+    fs::write(
+        &source_offer,
+        format!(
+            "PSTForge includes the dynamically linked libpff runtime at revision\n{libpff_revision}.\n\nThe complete corresponding source used to build it is installed beside this\nfile as libpff-source.tar.gz. The maintained public source is also available at\nhttps://github.com/calculatetech/libpff/tree/{libpff_revision}\n\nBuild instructions are in PSTFORGE_FORK.md inside that archive.\n"
+        ),
+    )
+    .map_err(|error| format!("cannot write libpff source instructions: {error}"))?;
+    fs::set_permissions(&source_offer, fs::Permissions::from_mode(0o644))
+        .map_err(|error| format!("cannot set libpff source instruction permissions: {error}"))?;
+    let source_tar = stage.join("usr/share/doc/pstforge/libpff-source.tar");
+    run_checked_os(
+        root,
+        OsStr::new("git"),
+        &[
+            OsString::from("-C"),
+            root.join("third_party/libpff").as_os_str().to_owned(),
+            OsString::from("archive"),
+            OsString::from("--format=tar"),
+            OsString::from(format!("--prefix=libpff-{libpff_revision}/")),
+            OsString::from("--output"),
+            source_tar.as_os_str().to_owned(),
+            OsString::from(libpff_revision),
+        ],
+    )?;
+    run_checked_os(
+        root,
+        OsStr::new("gzip"),
+        &[
+            OsString::from("-n"),
+            OsString::from("-9"),
+            source_tar.as_os_str().to_owned(),
+        ],
+    )?;
+    fs::set_permissions(
+        stage.join("usr/share/doc/pstforge/libpff-source.tar.gz"),
+        fs::Permissions::from_mode(0o644),
+    )
+    .map_err(|error| format!("cannot set libpff source archive permissions: {error}"))?;
     for entry in fs::read_dir(root.join("docs/schemas"))
         .map_err(|error| format!("cannot read public schemas: {error}"))?
     {
@@ -865,11 +989,19 @@ fn validate_deb_package(
         "./usr/",
         "./usr/bin/",
         "./usr/bin/pstforge",
+        "./usr/lib/",
+        "./usr/lib/pstforge/",
+        "./usr/lib/pstforge/libpff.so.1",
+        "./usr/lib/pstforge/libpff.so.1.0.0",
         "./usr/share/",
         "./usr/share/doc/",
         "./usr/share/doc/pstforge/",
         "./usr/share/doc/pstforge/LICENSE-APACHE",
         "./usr/share/doc/pstforge/LICENSE-MIT",
+        "./usr/share/doc/pstforge/LIBPFF-COPYING",
+        "./usr/share/doc/pstforge/LIBPFF-COPYING.LESSER",
+        "./usr/share/doc/pstforge/LIBPFF-FORK.md",
+        "./usr/share/doc/pstforge/LIBPFF-SOURCE.txt",
         "./usr/share/doc/pstforge/PRODUCT_SPEC.md",
         "./usr/share/doc/pstforge/RUST-DEPENDENCY-LICENSES.txt",
         "./usr/share/man/man1/pstforge.1.gz",
@@ -878,6 +1010,7 @@ fn validate_deb_package(
         "./usr/share/doc/pstforge/WRITER-LICENSE-MIT",
         "./usr/share/doc/pstforge/changelog.gz",
         "./usr/share/doc/pstforge/copyright",
+        "./usr/share/doc/pstforge/libpff-source.tar.gz",
         "./usr/share/man/",
         "./usr/share/man/man1/",
         "./usr/share/pstforge/",
@@ -893,7 +1026,7 @@ fn validate_deb_package(
     .collect::<BTreeSet<_>>();
     let actual_paths = contents
         .lines()
-        .filter_map(|line| line.split_whitespace().last())
+        .filter_map(deb_contents_path)
         .collect::<BTreeSet<_>>();
     if actual_paths != expected_paths {
         return Err(format!(
@@ -945,14 +1078,29 @@ fn validate_deb_package(
     )?;
     if !linkage.contains("Shared library: [libpff.so.1]")
         || linkage.contains("(RPATH)")
-        || linkage.contains("(RUNPATH)")
+        || !linkage.contains("Library runpath: [$ORIGIN/../lib/pstforge]")
     {
         return Err(
-            "packaged binary has unexpected libpff linkage or runtime search path".to_owned(),
+            "packaged binary has unexpected libpff linkage or private runtime search path"
+                .to_owned(),
         );
+    }
+    let packaged_libpff = extracted.join("usr/lib/pstforge/libpff.so.1");
+    if fs::read_link(&packaged_libpff)
+        .map_err(|error| format!("cannot inspect packaged libpff link: {error}"))?
+        != Path::new("libpff.so.1.0.0")
+    {
+        return Err("packaged libpff SONAME link has an unexpected target".to_owned());
     }
     validate_isolated_install_remove(root, package_root, package)?;
     run_checked(root, "lintian", &["--fail-on", "error", package_text])
+}
+
+fn deb_contents_path(line: &str) -> Option<&str> {
+    line.split_once(" -> ")
+        .map_or(line, |(link, _)| link)
+        .split_whitespace()
+        .last()
 }
 
 fn validate_isolated_install_remove(
@@ -973,13 +1121,12 @@ fn validate_isolated_install_remove(
     let admin_argument = OsString::from(format!("--admindir={}", admin.display()));
     let common = [
         OsString::from("--force-not-root"),
-        OsString::from("--force-depends"),
         OsString::from("--log=/dev/null"),
         root_argument,
         admin_argument,
     ];
     let mut install = common.to_vec();
-    install.push(OsString::from("--install"));
+    install.push(OsString::from("--unpack"));
     install.push(package.as_os_str().to_owned());
     run_checked_os(root, OsStr::new("dpkg"), &install)?;
     if !install_root.join("usr/bin/pstforge").is_file() {
@@ -1063,8 +1210,7 @@ fn tree_file_bytes(root: &Path) -> Result<u64, String> {
             .map_err(|error| format!("cannot read {}: {error}", directory.display()))?
         {
             let entry = entry.map_err(|error| format!("cannot read package entry: {error}"))?;
-            let metadata = entry
-                .metadata()
+            let metadata = fs::symlink_metadata(entry.path())
                 .map_err(|error| format!("cannot inspect {}: {error}", entry.path().display()))?;
             if metadata.is_dir() {
                 pending.push(entry.path());
@@ -3518,7 +3664,7 @@ mod tests {
     use std::os::unix::fs::symlink;
 
     use super::{
-        GithubWorkflow, document_checkpoint_payload, package_validation_option,
+        GithubWorkflow, deb_contents_path, document_checkpoint_payload, package_validation_option,
         prepare_generated_directory, require_workflow_command, rust_dependency_licenses,
     };
 
@@ -3551,6 +3697,17 @@ mod tests {
                 .into_iter()
             )
             .is_err()
+        );
+    }
+
+    #[test]
+    fn deb_contents_parser_retains_symbolic_link_path() {
+        let file = "-rwxr-xr-x root/root 12 2026-07-22 21:00 ./usr/bin/pstforge";
+        let link = "lrwxrwxrwx root/root 0 2026-07-22 21:00 ./usr/lib/pstforge/libpff.so.1 -> libpff.so.1.0.0";
+        assert_eq!(deb_contents_path(file), Some("./usr/bin/pstforge"));
+        assert_eq!(
+            deb_contents_path(link),
+            Some("./usr/lib/pstforge/libpff.so.1")
         );
     }
 

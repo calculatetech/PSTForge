@@ -26,6 +26,7 @@ jobs:
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
           persist-credentials: false
+          submodules: recursive
       - name: Validate GitHub Actions workflows
         run: |
           curl --fail --location --silent --show-error \
@@ -38,7 +39,9 @@ jobs:
       - name: Install native tools
         run: |
           sudo apt-get update
-          sudo apt-get install --yes libpff-dev pff-tools pst-utils pkg-config
+          sudo apt-get install --yes \
+            autoconf automake autopoint build-essential libtool pkg-config \
+            pff-tools pst-utils zlib1g-dev
       - name: Install Rust 1.85
         uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c
         with:
@@ -64,12 +67,14 @@ jobs:
         run: |
           apt-get update
           apt-get install --yes --no-install-recommends \
-            binutils build-essential ca-certificates curl dpkg-dev findutils git gzip \
-            libpff-dev lintian pkg-config pff-tools pst-utils
+            autoconf automake autopoint binutils build-essential ca-certificates curl \
+            dpkg-dev findutils git gzip libtool lintian pkg-config \
+            pff-tools pst-utils zlib1g-dev
       - name: Check out source
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
           persist-credentials: false
+          submodules: recursive
       - name: Install Rust 1.85
         uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c
         with:
