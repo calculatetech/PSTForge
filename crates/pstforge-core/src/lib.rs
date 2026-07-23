@@ -47,6 +47,7 @@ pub use catalog::{
 };
 pub use libpff_sys::PffError;
 pub use libpff_sys::RecoveryMode;
+pub use libpff_sys::{library_revision as libpff_revision, library_version as libpff_version};
 
 #[cfg(test)]
 mod public_json_fixture_tests {

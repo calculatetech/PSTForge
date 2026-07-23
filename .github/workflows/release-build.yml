@@ -27,14 +27,16 @@ jobs:
         run: |
           apt-get update
           apt-get install --yes --no-install-recommends \
-            binutils build-essential ca-certificates curl dpkg-dev findutils git gzip jq \
-            libpff-dev lintian pkg-config pff-tools pst-utils
+            autoconf automake autopoint binutils build-essential ca-certificates curl \
+            dpkg-dev findutils git gzip jq libtool lintian pkg-config \
+            pff-tools pst-utils zlib1g-dev
       - name: Check out approved tag
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
           ref: ${{ inputs.tag }}
           fetch-depth: 0
           persist-credentials: false
+          submodules: recursive
       - name: Trust container checkout
         run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
       - name: Verify immutable release tag

@@ -1,3 +1,11 @@
+pstforge (1.1.0) unstable; urgency=medium
+
+  * Ship the maintained recovery-capable libpff runtime and its corresponding
+    source.
+  * Remove the distribution libpff runtime dependency.
+
+ -- PSTForge Maintainers <noreply@pstforge.invalid>  Wed, 22 Jul 2026 21:00:00 +0000
+
 pstforge (1.0.0) unstable; urgency=medium
 
   * Complete the MailPlus-ready compatibility and safety release gate.

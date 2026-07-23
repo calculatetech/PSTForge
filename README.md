@@ -75,7 +75,7 @@ runtime dependencies are resolved:
 
 ```bash
 cargo xtask package deb
-sudo apt install ./target/debian/pstforge_1.0.0_amd64.deb
+sudo apt install ./target/debian/pstforge_1.1.0_amd64.deb
 pstforge --version
 ```
 
@@ -87,9 +87,11 @@ contents, linkage, lintian, and isolated install/removal checks:
 cargo xtask package deb --validate
 ```
 
-The package targets `amd64` and dynamically links the replaceable system
-`libpff.so.1`. It installs the binary, manpage, product documentation, public
-JSON schemas, and all applicable license notices. Remove the program without
+The package targets `amd64` and dynamically links a replaceable private
+`libpff.so.1` built from the pinned `calculatetech/libpff` submodule. It
+installs that runtime below `/usr/lib/pstforge` together with its complete
+corresponding source, revision, LGPL notices, the PSTForge binary, manpage,
+product documentation, and public JSON schemas. Remove the program without
 touching source PSTs or recovery jobs:
 
 ```bash
@@ -103,16 +105,16 @@ packages are:
 
 ```bash
 sudo apt update
-sudo apt install build-essential pkg-config cargo rustc libpff-dev
+sudo apt install autoconf automake autopoint build-essential cargo libtool \
+  pkg-config rustc zlib1g-dev
+git submodule update --init --recursive
 cargo build --locked --release -p pstforge-cli
 ./target/release/pstforge --version
 ```
 
-To install that source build outside the package manager:
-
-```bash
-sudo install -Dm755 target/release/pstforge /usr/local/bin/pstforge
-```
+Run source builds from their build tree so the executable can resolve the
+pinned shared runtime there. Use the Debian package above for a system-wide
+installation; it installs the executable and its matching runtime together.
 
 Development and full acceptance use these additional verified Ubuntu packages:
 
@@ -122,10 +124,11 @@ sudo apt install rustfmt rust-clippy pff-tools pst-utils dpkg-dev lintian \
 cargo install cargo-audit --locked
 ```
 
-`libpff-dev` supplies the dynamically linked parser headers/library,
-`pff-tools` supplies `pffinfo`, and `pst-utils` supplies `readpst`. The Debian
-builder additionally uses `dpkg-dev`, `lintian`, `binutils`, `gzip`, `findutils`,
-and `coreutils`.
+The normal Cargo graph compiles the pinned libpff shared runtime once and
+reuses it across workspace crates and profiles. `pff-tools` supplies the
+independent `pffinfo` validator, and `pst-utils` supplies `readpst`. The Debian
+builder additionally uses `dpkg-dev`, `lintian`, `binutils`, `gzip`,
+`findutils`, and `coreutils`.
 
 ## Basic Usage
 

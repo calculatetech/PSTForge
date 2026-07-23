@@ -13,6 +13,7 @@ use thiserror::Error;
 
 const ERROR_BUFFER_SIZE: usize = 16 * 1024;
 const MAX_FOLDERS: u64 = 1_000_000;
+pub const LIBPFF_REVISION: &str = env!("PSTFORGE_LIBPFF_REVISION");
 
 #[derive(Debug, Error)]
 pub enum PffError {
@@ -160,6 +161,10 @@ pub fn library_version() -> String {
     unsafe { CStr::from_ptr(version) }
         .to_string_lossy()
         .into_owned()
+}
+
+pub const fn library_revision() -> &'static str {
+    LIBPFF_REVISION
 }
 
 pub struct PffFile {

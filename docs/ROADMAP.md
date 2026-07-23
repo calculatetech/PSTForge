@@ -231,6 +231,31 @@ A MailPlus-only failure after those checks is a Synology support issue and does
 not block the release. Tag, publish, push, or merge only after explicit human
 approval.
 
+### 18. Version 1.1.0 - Maintained Recovery Runtime
+
+Replace the distribution-selected parser with a private, dynamically linked
+build of the separately maintained `calculatetech/libpff` fork. Restore the
+deleted-item recovery breadth of the exact Debian 20180714 source while
+retaining current upstream format and safety fixes. The known 50 GB damaged
+source must expose every legacy recovery candidate or a verified readable
+superset before a final split is generated. Ship the fork and its corresponding
+LGPL source provenance inside the single PSTForge Debian deliverable without a
+runtime dependency on the distribution `libpff1t64` package.
+
+### 19. Version 1.2.0 - Parallel Recovery Performance
+
+Profile the accepted 1.1.0 fork, remove demonstrated single-threaded recovery
+bottlenecks, and parallelize immutable recovery scanning with independent file
+handles, thread-local state, and deterministic merging. Add an automatic
+parser-thread default plus an explicit operator override. Require identical
+semantic inventory across thread counts and a repeatable improvement beyond
+measurement noise, without imposing an arbitrary RSS or speedup threshold.
+
+Large-file development and final proof use the immutable 50 GB source with
+inventory-only passes wherever output is unnecessary. Do not read, hash,
+parse, copy, or split the separate approximately 83 GB candidate until 1.2.0
+has passed its 50 GB correctness, performance, and interoperability gates.
+
 ## Beyond 1.0
 
 Post-1.0 candidates include selection by date range, partitioning by folder,

@@ -26,7 +26,16 @@ Files: crates/libpff-sys/*
 Copyright: 2026 PSTForge contributors
 License: Apache-2.0 or MIT
 Comment:
- This wrapper dynamically links the separately distributed system libpff.
- libpff is LGPL-3.0-or-later and is not copied into this package. See
- /usr/share/doc/pstforge/THIRD_PARTY_LICENSES.md and
+ This wrapper dynamically links the separately maintained libpff runtime
+ installed below /usr/lib/pstforge.
+
+Files: usr/lib/pstforge/libpff.so.1.0.0
+ usr/share/doc/pstforge/LIBPFF-*
+ usr/share/doc/pstforge/libpff-source.tar.gz
+Copyright: Joachim Metz and the libyal contributors
+License: LGPL-3.0+
+ The complete LGPL and GPL texts are installed as LIBPFF-COPYING.LESSER and
+ LIBPFF-COPYING. Complete corresponding source and build instructions are
+ installed as libpff-source.tar.gz and LIBPFF-SOURCE.txt.
+ On Debian systems the LGPL-3 text is also available at
  /usr/share/common-licenses/LGPL-3.

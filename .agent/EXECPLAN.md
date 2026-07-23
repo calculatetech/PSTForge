@@ -3701,7 +3701,7 @@ not modified.
   - [x] (2026-07-21) Resolved every blocker/high finding and the one actionable
     review finding, merged protected pull request #2 as `c0c5ce5`, and observed
     green required post-merge CI.
-- [ ] Milestone 1.0.0: MailPlus-Ready Release.
+- [x] Milestone 1.0.0: MailPlus-Ready Release.
   - [x] (2026-07-22) Started
     `milestone/v1.0.0-mailplus-ready-release` in sibling worktree
     `../pstforge-worktrees/v1.0.0-mailplus-ready-release` from approved,
@@ -3899,8 +3899,98 @@ not modified.
     Release automation now explicitly trusts only `GITHUB_WORKSPACE` before
     invoking Git; this workflow-only correction does not change tagged source
     or package contents.
+- [ ] Milestone 1.1.0: Maintained Recovery Runtime.
+  - [x] (2026-07-22) Created the clean milestone worktree from protected main,
+    verified the public `calculatetech/libpff` fork, and protected its default
+    branch with a non-bypassable pull-request ruleset.
+  - [x] (2026-07-22) Resolved the exact Debian 20180714 oracle to upstream
+    commit `96f8b36` for recovery code and source archive SHA-256
+    `d9657aa592e2e155a5dbb49a019f99988e2347a8c7b939c21883e8be3003695b`.
+  - [x] (2026-07-23) Restore and regression-test legacy recovery semantics on the fork;
+    prove the known 50 GB inventory is the legacy set or a readable superset.
+    Current-upstream diagnosis found two refactor defects: allocation checks
+    read obsolete zero-valued locals after entries moved into
+    `libpff_index_value_t`, and recovered-offset lookup copied location fields
+    from its empty lookup object rather than the selected value. The fork also
+    restores active-index remnant ordering, validates the selected recovered
+    offset variant, filters empty remnant slots, and frees the temporary lookup
+    copy. On the 31,761,408-byte public damaged Enron case, the maintained fork
+    and exact 20180714 oracle now return the identical sorted 24-entry recovered
+    identifier multiset and zero orphans. All native release-configuration
+    tests pass. On the 50 GB raw collection, the fork retains all 35,635 unique
+    oracle identifiers and adds seven, but its occurrence multiset has 29
+    fewer repeated oracle IDs and seven new IDs. Read-only descriptor-variant
+    fingerprinting proved all 39,836 unique oracle descriptor identities are
+    present and the fork adds seven. The oracle's 29 excess occurrences are
+    exact duplicate identities. Final fork commit `2165ea6` resolves every
+    selected data/local block; the oracle cannot resolve at least one stored
+    index-1 selection and its repeated lookup path aborts with a double free.
+    The fork therefore satisfies the required readable-superset gate.
+  - [x] (2026-07-23) Pinned protected libpff PR #1 merge `08cf742` through the
+    submodule, built and packaged its private shared runtime plus complete
+    corresponding source, and removed the distribution `libpff1t64`
+    dependency. The reproducible Debian package is
+    `pstforge_1.1.0_amd64.deb`, SHA-256
+    `ba2da82b2575d92fba8f734f73fd6841b0ac2fd0a36e61706adbbc142f087e1e`,
+    with only `libc6`, `libgcc-s1`, and `zlib1g` runtime dependencies.
+  - [ ] Pass the canonical gates, final 50 GB split, ScanPST, Outlook, review,
+    protected fork PR, and protected PSTForge PR.
+    The fast, canonical full, and release-foundation gates passed from the
+    accepted fork merge; bounded local evidence is under ignored
+    `.agent/test-results/1784793745-fast`, `1784793771-full`, and final
+    post-review `1784804033-release`. The fork pull-request recovery-runtime check passed
+    and no review comments were filed. The packaged direct-mode split then
+    completed the immutable 50 GB source without retry or worker-protocol
+    failure: 120,367 candidates, including 37,298 recovered items and one
+    detached item, produced five finalized Unicode PSTs totaling
+    48,689,796,096 bytes. Read-only inspection found no corruption and source
+    identity remained unchanged. The run measured 247,274,311,680 supervisor
+    read bytes and 271,822,528,512 write bytes, confirming libpff recovery and
+    durable-ledger I/O as 1.2.0 performance targets. On 2026-07-23 the human
+    owner confirmed that all required ScanPST and Outlook checks pass. Only
+    final commit review and the protected PSTForge pull request remain.
+    Protected PR #6 then received one actionable automated P2 review finding:
+    the libpff system build script did not invalidate Cargo metadata when
+    `PSTFORGE_LIBPFF_PREFIX` changed. The missing rerun directive was added;
+    the fast and full release gates passed again, producing final package
+    SHA-256
+    `ba2da82b2575d92fba8f734f73fd6841b0ac2fd0a36e61706adbbc142f087e1e`.
+- [ ] Milestone 1.2.0: Parallel Recovery Performance.
+  - [ ] Begin only after 1.1.0 is human-approved and integrated; profile and
+    implement deterministic recovery concurrency on a new milestone branch.
+  - [ ] Prove semantic identity and repeatable improvement on the 50 GB source
+    before making any content read from the separate 83 GB candidate.
 
 ## Surprises & Discoveries
+
+- Observation: Legacy recovered-value indexes are ordering artifacts, not
+  content identities. The 2018 oracle reports 630 selected data indexes as 1
+  where the maintained fork uses 0, but the oracle cannot resolve at least one
+  such stored selection after recovery and repeated legacy lookups corrupt
+  ownership. Comparing descriptor and selected-block identity instead shows
+  the fork retains every unique readable oracle identity and adds seven.
+  Evidence: ignored 50 GB tuple/block diagnostics under
+  `.agent/test-results/1.1.0-libpff-diagnosis/`; all passes were read-only and
+  source identity remained unchanged.
+
+- Observation: The post-2018 recovery refactor retained valid parsed recovered
+  offsets but tested obsolete local offset/size variables that remained zero,
+  causing default recovery to reject them as allocated.
+  Evidence: upstream commit `33258b9`, the focused allocation-range test, and
+  the private no-output inventory changing from zero to 171 recovered items.
+- Observation: Recovered local-descriptor validation used offset zero because
+  `libpff_offsets_index_get_index_value_by_identifier` assigned each selected
+  field from the lookup object back to itself. Correct field selection restores
+  exact 20180714 recovery on the small damaged public corpus.
+  Evidence: 135 offset and 57 descriptor scan candidates in both versions;
+  before the copy fix current finalized 17 of 24, and afterward both finalize
+  the same 24-entry identifier multiset.
+- Observation: A one-page `>=` range-selection experiment increased the private
+  raw inventory but diverged from the 20180714 scanner and introduced extra
+  small-corpus identifiers. It was diagnostic, not a recovery correction, and
+  has been removed.
+  Evidence: ignored raw-ID comparisons in
+  `.agent/test-results/1.1.0-libpff-diagnosis/`.
 
 - Observation: Debian 13 libpff 20180714 can spend more than 15 minutes inside
   one damaged-source recovery scan without emitting a worker-protocol frame,
@@ -5049,6 +5139,25 @@ not modified.
   `large-qualification-20260717T204931Z`.
 
 ## Decision Log
+
+- Decision: Restore recovery on current upstream libpff and deliver that fork
+  as a private dynamically linked runtime in the single PSTForge Debian
+  package. Keep recovery restoration in 1.1.0 and performance/threading in
+  1.2.0, using protected pull requests in both repositories.
+  Rationale: Current upstream retains format and safety work that should not be
+  discarded, while controlled evidence proves its recovery breadth regressed
+  relative to the Debian 20180714 implementation. Separating correctness from
+  performance keeps both review and acceptance attributable.
+  Date/Author: 2026-07-22 / human owner direction.
+
+- Decision: Do not read, hash, parse, copy, benchmark, or split the private
+  approximately 83 GB candidate until 1.2.0 has passed correctness and
+  performance proof on the existing 50 GB source. Do not commit its private
+  path or metadata.
+  Rationale: Its recoverable content and scan duration are unknown, and using
+  the unoptimized parser would spend substantial time and SSD writes without a
+  useful baseline. The 50 GB source already has an exact legacy oracle.
+  Date/Author: 2026-07-22 / human owner direction.
 
 - Decision: Do not modify, replace, bundle, or pin Ubuntu's system libpff in
   the current PSTForge worktree. Treat recovery parity as a separate upstream
@@ -6692,7 +6801,7 @@ The planned workspace is:
     crates/
       pstforge-cli/       clap commands and presentation
       pstforge-core/      domain models, recovery orchestration, packing
-      libpff-sys/         pkg-config linking, bindings, all unsafe code
+      libpff-sys/         pinned fork build/linking, bindings, all unsafe code
       pstforge-pst/       MIT PST writer adapted from outlook-pst 1.2.0
       pstforge-job/       SQLite ledger and spool
       xtask/              local and CI automation
@@ -7352,6 +7461,58 @@ reproducibility, documentation, and licensing. Record bounded conclusions and
 artifact hashes. After adversarial review is clean, create the local release
 commit. Do not merge, tag, push, or publish until explicit human approval.
 
+### Milestone 18: Version 1.1.0 - Maintained Recovery Runtime
+
+Maintain libpff in the separate LGPL-3.0-or-later fork at
+`https://github.com/calculatetech/libpff`. Start from current upstream and
+forward-port the recovery semantics present in the exact Debian 20180714
+oracle rather than reverting the full library. Diagnose with no-output
+inventories. The known immutable 50 GB source establishes two acceptance
+views. Its legacy high-level catalog contains 83,500 normal items, 37,291
+readable recovered items, and one orphan. The lower-level 20180714 recovery
+oracle exposes 39,864 recovered descriptor identifiers plus that orphan. The
+fork must match the exact raw identifier multiset and retain the entire
+readable catalog, or return a provenance- and content-verified readable
+superset; count equality alone is insufficient.
+
+Pin the approved fork commit as `third_party/libpff`. The normal build command
+must compile the fork once and then compile PSTForge once. The Debian package
+installs `libpff.so.1` below `/usr/lib/pstforge`, links `pstforge` with a
+relative run path to that directory, and contains the fork revision, LGPL
+notices, and corresponding-source instructions. The package must not depend on
+the distribution `libpff1t64`. Development may still use independent system
+`pffinfo` and `readpst` validators.
+
+Acceptance consists of hosted generated-fixture tests, the canonical external
+gate, one final 50 GB split after inventory parity is established, clean
+ScanPST analysis, Outlook interoperability, unchanged source identity, and
+clean adversarial review. Detailed inventory and timing evidence stays in the
+ignored test-results directory.
+
+### Milestone 19: Version 1.2.0 - Parallel Recovery Performance
+
+Begin from the approved 1.1.0 merge in a new milestone worktree. Instrument the
+fork's recovery scan without logging user data, remove measured serial copying
+and read amplification, then partition immutable scan ranges across independent
+file handles. Workers own all parser state and bounded buffers; a deterministic
+single-thread merge validates, sorts, and deduplicates their candidates.
+
+Expose `--parser-threads auto|N`, defaulting to `auto`. Automatic selection
+uses available parallelism up to the number of useful work ranges; an explicit
+positive integer overrides it. The report records requested and effective
+counts and the exact libpff revision. One-thread and automatic/16-thread
+inventories must be semantically identical. Accept performance when alternating
+inventory-only comparisons show a repeatable improvement beyond observed
+noise; do not impose a fixed percentage, linear-scaling, or RSS threshold.
+
+Use generated fixtures for repeated race and failure testing and the 50 GB
+source for bounded large-file proof. Generate the full 50 GB output only after
+inventory identity is proven. The separate approximately 83 GB candidate is
+not part of either milestone's development corpus. Its first content access is
+permitted only after 1.2.0 approval and must begin with source-safety metadata,
+one sequential SHA-256 pass, identity recheck, and a restartable no-output
+inventory using the optimized runtime.
+
 ## Concrete Steps
 
 All commands run from the active milestone worktree, never from `main`. Before
@@ -7504,10 +7665,13 @@ pin, and record every license in policy. Avoid dependencies for byte parsing or
 size strings when a small audited implementation or mature existing crate
 already in the graph suffices.
 
-Use dynamically linked `libpff` with a minimum supported API corresponding to
-20180714. At startup report the detected version. Reject a library missing a
-required symbol with an installation diagnostic. Ubuntu development uses
-20231205. Debian 13 compatibility is a required build/test lane.
+Use the dynamically linked, pinned `calculatetech/libpff` fork. Build and cache
+its shared runtime by exact revision, report that revision and the detected
+library version, and give source-built executables an explicit development
+run path. Debian packages use a relative private run path, include the
+replaceable shared object and its complete corresponding source, and carry no
+distribution libpff dependency. Debian 13 compatibility remains a required
+build/test lane.
 
 The PST writer implements Microsoft MS-PST revision 11.2. The adapted
 `pstforge-pst` crate remains MIT and includes its upstream commit and changes.
@@ -7522,7 +7686,7 @@ protection build on the approved remote baseline. Recheck authentication and
 repository settings before creating or configuring them. Local work and
 private-corpus acceptance must never depend on their existence.
 
-Revision note (2026-07-22): Started 1.0.0 from protected green merge `83c29bf`.
-The release milestone repeats the real 50 GB recovery from a clean Debian 13
-package install, validates every part, and requires ScanPST followed by Outlook
-acceptance without introducing a MailPlus resource dependency.
+Revision note (2026-07-22): Extended the completed 1.0 program with the
+owner-approved 1.1.0 maintained recovery runtime and 1.2.0 parallel recovery
+milestones. Large-file proof remains on the known 50 GB source; the unknown
+approximately 83 GB candidate is explicitly deferred until 1.2.0 approval.

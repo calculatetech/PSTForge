@@ -27,14 +27,13 @@ deleted or disconnected items exposed by `libpff`, orphan items, and fragment
 candidates in explicit aggressive mode when the input library can prove
 fragment origin.
 
-PSTForge 1.0 dynamically links the platform `libpff.so.1`; recovery breadth is
-therefore limited to the candidates exposed by that installed implementation.
-The Debian package accepts `libpff1t64 (>= 20180714)`. Controlled qualification
-found that Debian's 20180714 implementation exposed substantially more deleted
-records from one damaged source than Ubuntu's 20231205 implementation, even
-though both satisfy that ABI dependency. `--aggressive` changes recovery flags;
-it does not reproduce an older library's recovery behavior. A maintained libpff
-fork and any corresponding package policy are explicitly post-1.0 work.
+PSTForge 1.1 dynamically links a private, replaceable `libpff.so.1` built from
+the pinned `calculatetech/libpff` fork. The Debian package installs that runtime
+below `/usr/lib/pstforge`, records its exact revision, and includes its complete
+LGPL corresponding source; it does not depend on distribution `libpff1t64`.
+This restores recovery behavior lost after Debian's 20180714 implementation
+while retaining current upstream parser changes. `--aggressive` changes
+recovery flags and remains separate from library-version recovery breadth.
 
 PSTForge 1.0 always writes new 64-bit Unicode PST version 23 files with
 512-byte pages. Output uses the format's compressible permutation encoding for

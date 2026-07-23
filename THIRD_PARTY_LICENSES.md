@@ -3,11 +3,11 @@
 PSTForge application and FFI wrapper code is licensed under
 `Apache-2.0 OR MIT`.
 
-PSTForge dynamically links to the system `libpff` library. `libpff` is
-distributed under `LGPL-3.0-or-later`; it is not copied, statically linked, or
-modified in this repository. Operators can replace the system shared library
-subject to ABI compatibility. Source and license information for `libpff` is
-available from its upstream project and the operating-system package metadata.
+PSTForge dynamically links to a private build of the separately maintained
+`calculatetech/libpff` fork. `libpff` remains `LGPL-3.0-or-later`, is pinned as
+the `third_party/libpff` submodule, and is not statically combined with
+PSTForge. Debian packages install the replaceable shared object, its exact
+revision, complete corresponding source, LGPL notices, and build instructions.
 
 Rust dependency license expressions are checked by `cargo xtask gate full`.
 The committed `Cargo.lock` fixes the dependency set reviewed for each
