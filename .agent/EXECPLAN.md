@@ -3931,14 +3931,14 @@ not modified.
     corresponding source, and removed the distribution `libpff1t64`
     dependency. The reproducible Debian package is
     `pstforge_1.1.0_amd64.deb`, SHA-256
-    `3f7787d9e1c072151e628724e06d77d40df0280aeedb12694e2529dc47723316`,
+    `ba2da82b2575d92fba8f734f73fd6841b0ac2fd0a36e61706adbbc142f087e1e`,
     with only `libc6`, `libgcc-s1`, and `zlib1g` runtime dependencies.
   - [ ] Pass the canonical gates, final 50 GB split, ScanPST, Outlook, review,
     protected fork PR, and protected PSTForge PR.
     The fast, canonical full, and release-foundation gates passed from the
     accepted fork merge; bounded local evidence is under ignored
-    `.agent/test-results/1784793745-fast`, `1784793771-full`, and
-    `1784799958-release`. The fork pull-request recovery-runtime check passed
+    `.agent/test-results/1784793745-fast`, `1784793771-full`, and final
+    post-review `1784804033-release`. The fork pull-request recovery-runtime check passed
     and no review comments were filed. The packaged direct-mode split then
     completed the immutable 50 GB source without retry or worker-protocol
     failure: 120,367 candidates, including 37,298 recovered items and one
@@ -3949,6 +3949,12 @@ not modified.
     durable-ledger I/O as 1.2.0 performance targets. On 2026-07-23 the human
     owner confirmed that all required ScanPST and Outlook checks pass. Only
     final commit review and the protected PSTForge pull request remain.
+    Protected PR #6 then received one actionable automated P2 review finding:
+    the libpff system build script did not invalidate Cargo metadata when
+    `PSTFORGE_LIBPFF_PREFIX` changed. The missing rerun directive was added;
+    the fast and full release gates passed again, producing final package
+    SHA-256
+    `ba2da82b2575d92fba8f734f73fd6841b0ac2fd0a36e61706adbbc142f087e1e`.
 - [ ] Milestone 1.2.0: Parallel Recovery Performance.
   - [ ] Begin only after 1.1.0 is human-approved and integrated; profile and
     implement deterministic recovery concurrency on a new milestone branch.

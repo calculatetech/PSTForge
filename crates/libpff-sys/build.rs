@@ -9,6 +9,7 @@ fn main() {
     println!("cargo:rerun-if-changed=src/bindings.rs");
     println!("cargo:rerun-if-changed=../../.gitmodules");
     println!("cargo:rerun-if-changed=../../third_party/libpff");
+    println!("cargo:rerun-if-env-changed=PSTFORGE_LIBPFF_PREFIX");
 
     if let Err(error) = configure() {
         eprintln!("cannot build the pinned PSTForge libpff runtime: {error}");
