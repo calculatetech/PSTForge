@@ -2,13 +2,14 @@ use std::collections::HashSet;
 use std::io::{self, Read, Seek, SeekFrom};
 use std::ptr;
 use std::rc::Rc;
+use std::time::Instant;
 
 use serde::{Deserialize, Serialize};
 
 use crate::bindings::{
     self, libpff_error_t, libpff_item_t, libpff_record_entry_t, libpff_record_set_t,
 };
-use crate::{PffError, PffFile, PffItem, check_one, free_error, native_error};
+use crate::{PffError, PffFile, PffItem, RecoveryScanResult, check_one, free_error, native_error};
 
 pub const STREAM_CHUNK_BYTES: usize = 64 * 1024;
 const MAX_STRING_BYTES: u64 = 1024 * 1024;
@@ -18,6 +19,7 @@ const MAX_MESSAGES: u64 = 100_000_000;
 const MAX_EMBEDDED_DEPTH: u32 = 256;
 const MAX_FOLDER_DEPTH: usize = 64;
 const MAX_CATALOG_ISSUES: usize = 10_000;
+const MIN_PARALLEL_SCAN_RANGE_BYTES: u64 = 8 * 1024 * 1024;
 const RECOVERY_FLAG_IGNORE_ALLOCATION_DATA: u8 = 0x01;
 const RECOVERY_FLAG_SCAN_FOR_FRAGMENTS: u8 = 0x02;
 
@@ -340,8 +342,17 @@ pub struct RawCatalog {
     pub attachment_bytes: u64,
     pub issues: Vec<CatalogIssue>,
     pub issues_dropped: u64,
+    pub parser_phase_metrics: ParserPhaseMetrics,
     #[doc(hidden)]
     pub active_message_issues: Vec<(u32, u64)>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ParserPhaseMetrics {
+    pub effective_threads: usize,
+    pub reachable_catalog_millis: u64,
+    pub native_recovery_scan_millis: u64,
+    pub recovery_collection_millis: u64,
 }
 
 impl RawCatalog {
@@ -382,8 +393,11 @@ impl MessageIssueState {
 
 impl PffFile {
     pub fn catalog(&self, sink: &mut dyn CatalogSink) -> Result<RawCatalog, PffError> {
-        self.catalog_reachable(sink, &HashSet::new())
-            .map(|(catalog, _)| catalog)
+        let started = Instant::now();
+        let (mut catalog, _) = self.catalog_reachable(sink, &HashSet::new())?;
+        catalog.parser_phase_metrics.effective_threads = 1;
+        catalog.parser_phase_metrics.reachable_catalog_millis = elapsed_millis(started);
+        Ok(catalog)
     }
 
     pub fn recovery_catalog(&mut self, sink: &mut dyn CatalogSink) -> Result<RawCatalog, PffError> {
@@ -396,6 +410,17 @@ impl PffFile {
         skipped: &HashSet<RecoveryUnit>,
         mode: RecoveryMode,
     ) -> Result<RawCatalog, PffError> {
+        self.recovery_catalog_skipping_with_threads(sink, skipped, mode, 1)
+    }
+
+    pub fn recovery_catalog_skipping_with_threads(
+        &mut self,
+        sink: &mut dyn CatalogSink,
+        skipped: &HashSet<RecoveryUnit>,
+        mode: RecoveryMode,
+        requested_threads: usize,
+    ) -> Result<RawCatalog, PffError> {
+        let reachable_started = Instant::now();
         let (mut catalog, mut visited_messages) = match self.catalog_reachable(sink, skipped) {
             Ok(reachable) => reachable,
             Err(
@@ -409,13 +434,14 @@ impl PffFile {
             }
             Err(error) => return Err(error),
         };
-        let mut error = ptr::null_mut();
-        let recovery_flags = recovery_flags(mode);
-        // SAFETY: self.raw is an open file and recovery_flags contains only libpff-defined flags.
-        let result =
-            unsafe { bindings::libpff_file_recover_items(self.raw, recovery_flags, &mut error) };
-        check_one(result, error, "recover items")?;
+        catalog.parser_phase_metrics.reachable_catalog_millis = elapsed_millis(reachable_started);
+        let recovery_scan_started = Instant::now();
+        catalog.parser_phase_metrics.effective_threads =
+            self.recover_items_with_threads(mode, requested_threads.max(1))?;
+        catalog.parser_phase_metrics.native_recovery_scan_millis =
+            elapsed_millis(recovery_scan_started);
         let recovered_provenance = recovered_provenance(mode);
+        let recovery_collection_started = Instant::now();
         self.stream_recovery_collection(
             recovered_provenance,
             RecoveryCollectionFunctions {
@@ -438,7 +464,126 @@ impl PffFile {
             &mut catalog,
             skipped,
         )?;
+        catalog.parser_phase_metrics.recovery_collection_millis =
+            elapsed_millis(recovery_collection_started);
         Ok(catalog)
+    }
+
+    fn recover_items_with_threads(
+        &mut self,
+        mode: RecoveryMode,
+        requested_threads: usize,
+    ) -> Result<usize, PffError> {
+        if mode == RecoveryMode::Aggressive || requested_threads <= 1 {
+            self.recover_items_serial(mode)?;
+            return Ok(1);
+        }
+        let metadata = self.metadata()?;
+        let alignment = if metadata.file_type == Some(65) {
+            4096
+        } else {
+            512
+        };
+        let useful_ranges = metadata.size.div_ceil(MIN_PARALLEL_SCAN_RANGE_BYTES).max(1);
+        let useful_ranges = usize::try_from(useful_ranges).unwrap_or(usize::MAX);
+        let maximum_result_count = usize::try_from(i32::MAX).unwrap_or(usize::MAX);
+        let effective_threads = requested_threads
+            .min(useful_ranges)
+            .min(crate::MAX_PARALLEL_SCAN_THREADS)
+            .min(maximum_result_count)
+            .max(1);
+        if effective_threads == 1 {
+            self.recover_items_serial(mode)?;
+            return Ok(1);
+        }
+        let ranges = recovery_scan_ranges(metadata.size, alignment, effective_threads);
+        let native_path = self.native_path.clone();
+        let recovery_flags = recovery_flags(mode);
+        let scan_results = std::thread::scope(|scope| {
+            let handles = ranges
+                .iter()
+                .copied()
+                .map(|(start, end)| {
+                    let native_path = native_path.clone();
+                    std::thread::Builder::new()
+                        .spawn_scoped(scope, move || {
+                            let mut file = PffFile::open_native_path(native_path, None)?;
+                            file.recovery_scan_range(recovery_flags, start, end)
+                        })
+                        .map_err(PffError::RecoveryScanThreadSpawn)
+                })
+                .collect::<Result<Vec<_>, PffError>>()?;
+            handles
+                .into_iter()
+                .map(|handle| {
+                    handle
+                        .join()
+                        .map_err(|_| PffError::RecoveryScanThreadPanicked)?
+                })
+                .collect::<Result<Vec<_>, PffError>>()
+        })?;
+        let raw_results = scan_results
+            .iter()
+            .map(|result| result.raw)
+            .collect::<Vec<_>>();
+        let result_count =
+            i32::try_from(raw_results.len()).map_err(|_| PffError::LimitExceeded {
+                field: "parallel recovery scan result count",
+                value: u64::try_from(raw_results.len()).unwrap_or(u64::MAX),
+                limit: u64::try_from(i32::MAX).unwrap_or(u64::MAX),
+            })?;
+        let mut error = ptr::null_mut();
+        // SAFETY: self.raw is an open master handle; every scan result remains
+        // alive and uniquely owned for this call; the count matches the slice.
+        let result = unsafe {
+            bindings::libpff_file_recover_items_with_scan_results(
+                self.raw,
+                recovery_flags,
+                raw_results.as_ptr(),
+                result_count,
+                &mut error,
+            )
+        };
+        check_one(result, error, "merge partitioned recovery scans")?;
+        Ok(scan_results.len())
+    }
+
+    fn recover_items_serial(&mut self, mode: RecoveryMode) -> Result<(), PffError> {
+        let mut error = ptr::null_mut();
+        let recovery_flags = recovery_flags(mode);
+        // SAFETY: self.raw is an open file and recovery_flags contains only libpff-defined flags.
+        let result =
+            unsafe { bindings::libpff_file_recover_items(self.raw, recovery_flags, &mut error) };
+        check_one(result, error, "recover items")
+    }
+
+    fn recovery_scan_range(
+        &mut self,
+        recovery_flags: u8,
+        start: u64,
+        end: u64,
+    ) -> Result<RecoveryScanResult, PffError> {
+        let mut raw = ptr::null_mut();
+        let mut error = ptr::null_mut();
+        // SAFETY: self.raw is an independent read-only file handle; raw and
+        // error are initialized out-pointers and the half-open range is aligned.
+        let result = unsafe {
+            bindings::libpff_file_recovery_scan_range(
+                self.raw,
+                recovery_flags,
+                start,
+                end,
+                &mut raw,
+                &mut error,
+            )
+        };
+        check_one(result, error, "scan recovery range")?;
+        if raw.is_null() {
+            return Err(PffError::NullPointer {
+                operation: "scan recovery range",
+            });
+        }
+        Ok(RecoveryScanResult { raw })
     }
 
     fn catalog_reachable(
@@ -857,6 +1002,30 @@ impl PffFile {
         check_one(result, error, "get root folder")?;
         PffItem::from_raw(raw, "get root folder")
     }
+}
+
+fn elapsed_millis(started: Instant) -> u64 {
+    u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)
+}
+
+fn recovery_scan_ranges(file_size: u64, alignment: u64, threads: usize) -> Vec<(u64, u64)> {
+    let thread_count = u64::try_from(threads).unwrap_or(u64::MAX).max(1);
+    let target_bytes = file_size.div_ceil(thread_count).max(1);
+    let chunk_bytes = target_bytes
+        .div_ceil(alignment)
+        .saturating_mul(alignment)
+        .max(alignment);
+    let mut ranges = Vec::new();
+    let mut start = 0;
+    while start < file_size {
+        let end = start.saturating_add(chunk_bytes).min(file_size);
+        ranges.push((start, end));
+        start = end;
+    }
+    if ranges.is_empty() {
+        ranges.push((0, 0));
+    }
+    ranges
 }
 
 fn bounded_folder_item_count(count: u64, field: &'static str) -> Result<u64, PffError> {
@@ -3134,8 +3303,8 @@ mod tests {
         RecoveryMode, RecoveryUnit, STREAM_CHUNK_BYTES, checked_increment, contain_filetime,
         decode_native_identity_string, decode_native_string, mark_stable_top_level_identifier,
         record_attachment_issue, record_item_issue, recover_item_value, recovered_provenance,
-        recovery_flags, stable_top_level_identifier_seen, supported_message_class,
-        validate_string_size,
+        recovery_flags, recovery_scan_ranges, stable_top_level_identifier_seen,
+        supported_message_class, validate_string_size,
     };
     use crate::PffError;
 
@@ -3339,6 +3508,18 @@ mod tests {
     fn native_strings_drop_only_the_trailing_nul() {
         assert_eq!(decode_native_string(b"hello\0".to_vec()), "hello");
         assert_eq!(decode_native_string(b"hello".to_vec()), "hello");
+    }
+
+    #[test]
+    fn recovery_scan_ranges_are_contiguous_aligned_and_bounded() {
+        let ranges = recovery_scan_ranges(50_995_610_624, 512, 16);
+        assert_eq!(ranges.first().map(|range| range.0), Some(0));
+        assert_eq!(ranges.last().map(|range| range.1), Some(50_995_610_624));
+        assert!(ranges.len() <= 16);
+        for pair in ranges.windows(2) {
+            assert_eq!(pair[0].1, pair[1].0);
+            assert_eq!(pair[1].0 % 512, 0);
+        }
     }
 
     #[test]

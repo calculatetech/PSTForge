@@ -39,7 +39,7 @@ use crate::{
     load_canonical_mail_interruptible,
 };
 
-pub const SPLIT_SCHEMA_VERSION: &str = "0.5.0";
+pub const SPLIT_SCHEMA_VERSION: &str = "1.2.0";
 const TOOL_COMPATIBILITY_MAJOR: u64 = 0;
 const PART_SIZE_POLICY: &str = "hard-maximum-v1";
 const WRITER_FORMAT: &str = "unicode-pst-v23";
@@ -248,6 +248,7 @@ pub enum DirectFailureCategory {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SplitOptions {
     pub maximum_pst_bytes: u64,
+    pub parser_threads: crate::ParserThreadRequest,
     pub restartable: bool,
     pub resume: bool,
     pub keep_work: bool,
@@ -264,6 +265,7 @@ pub fn split(
     let process_io_started = process_io_snapshot();
     let SplitOptions {
         maximum_pst_bytes,
+        parser_threads,
         restartable,
         resume,
         keep_work,
@@ -298,6 +300,8 @@ pub fn split(
         split_schema_version: SPLIT_SCHEMA_VERSION.to_owned(),
         execution_mode: if restartable { "restartable" } else { "direct" }.to_owned(),
         recovery_mode: recovery_mode_name(mode).to_owned(),
+        parser_threads: parser_threads.requested(),
+        libpff_revision: Some(libpff_sys::library_revision().to_owned()),
         maximum_pst_bytes,
         part_size_policy: PART_SIZE_POLICY.to_owned(),
         writer_format: WRITER_FORMAT.to_owned(),
@@ -346,6 +350,7 @@ pub fn split(
             job_directory,
             worker_executable,
             mode,
+            parser_threads,
             std::sync::Arc::clone(&interrupt_flag),
             PreparedSplitRecovery {
                 resume,
@@ -376,6 +381,16 @@ pub fn split(
                 schema_version: crate::recovery::RECOVERY_SCHEMA_VERSION.to_owned(),
                 command: "recover".to_owned(),
                 mode: recovery_mode_name(mode).to_owned(),
+                libpff_revision: libpff_sys::library_revision().to_owned(),
+                parser_threads: crate::ParserThreadSelection {
+                    requested: parser_threads.requested(),
+                    effective: 1,
+                },
+                parser_performance: crate::ParserPerformanceReport {
+                    reachable_catalog_millis: 0,
+                    native_recovery_scan_millis: 0,
+                    recovery_collection_millis: 0,
+                },
                 source: source.identity().clone(),
                 job_directory: job_directory
                     .canonicalize()
@@ -444,6 +459,7 @@ pub fn split(
             &mut job,
             worker_executable,
             mode,
+            parser_threads,
             maximum_pst_bytes,
             &interrupt_flag,
         )?;
@@ -471,6 +487,12 @@ pub fn split(
         recovery.blob_bytes = summary.blob_bytes;
         recovery.issues = outcome.catalog.issues;
         recovery.issues_dropped = outcome.catalog.issues_dropped;
+        recovery.parser_threads.effective = outcome.catalog.effective_parser_threads.max(1);
+        recovery.parser_performance = crate::ParserPerformanceReport {
+            reachable_catalog_millis: outcome.catalog.reachable_catalog_millis,
+            native_recovery_scan_millis: outcome.catalog.native_recovery_scan_millis,
+            recovery_collection_millis: outcome.catalog.recovery_collection_millis,
+        };
         if recovery.interrupted {
             recovery.source_unchanged = false;
         } else {
@@ -1293,6 +1315,7 @@ fn split_direct_recovered_job(
     job: &mut DurableCatalogSink,
     worker_executable: &Path,
     recovery_mode: RecoveryMode,
+    parser_threads: crate::ParserThreadRequest,
     maximum_pst_bytes: u64,
     interrupted: &std::sync::Arc<AtomicBool>,
 ) -> Result<DirectSplitOutcome, SplitError> {
@@ -1397,6 +1420,7 @@ fn split_direct_recovered_job(
                 worker_executable,
                 source.identity(),
                 recovery_mode,
+                parser_threads,
                 &skipped_units,
                 std::sync::Arc::clone(interrupted),
                 worker_attempts,
@@ -1715,6 +1739,11 @@ fn split_direct_recovered_job(
                     issues: catalog.issues,
                     issues_dropped: catalog.issues_dropped,
                     peak_worker_rss_bytes: 0,
+                    libpff_revision: Some(libpff_sys::library_revision().to_owned()),
+                    effective_parser_threads: catalog.effective_parser_threads.max(1),
+                    reachable_catalog_millis: catalog.reachable_catalog_millis,
+                    native_recovery_scan_millis: catalog.native_recovery_scan_millis,
+                    recovery_collection_millis: catalog.recovery_collection_millis,
                 })?;
                 job.checkpoint()?;
             }
@@ -3764,6 +3793,7 @@ mod tests {
                 RecoveryMode::Balanced,
                 SplitOptions {
                     maximum_pst_bytes: 4_294_967_296,
+                    parser_threads: crate::ParserThreadRequest::Auto,
                     restartable: false,
                     resume: false,
                     keep_work: false,
@@ -3790,6 +3820,7 @@ mod tests {
                 RecoveryMode::Balanced,
                 SplitOptions {
                     maximum_pst_bytes: 4_294_967_296,
+                    parser_threads: crate::ParserThreadRequest::Auto,
                     restartable: false,
                     resume: true,
                     keep_work: false,
@@ -3818,6 +3849,8 @@ mod tests {
                 split_schema_version: legacy_schema.to_owned(),
                 execution_mode: "restartable".to_owned(),
                 recovery_mode: "balanced".to_owned(),
+                parser_threads: "auto".to_owned(),
+                libpff_revision: None,
                 maximum_pst_bytes: 4_294_967_296,
                 part_size_policy: "hard-maximum-v1".to_owned(),
                 writer_format: "unicode-pst-v23".to_owned(),
@@ -3923,9 +3956,19 @@ mod tests {
                 supervisor_filesystem_write_bytes: Some(0),
             },
             recovery: RecoveryReport {
-                schema_version: "0.5.0".to_owned(),
+                schema_version: "1.2.0".to_owned(),
                 command: "recover".to_owned(),
                 mode: "balanced".to_owned(),
+                libpff_revision: libpff_sys::library_revision().to_owned(),
+                parser_threads: crate::ParserThreadSelection {
+                    requested: "auto".to_owned(),
+                    effective: 1,
+                },
+                parser_performance: crate::ParserPerformanceReport {
+                    reachable_catalog_millis: 1,
+                    native_recovery_scan_millis: 1,
+                    recovery_collection_millis: 1,
+                },
                 source: SourceIdentity {
                     canonical_path: "/private/source.pst".to_owned(),
                     device: 1,

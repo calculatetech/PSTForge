@@ -2,7 +2,7 @@
 
 #![allow(non_camel_case_types)]
 
-use std::ffi::{c_char, c_int, c_uchar};
+use std::ffi::{c_char, c_int, c_uchar, c_void};
 
 #[repr(C)]
 pub(crate) struct libpff_error_t {
@@ -69,6 +69,25 @@ unsafe extern "C" {
     pub(crate) fn libpff_file_recover_items(
         file: *mut libpff_file_t,
         recovery_flags: c_uchar,
+        error: *mut *mut libpff_error_t,
+    ) -> c_int;
+    pub(crate) fn libpff_file_recovery_scan_range(
+        file: *mut libpff_file_t,
+        recovery_flags: c_uchar,
+        scan_start_offset: u64,
+        scan_end_offset: u64,
+        scan_result: *mut *mut c_void,
+        error: *mut *mut libpff_error_t,
+    ) -> c_int;
+    pub(crate) fn libpff_file_recovery_scan_result_free(
+        scan_result: *mut *mut c_void,
+        error: *mut *mut libpff_error_t,
+    ) -> c_int;
+    pub(crate) fn libpff_file_recover_items_with_scan_results(
+        file: *mut libpff_file_t,
+        recovery_flags: c_uchar,
+        scan_results: *const *mut c_void,
+        number_of_scan_results: c_int,
         error: *mut *mut libpff_error_t,
     ) -> c_int;
     pub(crate) fn libpff_file_get_number_of_orphan_items(

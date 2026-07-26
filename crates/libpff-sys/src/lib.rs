@@ -4,8 +4,8 @@ mod bindings;
 mod catalog;
 
 use std::collections::HashSet;
-use std::ffi::{CStr, CString};
-use std::os::fd::{AsRawFd, BorrowedFd};
+use std::ffi::{CStr, CString, c_void};
+use std::os::fd::{AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
 use std::ptr;
 
 use bindings::{libpff_error_t, libpff_file_t, libpff_item_t};
@@ -14,6 +14,7 @@ use thiserror::Error;
 const ERROR_BUFFER_SIZE: usize = 16 * 1024;
 const MAX_FOLDERS: u64 = 1_000_000;
 pub const LIBPFF_REVISION: &str = env!("PSTFORGE_LIBPFF_REVISION");
+pub const MAX_PARALLEL_SCAN_THREADS: usize = 256;
 
 #[derive(Debug, Error)]
 pub enum PffError {
@@ -30,6 +31,12 @@ pub enum PffError {
     NullPointer { operation: &'static str },
     #[error("source file descriptor is not available through /proc/self/fd")]
     ProcFileDescriptorUnavailable,
+    #[error("cannot duplicate the read-only source descriptor: {0}")]
+    DuplicateSourceDescriptor(std::io::Error),
+    #[error("parallel recovery scan worker panicked")]
+    RecoveryScanThreadPanicked,
+    #[error("cannot start a parallel recovery scan worker: {0}")]
+    RecoveryScanThreadSpawn(std::io::Error),
     #[error("catalog sink rejected {operation}: {detail}")]
     Sink {
         operation: &'static str,
@@ -51,8 +58,9 @@ pub enum PffError {
 
 pub use catalog::{
     AttachmentDataReader, CatalogEvent, CatalogIssue, CatalogProvenance, CatalogSink,
-    FolderAddress, NamedPropertyIdentity, NamedPropertyName, PayloadRequest, PropertyDescriptor,
-    PropertyOwner, RawCatalog, RecoveryMode, RecoveryUnit, STREAM_CHUNK_BYTES, TraversalOrder,
+    FolderAddress, NamedPropertyIdentity, NamedPropertyName, ParserPhaseMetrics, PayloadRequest,
+    PropertyDescriptor, PropertyOwner, RawCatalog, RecoveryMode, RecoveryUnit, STREAM_CHUNK_BYTES,
+    TraversalOrder,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -170,11 +178,24 @@ pub const fn library_revision() -> &'static str {
 pub struct PffFile {
     raw: *mut libpff_file_t,
     is_open: bool,
+    native_path: CString,
+    _source_fd: Option<OwnedFd>,
 }
 
 impl PffFile {
     pub fn open_fd(fd: BorrowedFd<'_>) -> Result<Self, PffError> {
-        let proc_path = format!("/proc/self/fd/{}", fd.as_raw_fd());
+        // SAFETY: fd is live for this call. F_DUPFD_CLOEXEC creates a new
+        // descriptor referring to the same already read-only open file
+        // description without changing source access or file contents.
+        let duplicated = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 0) };
+        if duplicated < 0 {
+            return Err(PffError::DuplicateSourceDescriptor(
+                std::io::Error::last_os_error(),
+            ));
+        }
+        // SAFETY: fcntl returned a new uniquely owned descriptor.
+        let source_fd = unsafe { OwnedFd::from_raw_fd(duplicated) };
+        let proc_path = format!("/proc/self/fd/{}", source_fd.as_raw_fd());
         if !std::path::Path::new(&proc_path).exists() {
             return Err(PffError::ProcFileDescriptorUnavailable);
         }
@@ -182,7 +203,13 @@ impl PffFile {
             operation: "prepare source path",
             detail: error.to_string(),
         })?;
+        Self::open_native_path(native_path, Some(source_fd))
+    }
 
+    fn open_native_path(
+        native_path: CString,
+        source_fd: Option<OwnedFd>,
+    ) -> Result<Self, PffError> {
         let mut raw = ptr::null_mut();
         let mut error = ptr::null_mut();
         // SAFETY: raw and error are valid out-pointers initialized to null.
@@ -210,7 +237,12 @@ impl PffFile {
             return Err(open_error);
         }
 
-        Ok(Self { raw, is_open: true })
+        Ok(Self {
+            raw,
+            is_open: true,
+            native_path,
+            _source_fd: source_fd,
+        })
     }
 
     pub fn metadata(&self) -> Result<RawPffMetadata, PffError> {
@@ -372,6 +404,28 @@ impl PffFile {
                 Ok(None)
             }
             _ => Err(native_error(error, operation)),
+        }
+    }
+}
+
+struct RecoveryScanResult {
+    raw: *mut c_void,
+}
+
+// SAFETY: the fork's scan result owns only immutable candidate values and has
+// no parser handle or shared native state. Ownership is moved back to the
+// supervisor thread before the result is consumed or freed.
+unsafe impl Send for RecoveryScanResult {}
+
+impl Drop for RecoveryScanResult {
+    fn drop(&mut self) {
+        if self.raw.is_null() {
+            return;
+        }
+        // SAFETY: raw is uniquely owned by this wrapper and the native free
+        // function accepts a null error out-pointer during infallible cleanup.
+        unsafe {
+            bindings::libpff_file_recovery_scan_result_free(&mut self.raw, std::ptr::null_mut());
         }
     }
 }

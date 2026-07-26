@@ -28,8 +28,11 @@ changes the product specification.
 - Never repair, truncate, rename, move, delete, or overwrite a source PST.
 - Refuse a source that resolves inside the output job directory, and refuse
   symlinked source files rather than following them.
-- Record the source device, inode, size, modification time, and SHA-256 before
-  recovery. Recheck identity metadata before reporting completion.
+- Record the source device, inode, size, and modification time before recovery.
+  Record SHA-256 before restartable recovery, where it is required to bind
+  durable state. Default direct output deliberately skips the pre-hash to
+  remain single-pass; recheck its held-descriptor and path identity metadata
+  before reporting completion.
 - Write generated data only beneath the selected output job directory.
 - Create temporary output beside its final destination and publish it with an
   atomic rename only after validation and `fsync` complete.

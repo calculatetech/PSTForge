@@ -10,8 +10,8 @@ use std::time::Duration;
 
 use clap::{ArgAction, Parser, Subcommand, ValueEnum};
 use pstforge_core::{
-    EncryptionMode, FileFormat, InfoReport, InspectionError, JobReport, RecoveryError,
-    RecoveryMode, RecoveryReport, ReportError, SourceError, SourceFile, SplitError,
+    EncryptionMode, FileFormat, InfoReport, InspectionError, JobReport, ParserThreadRequest,
+    RecoveryError, RecoveryMode, RecoveryReport, ReportError, SourceError, SourceFile, SplitError,
     SplitFailureKind, SplitReport, VerifyReport, WorkerProtocolError,
 };
 use thiserror::Error;
@@ -52,6 +52,8 @@ pub enum Command {
         source: PathBuf,
         #[arg(long, value_enum, default_value_t = VerifyMode::Full)]
         mode: VerifyMode,
+        #[arg(long, default_value = "auto")]
+        parser_threads: ParserThreadRequest,
         #[arg(long)]
         json: bool,
     },
@@ -68,6 +70,8 @@ pub enum Command {
         output: PathBuf,
         #[arg(long, value_enum, default_value_t = RecoveryModeArg::Balanced)]
         recovery: RecoveryModeArg,
+        #[arg(long, default_value = "auto")]
+        parser_threads: ParserThreadRequest,
         #[arg(long)]
         json: bool,
     },
@@ -80,6 +84,8 @@ pub enum Command {
         max_pst_size: u64,
         #[arg(long, value_enum, default_value_t = RecoveryModeArg::Balanced)]
         recovery: RecoveryModeArg,
+        #[arg(long, default_value = "auto")]
+        parser_threads: ParserThreadRequest,
         /// Retain a durable payload spool so an interrupted job can resume.
         #[arg(long)]
         restartable: bool,
@@ -97,6 +103,8 @@ pub enum Command {
         skipped_units: String,
         #[arg(value_enum)]
         recovery: RecoveryModeArg,
+        #[arg(long, hide = true, default_value = "1")]
+        parser_threads: ParserThreadRequest,
         #[arg(long, hide = true)]
         metadata_only: bool,
         #[arg(long, hide = true)]
@@ -114,6 +122,8 @@ pub enum Command {
     VerifyWorker {
         source: PathBuf,
         expected_identity: String,
+        #[arg(long, hide = true, default_value = "1")]
+        parser_threads: ParserThreadRequest,
     },
 }
 
@@ -258,12 +268,19 @@ pub fn execute(cli: &Cli, output: &mut dyn Write) -> Result<CommandStatus, CliEr
             }
             Ok(CommandStatus::Complete)
         }
-        Command::Verify { source, mode, json } => {
+        Command::Verify {
+            source,
+            mode,
+            parser_threads,
+            json,
+        } => {
             let report = match mode {
-                VerifyMode::Full => pstforge_core::verify(source)?,
+                VerifyMode::Full => {
+                    pstforge_core::verify_with_parser_threads(source, *parser_threads)?
+                }
                 VerifyMode::Recovery => {
                     let executable = std::env::current_exe().map_err(CliError::Executable)?;
-                    supervised_recovery_verify(source, &executable)?
+                    supervised_recovery_verify(source, &executable, *parser_threads)?
                 }
             };
             if *json {
@@ -302,11 +319,17 @@ pub fn execute(cli: &Cli, output: &mut dyn Write) -> Result<CommandStatus, CliEr
             source,
             output: job_directory,
             recovery,
+            parser_threads,
             json,
         } => {
             let executable = std::env::current_exe().map_err(CliError::Executable)?;
-            let report =
-                pstforge_core::recover(source, job_directory, &executable, (*recovery).into())?;
+            let report = pstforge_core::recover(
+                source,
+                job_directory,
+                &executable,
+                (*recovery).into(),
+                *parser_threads,
+            )?;
             if *json {
                 write_json(output, &report)?;
             } else {
@@ -329,6 +352,7 @@ pub fn execute(cli: &Cli, output: &mut dyn Write) -> Result<CommandStatus, CliEr
             output: job_directory,
             max_pst_size,
             recovery,
+            parser_threads,
             restartable,
             resume,
             keep_work,
@@ -342,6 +366,7 @@ pub fn execute(cli: &Cli, output: &mut dyn Write) -> Result<CommandStatus, CliEr
                 (*recovery).into(),
                 pstforge_core::SplitOptions {
                     maximum_pst_bytes: *max_pst_size,
+                    parser_threads: *parser_threads,
                     restartable: *restartable,
                     resume: *resume,
                     keep_work: *keep_work,
@@ -365,6 +390,7 @@ pub fn execute(cli: &Cli, output: &mut dyn Write) -> Result<CommandStatus, CliEr
             expected_identity,
             skipped_units,
             recovery,
+            parser_threads,
             metadata_only,
             writer_order,
         } => {
@@ -375,8 +401,11 @@ pub fn execute(cli: &Cli, output: &mut dyn Write) -> Result<CommandStatus, CliEr
                 &expected_identity,
                 &skipped_units,
                 (*recovery).into(),
-                *metadata_only,
-                *writer_order,
+                pstforge_core::RecoveryWorkerOptions {
+                    parser_threads: *parser_threads,
+                    metadata_only: *metadata_only,
+                    writer_order: *writer_order,
+                },
                 output,
             )?;
             Ok(CommandStatus::Complete)
@@ -439,6 +468,7 @@ pub fn execute(cli: &Cli, output: &mut dyn Write) -> Result<CommandStatus, CliEr
         Command::VerifyWorker {
             source,
             expected_identity,
+            parser_threads,
         } => {
             arm_verify_worker_parent_death_signal()?;
             if std::env::var_os("PSTFORGE_TEST_VERIFY_WORKER_ABORT").is_some() {
@@ -458,7 +488,7 @@ pub fn execute(cli: &Cli, output: &mut dyn Write) -> Result<CommandStatus, CliEr
                 ))
                 .into());
             }
-            let report = pstforge_core::verify_recovery_source(&source)?;
+            let report = pstforge_core::verify_recovery_source(&source, *parser_threads)?;
             write_json(output, &report)?;
             if report.inventory.unsupported_messages == 0
                 && report.inventory.issues.is_empty()
@@ -475,10 +505,12 @@ pub fn execute(cli: &Cli, output: &mut dyn Write) -> Result<CommandStatus, CliEr
 fn supervised_recovery_verify(
     source_path: &std::path::Path,
     executable: &std::path::Path,
+    parser_threads: ParserThreadRequest,
 ) -> Result<VerifyReport, CliError> {
     let source =
         SourceFile::open_protected(source_path).map_err(pstforge_core::InspectionError::Source)?;
-    let result = run_recovery_verify_worker(source_path, executable, source.identity());
+    let result =
+        run_recovery_verify_worker(source_path, executable, source.identity(), parser_threads);
     let unchanged = source
         .verify_unchanged()
         .map_err(pstforge_core::InspectionError::Source);
@@ -493,6 +525,7 @@ fn run_recovery_verify_worker(
     source_path: &std::path::Path,
     executable: &std::path::Path,
     source_identity: &pstforge_core::SourceIdentity,
+    parser_threads: ParserThreadRequest,
 ) -> Result<VerifyReport, CliError> {
     const MAX_WORKER_REPORT_BYTES: u64 = 16 * 1024 * 1024;
 
@@ -501,6 +534,8 @@ fn run_recovery_verify_worker(
         .arg("__verify-worker")
         .arg(source_path)
         .arg(expected_identity)
+        .arg("--parser-threads")
+        .arg(parser_threads.to_string())
         .arg("--quiet")
         .arg("--color")
         .arg("never")
@@ -598,6 +633,12 @@ fn write_verify(output: &mut dyn Write, report: &VerifyReport) -> Result<(), std
         "Corruption observed: {}",
         yes_no(report.pst.corruption_observed)
     )?;
+    writeln!(
+        output,
+        "libpff revision: {}",
+        report.producer.libpff_revision
+    )?;
+    write_parser_metrics(output, &report.parser_threads, &report.parser_performance)?;
     writeln!(output, "Folders: {}", report.inventory.folders)?;
     writeln!(output, "Normal items: {}", report.inventory.normal_items)?;
     writeln!(output, "Recipients: {}", report.inventory.recipients)?;
@@ -659,6 +700,8 @@ fn write_recovery(output: &mut dyn Write, report: &RecoveryReport) -> Result<(),
     write_source_hash(output, report.source.sha256.as_deref())?;
     writeln!(output, "Job: {}", report.job_directory)?;
     writeln!(output, "Mode: {}", report.mode)?;
+    writeln!(output, "libpff revision: {}", report.libpff_revision)?;
+    write_parser_metrics(output, &report.parser_threads, &report.parser_performance)?;
     writeln!(output, "Normal items: {}", report.normal_items)?;
     writeln!(output, "Recovered items: {}", report.recovered_items)?;
     writeln!(output, "Orphan items: {}", report.orphan_items)?;
@@ -724,6 +767,11 @@ fn write_split_details(output: &mut dyn Write, report: &SplitReport) -> Result<(
         report.maximum_pst_bytes
     )?;
     writeln!(output, "Execution mode: {}", report.execution_mode)?;
+    write_parser_metrics(
+        output,
+        &report.recovery.parser_threads,
+        &report.recovery.parser_performance,
+    )?;
     writeln!(output, "Resumed: {}", yes_no(report.resumed))?;
     writeln!(output, "Keep private work: {}", yes_no(report.keep_work))?;
     writeln!(
@@ -806,6 +854,25 @@ fn write_split_details(output: &mut dyn Write, report: &SplitReport) -> Result<(
     Ok(())
 }
 
+fn write_parser_metrics(
+    output: &mut dyn Write,
+    threads: &pstforge_core::ParserThreadSelection,
+    performance: &pstforge_core::ParserPerformanceReport,
+) -> Result<(), std::io::Error> {
+    writeln!(
+        output,
+        "Parser threads: {} requested, {} effective",
+        threads.requested, threads.effective
+    )?;
+    writeln!(
+        output,
+        "Parser phases: reachable {} ms, native recovery scan {} ms, recovery collection {} ms",
+        performance.reachable_catalog_millis,
+        performance.native_recovery_scan_millis,
+        performance.recovery_collection_millis
+    )
+}
+
 fn write_optional_metric(
     output: &mut dyn Write,
     name: &str,
@@ -873,6 +940,11 @@ fn write_common(output: &mut dyn Write, report: &InfoReport) -> Result<(), std::
     writeln!(output, "libpff: {}", report.producer.libpff_version)?;
     writeln!(
         output,
+        "libpff revision: {}",
+        report.producer.libpff_revision
+    )?;
+    writeln!(
+        output,
         "Source unchanged: {}",
         yes_no(report.source_unchanged)
     )?;
@@ -924,7 +996,7 @@ mod tests {
     use std::path::PathBuf;
 
     use clap::Parser;
-    use pstforge_core::{RecoveryError, SourceError};
+    use pstforge_core::{ParserThreadRequest, RecoveryError, SourceError};
     use pstforge_job::JobError;
 
     use super::{Cli, CliError, Command, RecoveryModeArg, VerifyMode, parse_byte_size};
@@ -1015,6 +1087,39 @@ mod tests {
                 ..
             }
         ));
+        Ok(())
+    }
+
+    #[test]
+    fn parser_threads_accepts_auto_or_a_positive_integer() -> Result<(), clap::Error> {
+        let cli = Cli::try_parse_from([
+            "pstforge",
+            "recover",
+            "mail.pst",
+            "--output",
+            "job",
+            "--parser-threads",
+            "4",
+        ])?;
+        assert!(matches!(
+            cli.command,
+            Command::Recover {
+                parser_threads: ParserThreadRequest::Count(count),
+                ..
+            } if count.get() == 4
+        ));
+        assert!(
+            Cli::try_parse_from([
+                "pstforge",
+                "recover",
+                "mail.pst",
+                "--output",
+                "job",
+                "--parser-threads",
+                "0",
+            ])
+            .is_err()
+        );
         Ok(())
     }
 

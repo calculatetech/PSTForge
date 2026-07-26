@@ -5,6 +5,7 @@ mod canonical;
 mod catalog;
 mod inspection;
 mod packing;
+mod parser_threads;
 mod recovery;
 mod report;
 mod source;
@@ -21,12 +22,14 @@ pub use canonical::{
 };
 pub use inspection::{
     EncryptionMode, FileFormat, InfoReport, InspectionBackend, InspectionError, InventoryReport,
-    LibpffBackend, PstMetadata, VerifyReport, info, info_with_backend, verify, verify_recovery,
-    verify_recovery_source, verify_recovery_with_backend, verify_with_backend,
+    LibpffBackend, ParserPerformanceReport, PstMetadata, VerifyReport, info, info_with_backend,
+    verify, verify_recovery, verify_recovery_source, verify_recovery_with_backend,
+    verify_with_backend, verify_with_parser_threads,
 };
 pub use packing::{
     PackCandidate, PackingError, PartAssignment, PartSizeEstimator, pack_candidates,
 };
+pub use parser_threads::{ParserThreadParseError, ParserThreadRequest, ParserThreadSelection};
 pub use recovery::{RecoveryError, RecoveryReport, recover};
 pub use report::{JobReport, REPORT_SCHEMA_VERSION, ReportError, report};
 pub use source::{SourceError, SourceFile, SourceIdentity, validate_output_relationship};
@@ -34,7 +37,7 @@ pub use split::{
     DiskPreflight, ExecutionMetrics, PartReport, SplitError, SplitFailureKind, SplitOptions,
     SplitReport, split, split_recovered_job,
 };
-pub use worker::{WorkerProtocolError, run_recovery_worker};
+pub use worker::{RecoveryWorkerOptions, WorkerProtocolError, run_recovery_worker};
 pub(crate) use worker::{receive_worker_catalog_body_with_progress, receive_worker_hello};
 pub use writer_input::{
     CanonicalWriteError, PartWriterInput, build_part_writer_input,

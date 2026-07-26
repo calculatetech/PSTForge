@@ -119,8 +119,9 @@ payload spool and therefore costs approximately one extra full
 readable-payload write and temporary allocation.
 
 Restore the 19 GB cold-run ceiling to one minute per source GiB on the current
-host, target the previously demonstrated approximately ten-minute result, and
-keep aggregate PSTForge RSS below 2 GiB. Complete the deferred 0.4.2 whole-job
+host and target the previously demonstrated approximately ten-minute result.
+Measure aggregate PSTForge RSS for capacity planning without imposing the
+former arbitrary 2 GiB release ceiling. Complete the deferred 0.4.2 whole-job
 reconciliation across independently validated 4 GiB splits before proceeding.
 A low-write direct-output mode remains future work after the newly exposed
 native-item data-correctness gaps are resolved.

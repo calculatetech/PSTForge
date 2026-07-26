@@ -3313,8 +3313,9 @@ not modified.
     report snapshot stored in the private SQLite ledger. Opening a report must
     not create, reconcile, compact, or otherwise mutate job state. Validate the
     ledger, manifests, published part type/identity/size, and every SHA-256 that
-    the producing mode recorded. Direct mode remains deliberately hash-free and
-    reports `not calculated`; do not reintroduce a post-write read. A 0.4 job
+    the producing mode recorded. Direct output parts remain deliberately
+    hash-free and report `not calculated`; do not reintroduce a post-write
+    read. A 0.4 job
     without a report snapshot receives a clear compatibility error rather than
     fabricated zero metrics. Preserve exit statuses 0, 1, 2, 3, 4, 5, 6, and
     130 and keep final JSON isolated on stdout.
@@ -3899,7 +3900,7 @@ not modified.
     Release automation now explicitly trusts only `GITHUB_WORKSPACE` before
     invoking Git; this workflow-only correction does not change tagged source
     or package contents.
-- [ ] Milestone 1.1.0: Maintained Recovery Runtime.
+- [x] Milestone 1.1.0: Maintained Recovery Runtime.
   - [x] (2026-07-22) Created the clean milestone worktree from protected main,
     verified the public `calculatetech/libpff` fork, and protected its default
     branch with a non-bypassable pull-request ruleset.
@@ -3933,7 +3934,7 @@ not modified.
     `pstforge_1.1.0_amd64.deb`, SHA-256
     `ba2da82b2575d92fba8f734f73fd6841b0ac2fd0a36e61706adbbc142f087e1e`,
     with only `libc6`, `libgcc-s1`, and `zlib1g` runtime dependencies.
-  - [ ] Pass the canonical gates, final 50 GB split, ScanPST, Outlook, review,
+  - [x] Pass the canonical gates, final 50 GB split, ScanPST, Outlook, review,
     protected fork PR, and protected PSTForge PR.
     The fast, canonical full, and release-foundation gates passed from the
     accepted fork merge; bounded local evidence is under ignored
@@ -3955,13 +3956,183 @@ not modified.
     the fast and full release gates passed again, producing final package
     SHA-256
     `ba2da82b2575d92fba8f734f73fd6841b0ac2fd0a36e61706adbbc142f087e1e`.
+    Protected PR #6 merged as `b968126` with every required check green.
+    The approved annotated `v1.1.0` tag points to that merge. Protected release
+    build `30003922337` passed the public CI and reproducible-package gates,
+    and the public GitHub release contains the tag-built
+    `pstforge_1.1.0_amd64.deb` with SHA-256
+    `f31f6171336dcc39af044c0763c326f4797cd789308e5e994cadf4f9395a08d6`.
 - [ ] Milestone 1.2.0: Parallel Recovery Performance.
-  - [ ] Begin only after 1.1.0 is human-approved and integrated; profile and
-    implement deterministic recovery concurrency on a new milestone branch.
-  - [ ] Prove semantic identity and repeatable improvement on the 50 GB source
-    before making any content read from the separate 83 GB candidate.
+  - [x] (2026-07-23) Began after 1.1.0 approval, protected integration, and
+    publication. Created PSTForge branch
+    `milestone/v1.2.0-parallel-recovery-performance` in sibling worktree
+    `../pstforge-worktrees/v1.2.0-parallel-recovery-performance` from approved
+    main merge `b968126`, and created separate LGPL fork branch
+    `pstforge/parallel-recovery` from protected libpff merge `08cf742`.
+  - [x] (2026-07-23) Profile the accepted single-thread path with privacy-safe phase
+    instrumentation before selecting the concurrency boundary.
+    The public damaged 31,761,408-byte case measured 245-266 ms for reachable
+    catalog traversal, 17-18 ms for the native recovery scan, and 1-2 ms for
+    recovered collection. The read-only 50 GB metadata-only baseline completed
+    in 4,493,914 ms: reachable catalog traversal took 284,701 ms, the native
+    recovery scan took 4,134,389 ms, and recovered collection took 65,990 ms.
+    The scan is therefore about 92 percent of observed elapsed time and is the
+    demonstrated concurrency boundary. Detailed results remain under ignored
+    `.agent/test-results/v120-profile-50gb-r1/`.
+  - [x] (2026-07-23) Implement deterministic recovery concurrency and expose
+    `--parser-threads auto|N`, including requested/effective counts in reports.
+    Fork commits `1f4589b` and `f7bd708` add independent bounded scan handles,
+    preserve the original serial traversal ordinal during merge, and pass all
+    47 library, three manpage, and three tool tests. PSTForge uses a private
+    handle per range, keeps aggressive fragment scanning serial, and records
+    phase timings, requested/effective threads, and exact fork revision.
+    The canonical public damaged case produces byte-identical semantic verify
+    JSON with one and four threads after timing/thread fields are removed; a
+    canonical external regression now enforces the same one-versus-two-thread
+    contract over both the public report and exact ordered message/property/
+    payload fingerprints. The post-integration fast gate passed at
+    `.agent/test-results/1784811811-fast`; the canonical full gate, including
+    the external parallel-recovery comparison and independent readers, passed
+    at `.agent/test-results/1784812096-full`.
+  - [x] (2026-07-23) Prove semantic identity and repeatable improvement on the
+    50 GB source before making any content read from the separate 83 GB
+    candidate.
+    The first 32-thread large-file prototype completed successfully and kept
+    physical reads bounded, but failed the performance gate: 4,571,180 ms
+    elapsed versus the 4,493,914 ms serial baseline. Its native phase took
+    4,230,579 ms and peaked at 3,236,832 KiB RSS because range workers retained
+    every structurally plausible index entry for serial replay. This result is
+    retained as rejected diagnostic evidence under
+    `.agent/test-results/v120-profile-50gb-auto-r2/`. The next revision moves
+    only immutable-source-index rejection into each range worker while leaving
+    recovered-state conflict decisions and insertion order in the master.
+    That prefilter-only revision also failed the gate: it completed in
+    4,751,454 ms, with a 4,390,473 ms native phase and 3,254,420 KiB peak RSS.
+    It did complete the aggregate inventory successfully (120,799 catalog
+    messages, 37,298 recovered, one orphan, and 6,446 issues) and left the
+    source unchanged. The run was deliberately treated as diagnostic after its
+    replay exceeded the gate, so concurrent fork tests/builds make its timing
+    non-comparative; evidence is under
+    `.agent/test-results/v120-profile-50gb-filtered-auto-r1/`.
+    The refined revision performs exact range-local duplicate suppression and
+    reuses worker source validation while preserving serial-ordinal master
+    insertion. Its first uncontended automatic 32-thread run completed in
+    1,872,878 ms: 285,775 ms reachable traversal, 1,523,256 ms native recovery,
+    and 54,841 ms collection, with 3,779,272 KiB peak RSS. Every aggregate
+    inventory total exactly matched the prior successful reference, including
+    120,799 catalog messages, 37,298 recovered messages, one orphan, 300,348
+    recipients, 115,843 attachments, 24,456,487 properties, byte totals, and
+    6,446 issues. Source identity remained unchanged. This is a material first
+    improvement. The same revision's uncontended one-thread control then
+    completed in 4,345,707 ms: 252,854 ms reachable traversal, 4,011,806 ms
+    native recovery, and 72,124 ms collection, with 718,604 KiB peak RSS.
+    Its complete aggregate inventory exactly matched the automatic run and the
+    source identity again remained unchanged. Automatic execution therefore
+    improved native recovery by 2.63x and end-to-end elapsed time by 2.32x in
+    the current alternating series. Control evidence:
+    `.agent/test-results/v120-profile-50gb-dedup-auto-r1/` and
+    `.agent/test-results/v120-profile-50gb-dedup-serial-r1/`.
+    The protected-merge automatic repeat completed in 1,921,888 ms, with
+    284,454 ms reachable traversal, 1,571,621 ms native recovery, and 56,234 ms
+    collection. That is within 2.6 percent of the first automatic result and
+    again exactly matches every aggregate inventory field. The source identity
+    remained unchanged. Fork PR #2 merged the runtime as `97ce41e`; focused
+    packaging-remediation PR #3 then merged as `79cb8b7` after its formerly
+    failing Ubuntu 26.04 Debian source job passed. The latter changes only
+    `dpkg/source/local-options`; rebuilt `.text`, `.rodata`, `.data`, dynamic
+    symbol/string, relocation, and unwind sections are byte-identical to the
+    measured runtime. PSTForge is pinned to `79cb8b7`, and the 83 GB candidate
+    remains untouched. Repeat evidence:
+    `.agent/test-results/v120-profile-50gb-dedup-auto-r2-final/`.
+  - [x] (2026-07-26) Complete the optimized 50 GB direct split and bounded
+    independent structural validation. The run produced five finalized parts
+    totaling 48,689,796,096 bytes with 120,367 written candidates. All five
+    pass `pffinfo`; their exact SHA-256 values and bounded run evidence remain
+    under ignored `.agent/test-results/v120-final-50gb-split-r1/`. The held
+    source device, inode, size, and mtime were unchanged.
+  - [x] (2026-07-26) Accept the current five-part output. The owner confirms
+    that ScanPST and Outlook already passed artifacts with the identical
+    hashes produced by 1.1.0, so the byte-identical 1.2.0 artifacts inherit
+    that interoperability evidence:
+    `ce6130dc847b5dc36d82a54844c7f42e589d8f1ad8f244c5037047feeae221ec`,
+    `9f1ccf77b090ffe59fda42bc90015c921320bdf7d45901ccc9f6c4a65b3aa4fa`,
+    `2eb96ec1a23d221cb31ff7d5931b482d4c20cb4650d03d4080283fd676b5f5fe`,
+    `1a5d2579bcf339a656dc11791982f23767b032622b0102413368e8733e348261`,
+    and
+    `d781757d0c1be1dc454848d6e1957eb05459147abd8c21f7435ea1d8a19a396a`.
+  - [ ] Complete integration. Direct mode intentionally
+    remains hash-free and single-pass; source SHA-256 is an explicit
+    restartable-mode tradeoff, not a default-output requirement. No additional
+    50 GB performance or output rerun is required. The applicable fast gate
+    passed at `.agent/test-results/1784831227-fast`, and the canonical full gate
+    passed at `.agent/test-results/1784831274-full`. Remaining work is clean
+    adversarial review, commit, PR, and protected merge.
 
 ## Surprises & Discoveries
+
+- Observation: Concatenating byte-range results does not preserve libpff's
+  serial candidate order even when candidate counts and content totals match.
+  The allocation-table traversal can visit page ranges in a non-monotonic
+  sequence. Recording that traversal ordinal in each range and performing a
+  stable ordinal merge restores exact recovered-item and diagnostic order.
+  Evidence: the first one-versus-four-thread public comparison moved five
+  diagnostics; fork commit `f7bd708` and the repeated comparison are exact.
+
+- Observation: On the small public damaged case, reachable catalog traversal
+  dominates the measured parser time while the balanced native recovery scan
+  is only 17-18 ms. Four scan handles are therefore correctly slower on that
+  fixture (22 ms) and are not performance evidence. The ongoing 50 GB baseline
+  is required to decide whether recovery-scan parallelism is material or the
+  next boundary must target reachable traversal or supervisor ledger work.
+  Evidence: ignored `.agent/test-results/v120-profile-public-r1` and
+  `.agent/test-results/v120-public-parallel-r1`.
+
+- Observation: The accepted 50 GB single-thread path spends approximately
+  92 percent of its 4,493,914 ms elapsed time in the native recovery scan:
+  4,134,389 ms, compared with 284,701 ms for reachable catalog traversal and
+  65,990 ms for recovered collection. The worker stayed CPU-bound and wrote
+  only protocol data to `/dev/null`; source identity remained unchanged.
+  Evidence: ignored `.agent/test-results/v120-profile-50gb-r1/`.
+
+- Observation: Parallel candidate discovery without the serial path's
+  immutable-source-index filter creates an oversized replay set. On the 50 GB
+  source, 32 range workers saturated available CPUs and bounded physical reads,
+  but the deterministic master replay erased the gain: 4,571,180 ms total and
+  4,230,579 ms in the native phase, slightly slower than serial, with a
+  3,236,832 KiB peak RSS. Treat this as a rejected prototype, not a passing
+  performance result. Evidence: ignored
+  `.agent/test-results/v120-profile-50gb-auto-r2/`.
+
+- Observation: Immutable-source filtering in range workers does not by itself
+  reduce the dominant recovered-duplicate replay. The filtered-only 50 GB run
+  completed successfully with the expected aggregate recovered/orphan counts
+  and unchanged source, but its native phase still took 4,390,473 ms and peak
+  RSS reached 3,254,420 KiB. Exact per-range duplicate suppression plus master
+  reuse of worker source validation is required; the master must retain only
+  evolving recovered-state conflict checks and ordered insertion.
+  Evidence: ignored
+  `.agent/test-results/v120-profile-50gb-filtered-auto-r1/`.
+
+- Observation: Exact range-local duplicate suppression plus reuse of worker
+  source validation removes the rejected prototype's dominant master replay.
+  On the same 50 GB source, the refined automatic run reduced native recovery
+  from the 4,134,389 ms serial baseline to 1,523,256 ms and end-to-end elapsed
+  from 4,493,914 ms to 1,872,878 ms while preserving every aggregate inventory
+  count and leaving the source unchanged. Physical reads observed immediately
+  before completion were approximately 62 GB, so independent-handle metadata
+  amplification remains a future optimization opportunity even though the
+  runtime gate now has a passing first result. Evidence: ignored
+  `.agent/test-results/v120-profile-50gb-dedup-auto-r1/`.
+
+- Observation: The refined fork's current one-thread control completed in
+  4,345,707 ms with 4,011,806 ms in native recovery, compared with the first
+  automatic run's 1,872,878 ms total and 1,523,256 ms native recovery. Both
+  runs emitted exactly the same privacy-safe aggregate inventory and left the
+  source identity unchanged. The serial control's saturated single core and
+  nearly flat disk reads during native analysis independently confirm that
+  libpff recovery computation remains the primary bottleneck even after the
+  accepted parallel improvement. Evidence: ignored
+  `.agent/test-results/v120-profile-50gb-dedup-serial-r1/`.
 
 - Observation: Legacy recovered-value indexes are ordering artifacts, not
   content identities. The 2018 oracle reports 630 selected data indexes as 1
@@ -5203,7 +5374,7 @@ not modified.
   evade readers that do not cross-check the table index.
   Date/Author: 2026-07-22 / ScanPST failure diagnosis and MS-PST LTP contract.
 
-- Decision: Remove the arbitrary 2 GiB per-process RSS ceiling from the 1.0
+- Decision: Remove the arbitrary 2 GiB RSS ceiling from the 1.0
   release gate. Continue measuring and reporting supervisor and parser-worker
   peaks so operators can plan capacity, but judge the real 50 GB rehearsal on
   completion, correctness, source safety, validation, and the retained 24-hour
@@ -6463,14 +6634,15 @@ not modified.
   correctly as bytes land. It then performs one file `fsync`, an atomic
   no-replace rename, and a directory `fsync`. Independent validation remains a
   mandatory CI, adversarial-review, ScanPST, and Outlook acceptance layer, not
-  a production transformation stage. Restartable mode retains
-  source and payload SHA-256 because persisted state must be matched on a later
+  a production transformation stage. Restartable mode retains source and
+  payload SHA-256 because persisted state must be matched on a later
   invocation.
   Rationale: Runtime self-reading cannot make a structurally incorrect writer
   trustworthy and multiplied the 19 GB job's reads and elapsed time. A direct
   job has no resume state whose identity requires a content digest.
   Date/Author: 2026-07-20 / human owner direction after the 19 GB r11 timing
-  analysis.
+  analysis; reaffirmed 2026-07-26 after rejecting an unnecessary pre-hash
+  qualification rerun.
 
 - Decision: Hold the source through one read-only, no-follow descriptor and
   request every applicable Linux read-side protection: a kernel read lease,
@@ -7686,7 +7858,9 @@ protection build on the approved remote baseline. Recheck authentication and
 repository settings before creating or configuring them. Local work and
 private-corpus acceptance must never depend on their existence.
 
-Revision note (2026-07-22): Extended the completed 1.0 program with the
-owner-approved 1.1.0 maintained recovery runtime and 1.2.0 parallel recovery
-milestones. Large-file proof remains on the known 50 GB source; the unknown
-approximately 83 GB candidate is explicitly deferred until 1.2.0 approval.
+Revision note (2026-07-26): Recorded repeatable 50 GB parallel improvement,
+protected libpff integrations, the completed five-part 50 GB output, and clean
+`pffinfo` results. Reaffirmed that default direct output remains deliberately
+single-pass and hash-free; restartable mode is the explicit source-digest
+opt-in. No additional performance rerun is required, and the approximately
+83 GB candidate remains untouched until 1.2.0 approval.

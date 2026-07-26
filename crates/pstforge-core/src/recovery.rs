@@ -16,12 +16,13 @@ use thiserror::Error;
 
 use crate::worker::WorkerCatalog;
 use crate::{
-    SourceError, SourceFile, SourceIdentity, WorkerProtocolError,
-    receive_worker_catalog_body_with_progress, receive_worker_hello, validate_output_relationship,
+    ParserPerformanceReport, ParserThreadRequest, ParserThreadSelection, SourceError, SourceFile,
+    SourceIdentity, WorkerProtocolError, receive_worker_catalog_body_with_progress,
+    receive_worker_hello, validate_output_relationship,
 };
 use libpff_sys::{RecoveryMode, RecoveryUnit};
 
-pub const RECOVERY_SCHEMA_VERSION: &str = "0.5.0";
+pub const RECOVERY_SCHEMA_VERSION: &str = "1.2.0";
 const MAX_WORKER_RETRIES: u32 = 3;
 const MAX_UNIT_RETRIES: u32 = 0;
 
@@ -56,6 +57,9 @@ pub struct RecoveryReport {
     pub schema_version: String,
     pub command: String,
     pub mode: String,
+    pub libpff_revision: String,
+    pub parser_threads: ParserThreadSelection,
+    pub parser_performance: ParserPerformanceReport,
     pub source: SourceIdentity,
     pub job_directory: String,
     pub normal_items: u64,
@@ -83,6 +87,7 @@ pub fn recover(
     job_directory: &Path,
     worker_executable: &Path,
     mode: RecoveryMode,
+    parser_threads: ParserThreadRequest,
 ) -> Result<RecoveryReport, RecoveryError> {
     let interrupt = InterruptHandler::install()?;
     let interrupted = interrupt.flag();
@@ -99,6 +104,7 @@ pub fn recover(
         job_directory,
         worker_executable,
         mode,
+        parser_threads,
         interrupted,
         None,
     )?;
@@ -117,6 +123,7 @@ pub(crate) fn recover_for_split(
     job_directory: &Path,
     worker_executable: &Path,
     mode: RecoveryMode,
+    parser_threads: ParserThreadRequest,
     interrupted: Arc<AtomicBool>,
     prepared: PreparedSplitRecovery<'_>,
 ) -> Result<(RecoveryReport, DurableCatalogSink), RecoveryError> {
@@ -125,6 +132,7 @@ pub(crate) fn recover_for_split(
         job_directory,
         worker_executable,
         mode,
+        parser_threads,
         interrupted,
         Some(prepared),
     )
@@ -135,6 +143,7 @@ fn recover_source(
     job_directory: &Path,
     worker_executable: &Path,
     mode: RecoveryMode,
+    parser_threads: ParserThreadRequest,
     interrupted: Arc<AtomicBool>,
     prepared: Option<PreparedSplitRecovery<'_>>,
 ) -> Result<(RecoveryReport, DurableCatalogSink), RecoveryError> {
@@ -217,6 +226,11 @@ fn recover_source(
             issues: 1,
             issues_dropped: 0,
             peak_worker_rss_bytes: 0,
+            libpff_revision: Some(libpff_sys::library_revision().to_owned()),
+            effective_parser_threads: 1,
+            reachable_catalog_millis: 0,
+            native_recovery_scan_millis: 0,
+            recovery_collection_millis: 0,
         };
         sink.record_recovery_completion(&terminal)?;
         sink.checkpoint()?;
@@ -237,6 +251,19 @@ fn recover_source(
                 schema_version: RECOVERY_SCHEMA_VERSION.to_owned(),
                 command: "recover".to_owned(),
                 mode: recovery_mode_name(mode).to_owned(),
+                libpff_revision: completion
+                    .libpff_revision
+                    .clone()
+                    .unwrap_or_else(|| libpff_sys::library_revision().to_owned()),
+                parser_threads: ParserThreadSelection {
+                    requested: parser_threads.requested(),
+                    effective: completion.effective_parser_threads.max(1),
+                },
+                parser_performance: ParserPerformanceReport {
+                    reachable_catalog_millis: completion.reachable_catalog_millis,
+                    native_recovery_scan_millis: completion.native_recovery_scan_millis,
+                    recovery_collection_millis: completion.recovery_collection_millis,
+                },
                 source: source.identity().clone(),
                 job_directory: canonical_job_directory(job_directory),
                 normal_items: completion.normal_items,
@@ -267,6 +294,7 @@ fn recover_source(
     }
     let worker_controls = WorkerControls {
         mode,
+        parser_threads,
         interrupted,
         peak_worker_rss_bytes: Arc::new(AtomicU64::new(0)),
         metadata_only,
@@ -571,6 +599,11 @@ fn recover_source(
             issues: catalog.issues,
             issues_dropped: catalog.issues_dropped,
             peak_worker_rss_bytes,
+            libpff_revision: Some(libpff_sys::library_revision().to_owned()),
+            effective_parser_threads: catalog.effective_parser_threads.max(1),
+            reachable_catalog_millis: catalog.reachable_catalog_millis,
+            native_recovery_scan_millis: catalog.native_recovery_scan_millis,
+            recovery_collection_millis: catalog.recovery_collection_millis,
         })?;
         sink.checkpoint()?;
     }
@@ -579,6 +612,16 @@ fn recover_source(
             schema_version: RECOVERY_SCHEMA_VERSION.to_owned(),
             command: "recover".to_owned(),
             mode: recovery_mode_name(mode).to_owned(),
+            libpff_revision: libpff_sys::library_revision().to_owned(),
+            parser_threads: ParserThreadSelection {
+                requested: parser_threads.requested(),
+                effective: catalog.effective_parser_threads.max(1),
+            },
+            parser_performance: ParserPerformanceReport {
+                reachable_catalog_millis: catalog.reachable_catalog_millis,
+                native_recovery_scan_millis: catalog.native_recovery_scan_millis,
+                recovery_collection_millis: catalog.recovery_collection_millis,
+            },
             source: source.identity().clone(),
             job_directory: canonical_job_directory(job_directory),
             normal_items,
@@ -725,6 +768,7 @@ pub(crate) fn spawn_direct_worker(
     worker_executable: &Path,
     source: &SourceIdentity,
     mode: RecoveryMode,
+    parser_threads: ParserThreadRequest,
     skipped_units: &HashSet<RecoveryUnit>,
     interrupted: Arc<AtomicBool>,
     attempt: u32,
@@ -732,6 +776,7 @@ pub(crate) fn spawn_direct_worker(
     let expected_identity = serde_json::to_string(source).map_err(WorkerProtocolError::Json)?;
     let controls = WorkerControls {
         mode,
+        parser_threads,
         interrupted,
         peak_worker_rss_bytes: Arc::new(AtomicU64::new(0)),
         metadata_only: false,
@@ -960,6 +1005,8 @@ fn spawn_worker(
         .arg(expected_identity)
         .arg(serde_json::to_string(skipped_units).map_err(WorkerProtocolError::Json)?)
         .arg(recovery_mode_name(controls.mode))
+        .arg("--parser-threads")
+        .arg(controls.parser_threads.to_string())
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit());
@@ -1173,6 +1220,7 @@ struct AttemptFailure {
 
 struct WorkerControls {
     mode: RecoveryMode,
+    parser_threads: ParserThreadRequest,
     interrupted: Arc<AtomicBool>,
     peak_worker_rss_bytes: Arc<AtomicU64>,
     metadata_only: bool,

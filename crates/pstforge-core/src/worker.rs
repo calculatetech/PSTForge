@@ -1344,6 +1344,10 @@ pub(crate) struct WorkerCatalog {
     pub(crate) attachment_bytes: u64,
     pub(crate) issues: u64,
     pub(crate) issues_dropped: u64,
+    pub(crate) effective_parser_threads: usize,
+    pub(crate) reachable_catalog_millis: u64,
+    pub(crate) native_recovery_scan_millis: u64,
+    pub(crate) recovery_collection_millis: u64,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
@@ -1370,6 +1374,10 @@ impl From<RawCatalog> for WorkerCatalog {
             attachment_bytes: catalog.attachment_bytes,
             issues: u64::try_from(catalog.issues.len()).unwrap_or(u64::MAX),
             issues_dropped: catalog.issues_dropped,
+            effective_parser_threads: catalog.parser_phase_metrics.effective_threads,
+            reachable_catalog_millis: catalog.parser_phase_metrics.reachable_catalog_millis,
+            native_recovery_scan_millis: catalog.parser_phase_metrics.native_recovery_scan_millis,
+            recovery_collection_millis: catalog.parser_phase_metrics.recovery_collection_millis,
         }
     }
 }
@@ -1827,15 +1835,26 @@ impl std::io::Seek for AttachmentProbeReader<'_> {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct RecoveryWorkerOptions {
+    pub parser_threads: crate::ParserThreadRequest,
+    pub metadata_only: bool,
+    pub writer_order: bool,
+}
+
 pub fn run_recovery_worker(
     source_path: &Path,
     expected_identity: &crate::SourceIdentity,
     skipped_units: &std::collections::HashSet<RecoveryUnit>,
     mode: RecoveryMode,
-    metadata_only: bool,
-    writer_order: bool,
+    options: RecoveryWorkerOptions,
     output: &mut dyn Write,
 ) -> Result<(), WorkerProtocolError> {
+    let RecoveryWorkerOptions {
+        parser_threads,
+        metadata_only,
+        writer_order,
+    } = options;
     arm_parent_death_signal()?;
     let source = match SourceFile::open_for_expected_identity(source_path, expected_identity) {
         Ok(source) => source,
@@ -1868,7 +1887,12 @@ pub fn run_recovery_worker(
         );
     }
     let mut sink = ProtocolSink::start(output, metadata_only, writer_order)?;
-    let catalog = match file.recovery_catalog_skipping(&mut sink, skipped_units, mode) {
+    let catalog = match file.recovery_catalog_skipping_with_threads(
+        &mut sink,
+        skipped_units,
+        mode,
+        parser_threads.requested_count(),
+    ) {
         Ok(catalog) => catalog,
         Err(error) => {
             if writer_order {
@@ -1884,6 +1908,27 @@ pub fn run_recovery_worker(
             return report_worker_error(sink.output, WorkerFailureKind::Parser, error.into());
         }
     };
+    tracing::info!(
+        folders = catalog.folders,
+        normal_items = catalog.messages,
+        recovered_items = catalog.recovered_messages,
+        orphan_items = catalog.orphan_messages,
+        fragment_items = catalog.fragment_messages,
+        recipients = catalog.recipients,
+        attachments = catalog.attachments,
+        embedded_messages = catalog.embedded_messages,
+        unsupported_messages = catalog.unsupported_messages,
+        properties = catalog.properties,
+        property_bytes = catalog.property_bytes,
+        attachment_bytes = catalog.attachment_bytes,
+        issues = catalog.issues.len(),
+        issues_dropped = catalog.issues_dropped,
+        effective_parser_threads = catalog.parser_phase_metrics.effective_threads,
+        reachable_catalog_millis = catalog.parser_phase_metrics.reachable_catalog_millis,
+        native_recovery_scan_millis = catalog.parser_phase_metrics.native_recovery_scan_millis,
+        recovery_collection_millis = catalog.parser_phase_metrics.recovery_collection_millis,
+        "parser phase timings and inventory recorded"
+    );
     if let Err(error) = source.verify_unchanged() {
         return report_worker_error(sink.output, WorkerFailureKind::Source, error.into());
     }

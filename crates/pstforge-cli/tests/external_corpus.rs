@@ -1,6 +1,6 @@
 #![deny(unsafe_code)]
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fs;
 use std::os::fd::AsFd;
 use std::os::unix::fs::MetadataExt;
@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 
 use libpff_sys::{
     CatalogEvent, CatalogSink, NamedPropertyIdentity, NamedPropertyName, PropertyDescriptor,
-    PropertyOwner, TraversalOrder,
+    PropertyOwner, RecoveryMode, TraversalOrder,
 };
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
@@ -698,7 +698,7 @@ struct MessageContentFingerprint {
     body_properties: Vec<PropertyFingerprint>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct MessageFingerprint {
     folder_path: Vec<String>,
     folder_identity: FolderIdentity,
@@ -1773,6 +1773,9 @@ fn root_and_associated_data_roundtrip_through_the_supervised_split()
     let direct: serde_json::Value = serde_json::from_slice(&direct.stdout)?;
     if !direct["parts"][0]["sha256"].is_null() {
         return Err("direct split unexpectedly calculated a finalized-part hash".into());
+    }
+    if !direct["recovery"]["source"]["sha256"].is_null() {
+        return Err("direct split unexpectedly recorded a source hash".into());
     }
     let direct_report = Command::new(env!("CARGO_BIN_EXE_pstforge"))
         .arg("report")
@@ -5273,6 +5276,97 @@ fn milestone_0_3_sigsegv_is_contained_and_isolated() -> Result<(), Box<dyn std::
     assert_eq!(report["isolated_units"], 1);
     assert!(report["committed_candidates"].as_u64().unwrap_or_default() > 1);
     assert!(job.join(".pstforge/job.sqlite3").is_file());
+    assert_eq!(
+        pstforge_core::SourceFile::open(&case.path)?.identity(),
+        &before
+    );
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires PSTFORGE_CORPUS_MANIFEST with an external damaged PST"]
+fn milestone_1_2_parallel_recovery_matches_serial_semantics()
+-> Result<(), Box<dyn std::error::Error>> {
+    let manifest_path = std::env::var_os("PSTFORGE_CORPUS_MANIFEST")
+        .ok_or("PSTFORGE_CORPUS_MANIFEST is required")?;
+    let manifest: Manifest = toml::from_str(&fs::read_to_string(&manifest_path)?)?;
+    let case = manifest
+        .cases
+        .iter()
+        .filter(|case| case.milestone_0_3 || case.classification == "damaged")
+        .filter_map(|case| {
+            fs::metadata(&case.path)
+                .ok()
+                .filter(|metadata| metadata.len() >= 16 * 1024 * 1024)
+                .map(|metadata| (metadata.len(), case))
+        })
+        .min_by_key(|(size, _)| *size)
+        .map(|(_, case)| case)
+        .ok_or("manifest has no damaged recovery case large enough for two useful ranges")?;
+    let before = pstforge_core::SourceFile::open(&case.path)?
+        .identity()
+        .clone();
+    let verify = |threads: &str| -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+        let output = Command::new(env!("CARGO_BIN_EXE_pstforge"))
+            .arg("verify")
+            .arg(&case.path)
+            .arg("--mode")
+            .arg("recovery")
+            .arg("--parser-threads")
+            .arg(threads)
+            .arg("--json")
+            .output()?;
+        if !output.status.success() && output.status.code() != Some(1) {
+            return Err(String::from_utf8_lossy(&output.stderr).into_owned().into());
+        }
+        Ok(serde_json::from_slice(&output.stdout)?)
+    };
+    let mut serial = verify("1")?;
+    let mut parallel = verify("2")?;
+    assert_eq!(serial["parser_threads"]["effective"], 1);
+    assert_eq!(parallel["parser_threads"]["effective"], 2);
+    serial
+        .as_object_mut()
+        .ok_or("serial verify report is not an object")?
+        .remove("parser_threads");
+    serial
+        .as_object_mut()
+        .ok_or("serial verify report is not an object")?
+        .remove("parser_performance");
+    parallel
+        .as_object_mut()
+        .ok_or("parallel verify report is not an object")?
+        .remove("parser_threads");
+    parallel
+        .as_object_mut()
+        .ok_or("parallel verify report is not an object")?
+        .remove("parser_performance");
+    assert_eq!(serial, parallel);
+
+    let source = pstforge_core::SourceFile::open(&case.path)?;
+    let inventory = |threads| -> Result<_, Box<dyn std::error::Error>> {
+        let mut native = libpff_sys::PffFile::open_fd(source.file().as_fd())?;
+        let mut sink = IndependentMessageSink::default();
+        let mut catalog = native.recovery_catalog_skipping_with_threads(
+            &mut sink,
+            &HashSet::new(),
+            RecoveryMode::Balanced,
+            threads,
+        )?;
+        catalog.parser_phase_metrics = libpff_sys::ParserPhaseMetrics::default();
+        if !sink.active.is_empty()
+            || !sink.attachments.is_empty()
+            || !sink.properties.is_empty()
+            || !sink.attachment_properties.is_empty()
+        {
+            return Err("parallel comparison ended with unfinished message state".into());
+        }
+        Ok((catalog, sink.completed))
+    };
+    let (serial_catalog, serial_messages) = inventory(1)?;
+    let (parallel_catalog, parallel_messages) = inventory(2)?;
+    assert_eq!(serial_catalog, parallel_catalog);
+    assert_eq!(serial_messages, parallel_messages);
     assert_eq!(
         pstforge_core::SourceFile::open(&case.path)?.identity(),
         &before
