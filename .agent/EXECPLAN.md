@@ -7943,9 +7943,12 @@ protection build on the approved remote baseline. Recheck authentication and
 repository settings before creating or configuring them. Local work and
 private-corpus acceptance must never depend on their existence.
 
-Revision note (2026-07-26): Recorded repeatable 50 GB parallel improvement,
-protected libpff integrations, the completed five-part 50 GB output, and clean
-`pffinfo` results. Reaffirmed that default direct output remains deliberately
-single-pass and hash-free; restartable mode is the explicit source-digest
-opt-in. No additional performance rerun is required, and the approximately
-83 GB candidate remains untouched until 1.2.0 approval.
+Revision note (2026-07-26): Closed 1.2.0 after repeatable 50 GB parallel
+improvement, byte-identical accepted output, protected libpff integrations,
+and protected PSTForge PR #7 merge `a8e4529`. Reaffirmed that default direct
+output remains deliberately single-pass and hash-free; restartable mode is the
+explicit source-digest opt-in. The separate large candidate was split
+independently and passed ScanPST and Outlook. A bounded ReadPST/libpst 0.6.76
+comparison reproduced MailPlus's deliberate Deleted Items exclusion, so local
+ReadPST item visibility is the optional MailPlus compatibility proxy and no
+content-relocation workaround or repeat large-source run is required.
