@@ -606,6 +606,13 @@ interoperability acceptance boundary and MailPlus compatibility is assumed.
 MailPlus import is optional operator evidence, not a release gate or an
 external resource dependency. A failure confined to MailPlus after ScanPST and
 Outlook pass is a Synology support issue rather than PSTForge release work.
+When a local MailPlus-targeted qualification is useful, the supported
+self-hosted proxy is ReadPST/libpst 0.6.76 with its default Deleted Items
+exclusion. A ScanPST-clean part for which default `readpst` exposes at least one
+supported item is positive MailPlus-importability evidence. Zero default output
+from a part containing only the well-known Deleted Items folder is expected
+importer policy, not an invalid PST; PSTForge does not relocate or discard that
+content to satisfy the importer.
 
 Before the 0.4 correctness series closes, every corrupt external acceptance
 sample with an owner-supplied ScanPST-repaired reference must be classified by

@@ -268,6 +268,11 @@ affect output PST bytes or recovered content also require a focused
 ScanPST-first human gate followed by Outlook inspection. MailPlus import is not
 an external acceptance dependency. Documentation, automation, packaging,
 reporting, and proven byte-identical refactors do not require the human gate.
+For optional MailPlus-targeted qualification, ScanPST-clean output plus at
+least one item exposed by default ReadPST/libpst 0.6.76 is positive local
+evidence. ReadPST intentionally omits the well-known Deleted Items folder
+unless `-D` is supplied, so zero default output from a Deleted Items-only part
+is an importer-policy result rather than PST corruption.
 Release automation accepts only the existing tag matching the package version,
 requires approval through the `release` environment, and retains a Debian
 build artifact without creating a GitHub release.
