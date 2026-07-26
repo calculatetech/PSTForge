@@ -3962,7 +3962,7 @@ not modified.
     and the public GitHub release contains the tag-built
     `pstforge_1.1.0_amd64.deb` with SHA-256
     `f31f6171336dcc39af044c0763c326f4797cd789308e5e994cadf4f9395a08d6`.
-- [ ] Milestone 1.2.0: Parallel Recovery Performance.
+- [x] Milestone 1.2.0: Parallel Recovery Performance.
   - [x] (2026-07-23) Began after 1.1.0 approval, protected integration, and
     publication. Created PSTForge branch
     `milestone/v1.2.0-parallel-recovery-performance` in sibling worktree
@@ -4060,13 +4060,15 @@ not modified.
     `1a5d2579bcf339a656dc11791982f23767b032622b0102413368e8733e348261`,
     and
     `d781757d0c1be1dc454848d6e1957eb05459147abd8c21f7435ea1d8a19a396a`.
-  - [ ] Complete integration. Direct mode intentionally
+  - [x] (2026-07-26) Complete integration. Direct mode intentionally
     remains hash-free and single-pass; source SHA-256 is an explicit
     restartable-mode tradeoff, not a default-output requirement. No additional
     50 GB performance or output rerun is required. The applicable fast gate
     passed at `.agent/test-results/1784831227-fast`, and the canonical full gate
-    passed at `.agent/test-results/1784831274-full`. Remaining work is clean
-    adversarial review, commit, PR, and protected merge.
+    passed at `.agent/test-results/1784831274-full`. Clean adversarial review,
+    focused commit review, and protected PR #7 completed; Ubuntu, Debian, and
+    CodeQL were green, every actionable review thread was resolved, and the
+    pull request merged as `a8e4529`.
   - [x] (2026-07-26) Remediate PR #7 review. Ubuntu, Debian, and CodeQL passed
     for commit `39fd250`. Review correctly found that compile-time fork
     revision alone cannot distinguish a dynamically replaced runtime and that
@@ -4075,8 +4077,30 @@ not modified.
     actually loaded `libpff` object, pins that digest in new restartable job
     configuration, and reports legacy completion provenance as `unknown`.
     Focused tests and fast gate `.agent/test-results/1785092341-fast` pass.
+  - [x] (2026-07-26) Resolve the apparent MailPlus rejection of the separate
+    large-candidate split without another source pass or external service
+    dependency. The development host and Synology both use ReadPST/libpst
+    0.6.76. The bounded 76 MB diagnostic part is structurally accepted and
+    lists 170 mail items and two appointments, but default `readpst` exports
+    none because they reside in the well-known Deleted Items folder. Adding
+    `-D` exports about 91 MB. The durable job ledger independently proves that
+    original parts 2 and 3 contain only Deleted Items, while part 1 is 95.14
+    percent Deleted Items and retains 1,111 other items. Synology's
+    owner-confirmed product choice not to import Deleted Items is accepted;
+    PSTForge will not
+    relocate or omit readable content to work around it.
 
 ## Surprises & Discoveries
+
+- Observation: Synology MailPlus's importer behavior is reproducible locally
+  with the same ReadPST/libpst 0.6.76 build. Default `readpst` can return
+  success immediately while exporting zero items when every visible item is
+  beneath the well-known Deleted Items folder; `lspst` still lists those
+  objects, and `readpst -D` exports them. A wrapper can consequently describe
+  a valid PST as an invalid type when the actual result is “no supported
+  importable items.”
+  Evidence: bounded RAM-backed default-versus-`-D` comparison of the 76 MB
+  regenerated diagnostic part, plus read-only finalized-job ledger counts.
 
 - Observation: A compile-time Git revision identifies the intended libpff
   source but not necessarily the dynamically loaded runtime because operators
@@ -5334,6 +5358,19 @@ not modified.
   `large-qualification-20260717T204931Z`.
 
 ## Decision Log
+
+- Decision: Use the installed ReadPST/libpst 0.6.76 behavior as an optional,
+  self-hosted MailPlus compatibility proxy. A ScanPST-clean part for which
+  default `readpst` exposes at least one supported item passes that proxy. Zero
+  default output from a part containing only the well-known Deleted Items
+  folder is an expected Synology import-policy result, not PST corruption.
+  Never move, rename, or omit readable source content merely to make that
+  importer consume it.
+  Rationale: The exact Synology parser version reproduces both the instant
+  empty result and successful `-D` extraction locally. This supplies
+  deterministic evidence without making MailPlus an external acceptance
+  resource and preserves PSTForge's native-fidelity contract.
+  Date/Author: 2026-07-26 / human owner direction after bounded diagnosis.
 
 - Decision: Restore recovery on current upstream libpff and deliver that fork
   as a private dynamically linked runtime in the single PSTForge Debian
@@ -6966,6 +7003,30 @@ evidence identifies writer/SQLite lifecycle rather than libpff traversal as
 the end-to-end bottleneck. All four direct parts passed ScanPST and Outlook.
 That pair is now the release interoperability boundary, so no MailPlus-hosting
 resource or import rehearsal remains before 1.0.
+
+Version 1.0.0 completed the protected release path after the canonical full
+and release gates, clean ScanPST analysis, successful Outlook inspection,
+reproducible Debian packaging, licensing review, and final structural-ID
+collision remediation. The approved tag and GitHub release preserve the
+replaceable distribution-selected parser boundary that was in scope for 1.0.
+
+Version 1.1.0 restores the broader readable recovery set through the separately
+maintained `calculatetech/libpff` fork and ships its private replaceable shared
+runtime, corresponding LGPL source, and provenance in one Debian package. The
+known damaged 50 GB source proved a readable superset of the 20180714 oracle,
+produced five accepted parts, and passed ScanPST and Outlook before the
+protected tag and release were published.
+
+Version 1.2.0 parallelizes the demonstrated native recovery-scan bottleneck
+with deterministic range-local filtering, deduplication, and serial-ordinal
+merge. Automatic execution reduced the accepted 50 GB end-to-end inventory
+time from 4,345,707 ms to repeatable 1,872,878-1,921,888 ms while preserving
+every aggregate inventory field and source identity. The final five output
+parts are byte-identical to the accepted 1.1.0 artifacts, and PR #7 merged
+through Ubuntu, Debian, CodeQL, and resolved-review protection. ReadPST 0.6.76
+now supplies optional local MailPlus importability evidence without changing
+the ScanPST/Outlook release boundary or PSTForge's obligation to preserve
+Deleted Items.
 
 ## Context and Orientation
 
