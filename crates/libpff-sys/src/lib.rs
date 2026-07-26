@@ -4,17 +4,25 @@ mod bindings;
 mod catalog;
 
 use std::collections::HashSet;
-use std::ffi::{CStr, CString, c_void};
+use std::ffi::{CStr, CString, OsStr, c_void};
+use std::fs::File;
+use std::io::Read;
 use std::os::fd::{AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
+use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::MetadataExt;
+use std::path::PathBuf;
 use std::ptr;
+use std::sync::OnceLock;
 
 use bindings::{libpff_error_t, libpff_file_t, libpff_item_t};
+use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 const ERROR_BUFFER_SIZE: usize = 16 * 1024;
 const MAX_FOLDERS: u64 = 1_000_000;
 pub const LIBPFF_REVISION: &str = env!("PSTFORGE_LIBPFF_REVISION");
 pub const MAX_PARALLEL_SCAN_THREADS: usize = 256;
+static LIBPFF_RUNTIME_SHA256: OnceLock<Result<String, String>> = OnceLock::new();
 
 #[derive(Debug, Error)]
 pub enum PffError {
@@ -37,6 +45,8 @@ pub enum PffError {
     RecoveryScanThreadPanicked,
     #[error("cannot start a parallel recovery scan worker: {0}")]
     RecoveryScanThreadSpawn(std::io::Error),
+    #[error("cannot identify the loaded libpff runtime: {0}")]
+    RuntimeIdentity(String),
     #[error("catalog sink rejected {operation}: {detail}")]
     Sink {
         operation: &'static str,
@@ -173,6 +183,105 @@ pub fn library_version() -> String {
 
 pub const fn library_revision() -> &'static str {
     LIBPFF_REVISION
+}
+
+pub fn library_runtime_sha256() -> Result<&'static str, PffError> {
+    match LIBPFF_RUNTIME_SHA256.get_or_init(hash_loaded_library) {
+        Ok(sha256) => Ok(sha256),
+        Err(error) => Err(PffError::RuntimeIdentity(error.clone())),
+    }
+}
+
+fn hash_loaded_library() -> Result<String, String> {
+    let symbol = bindings::libpff_get_version as *const () as *const c_void;
+    let mut info = std::mem::MaybeUninit::<libc::Dl_info>::zeroed();
+    // SAFETY: symbol identifies a loaded libpff function and info points to
+    // writable storage for dladdr's result.
+    if unsafe { libc::dladdr(symbol, info.as_mut_ptr()) } == 0 {
+        return Err("dladdr could not locate libpff_get_version".to_owned());
+    }
+    // SAFETY: dladdr succeeded and initialized the structure.
+    let info = unsafe { info.assume_init() };
+    if info.dli_fname.is_null() {
+        return Err("dladdr returned no libpff path".to_owned());
+    }
+    // SAFETY: dli_fname is a NUL-terminated string owned by the dynamic loader.
+    let path = PathBuf::from(OsStr::from_bytes(
+        unsafe { CStr::from_ptr(info.dli_fname) }.to_bytes(),
+    ));
+    let mut file =
+        File::open(&path).map_err(|error| format!("cannot open {}: {error}", path.display()))?;
+    let before = file
+        .metadata()
+        .map_err(|error| format!("cannot inspect {}: {error}", path.display()))?;
+    let mapped_inode = mapped_inode_for_address(symbol as usize)?;
+    if before.ino() != mapped_inode {
+        return Err(format!(
+            "{} no longer names the loaded libpff inode",
+            path.display()
+        ));
+    }
+    let mut hasher = Sha256::new();
+    let mut buffer = vec![0_u8; 1024 * 1024];
+    loop {
+        let read = file
+            .read(&mut buffer)
+            .map_err(|error| format!("cannot hash {}: {error}", path.display()))?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    let after = file
+        .metadata()
+        .map_err(|error| format!("cannot recheck {}: {error}", path.display()))?;
+    if before.dev() != after.dev()
+        || before.ino() != after.ino()
+        || before.len() != after.len()
+        || before.mtime() != after.mtime()
+        || before.mtime_nsec() != after.mtime_nsec()
+        || before.ctime() != after.ctime()
+        || before.ctime_nsec() != after.ctime_nsec()
+    {
+        return Err(format!("{} changed while it was hashed", path.display()));
+    }
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+fn mapped_inode_for_address(address: usize) -> Result<u64, String> {
+    let maps = std::fs::read_to_string("/proc/self/maps")
+        .map_err(|error| format!("cannot read /proc/self/maps: {error}"))?;
+    for line in maps.lines() {
+        let mut fields = line.split_whitespace();
+        let Some(range) = fields.next() else {
+            continue;
+        };
+        let Some((start, end)) = range.split_once('-') else {
+            continue;
+        };
+        let Ok(start) = usize::from_str_radix(start, 16) else {
+            continue;
+        };
+        let Ok(end) = usize::from_str_radix(end, 16) else {
+            continue;
+        };
+        if !(start..end).contains(&address) {
+            continue;
+        }
+        let _permissions = fields.next();
+        let _offset = fields.next();
+        let _device = fields.next();
+        let inode = fields
+            .next()
+            .ok_or_else(|| "loaded libpff mapping has no inode".to_owned())?
+            .parse::<u64>()
+            .map_err(|_| "loaded libpff mapping inode is invalid".to_owned())?;
+        if inode == 0 {
+            return Err("loaded libpff mapping has no file-backed inode".to_owned());
+        }
+        return Ok(inode);
+    }
+    Err("libpff_get_version is absent from /proc/self/maps".to_owned())
 }
 
 pub struct PffFile {
@@ -627,12 +736,25 @@ fn free_file(file: &mut *mut libpff_file_t) {
 mod tests {
     use std::ptr;
 
-    use super::{MAX_FOLDERS, check_one, library_version, validate_folder_capacity};
+    use super::{
+        MAX_FOLDERS, check_one, library_runtime_sha256, library_version, validate_folder_capacity,
+    };
 
     #[test]
     fn linked_library_meets_the_supported_floor() {
         let version = library_version();
         assert!(version.as_str() >= "20180714", "version was {version}");
+    }
+
+    #[test]
+    fn loaded_library_has_a_stable_content_identity() {
+        let sha256 = library_runtime_sha256().expect("identify loaded libpff");
+        assert_eq!(sha256.len(), 64);
+        assert!(sha256.bytes().all(|byte| byte.is_ascii_hexdigit()));
+        assert_eq!(
+            library_runtime_sha256().expect("reuse loaded libpff identity"),
+            sha256
+        );
     }
 
     #[test]

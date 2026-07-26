@@ -326,6 +326,8 @@ pub struct JobConfiguration {
     pub parser_threads: String,
     #[serde(default)]
     pub libpff_revision: Option<String>,
+    #[serde(default)]
+    pub libpff_runtime_sha256: Option<String>,
     pub maximum_pst_bytes: u64,
     pub part_size_policy: String,
     pub writer_format: String,
@@ -4231,6 +4233,11 @@ fn validate_resume_metadata(
     {
         return Err(JobError::ResumeMismatch("libpff revision"));
     }
+    if stored_configuration.libpff_runtime_sha256.is_some()
+        && stored_configuration.libpff_runtime_sha256 != configuration.libpff_runtime_sha256
+    {
+        return Err(JobError::ResumeMismatch("libpff runtime SHA-256"));
+    }
     if stored_configuration.maximum_pst_bytes != configuration.maximum_pst_bytes
         || stored_configuration.part_size_policy != configuration.part_size_policy
     {
@@ -6011,6 +6018,7 @@ mod tests {
             recovery_mode: "balanced".to_owned(),
             parser_threads: "auto".to_owned(),
             libpff_revision: None,
+            libpff_runtime_sha256: None,
             maximum_pst_bytes: 4_294_967_296,
             part_size_policy: "hard-maximum-v1".to_owned(),
             writer_format: "unicode-pst-v23".to_owned(),
@@ -6087,6 +6095,7 @@ mod tests {
             recovery_mode: "balanced".to_owned(),
             parser_threads: "auto".to_owned(),
             libpff_revision: None,
+            libpff_runtime_sha256: None,
             maximum_pst_bytes: 4_294_967_296,
             part_size_policy: "hard-maximum-v1".to_owned(),
             writer_format: "unicode-pst-v23".to_owned(),
@@ -6144,6 +6153,7 @@ mod tests {
             recovery_mode: "balanced".to_owned(),
             parser_threads: "auto".to_owned(),
             libpff_revision: Some("a".repeat(40)),
+            libpff_runtime_sha256: Some("c".repeat(64)),
             maximum_pst_bytes: 4_294_967_296,
             part_size_policy: "hard-maximum-v1".to_owned(),
             writer_format: "unicode-pst-v23".to_owned(),
@@ -6182,6 +6192,12 @@ mod tests {
             DurableCatalogSink::validate_resume(&job, &source, &mismatch),
             Err(JobError::ResumeMismatch("libpff revision"))
         ));
+        let mut mismatch = configuration.clone();
+        mismatch.libpff_runtime_sha256 = Some("d".repeat(64));
+        assert!(matches!(
+            DurableCatalogSink::validate_resume(&job, &source, &mismatch),
+            Err(JobError::ResumeMismatch("libpff runtime SHA-256"))
+        ));
         let mut wrong_source = source.clone();
         wrong_source.sha256 = Some("b".repeat(64));
         assert!(matches!(
@@ -6206,6 +6222,7 @@ mod tests {
         assert_eq!(configuration.execution_mode, "restartable");
         assert_eq!(configuration.parser_threads, "auto");
         assert_eq!(configuration.libpff_revision, None);
+        assert_eq!(configuration.libpff_runtime_sha256, None);
         Ok(())
     }
 
@@ -6230,6 +6247,7 @@ mod tests {
             recovery_mode: "balanced".to_owned(),
             parser_threads: "auto".to_owned(),
             libpff_revision: None,
+            libpff_runtime_sha256: None,
             maximum_pst_bytes: 4_294_967_296,
             part_size_policy: "hard-maximum-v1".to_owned(),
             writer_format: "unicode-pst-v23".to_owned(),
@@ -6362,6 +6380,7 @@ mod tests {
             recovery_mode: "balanced".to_owned(),
             parser_threads: "auto".to_owned(),
             libpff_revision: None,
+            libpff_runtime_sha256: None,
             maximum_pst_bytes: 4_294_967_296,
             part_size_policy: "hard-maximum-v1".to_owned(),
             writer_format: "unicode-pst-v23".to_owned(),
@@ -6439,6 +6458,7 @@ mod tests {
             recovery_mode: "balanced".to_owned(),
             parser_threads: "auto".to_owned(),
             libpff_revision: None,
+            libpff_runtime_sha256: None,
             maximum_pst_bytes: 4_294_967_296,
             part_size_policy: "hard-maximum-v1".to_owned(),
             writer_format: "unicode-pst-v23".to_owned(),

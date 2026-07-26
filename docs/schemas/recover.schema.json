@@ -9,7 +9,7 @@
     "schema_version": { "const": "1.2.0" },
     "command": { "const": "recover" },
     "mode": { "enum": ["balanced", "aggressive"] },
-    "libpff_revision": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
+    "libpff_revision": { "type": "string", "pattern": "^(unknown|[0-9a-f]{40})$" },
     "parser_threads": { "$ref": "common.schema.json#/$defs/parser_threads" },
     "parser_performance": { "$ref": "common.schema.json#/$defs/parser_performance" },
     "source": { "$ref": "common.schema.json#/$defs/source" },

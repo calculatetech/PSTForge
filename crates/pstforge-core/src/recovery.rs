@@ -48,6 +48,8 @@ pub enum RecoveryError {
     Interrupted,
     #[error("recovery catalog counters are inconsistent")]
     InconsistentCounters,
+    #[error(transparent)]
+    Parser(#[from] libpff_sys::PffError),
     #[error("resume requires an immutable job configuration")]
     ResumeConfigurationRequired,
 }
@@ -226,7 +228,7 @@ fn recover_source(
             issues: 1,
             issues_dropped: 0,
             peak_worker_rss_bytes: 0,
-            libpff_revision: Some(libpff_sys::library_revision().to_owned()),
+            libpff_revision: None,
             effective_parser_threads: 1,
             reachable_catalog_millis: 0,
             native_recovery_scan_millis: 0,
@@ -251,10 +253,7 @@ fn recover_source(
                 schema_version: RECOVERY_SCHEMA_VERSION.to_owned(),
                 command: "recover".to_owned(),
                 mode: recovery_mode_name(mode).to_owned(),
-                libpff_revision: completion
-                    .libpff_revision
-                    .clone()
-                    .unwrap_or_else(|| libpff_sys::library_revision().to_owned()),
+                libpff_revision: completion_revision(&completion),
                 parser_threads: ParserThreadSelection {
                     requested: parser_threads.requested(),
                     effective: completion.effective_parser_threads.max(1),
@@ -1356,6 +1355,13 @@ fn recovery_mode_name(mode: RecoveryMode) -> &'static str {
     }
 }
 
+fn completion_revision(completion: &RecoveryCompletion) -> String {
+    completion
+        .libpff_revision
+        .clone()
+        .unwrap_or_else(|| "unknown".to_owned())
+}
+
 #[cfg(test)]
 mod tests {
     use std::process::{Command, Stdio};
@@ -1363,13 +1369,32 @@ mod tests {
     use std::sync::atomic::{AtomicBool, AtomicU64};
     use std::time::{Duration, Instant};
 
-    use pstforge_job::JobSummary;
+    use pstforge_job::{JobSummary, RecoveryCompletion};
 
     use super::{
         AttemptWatchdog, DirectWorkerProcess, RecoveryError, WatchdogOutcome, WorkerProcess,
-        validate_catalog, worker_failure_category,
+        completion_revision, validate_catalog, worker_failure_category,
     };
     use crate::worker::WorkerCatalog;
+
+    #[test]
+    fn legacy_completion_revision_remains_unknown() {
+        let completion = RecoveryCompletion {
+            normal_items: 0,
+            recovered_items: 0,
+            orphan_items: 0,
+            fragment_items: 0,
+            issues: 0,
+            issues_dropped: 0,
+            peak_worker_rss_bytes: 0,
+            libpff_revision: None,
+            effective_parser_threads: 1,
+            reachable_catalog_millis: 0,
+            native_recovery_scan_millis: 0,
+            recovery_collection_millis: 0,
+        };
+        assert_eq!(completion_revision(&completion), "unknown");
+    }
 
     #[test]
     fn forged_completion_counts_are_rejected() {

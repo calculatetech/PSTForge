@@ -157,9 +157,13 @@ non-directory path components are refused. Without `--resume`, an existing
 nonempty job directory is an error. With `--resume`, the restartable
 job's source
 SHA-256, source identity, job schema, recovery mode, part-size policy, writer
-format, and compatible tool major version must match. A mismatch is refused
-and neither existing parts nor state are changed. Restartable jobs retain the
-three-times-source conservative capacity requirement. Direct jobs use a
+format, requested parser concurrency, compile-time libpff fork revision,
+SHA-256 of the actually loaded libpff runtime, and compatible tool major
+version must match. A mismatch is refused and neither existing parts nor state
+are changed. Legacy completion records that predate parser provenance report
+their revision as `unknown` rather than attributing them to the current
+runtime. Restartable jobs retain the three-times-source conservative capacity
+requirement. Direct jobs use a
 mode-specific estimate for final parts, the active same-filesystem temporary,
 compact metadata, manifests, and safety margin;
 they include no payload-spool allocation. On resume, validated allocation

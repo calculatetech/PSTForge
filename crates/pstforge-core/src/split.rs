@@ -302,6 +302,11 @@ pub fn split(
         recovery_mode: recovery_mode_name(mode).to_owned(),
         parser_threads: parser_threads.requested(),
         libpff_revision: Some(libpff_sys::library_revision().to_owned()),
+        libpff_runtime_sha256: Some(
+            libpff_sys::library_runtime_sha256()
+                .map_err(RecoveryError::Parser)?
+                .to_owned(),
+        ),
         maximum_pst_bytes,
         part_size_policy: PART_SIZE_POLICY.to_owned(),
         writer_format: WRITER_FORMAT.to_owned(),
@@ -3851,6 +3856,7 @@ mod tests {
                 recovery_mode: "balanced".to_owned(),
                 parser_threads: "auto".to_owned(),
                 libpff_revision: None,
+                libpff_runtime_sha256: None,
                 maximum_pst_bytes: 4_294_967_296,
                 part_size_policy: "hard-maximum-v1".to_owned(),
                 writer_format: "unicode-pst-v23".to_owned(),

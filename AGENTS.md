@@ -129,6 +129,9 @@ squash, amend, or discard human-authored work without explicit permission.
 - Keep all `unsafe` code inside the `libpff` system crate. Add
   `#![deny(unsafe_code)]` to every other crate.
 - Dynamically link `libpff`; do not statically combine it with PSTForge.
+- Bind new restartable jobs to both the compile-time fork revision and the
+  SHA-256 of the actually loaded `libpff` runtime. A replaceable runtime must
+  not silently resume state produced by different parser bytes.
 - Wrap every native pointer in a single-owner RAII type. Validate nullability,
   return codes, lengths, integer conversions, and cleanup paths.
 - Do not expose raw `libpff` pointers outside the FFI crate and do not send

@@ -238,6 +238,7 @@ impl CliError {
                 | RecoveryError::WorkerExit { .. }
                 | RecoveryError::WorkerStalled
                 | RecoveryError::InconsistentCounters
+                | RecoveryError::Parser(_)
                 | RecoveryError::ResumeConfigurationRequired,
             )
             | Self::Worker(_)

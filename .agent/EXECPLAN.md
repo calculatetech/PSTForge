@@ -4067,8 +4067,32 @@ not modified.
     passed at `.agent/test-results/1784831227-fast`, and the canonical full gate
     passed at `.agent/test-results/1784831274-full`. Remaining work is clean
     adversarial review, commit, PR, and protected merge.
+  - [x] (2026-07-26) Remediate PR #7 review. Ubuntu, Debian, and CodeQL passed
+    for commit `39fd250`. Review correctly found that compile-time fork
+    revision alone cannot distinguish a dynamically replaced runtime and that
+    a legacy completed job with no revision was falsely attributed to the
+    current parser. The focused remediation hashes and inode-checks the
+    actually loaded `libpff` object, pins that digest in new restartable job
+    configuration, and reports legacy completion provenance as `unknown`.
+    Focused tests and fast gate `.agent/test-results/1785092341-fast` pass.
 
 ## Surprises & Discoveries
+
+- Observation: A compile-time Git revision identifies the intended libpff
+  source but not necessarily the dynamically loaded runtime because operators
+  retain the right to replace `libpff.so.1`. Resume therefore also needs a
+  content identity for the mapped shared object. `dladdr` locates the object,
+  `/proc/self/maps` proves the pathname still names the mapped inode, and a
+  metadata-stable SHA-256 pass supplies the durable identity. This reads only
+  the small shared library, not the source PST.
+  Evidence: actionable P1 review thread on PSTForge PR #7 and focused
+  `loaded_library_has_a_stable_content_identity` coverage.
+
+- Observation: A legacy `RecoveryCompletion` deserializes its newly added
+  revision as absent. Substituting the current compile-time revision in a
+  report incorrectly claims that current code produced old durable work.
+  Preserve explicit `unknown` provenance instead.
+  Evidence: actionable P2 review thread on PSTForge PR #7.
 
 - Observation: Concatenating byte-range results does not preserve libpff's
   serial candidate order even when candidate counts and content totals match.
