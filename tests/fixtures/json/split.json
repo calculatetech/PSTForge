@@ -1,5 +1,5 @@
 {
-  "schema_version": "0.5.0",
+  "schema_version": "1.2.0",
   "command": "split",
   "execution_mode": "direct",
   "maximum_pst_bytes": 4294967296,
@@ -22,9 +22,19 @@
     "supervisor_filesystem_write_bytes": 8192
   },
   "recovery": {
-    "schema_version": "0.5.0",
+    "schema_version": "1.2.0",
     "command": "recover",
     "mode": "balanced",
+    "libpff_revision": "79cb8b7adce7796e79424fe160a0395cc3d2412e",
+    "parser_threads": {
+      "requested": "auto",
+      "effective": 1
+    },
+    "parser_performance": {
+      "reachable_catalog_millis": 12,
+      "native_recovery_scan_millis": 34,
+      "recovery_collection_millis": 56
+    },
     "source": {
       "canonical_path": "/external/example.pst",
       "device": 1,

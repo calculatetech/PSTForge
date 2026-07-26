@@ -33,6 +33,30 @@ fn configure() -> Result<(), String> {
             source.display()
         ));
     }
+    let git_head = command_output(
+        root,
+        "git",
+        [
+            OsStr::new("-C"),
+            source.as_os_str(),
+            OsStr::new("rev-parse"),
+            OsStr::new("--git-path"),
+            OsStr::new("HEAD"),
+        ],
+    )?;
+    let git_head = PathBuf::from(git_head.trim());
+    let git_head = if git_head.is_absolute() {
+        git_head
+    } else {
+        source.join(git_head)
+    };
+    if !git_head.is_file() {
+        return Err(format!(
+            "cannot resolve the libpff Git HEAD at {}",
+            git_head.display()
+        ));
+    }
+    println!("cargo:rerun-if-changed={}", git_head.display());
     let revision = command_output(
         root,
         "git",

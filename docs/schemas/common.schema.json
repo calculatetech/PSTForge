@@ -5,10 +5,30 @@
     "producer": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["pstforge_version", "libpff_version"],
+      "required": ["pstforge_version", "libpff_version", "libpff_revision"],
       "properties": {
         "pstforge_version": { "type": "string" },
-        "libpff_version": { "type": "string" }
+        "libpff_version": { "type": "string" },
+        "libpff_revision": { "type": "string", "pattern": "^[0-9a-f]{40}$" }
+      }
+    },
+    "parser_threads": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["requested", "effective"],
+      "properties": {
+        "requested": { "type": "string", "pattern": "^(auto|[1-9][0-9]*)$" },
+        "effective": { "type": "integer", "minimum": 1, "maximum": 256 }
+      }
+    },
+    "parser_performance": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["reachable_catalog_millis", "native_recovery_scan_millis", "recovery_collection_millis"],
+      "properties": {
+        "reachable_catalog_millis": { "type": "integer", "minimum": 0 },
+        "native_recovery_scan_millis": { "type": "integer", "minimum": 0 },
+        "recovery_collection_millis": { "type": "integer", "minimum": 0 }
       }
     },
     "source": {

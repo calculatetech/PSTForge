@@ -75,7 +75,7 @@ runtime dependencies are resolved:
 
 ```bash
 cargo xtask package deb
-sudo apt install ./target/debian/pstforge_1.1.0_amd64.deb
+sudo apt install ./target/debian/pstforge_1.2.0_amd64.deb
 pstforge --version
 ```
 
@@ -144,6 +144,11 @@ Account for reachable content, or include balanced recovery collections:
 pstforge verify /storage/damaged.pst --mode full
 pstforge verify /storage/damaged.pst --mode recovery --json > verify.json
 ```
+
+Balanced recovery uses automatic parser parallelism. Use
+`--parser-threads N` to cap it explicitly; JSON and human reports record both
+the requested and effective count. Aggressive fragment scanning remains
+single-threaded to preserve exact recovery semantics.
 
 Split directly using the default 4 GiB target:
 

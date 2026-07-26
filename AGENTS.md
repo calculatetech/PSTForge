@@ -28,8 +28,11 @@ changes the product specification.
 - Never repair, truncate, rename, move, delete, or overwrite a source PST.
 - Refuse a source that resolves inside the output job directory, and refuse
   symlinked source files rather than following them.
-- Record the source device, inode, size, modification time, and SHA-256 before
-  recovery. Recheck identity metadata before reporting completion.
+- Record the source device, inode, size, and modification time before recovery.
+  Record SHA-256 before restartable recovery, where it is required to bind
+  durable state. Default direct output deliberately skips the pre-hash to
+  remain single-pass; recheck its held-descriptor and path identity metadata
+  before reporting completion.
 - Write generated data only beneath the selected output job directory.
 - Create temporary output beside its final destination and publish it with an
   atomic rename only after validation and `fsync` complete.
@@ -126,6 +129,9 @@ squash, amend, or discard human-authored work without explicit permission.
 - Keep all `unsafe` code inside the `libpff` system crate. Add
   `#![deny(unsafe_code)]` to every other crate.
 - Dynamically link `libpff`; do not statically combine it with PSTForge.
+- Bind new restartable jobs to both the compile-time fork revision and the
+  SHA-256 of the actually loaded `libpff` runtime. A replaceable runtime must
+  not silently resume state produced by different parser bytes.
 - Wrap every native pointer in a single-owner RAII type. Validate nullability,
   return codes, lengths, integer conversions, and cleanup paths.
 - Do not expose raw `libpff` pointers outside the FFI crate and do not send

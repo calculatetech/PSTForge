@@ -322,6 +322,12 @@ pub struct JobConfiguration {
     #[serde(default = "default_execution_mode")]
     pub execution_mode: String,
     pub recovery_mode: String,
+    #[serde(default = "default_parser_threads")]
+    pub parser_threads: String,
+    #[serde(default)]
+    pub libpff_revision: Option<String>,
+    #[serde(default)]
+    pub libpff_runtime_sha256: Option<String>,
     pub maximum_pst_bytes: u64,
     pub part_size_policy: String,
     pub writer_format: String,
@@ -329,6 +335,10 @@ pub struct JobConfiguration {
 
 fn default_execution_mode() -> String {
     "restartable".to_owned()
+}
+
+fn default_parser_threads() -> String {
+    "auto".to_owned()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -341,6 +351,39 @@ pub struct RecoveryCompletion {
     pub issues: u64,
     pub issues_dropped: u64,
     pub peak_worker_rss_bytes: u64,
+    #[serde(default)]
+    pub libpff_revision: Option<String>,
+    #[serde(default = "default_effective_parser_threads")]
+    pub effective_parser_threads: usize,
+    #[serde(default)]
+    pub reachable_catalog_millis: u64,
+    #[serde(default)]
+    pub native_recovery_scan_millis: u64,
+    #[serde(default)]
+    pub recovery_collection_millis: u64,
+}
+
+fn default_effective_parser_threads() -> usize {
+    1
+}
+
+fn validate_recovery_completion(completion: &RecoveryCompletion) -> Result<(), JobError> {
+    if !(1..=libpff_sys::MAX_PARALLEL_SCAN_THREADS).contains(&completion.effective_parser_threads) {
+        return Err(JobError::Integrity(
+            "recovery completion parser thread count is invalid".to_owned(),
+        ));
+    }
+    if completion.libpff_revision.as_ref().is_some_and(|revision| {
+        revision.len() != 40
+            || !revision
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    }) {
+        return Err(JobError::Integrity(
+            "recovery completion libpff revision is invalid".to_owned(),
+        ));
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1375,6 +1418,7 @@ impl DurableCatalogSink {
                 "cannot complete recovery during an active candidate".to_owned(),
             ));
         }
+        validate_recovery_completion(completion)?;
         self.connection.execute(
             "INSERT OR REPLACE INTO job_metadata(key, value) VALUES ('recovery_completion', ?1)",
             [serde_json::to_string(completion)?],
@@ -1391,9 +1435,13 @@ impl DurableCatalogSink {
                 |row| row.get::<_, String>(0),
             )
             .optional()?;
-        value
+        let completion = value
             .map(|value| serde_json::from_str(&value).map_err(JobError::from))
-            .transpose()
+            .transpose()?;
+        if let Some(completion) = &completion {
+            validate_recovery_completion(completion)?;
+        }
+        Ok(completion)
     }
 
     pub fn isolated_units(&self) -> Result<Vec<(RecoveryUnit, u32)>, JobError> {
@@ -3336,6 +3384,9 @@ fn report_ledger_evidence(connection: &Connection) -> Result<ReportLedgerEvidenc
         .optional()?
         .map(|value| serde_json::from_str(&value))
         .transpose()?;
+    if let Some(completion) = &recovery_completion {
+        validate_recovery_completion(completion)?;
+    }
     let (committed, recovered, orphan, fragment, complete, partial, unsupported) = connection
         .query_row(
             "SELECT COUNT(*),\
@@ -4173,6 +4224,19 @@ fn validate_resume_metadata(
     }
     if stored_configuration.recovery_mode != configuration.recovery_mode {
         return Err(JobError::ResumeMismatch("recovery mode"));
+    }
+    if stored_configuration.parser_threads != configuration.parser_threads {
+        return Err(JobError::ResumeMismatch("parser threads"));
+    }
+    if stored_configuration.libpff_revision.is_some()
+        && stored_configuration.libpff_revision != configuration.libpff_revision
+    {
+        return Err(JobError::ResumeMismatch("libpff revision"));
+    }
+    if stored_configuration.libpff_runtime_sha256.is_some()
+        && stored_configuration.libpff_runtime_sha256 != configuration.libpff_runtime_sha256
+    {
+        return Err(JobError::ResumeMismatch("libpff runtime SHA-256"));
     }
     if stored_configuration.maximum_pst_bytes != configuration.maximum_pst_bytes
         || stored_configuration.part_size_policy != configuration.part_size_policy
@@ -5897,13 +5961,40 @@ mod tests {
         CANDIDATE_CHECKPOINT_BATCH, CandidateRejectionCategory, DIRECT_SQLITE_CACHE_KIB,
         DirectEmbeddedCandidate, DurableCatalogSink, INLINE_BLOB_MAX_BYTES, INLINE_CACHE_DIRECTORY,
         JobConfiguration, JobError, JobSourceIdentity, PAYLOAD_PACK_FILENAME, PartSidecar,
-        PayloadPackMetrics, PublishedPart, WorkerEvent, digest_hex, private_state_attributes_valid,
-        read_validated_report_snapshot, run_sql_interruptible, validate_blob_store, write_hashed,
-        write_sidecar_partial,
+        PayloadPackMetrics, PublishedPart, RecoveryCompletion, WorkerEvent, digest_hex,
+        private_state_attributes_valid, read_validated_report_snapshot, run_sql_interruptible,
+        validate_blob_store, validate_recovery_completion, write_hashed, write_sidecar_partial,
     };
 
     struct PrefixThenError {
         remaining: usize,
+    }
+
+    #[test]
+    fn recovery_completion_rejects_untrusted_parser_provenance() {
+        let valid = RecoveryCompletion {
+            normal_items: 1,
+            recovered_items: 2,
+            orphan_items: 3,
+            fragment_items: 0,
+            issues: 0,
+            issues_dropped: 0,
+            peak_worker_rss_bytes: 1024,
+            libpff_revision: Some("a".repeat(40)),
+            effective_parser_threads: 2,
+            reachable_catalog_millis: 10,
+            native_recovery_scan_millis: 20,
+            recovery_collection_millis: 30,
+        };
+        assert!(validate_recovery_completion(&valid).is_ok());
+        let mut invalid = valid.clone();
+        invalid.effective_parser_threads = 0;
+        assert!(validate_recovery_completion(&invalid).is_err());
+        invalid.effective_parser_threads = 1;
+        invalid.libpff_revision = Some("../not-a-revision".to_owned());
+        assert!(validate_recovery_completion(&invalid).is_err());
+        invalid.libpff_revision = Some("A".repeat(40));
+        assert!(validate_recovery_completion(&invalid).is_err());
     }
 
     #[test]
@@ -5925,6 +6016,9 @@ mod tests {
             split_schema_version: "0.5.0".to_owned(),
             execution_mode: "direct".to_owned(),
             recovery_mode: "balanced".to_owned(),
+            parser_threads: "auto".to_owned(),
+            libpff_revision: None,
+            libpff_runtime_sha256: None,
             maximum_pst_bytes: 4_294_967_296,
             part_size_policy: "hard-maximum-v1".to_owned(),
             writer_format: "unicode-pst-v23".to_owned(),
@@ -5999,6 +6093,9 @@ mod tests {
             split_schema_version: "0.5.0".to_owned(),
             execution_mode: "restartable".to_owned(),
             recovery_mode: "balanced".to_owned(),
+            parser_threads: "auto".to_owned(),
+            libpff_revision: None,
+            libpff_runtime_sha256: None,
             maximum_pst_bytes: 4_294_967_296,
             part_size_policy: "hard-maximum-v1".to_owned(),
             writer_format: "unicode-pst-v23".to_owned(),
@@ -6054,6 +6151,9 @@ mod tests {
             split_schema_version: "0.4.4".to_owned(),
             execution_mode: "restartable".to_owned(),
             recovery_mode: "balanced".to_owned(),
+            parser_threads: "auto".to_owned(),
+            libpff_revision: Some("a".repeat(40)),
+            libpff_runtime_sha256: Some("c".repeat(64)),
             maximum_pst_bytes: 4_294_967_296,
             part_size_policy: "hard-maximum-v1".to_owned(),
             writer_format: "unicode-pst-v23".to_owned(),
@@ -6086,6 +6186,18 @@ mod tests {
             DurableCatalogSink::validate_resume(&job, &source, &mismatch),
             Err(JobError::ResumeMismatch("execution mode"))
         ));
+        let mut mismatch = configuration.clone();
+        mismatch.libpff_revision = Some("b".repeat(40));
+        assert!(matches!(
+            DurableCatalogSink::validate_resume(&job, &source, &mismatch),
+            Err(JobError::ResumeMismatch("libpff revision"))
+        ));
+        let mut mismatch = configuration.clone();
+        mismatch.libpff_runtime_sha256 = Some("d".repeat(64));
+        assert!(matches!(
+            DurableCatalogSink::validate_resume(&job, &source, &mismatch),
+            Err(JobError::ResumeMismatch("libpff runtime SHA-256"))
+        ));
         let mut wrong_source = source.clone();
         wrong_source.sha256 = Some("b".repeat(64));
         assert!(matches!(
@@ -6108,6 +6220,9 @@ mod tests {
             "writer_format": "unicode-pst-v23"
         }))?;
         assert_eq!(configuration.execution_mode, "restartable");
+        assert_eq!(configuration.parser_threads, "auto");
+        assert_eq!(configuration.libpff_revision, None);
+        assert_eq!(configuration.libpff_runtime_sha256, None);
         Ok(())
     }
 
@@ -6130,6 +6245,9 @@ mod tests {
             split_schema_version: "0.4.4".to_owned(),
             execution_mode: "restartable".to_owned(),
             recovery_mode: "balanced".to_owned(),
+            parser_threads: "auto".to_owned(),
+            libpff_revision: None,
+            libpff_runtime_sha256: None,
             maximum_pst_bytes: 4_294_967_296,
             part_size_policy: "hard-maximum-v1".to_owned(),
             writer_format: "unicode-pst-v23".to_owned(),
@@ -6260,6 +6378,9 @@ mod tests {
             split_schema_version: "0.4.4".to_owned(),
             execution_mode: "restartable".to_owned(),
             recovery_mode: "balanced".to_owned(),
+            parser_threads: "auto".to_owned(),
+            libpff_revision: None,
+            libpff_runtime_sha256: None,
             maximum_pst_bytes: 4_294_967_296,
             part_size_policy: "hard-maximum-v1".to_owned(),
             writer_format: "unicode-pst-v23".to_owned(),
@@ -6335,6 +6456,9 @@ mod tests {
             split_schema_version: "0.4.4".to_owned(),
             execution_mode: "restartable".to_owned(),
             recovery_mode: "balanced".to_owned(),
+            parser_threads: "auto".to_owned(),
+            libpff_revision: None,
+            libpff_runtime_sha256: None,
             maximum_pst_bytes: 4_294_967_296,
             part_size_policy: "hard-maximum-v1".to_owned(),
             writer_format: "unicode-pst-v23".to_owned(),

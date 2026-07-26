@@ -6,7 +6,7 @@
   "additionalProperties": false,
   "required": ["schema_version", "command", "execution_mode", "maximum_pst_bytes", "resumed", "keep_work", "disk_preflight", "metrics", "recovery", "rejection_counts", "parts", "written_candidates", "partial", "terminal_failure"],
   "properties": {
-    "schema_version": { "const": "0.5.0" },
+    "schema_version": { "const": "1.2.0" },
     "command": { "const": "split" },
     "execution_mode": { "enum": ["direct", "restartable"] },
     "maximum_pst_bytes": { "type": "integer", "minimum": 1 },

@@ -9,9 +9,11 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tracing::info;
 
-use crate::{SourceError, SourceFile, SourceIdentity, VERSION};
+use crate::{
+    ParserThreadRequest, ParserThreadSelection, SourceError, SourceFile, SourceIdentity, VERSION,
+};
 
-pub const INSPECTION_SCHEMA_VERSION: &str = "1.1.0";
+pub const INSPECTION_SCHEMA_VERSION: &str = "1.2.0";
 
 #[derive(Debug, Error)]
 pub enum InspectionError {
@@ -47,6 +49,7 @@ pub enum EncryptionMode {
 pub struct Producer {
     pub pstforge_version: String,
     pub libpff_version: String,
+    pub libpff_revision: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -104,7 +107,16 @@ pub struct VerifyReport {
     pub source: SourceIdentity,
     pub pst: PstMetadata,
     pub inventory: InventoryReport,
+    pub parser_threads: ParserThreadSelection,
+    pub parser_performance: ParserPerformanceReport,
     pub source_unchanged: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ParserPerformanceReport {
+    pub reachable_catalog_millis: u64,
+    pub native_recovery_scan_millis: u64,
+    pub recovery_collection_millis: u64,
 }
 
 pub trait InspectionBackend {
@@ -112,7 +124,11 @@ pub trait InspectionBackend {
     fn metadata(&self) -> Result<RawPffMetadata, PffError>;
     fn catalog(&self, sink: &mut dyn CatalogSink) -> Result<RawCatalog, PffError>;
 
-    fn recovery_catalog(&self, sink: &mut dyn CatalogSink) -> Result<RawCatalog, PffError> {
+    fn recovery_catalog(
+        &self,
+        sink: &mut dyn CatalogSink,
+        _requested_threads: usize,
+    ) -> Result<RawCatalog, PffError> {
         self.catalog(sink)
     }
 }
@@ -142,8 +158,19 @@ impl InspectionBackend for LibpffBackend {
         self.file.borrow().catalog(sink)
     }
 
-    fn recovery_catalog(&self, sink: &mut dyn CatalogSink) -> Result<RawCatalog, PffError> {
-        self.file.borrow_mut().recovery_catalog(sink)
+    fn recovery_catalog(
+        &self,
+        sink: &mut dyn CatalogSink,
+        requested_threads: usize,
+    ) -> Result<RawCatalog, PffError> {
+        self.file
+            .borrow_mut()
+            .recovery_catalog_skipping_with_threads(
+                sink,
+                &std::collections::HashSet::new(),
+                libpff_sys::RecoveryMode::Balanced,
+                requested_threads,
+            )
     }
 }
 
@@ -154,19 +181,29 @@ pub fn info(path: &Path) -> Result<InfoReport, InspectionError> {
 }
 
 pub fn verify(path: &Path) -> Result<VerifyReport, InspectionError> {
+    verify_with_parser_threads(path, ParserThreadRequest::Auto)
+}
+
+pub fn verify_with_parser_threads(
+    path: &Path,
+    parser_threads: ParserThreadRequest,
+) -> Result<VerifyReport, InspectionError> {
     let source = SourceFile::open(path)?;
     let backend = LibpffBackend::open(&source)?;
-    verify_with_backend(&source, &backend)
+    verify_with_scope(&source, &backend, false, parser_threads)
 }
 
 pub fn verify_recovery(path: &Path) -> Result<VerifyReport, InspectionError> {
     let source = SourceFile::open(path)?;
-    verify_recovery_source(&source)
+    verify_recovery_source(&source, ParserThreadRequest::Auto)
 }
 
-pub fn verify_recovery_source(source: &SourceFile) -> Result<VerifyReport, InspectionError> {
+pub fn verify_recovery_source(
+    source: &SourceFile,
+    parser_threads: ParserThreadRequest,
+) -> Result<VerifyReport, InspectionError> {
     let backend = LibpffBackend::open(source)?;
-    verify_recovery_with_backend(source, &backend)
+    verify_with_scope(source, &backend, true, parser_threads)
 }
 
 pub fn info_with_backend(
@@ -195,30 +232,40 @@ pub fn verify_with_backend(
     source: &SourceFile,
     backend: &dyn InspectionBackend,
 ) -> Result<VerifyReport, InspectionError> {
-    verify_with_scope(source, backend, false)
+    verify_with_scope(source, backend, false, ParserThreadRequest::Auto)
 }
 
 pub fn verify_recovery_with_backend(
     source: &SourceFile,
     backend: &dyn InspectionBackend,
 ) -> Result<VerifyReport, InspectionError> {
-    verify_with_scope(source, backend, true)
+    verify_with_scope(source, backend, true, ParserThreadRequest::Auto)
 }
 
 fn verify_with_scope(
     source: &SourceFile,
     backend: &dyn InspectionBackend,
     recovery: bool,
+    parser_threads: ParserThreadRequest,
 ) -> Result<VerifyReport, InspectionError> {
     let raw = backend.metadata()?;
     validate_metadata(source, raw)?;
     let mut sink = InventorySink::default();
     let raw_inventory = if recovery {
-        backend.recovery_catalog(&mut sink)?
+        backend.recovery_catalog(&mut sink, parser_threads.requested_count())?
     } else {
         backend.catalog(&mut sink)?
     };
     source.verify_unchanged()?;
+    let parser_performance = ParserPerformanceReport {
+        reachable_catalog_millis: raw_inventory.parser_phase_metrics.reachable_catalog_millis,
+        native_recovery_scan_millis: raw_inventory
+            .parser_phase_metrics
+            .native_recovery_scan_millis,
+        recovery_collection_millis: raw_inventory
+            .parser_phase_metrics
+            .recovery_collection_millis,
+    };
     let issues = raw_inventory
         .issues
         .into_iter()
@@ -233,6 +280,13 @@ fn verify_with_scope(
         folders = raw_inventory.folders,
         normal_items = raw_inventory.messages,
         recovery,
+        reachable_catalog_millis = raw_inventory.parser_phase_metrics.reachable_catalog_millis,
+        native_recovery_scan_millis = raw_inventory
+            .parser_phase_metrics
+            .native_recovery_scan_millis,
+        recovery_collection_millis = raw_inventory
+            .parser_phase_metrics
+            .recovery_collection_millis,
         "inventory complete"
     );
     Ok(VerifyReport {
@@ -265,6 +319,11 @@ fn verify_with_scope(
             issues,
             issues_dropped: raw_inventory.issues_dropped,
         },
+        parser_threads: ParserThreadSelection {
+            requested: parser_threads.requested(),
+            effective: raw_inventory.parser_phase_metrics.effective_threads.max(1),
+        },
+        parser_performance,
         source_unchanged: true,
     })
 }
@@ -306,6 +365,7 @@ fn producer(backend: &dyn InspectionBackend) -> Producer {
     Producer {
         pstforge_version: VERSION.to_owned(),
         libpff_version: backend.library_version(),
+        libpff_revision: libpff_sys::library_revision().to_owned(),
     }
 }
 
@@ -406,11 +466,16 @@ mod tests {
                 attachment_bytes: 17,
                 issues: Vec::new(),
                 issues_dropped: 0,
+                parser_phase_metrics: libpff_sys::ParserPhaseMetrics::default(),
                 active_message_issues: Vec::new(),
             })
         }
 
-        fn recovery_catalog(&self, sink: &mut dyn CatalogSink) -> Result<RawCatalog, PffError> {
+        fn recovery_catalog(
+            &self,
+            sink: &mut dyn CatalogSink,
+            _requested_threads: usize,
+        ) -> Result<RawCatalog, PffError> {
             let mut catalog = self.catalog(sink)?;
             catalog.recovered_messages = 3;
             catalog.orphan_messages = 2;
@@ -435,7 +500,31 @@ mod tests {
         assert_eq!(report.inventory.normal_items, 12);
         assert_eq!(report.inventory.recipients, 24);
         assert_eq!(report.inventory.peak_stream_chunk_bytes, 17);
+        assert_eq!(report.parser_threads.requested, "auto");
+        assert_eq!(report.parser_threads.effective, 1);
         assert!(report.source_unchanged);
+        Ok(())
+    }
+
+    #[test]
+    fn full_verification_preserves_an_explicit_parser_thread_request()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempdir()?;
+        let path = directory.path().join("fake.pst");
+        fs::write(&path, b"fake pst")?;
+        let source = SourceFile::open(&path)?;
+        let report = super::verify_with_scope(
+            &source,
+            &FakeBackend {
+                size: source.identity().size_bytes,
+            },
+            false,
+            crate::ParserThreadRequest::Count(
+                std::num::NonZeroUsize::new(4).expect("non-zero test thread count"),
+            ),
+        )?;
+        assert_eq!(report.parser_threads.requested, "4");
+        assert_eq!(report.parser_threads.effective, 1);
         Ok(())
     }
 

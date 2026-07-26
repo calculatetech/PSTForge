@@ -1,8 +1,12 @@
 {
-  "schema_version": "1.1.0",
+  "schema_version": "1.2.0",
   "command": "verify",
   "mode": "recovery",
-  "producer": { "pstforge_version": "0.5.0", "libpff_version": "20231205" },
+  "producer": {
+    "pstforge_version": "1.2.0",
+    "libpff_version": "20260625",
+    "libpff_revision": "79cb8b7adce7796e79424fe160a0395cc3d2412e"
+  },
   "source": {
     "canonical_path": "/external/example.pst",
     "device": 1,
@@ -35,6 +39,15 @@
     "orphan_items": 0,
     "issues": [],
     "issues_dropped": 0
+  },
+  "parser_threads": {
+    "requested": "auto",
+    "effective": 1
+  },
+  "parser_performance": {
+    "reachable_catalog_millis": 12,
+    "native_recovery_scan_millis": 34,
+    "recovery_collection_millis": 56
   },
   "source_unchanged": true
 }

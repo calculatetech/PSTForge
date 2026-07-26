@@ -4,9 +4,9 @@
   "title": "PSTForge verify result",
   "type": "object",
   "additionalProperties": false,
-  "required": ["schema_version", "command", "mode", "producer", "source", "pst", "inventory", "source_unchanged"],
+  "required": ["schema_version", "command", "mode", "producer", "source", "pst", "inventory", "parser_threads", "parser_performance", "source_unchanged"],
   "properties": {
-    "schema_version": { "const": "1.1.0" },
+    "schema_version": { "const": "1.2.0" },
     "command": { "const": "verify" },
     "mode": { "enum": ["full", "recovery"] },
     "producer": { "$ref": "common.schema.json#/$defs/producer" },
@@ -48,6 +48,8 @@
         "issues_dropped": { "type": "integer", "minimum": 0 }
       }
     },
+    "parser_threads": { "$ref": "common.schema.json#/$defs/parser_threads" },
+    "parser_performance": { "$ref": "common.schema.json#/$defs/parser_performance" },
     "source_unchanged": { "type": "boolean" }
   }
 }

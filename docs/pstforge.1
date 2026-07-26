@@ -1,4 +1,4 @@
-.TH PSTFORGE 1 "July 2026" "PSTForge 1.1.0" "User Commands"
+.TH PSTFORGE 1 "July 2026" "PSTForge 1.2.0" "User Commands"
 .SH NAME
 pstforge \- recover and split damaged Outlook PST files without modifying them
 .SH SYNOPSIS
@@ -9,6 +9,7 @@ pstforge \- recover and split damaged Outlook PST files without modifying them
 .B pstforge verify
 .I SOURCE
 .RI [ --mode " full|recovery" ]
+.RI [ --parser-threads " auto|N" ]
 .RI [ --json ]
 .br
 .B pstforge recover
@@ -16,6 +17,7 @@ pstforge \- recover and split damaged Outlook PST files without modifying them
 .B --output
 .I JOB-DIR
 .RI [ --recovery " balanced|aggressive" ]
+.RI [ --parser-threads " auto|N" ]
 .RI [ --json ]
 .br
 .B pstforge split
@@ -72,6 +74,15 @@ Use
 recovery. Aggressive mode also asks libpff to ignore allocation data and scan
 fragments, so additional damaged candidates may have lower confidence.
 .TP
+.BI --parser-threads " auto|N"
+Select independent read-only parser handles for balanced recovery scanning.
+The default,
+.B auto,
+uses available parallelism up to the number of useful scan ranges. Reports
+record requested and effective counts; the effective count has a defensive
+ceiling of 256. Aggressive fragment scanning currently uses one effective
+parser thread to preserve exact recovery semantics.
+.TP
 .B --restartable
 Persist recovered payloads so an interrupted job can resume. This costs about
 one extra payload write and additional temporary disk space. Direct mode is
@@ -79,7 +90,8 @@ the default.
 .TP
 .B --resume
 Resume a matching restartable job. Source digest, identity, configuration,
-schema, and writer format must match.
+schema, writer format, parser settings, fork revision, and loaded libpff
+runtime SHA-256 must match.
 .TP
 .B --keep-work
 Keep restartable payload storage after successful completion.

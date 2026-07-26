@@ -27,8 +27,9 @@ deleted or disconnected items exposed by `libpff`, orphan items, and fragment
 candidates in explicit aggressive mode when the input library can prove
 fragment origin.
 
-PSTForge 1.1 dynamically links a private, replaceable `libpff.so.1` built from
-the pinned `calculatetech/libpff` fork. The Debian package installs that runtime
+PSTForge 1.1 and later dynamically link a private, replaceable `libpff.so.1`
+built from the pinned `calculatetech/libpff` fork. The Debian package installs
+that runtime
 below `/usr/lib/pstforge`, records its exact revision, and includes its complete
 LGPL corresponding source; it does not depend on distribution `libpff1t64`.
 This restores recovery behavior lost after Debian's 20180714 implementation
@@ -64,7 +65,7 @@ path, size, file type, ANSI or Unicode format, page variant, encryption mode,
 `libpff` corruption flag, timestamps, and tool/library versions. It does not
 enumerate every item and does not invoke deleted-item recovery.
 
-### `pstforge verify <source.pst> [--mode <full|recovery>] [--json]`
+### `pstforge verify <source.pst> [--mode <full|recovery>] [--parser-threads <auto|N>] [--json]`
 
 `verify` defaults to `full`. Full mode traverses all reachable folders and mail
 and validates every readable property and attachment stream without writing a
@@ -75,10 +76,18 @@ and orphan discovery. The result states what was checked; it never calls the
 The full-mode inventory uses a bounded event stream and reports folders,
 normal mail, recipients, attachments, embedded messages, unsupported message
 classes, raw-property and payload byte totals, the peak stream chunk, and a
-capped issue list with an omitted-issue count. Version 0.1.1 emits inspection
-schema `1.1.0`; absent recovery scans remain `null`, never zero.
+capped issue list with an omitted-issue count. Version 1.2.0 emits inspection
+schema `1.2.0`; absent recovery scans remain `null`, never zero.
 
-### `pstforge recover <source.pst> --output <job-dir> [--json]`
+Balanced recovery scanning defaults to `--parser-threads auto`, which selects
+available parallelism up to the number of useful immutable scan ranges.
+An explicit positive integer bounds the independent read-only parser handles;
+the effective count is capped at 256 as a defensive resource ceiling.
+Reports record both the requested and effective count. Aggressive fragment
+scanning remains single-threaded because its overlapping byte scan cannot yet
+be partitioned without changing recovery semantics.
+
+### `pstforge recover <source.pst> --output <job-dir> [--parser-threads <auto|N>] [--json]`
 
 Version 0.3.0 exposes balanced recovery as an operator-visible checkpoint.
 It processes reachable mail first, invokes `libpff` deleted-item recovery with
@@ -103,6 +112,7 @@ failure is `4`.
 
     --max-pst-size <SIZE>        Default: 4GiB. Accept IEC or SI suffixes.
     --recovery <MODE>            balanced (default) or aggressive.
+    --parser-threads <auto|N>    Default: auto. Positive integer override.
     --restartable                Enable the durable payload spool.
     --resume                     Resume a matching --restartable job.
     --keep-work                  Retain --restartable payloads after success.
@@ -147,9 +157,13 @@ non-directory path components are refused. Without `--resume`, an existing
 nonempty job directory is an error. With `--resume`, the restartable
 job's source
 SHA-256, source identity, job schema, recovery mode, part-size policy, writer
-format, and compatible tool major version must match. A mismatch is refused
-and neither existing parts nor state are changed. Restartable jobs retain the
-three-times-source conservative capacity requirement. Direct jobs use a
+format, requested parser concurrency, compile-time libpff fork revision,
+SHA-256 of the actually loaded libpff runtime, and compatible tool major
+version must match. A mismatch is refused and neither existing parts nor state
+are changed. Legacy completion records that predate parser provenance report
+their revision as `unknown` rather than attributing them to the current
+runtime. Restartable jobs retain the three-times-source conservative capacity
+requirement. Direct jobs use a
 mode-specific estimate for final parts, the active same-filesystem temporary,
 compact metadata, manifests, and safety margin;
 they include no payload-spool allocation. On resume, validated allocation
@@ -574,8 +588,9 @@ cannot be read or cannot be represented safely in a Unicode PST; a generic
 writer rejection or unsupported status does not satisfy this exception.
 
 The 19 GB operational qualification has a cold-run ceiling of one minute per
-source GiB on the current host and a 2 GiB aggregate RSS limit. A normal part
-is serialized once; the implementation must not repeatedly rewrite a
+source GiB on the current host. Its measured aggregate RSS is capacity-planning
+evidence, not a fixed acceptance ceiling. A normal part is serialized once;
+the implementation must not repeatedly rewrite a
 multi-gigabyte candidate merely to discover whether it fits. Restartable mode
 after material progress must complete less work and finish faster than an
 equivalent cold restart. SIGINT and SIGTERM must be observed at bounded
